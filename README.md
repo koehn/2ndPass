@@ -21,7 +21,7 @@ Version 0.3.0.
 
 [Usage examples](docs/EXAMPLES.md) · [Security and key management](docs/SECURITY.md)
 
-mop stores secrets in an encrypted file and uses your Mac's Secure Enclave to
+mop stores secrets in an encrypted file and uses your Mac's [Secure Enclave](https://support.apple.com/guide/security/the-secure-enclave-sec59b0b31ff/web) to
 protect access. Use it to pass credentials to commands, fill in configuration
 files, and share a vault between your Macs. Each command that accesses a secret
 requires Touch ID or your system password.
@@ -52,12 +52,27 @@ cd mop
 scripts/package.sh
 scripts/install.sh
 export PATH="$HOME/.local/bin:$PATH"
+export MANPATH="$HOME/.local/share/man:${MANPATH:-}"
 ```
 
 The installer puts the executable in `~/.local/lib/mop/mop` and links it from
 `~/.local/bin/mop`. Set `MOP_INSTALL_ROOT` to use a different prefix. It refuses to
 replace unrelated files or symlinks. You can also run `swift run mop ...` from the
-checkout.
+checkout. Add the `PATH` and `MANPATH` settings to your shell's startup file to
+keep them in new terminals; adjust both paths if you use a custom prefix. The
+trailing colon in `MANPATH` preserves the system's default manpage directories.
+
+### Check the installation
+
+With either installation method, check that your shell can find mop:
+
+```sh
+command -v mop
+mop --version
+```
+
+All usage examples below run the `mop` on your `PATH`. If you have installed more
+than one copy, use `type -a mop` to see which takes precedence.
 
 ## Create a vault
 
@@ -90,61 +105,36 @@ The device key works only on the Mac that created it.
 
 ## Manpage and shell completions
 
-Run `man mop` for the command reference. Homebrew installs the manpage and
-completions in its standard directories.
+Run `man mop` for the command reference or `mop --help` for a command summary.
+Use `mop <command> --help` for details about a particular command.
 
-For a source installation under `~/.local`, configure your shell as follows.
-Substitute your installation prefix if you used `MOP_INSTALL_ROOT`.
+Load completions from `mop` in your shell's startup file. These instructions work
+for both Homebrew and source installations, as long as `mop` is on your `PATH`.
 
-To make the manpage discoverable, add this to your shell startup file (Bash/zsh):
-
-```sh
-export MANPATH="$HOME/.local/share/man:${MANPATH:-}"
-```
-
-Then run `man mop`. The trailing default search path preserves system manuals.
-You can also read the source directly with `man ./docs/man/mop.1` from this checkout.
-
-For **zsh**, add the following to `~/.zshrc`, placing the `fpath` assignment before
-your existing `compinit` call if your shell configuration already has one:
+For **zsh**, add this to `~/.zshrc` after your existing `compinit` call:
 
 ```zsh
-fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
-autoload -Uz compinit
-compinit
+eval "$(mop completion zsh)"
 ```
+
+If your configuration or shell framework doesn't already initialize completions,
+add `autoload -Uz compinit` and `compinit` before that line.
 
 For **Bash**, add this to `~/.bashrc` (or `~/.bash_profile` for a macOS login shell):
 
 ```bash
-source "$HOME/.local/share/bash-completion/completions/mop"
+eval "$(mop completion bash)"
 ```
 
-For **Fish**, the default installation uses its user vendor-completion directory,
-`~/.local/share/fish/vendor_completions.d/mop.fish`. If that directory is not on
-`$fish_complete_path`, add this to `~/.config/fish/config.fish`:
+For **Fish**, add this to `~/.config/fish/config.fish`:
 
 ```fish
-source "$HOME/.local/share/fish/vendor_completions.d/mop.fish"
+mop completion fish | source
 ```
 
-For Fish manpage lookup, use `set -gx MANPATH "$HOME/.local/share/man" $MANPATH ''`.
-Substitute your installation prefix in these paths when using `MOP_INSTALL_ROOT`.
-See the [Fish completion search rules](https://fishshell.com/docs/current/completions.html#where-to-put-completions)
-and [zsh initialization documentation](https://zsh.sourceforge.io/Doc/Release/Completion-System.html#Initialization).
-
-You can also generate scripts directly, without installing or accessing a vault:
-
-```sh
-mop completion bash
-mop completion zsh
-mop completion fish
-```
-
-`mop --generate-completion-script SHELL` is equivalent. Completions cover nested
-commands, options, shell names, and file/directory arguments. They do not enumerate
-secrets, vault names, device fingerprints, or revision hashes, and do not trigger
-Touch ID. Open a new shell after updating its configuration.
+Open a new shell or run the corresponding command in your current shell.
+Completions cover commands, options, and file paths. Generating them does not
+access your vault or prompt for authentication.
 
 ## iCloud Drive and other Macs
 

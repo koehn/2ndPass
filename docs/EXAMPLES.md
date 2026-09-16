@@ -3,7 +3,9 @@
 Use mop with command-line tools that accept credentials through environment
 variables, stdin, files, or file descriptors. These examples use Bash or zsh.
 
-Start with an initialized vault and the relevant third-party CLI installed. Each
+Install mop using either method in the [README](../README.md#install) and make
+sure `mop` is on your `PATH`. Start with an initialized vault and the relevant
+third-party CLI installed. Each
 `mop write` below prompts for a value; paste the actual credential at that prompt.
 On subsequent updates, add `--replace`. The selected `.mopfile` must contain the referenced fields.
 Run these commands from a logged-in Mac; secret access requires Touch ID or your

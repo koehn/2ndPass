@@ -5,6 +5,12 @@ checks. It explains both the protections and their boundaries; it is not an
 independent security audit. See [validation](VALIDATION.md) for executed checks
 and remaining hardware and multi-Mac acceptance tests.
 
+The commands and data paths in this guide are the same for Homebrew and source
+installations. Run `mop` from your `PATH`; vaults and local key records are stored
+separately from the executable. Changing installation methods does not require
+creating a new vault or enrolling the same Mac again, provided you keep its local
+state and use the same vault path.
+
 ## What protects a secret
 
 mop encrypts the complete reference/value dictionary with a random 256-bit AES

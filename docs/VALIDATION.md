@@ -3,6 +3,24 @@
 This page records test coverage, hardware results, and checks that still need
 manual validation. For installation and usage, see the [README](../README.md).
 
+The scripts on this page are developer tools in the source repository; they are
+not installed by Homebrew or `scripts/install.sh`. Run them from a checkout
+matching the version you want to test. Commands using `dist/mop` test the local
+release package built by `scripts/package.sh`.
+
+## Test an installed copy
+
+From that checkout, this runs the CLI smoke checks against whichever installation
+is on your `PATH`, whether installed from source or Homebrew:
+
+```sh
+python3 scripts/smoke-test.py "$(command -v mop)"
+```
+
+The checks use disposable files and do not open your vault or request
+authentication. The suite includes a version assertion, so use matching source
+and binary versions.
+
 ## Security regression update: 2026-09-16
 
 Validated after the fixes: all 39 Swift tests, 69 CLI smoke checks against the
@@ -57,6 +75,9 @@ files or symlinks. Fish was not installed on the validation host: generation and
 packaged content were checked, but Fish runtime checks remain unverified. The test
 script automatically performs Fish syntax/candidate checks when Fish is available.
 
+Build the source package with `scripts/package.sh` before checking its resources
+and installer:
+
 ```sh
 python3 scripts/test-shell-support.py dist/mop
 python3 scripts/test-tooling.py dist/mop
@@ -101,10 +122,11 @@ termination forwarding, terminal opt-out, atomic file creation/replacement and
 permissions, protected paths/symlinks, failed resolution without output changes,
 file enrollment isolation, and v1/v2 migration with recovery/history continuity.
 
-Run the opt-in end-to-end hardware workflow from a logged-in terminal:
+To test an installed copy, run the opt-in end-to-end hardware workflow from
+the checkout in a logged-in terminal. This works with either installation method:
 
 ```sh
-python3 scripts/test-hardware.py dist/mop
+python3 scripts/test-hardware.py "$(command -v mop)"
 ```
 
 It requires seven separate authentication approvals and creates only temporary
@@ -130,6 +152,9 @@ Hosted CI and interactive hardware upgrade checks were not covered by this run.
 See [Releasing mop](RELEASING.md) for the packaging test commands.
 
 ## Reproduce the hardware probe
+
+This separate diagnostic executable must be built from the checkout. It is not
+part of either standard installation.
 
 ```sh
 scripts/package.sh --check

@@ -1,5 +1,8 @@
 # Releasing mop
 
+Run the commands in this guide from a source checkout. Release scripts and tests
+are repository tools, not part of the installed CLI.
+
 The project repository also serves as the Homebrew tap. Its formula is
 [`Formula/mop.rb`](../Formula/mop.rb); users receive formula updates through
 `brew update`.

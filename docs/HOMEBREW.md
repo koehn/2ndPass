@@ -22,6 +22,11 @@ type -a mop
 
 An older copy in `~/.local/bin` may take precedence over the Homebrew installation.
 
+## Shell completions
+
+Follow the [shell completion setup](../README.md#manpage-and-shell-completions).
+The same instructions work for Homebrew and source installations.
+
 ## Upgrade
 
 ```sh
