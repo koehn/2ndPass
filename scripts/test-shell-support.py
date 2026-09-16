@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check packaged manpage/completions without opening a vault or authenticating."""
+"""Check resources without authentication: BINARY [HOMEBREW_KEG_PREFIX]."""
 import os
 import re
 from pathlib import Path
@@ -9,8 +9,11 @@ import sys
 import tempfile
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/mop').resolve()
-share = binary.parent / 'share'
-scripts = {'bash': share / 'bash-completion/completions/mop',
+brew_prefix = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
+share = brew_prefix / 'share' if brew_prefix else binary.parent / 'share'
+bash_script = (brew_prefix / 'etc/bash_completion.d/mop' if brew_prefix
+               else share / 'bash-completion/completions/mop')
+scripts = {'bash': bash_script,
            'zsh': share / 'zsh/site-functions/_mop',
            'fish': share / 'fish/vendor_completions.d/mop.fish'}
 env = os.environ | {'MOP_VAULT_FILE': '/nonexistent/mop-completion-test',

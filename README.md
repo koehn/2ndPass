@@ -30,6 +30,23 @@ required.** Local builds use the toolchain's ad-hoc signature; the packaging scr
 adds hardened runtime with an ad-hoc signature. This is local distribution, not
 notarization or App Store distribution.
 
+## Homebrew
+
+Homebrew packaging is prepared in `Formula/mop.rb`. Once these changes are pushed,
+this repository can be added directly as a tap:
+
+```sh
+brew tap koehn/mop https://github.com/koehn/2ndPass
+brew install koehn/mop/mop
+```
+
+The initial formula builds the pinned 0.3.0 source snapshot with Xcode 16+ on
+macOS 15+. Secret operations still require Secure Enclave hardware and an
+interactive login session. Homebrew installs the manpage and shell completions
+alongside the executable. See [Homebrew distribution](docs/HOMEBREW.md) for release
+updates, CI, and preparation for a future core submission. Mop is licensed under the
+[Copyright notice](LICENSE).
+
 ## Build and start
 
 ```sh

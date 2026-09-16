@@ -1,0 +1,57 @@
+name: Homebrew
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  formula:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test release preparation
+        run: python3 scripts/test-homebrew-release.py
+      - name: Stage a local tap and the exact checkout under test
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew tap-new --no-git koehn/mop-ci
+          tap="$(brew --repository)/Library/Taps/koehn/homebrew-mop-ci"
+          cp Formula/mop.rb "$tap/Formula/mop.rb"
+          # Test PR code without fetching main or requiring a published release.
+          git archive --format=tar.gz --output="$RUNNER_TEMP/mop-source.tar.gz" HEAD
+          export MOP_CI_FORMULA="$tap/Formula/mop.rb"
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re
+          archive = pathlib.Path(os.environ["RUNNER_TEMP"]) / "mop-source.tar.gz"
+          formula = pathlib.Path(os.environ["MOP_CI_FORMULA"])
+          text = formula.read_text()
+          text = re.sub(r'^  url .*$', f'  url "{archive.as_uri()}"', text, flags=re.M)
+          text = re.sub(r'^  sha256 .*$', f'  sha256 "{hashlib.sha256(archive.read_bytes()).hexdigest()}"', text, flags=re.M)
+          if not re.search(r'^  version ', text, re.M):
+              text = text.replace('  sha256 ', '  version "0.0.0"\n  sha256 ', 1)
+          formula.write_text(text)
+          PY
+      - name: Check formula style
+        run: brew style koehn/mop-ci/mop
+      - name: Build and test the installed formula
+        run: |
+          brew install --build-from-source koehn/mop-ci/mop
+          brew test koehn/mop-ci/mop
+          brew linkage --test koehn/mop-ci/mop
+      - name: Exercise the installed CLI without authentication
+        run: |
+          python3 scripts/smoke-test.py "$(brew --prefix mop)/bin/mop"
+          python3 scripts/test-shell-support.py "$(brew --prefix mop)/bin/mop" "$(brew --prefix mop)"
