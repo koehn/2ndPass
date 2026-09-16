@@ -1,16 +1,13 @@
-# Real-world usage examples
+# Usage examples
 
-These recipes follow the workflow structure of 1Password's guides for
-[scripts](https://www.1password.dev/cli/secrets-scripts),
-[environment variables](https://www.1password.dev/cli/secrets-environment-variables),
-and [configuration files](https://www.1password.dev/cli/secrets-config-files),
-adapted to mop's supported syntax and interactive macOS authentication.
+Use mop with command-line tools that accept credentials through environment
+variables, stdin, files, or file descriptors. These examples use Bash or zsh.
 
 Start with an initialized vault and the relevant third-party CLI installed. Each
 `mop write` below prompts for a value; paste the actual credential at that prompt.
-On subsequent updates, add `--replace`. Examples use Bash or zsh and assume the
-selected `.mopfile` contains the referenced fields. These are local, logged-in
-workflows: mop still needs Touch ID or system password authentication.
+On subsequent updates, add `--replace`. The selected `.mopfile` must contain the referenced fields.
+Run these commands from a logged-in Mac; secret access requires Touch ID or your
+system password.
 
 | What the application accepts | Use |
 |---|---|

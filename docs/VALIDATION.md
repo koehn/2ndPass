@@ -1,4 +1,7 @@
-# Validation
+# Testing and validation
+
+This page records test coverage, hardware results, and checks that still need
+manual validation. For installation and usage, see the [README](../README.md).
 
 ## Security regression update: 2026-09-16
 
@@ -22,15 +25,14 @@ Macs' pins. Recovery on a fresh Mac requires an independently saved fingerprint 
 a known-good backup revision hash. Replaying an older revision under the same
 still-trusted key remains outside this fix.
 
-## Secure Enclave feasibility: verified on 2026-09-16
+## Secure Enclave hardware results: 2026-09-16
 
 macOS 27.0 (26A428), Apple Silicon, Xcode beta / Swift 6.4:
 
 - CryptoKit reported Secure Enclave availability and LocalAuthentication reported
-  device-owner authentication availability outside the tool filesystem sandbox.
-- A locally built command-line executable, with no developer certificate,
-  entitlements, or provisioning profile, generated a user-presence-protected P-256
-  key and saved its opaque representation in a temporary file.
+  device-owner authentication availability in a logged-in terminal.
+- An ad-hoc-signed command-line executable generated a user-presence-protected
+  P-256 key and saved its opaque representation in a temporary file.
 - A new process reopened that representation and decrypted a disposable HPKE
   payload after macOS authentication.
 - A separate new process with authentication UI disabled was denied with
@@ -41,8 +43,8 @@ macOS 27.0 (26A428), Apple Silicon, Xcode beta / Swift 6.4:
   the same multiline secret and launched a child that verified both values after
   fresh authentication, without printing the secret.
 
-These observations establish local, unprovisioned hardware access. They do not
-constitute a cryptographic audit or verify cross-device iCloud synchronization.
+These checks cover local hardware access. Cross-device iCloud synchronization
+and an independent cryptographic audit are outside their scope.
 
 ## Manpage and shell support
 
@@ -67,15 +69,13 @@ parameterized cases), the release build with ad hoc signing, 62 CLI smoke checks
 against the release executable, installer creation/upgrade/collision checks, and
 shell syntax checks. The feasibility observations above are from 0.2.0.
 
-The 0.3.0 release hardware workflow passed on retry on 2026-09-16. Seven separate
+The 0.3.0 release hardware workflow passed on 2026-09-16. Seven separate
 CLI commands authenticated successfully: initialization, two field writes, masked
 execution, template injection, file read output, and a missing-field failure check.
 The run command verified two distinct secrets and a repeated reference, with both
 stdout and stderr masked. Sectioned multiline values, environment-variable
 expansion, default 0600 output permissions, and unchanged output on a missing-secret
-failure all passed. Temporary vaults, history, local key blobs, and recovery files
-were removed afterward. The first attempt had timed out during authentication;
-its child and fixtures were also cleaned up.
+failure all passed. The workflow uses disposable vaults and removes its fixtures after each run.
 
 ```sh
 swift test
@@ -114,10 +114,20 @@ multiline data, masking, expansion, and atomic output. All fixtures are removed 
 completion or failure. The script cannot determine which authentication method
 was used or count visible prompts; observe those separately.
 
-The Codex filesystem sandbox blocks some macOS services, including Secure Enclave,
-LocalAuthentication, NSFileCoordinator, and writable pseudo-terminals. Running
-these checks in that sandbox may report service/I/O errors even though they work
-from a normal logged-in terminal. Do not add a fallback that bypasses those checks.
+Run hardware checks from a logged-in terminal. Restricted execution sandboxes
+can block Secure Enclave access, LocalAuthentication, NSFileCoordinator, or
+pseudo-terminals and produce service or I/O errors.
+
+## Homebrew packaging
+
+The 0.3.0 source snapshot passed a Homebrew source installation on Apple Silicon
+with Swift 6.4 on 2026-09-16. Checks included formula style, strict online tap
+audit, linkage, formula tests, 78 CLI smoke checks, manpage rendering, and Bash/zsh
+completions. Three release-preparation tests also passed. Fish completion contents
+were checked; Fish runtime checks were skipped because Fish was unavailable.
+Hosted CI and interactive hardware upgrade checks were not covered by this run.
+
+See [Releasing mop](RELEASING.md) for the packaging test commands.
 
 ## Reproduce the hardware probe
 

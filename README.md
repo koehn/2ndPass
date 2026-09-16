@@ -21,41 +21,49 @@ Version 0.3.0.
 
 [Usage examples](docs/EXAMPLES.md) · [Security and key management](docs/SECURITY.md)
 
-A native macOS secrets CLI backed by an encrypted `.mopfile` and a Secure Enclave
-key on each authorized Mac. Requires macOS 15+, Secure Enclave hardware, and an
-interactive user login session. Build with Xcode / Swift 6+.
+mop stores secrets in an encrypted file and uses your Mac's Secure Enclave to
+protect access. Use it to pass credentials to commands, fill in configuration
+files, and share a vault between your Macs. Each command that accesses a secret
+requires Touch ID or your system password.
 
-**No Apple developer account, signing certificate, or provisioning profile is
-required.** Local builds use the toolchain's ad-hoc signature; the packaging script
-adds hardened runtime with an ad-hoc signature. This is local distribution, not
-notarization or App Store distribution.
+Requires macOS 15 or later, Secure Enclave hardware, and an interactive login
+session.
 
-## Homebrew
+## Install
 
-Homebrew packaging is prepared in `Formula/mop.rb`. Once these changes are pushed,
-this repository can be added directly as a tap:
+### Homebrew
 
 ```sh
 brew tap koehn/mop https://github.com/koehn/2ndPass
 brew install koehn/mop/mop
 ```
 
-The initial formula builds the pinned 0.3.0 source snapshot with Xcode 16+ on
-macOS 15+. Secret operations still require Secure Enclave hardware and an
-interactive login session. Homebrew installs the manpage and shell completions
-alongside the executable. See [Homebrew distribution](docs/HOMEBREW.md) for release
-updates, CI, and preparation for a future core submission. Mop is licensed under the
-[Copyright notice](LICENSE).
+The Homebrew package builds from source and requires Xcode 16 or later. It includes
+the manpage and Bash, zsh, and Fish completions. See the [Homebrew guide](docs/HOMEBREW.md)
+for upgrades and uninstalling.
 
-## Build and start
+### From source
+
+With Xcode 16 or later installed:
 
 ```sh
-swift test
+git clone https://github.com/koehn/2ndPass.git
+cd mop
 scripts/package.sh
 scripts/install.sh
 export PATH="$HOME/.local/bin:$PATH"
+```
 
-# Choose a NEW recovery-file path. Its parent directory must already exist.
+The installer puts the executable in `~/.local/lib/mop/mop` and links it from
+`~/.local/bin/mop`. Set `MOP_INSTALL_ROOT` to use a different prefix. It refuses to
+replace unrelated files or symlinks. You can also run `swift run mop ...` from the
+checkout.
+
+## Create a vault
+
+Choose a new recovery-file path in an existing directory:
+
+```sh
 mop vault init --recovery-file "$HOME/mop-recovery.key" --name "My Mac"
 mop write mop://personal/github/token
 mop read mop://personal/github/token
@@ -77,24 +85,16 @@ against losing all enrolled devices. Initialization never overwrites existing
 vaults or recovery files; if a later initialization step fails, any recovery file
 already written is retained.
 
-The installer uses `~/.local/lib/mop/mop` and a `~/.local/bin/mop` symlink. For a
-custom installation prefix, set `MOP_INSTALL_ROOT`. It refuses to replace unrelated
-executables or symlinks. A previous `Mop.app` installation is left intact; its
-known command symlink can be upgraded to the new CLI. Old Keychain entries are
-not deleted or automatically migrated. Legacy Keychain source/checks remain in the
-repository, but the new CLI neither links that backend nor needs its entitlements.
-
-You can also run `swift run mop ...` directly. Preserve `device.json` across
-rebuilds/upgrades; keys are bound to the hardware, not this binary's signing ID.
+Keep `~/.mop/device.json` and `~/.mop/trust/` when upgrading or reinstalling mop.
+The device key works only on the Mac that created it.
 
 ## Manpage and shell completions
 
-`scripts/package.sh` includes the manpage and Bash, zsh, and Fish completions under
-`dist/share/`. `scripts/install.sh` installs them alongside mop under `~/.local`
-(or `MOP_INSTALL_ROOT`). Keep the executable and its sibling `share/` directory
-together when passing a custom packaged executable to the installer. Installation
-refuses to replace unrelated manpages or completion files, and upgrades managed
-files. It does not edit shell startup files.
+Run `man mop` for the command reference. Homebrew installs the manpage and
+completions in its standard directories.
+
+For a source installation under `~/.local`, configure your shell as follows.
+Substitute your installation prefix if you used `MOP_INSTALL_ROOT`.
 
 To make the manpage discoverable, add this to your shell startup file (Bash/zsh):
 
@@ -337,10 +337,9 @@ secrets written directly to files or `/dev/tty`, or deliberate bypasses by a chi
 Shell output redirection can create/truncate a file before mop starts, even if mop
 subsequently fails without producing output. Prefer `--out-file` for read/inject.
 
-## Real-world examples
+## Examples
 
-The [usage cookbook](docs/EXAMPLES.md) adapts 1Password's documented workflows to
-mop: GitHub CLI tokens, local application dotenv files, Docker login through stdin,
+The [usage examples](docs/EXAMPLES.md) cover: GitHub CLI tokens, local application dotenv files, Docker login through stdin,
 temporary npm configuration, SSH passwords, and multiline private keys.
 
 For `sshpass`, Bash/zsh process substitution supplies the password on a file
@@ -354,6 +353,10 @@ See [the sshpass recipe](docs/EXAMPLES.md#give-sshpass-a-password-through-file-d
 for setup, descriptor lifetime, and asynchronous authentication behavior.
 
 ## File boundaries and upgrades
+
+If you used an earlier `Mop.app` installation, the source installer can update its
+command symlink. The old app and Keychain entries remain in place; Keychain secrets
+are not automatically migrated to the encrypted vault.
 
 Each `.mopfile` has its own encryption key, recipient list, recovery credential,
 and history. Logical vault names within that file are namespaces, not permissions.
@@ -422,8 +425,7 @@ File coordination is **local**, not a distributed lock. iCloud sync is eventual;
 offline Macs may independently create competing revisions. The implementation
 handles conflicts reported through `NSFileVersion` and keeps immutable encrypted
 history, but cannot guarantee detection of every provider's silent replacement or
-of a malicious replay of an older, valid file. Live two-Mac iCloud conflict behavior
-still needs validation. Sync the vault and its history and verify that both appear
+of a malicious replay of an older, valid file. Conflict handling across multiple Macs has not been fully validated. Sync the vault and its history and verify that both appear
 on the other Mac before relying on them. History currently has no automatic pruning.
 
 ## Cryptographic design
@@ -475,7 +477,7 @@ See [Apple's Secure Enclave description](https://developer.apple.com/documentati
 [CryptoKit key-blob clarification](https://developer.apple.com/forums/thread/786223),
 and [iCloud file coordination](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/iCloud/iCloud.html).
 
-## Exit codes and validation
+## Exit codes
 
 Diagnostics go to stderr and exclude secret values and arbitrary OS error text.
 
@@ -500,14 +502,12 @@ Diagnostics go to stderr and exclude secret values and arbitrary OS error text.
 
 After successful `run`, the child program's status applies.
 
-```sh
-swift test
-scripts/package.sh
-python3 scripts/smoke-test.py dist/mop
-python3 scripts/test-tooling.py dist/mop
-python3 scripts/test-shell-support.py dist/mop
-```
+## Development
 
-See [docs/VALIDATION.md](docs/VALIDATION.md) for observed hardware results and the
-remaining multi-Mac checks. `mop-enclave-check` is a separate, opt-in disposable
-hardware probe; normal tests do not prompt or create device keys.
+See [testing and validation](docs/VALIDATION.md) for automated tests, hardware
+checks, and known validation gaps, and [releasing](docs/RELEASING.md) for the
+Homebrew release process.
+
+## License
+
+[Copyright notice](LICENSE)

@@ -317,8 +317,7 @@ Writes use macOS file coordination, compare the exact snapshot originally read,
 retain old/new encrypted revisions, and atomically replace the main file. Stale
 writes and known unresolved file versions fail with code `11`. These mechanisms
 protect against ordinary local lost updates; they are not a distributed lock or
-a guarantee of iCloud consistency. Live multi-Mac conflict behavior still needs
-validation.
+a guarantee of iCloud consistency. Conflict handling across multiple Macs has not been fully validated.
 
 `vault resolve` verifies current local trust, the selected key against active or
 previous pins, matching vault identity, and the calling device's recipient slot
@@ -347,9 +346,8 @@ running as you, a compromised OS, or an attacker possessing recovery material.
 
 The file-based backend has no Keychain access-group isolation. Another program
 with the local opaque key blob can attempt to use it on this Mac, subject to its
-hardware authentication constraints. Ad hoc signing lets local builds run without
-a developer account; it is not publisher authentication, notarization, or a
-cryptographic boundary around a particular mop binary. Preserve the device record
+hardware authentication constraints. The executable uses ad hoc signing, which
+does not verify the publisher or restrict key access to a particular mop binary. Preserve the device record
 and trust directory across binary upgrades.
 
 Masking is an output convenience, not an access-control boundary. `run` passes
