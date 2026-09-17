@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in live Secure Enclave checks. Requires seven authentication approvals.
-Creates only disposable fixtures; removes the vault, history, key blob, and
-recovery file on completion or failure. Never reads a user's existing vault.
+Creates disposable fixtures; removes vault/history/metadata/recovery files.
+The disposable Keychain item remains; see docs/VALIDATION.md for cleanup. Never reads a user's existing vault.
 """
 import hashlib
 import os
@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 
-mop = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/mop').resolve())
+mop = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app/Contents/MacOS/mop').resolve())
 with tempfile.TemporaryDirectory(prefix='mop-hardware-030-') as directory:
     root = Path(directory)
     environment = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='mop-hardware-030-') as directory:
         return result
 
     command('Initialize disposable vault', ['vault', 'init', '--recovery-file', str(root / 'recovery.key'),
-                                           '--name', 'Disposable mop 0.3.0 test'])
+                                           '--name', 'Disposable mop v3 test'] + (['--strict-biometrics'] if os.environ.get('MOP_TEST_STRICT_BIOMETRICS') == '1' else []))
     command('Write sectioned multiline field', ['write', ref_a], first)
     command('Write second field', ['write', ref_b], second)
     # Hash assertions verify delivery without placing secret values in argv.

@@ -41,7 +41,7 @@ public enum SafeFile {
           catch { throw MopError.inputOutput }
     }
 
-    /// Ciphertext for vault/history; opaque key blobs or recovery material for local files.
+    /// Ciphertext for vault/history; public device metadata or recovery material for local files.
     /// New files are exclusive. Replacements require external coordination.
     public static func write(_ data: Data, to url: URL, replace: Bool = false) throws {
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".mop-write-" + UUID().uuidString)

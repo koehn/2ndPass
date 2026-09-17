@@ -75,7 +75,7 @@ private func fixture() throws -> (URL, VaultDisk, TestDevice, RecoveryKey) {
     #expect(throws: MopError.vaultConflict) { try b.write(ref, value: "stale", replace: true) }
     let old = try VaultDocument.decode(beforeRevoke)
     let oldKey = try second.unwrap(old.header.recipients.first { $0.publicKey == second.publicKey }!, vaultID: old.header.vaultID)
-    #expect(try old.decrypt(key: oldKey)[ref.description] == "shared") // Historical ciphertext remains decryptable.
+    #expect(try old.records[old.decryptIndex(key: oldKey)[ref.description]!]!.read(id: old.decryptIndex(key: oldKey)[ref.description]!, vaultID: old.header.vaultID, opener: second) == "shared") // Historical ciphertext remains decryptable.
     #expect(throws: MopError.vaultUntrusted) { try FileSecretStore(disk: disk, snapshot: beforeRevoke, opener: second) }
     let recovered = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: recovery)
     defer { recovered.close() }
@@ -155,50 +155,15 @@ private func fixture() throws -> (URL, VaultDisk, TestDevice, RecoveryKey) {
     #expect(try VaultDocument.decode(second).header.parent == VaultCoding.digest(first))
 }
 
-@Test func upgradesV1OnlyAfterSuccessfulSectionWriteAndRestoresWithoutDowngrade() throws {
-    let (directory, disk, device, recovery) = try fixture()
+@Test func legacyFormatsAreRejected() throws {
+    let (directory, disk, device, _) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let initial = try disk.read()
-    let document = try VaultDocument.decode(initial)
-    #expect(document.header.format == "mop-vault-v2")
-    let key = try device.unwrap(document.header.recipients.first { $0.publicKey == device.publicKey }!, vaultID: document.header.vaultID)
-    var header = document.header
-    header.format = "mop-vault-v1"
-    let oldReference = try SecretReference("mop://v/i/f")
-    let sectioned = try SecretReference("mop://v/i/s/f")
-    let v1 = try VaultCoding.encode(VaultDocument.seal(header: header, secrets: [oldReference.description: "old"], key: key))
-    try disk.commit(expected: initial, replacement: v1)
-    let store = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: device)
-    defer { store.close() }
-    #expect(throws: MopError.notFound) { try store.write(sectioned, value: "bad", replace: true) }
-    #expect(try disk.read() == v1)
-    try store.write(oldReference, value: "new", replace: true)
-    #expect(try VaultDocument.decode(disk.read()).header.format == "mop-vault-v1")
-    let stale = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: device)
-    defer { stale.close() }
-    try store.write(sectioned, value: "section", replace: false)
-    let upgraded = try disk.read()
-    #expect(try VaultDocument.decode(upgraded).header.format == "mop-vault-v2")
-    #expect(try store.read(oldReference) == "new")
-    #expect(try store.read(sectioned) == "section")
-    #expect(throws: MopError.vaultConflict) { try stale.write(sectioned, value: "bad", replace: false) }
-    #expect(try disk.read() == upgraded)
-    let second = TestDevice()
-    try store.enroll(second.request, expectedFingerprint: second.request.fingerprint)
-    let enrolled = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: second)
-    #expect(try enrolled.read(sectioned) == "section")
-    enrolled.close()
-    let recovered = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: recovery)
-    #expect(try recovered.read(sectioned) == "section")
-    recovered.close()
-    try FileSecretStore.resolve(disk: disk, revision: VaultCoding.digest(v1), opener: device)
-    #expect(try VaultDocument.decode(disk.read()).header.format == "mop-vault-v2")
-    let restored = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: device)
-    #expect(try restored.read(oldReference) == "old")
-    #expect(try restored.recipients().count == 2)
-    restored.close()
-    let invalidV1 = try VaultCoding.encode(VaultDocument.seal(header: header, secrets: [sectioned.description: "bad"], key: key))
-    #expect(throws: MopError.invalidVault) { try FileSecretStore(disk: disk, snapshot: invalidV1, opener: device) }
+    var document = try VaultDocument.decode(disk.read())
+    #expect(document.header.format == "mop-vault-v3")
+    for format in ["mop-vault-v1", "mop-vault-v2"] {
+        document.header.format = format
+        #expect(throws: MopError.invalidVault) { try FileSecretStore(disk: disk, snapshot: VaultCoding.encode(document), opener: device) }
+    }
 }
 
 @Test func enrollmentInOneFileDoesNotGrantAccessToAnother() throws {
@@ -231,7 +196,7 @@ private func fixture() throws -> (URL, VaultDisk, TestDevice, RecoveryKey) {
         try VaultDocument.wrap(key: attackerKey, request: DeviceRequest(name: $0.name, publicKey: $0.publicKey), kind: $0.kind, vaultID: header.vaultID)
     }
     header.recipients.append(try VaultDocument.wrap(key: attackerKey, request: attacker.request, kind: "device", vaultID: header.vaultID))
-    let forgedDocument = try VaultDocument.seal(header: header, secrets: [:], key: attackerKey)
+    let forgedDocument = try VaultDocument.seal(header: header, index: [:], records: [:], key: attackerKey)
     let forged = try VaultCoding.encode(forgedDocument)
     try disk.commit(expected: original, replacement: forged)
     #expect(throws: MopError.vaultUntrusted) { try FileSecretStore(disk: disk, snapshot: disk.read(), opener: device) }
@@ -328,4 +293,100 @@ private func fixture() throws -> (URL, VaultDisk, TestDevice, RecoveryKey) {
     try FileManager.default.removeItem(at: directory.appendingPathComponent("local-trust"))
     #expect(throws: MopError.vaultUntrusted) { try FileSecretStore(disk: disk, snapshot: original, opener: device) }
     #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("local-trust").path))
+}
+
+private final class CountingOpener: VaultKeyOpener {
+    let device: TestDevice
+    var purposes: [String] = []
+    var allowRecords = true
+    init(_ device: TestDevice) { self.device = device }
+    var publicKey: Data { device.publicKey }
+    func unwrap(_ recipient: VaultRecipient, vaultID: UUID) throws -> SymmetricKey {
+        purposes.append(recipient.purpose)
+        if recipient.purpose != "index", !allowRecords { throw MopError.authentication }
+        return try device.unwrap(recipient, vaultID: vaultID)
+    }
+}
+
+@Test func readsOnlyRequestedRecordAndMutationsPreserveOtherCiphertexts() throws {
+    let (directory, disk, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let spy = CountingOpener(device)
+    let store = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: spy)
+    defer { store.close() }
+    let first = try SecretReference("mop://v/i/first")
+    let second = try SecretReference("mop://v/i/section/second")
+    try store.write(first, value: "one", replace: false)
+    try store.write(second, value: "two", replace: false)
+    #expect(spy.purposes == ["index"])
+    let before = try VaultDocument.decode(disk.read())
+    let indexKey = try device.unwrap(before.header.recipients.first { $0.publicKey == device.publicKey }!, vaultID: before.header.vaultID)
+    let index = try before.decryptIndex(key: indexKey)
+    #expect(try store.list(vault: nil) == [first, second].sorted())
+    #expect(spy.purposes == ["index"])
+    #expect(try store.read(first) == "one")
+    #expect(spy.purposes == ["index", "record:" + index[first.description]!])
+    spy.allowRecords = false
+    #expect(throws: MopError.authentication) { try store.read(second) }
+    try store.write(first, value: "replacement", replace: true)
+    let after = try VaultDocument.decode(disk.read())
+    #expect(after.records[index[second.description]!] == before.records[index[second.description]!])
+    #expect(after.records[index[first.description]!] == nil)
+    try store.delete(second) // Neither replacement nor deletion opens old values.
+    store.close()
+    #expect(throws: MopError.authentication) { try store.read(first) }
+}
+
+@Test func recordTableTamperingAndContextSubstitutionFailClosed() throws {
+    let (directory, disk, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: device)
+    defer { store.close() }
+    try store.write(SecretReference("mop://v/i/a"), value: "alpha", replace: false)
+    try store.write(SecretReference("mop://v/i/b"), value: "beta", replace: false)
+    let original = try VaultDocument.decode(disk.read())
+    let ids = original.records.keys.sorted()
+    var changed = original
+    changed.records[ids[0]]!.sealed[12] ^= 1
+    #expect(throws: MopError.invalidVault) { try FileSecretStore(disk: disk, snapshot: VaultCoding.encode(changed), opener: device) }
+    changed = original
+    changed.records.removeValue(forKey: ids[0])
+    #expect(throws: MopError.invalidVault) { try FileSecretStore(disk: disk, snapshot: VaultCoding.encode(changed), opener: device) }
+    changed = original
+    changed.records[ids[0]] = original.records[ids[1]]
+    #expect(throws: MopError.invalidVault) { try FileSecretStore(disk: disk, snapshot: VaultCoding.encode(changed), opener: device) }
+    let record = original.records[ids[0]]!
+    var slot = record.recipients.first { $0.publicKey == device.publicKey }!
+    slot.purpose = "index"
+    #expect(throws: (any Error).self) { try device.unwrap(slot, vaultID: original.header.vaultID) }
+    #expect(throws: (any Error).self) { try record.read(id: ids[0], vaultID: UUID(), opener: device) }
+    #expect(throws: (any Error).self) { try record.read(id: ids[1], vaultID: original.header.vaultID, opener: device) }
+}
+
+@Test func enrollmentRewrapsWithoutChangingValuesAndRevocationRotatesEveryRecord() throws {
+    let (directory, disk, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let spy = CountingOpener(device)
+    let store = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: spy)
+    defer { store.close() }
+    for name in ["a", "b"] { try store.write(SecretReference("mop://v/i/" + name), value: name, replace: false) }
+    let before = try VaultDocument.decode(disk.read())
+    let other = TestDevice()
+    try store.enroll(other.request, expectedFingerprint: other.request.fingerprint)
+    let enrolled = try VaultDocument.decode(disk.read())
+    #expect(spy.purposes.filter { $0.hasPrefix("record:") }.count == 2)
+    for (id, record) in before.records {
+        #expect(enrolled.records[id]!.sealed == record.sealed)
+        #expect(enrolled.records[id]!.recipients.count == 3)
+    }
+    try store.revoke(other.request.fingerprint, currentDevice: device.publicKey)
+    let revoked = try VaultDocument.decode(disk.read())
+    for (id, record) in enrolled.records {
+        let rotated = revoked.records[id]!
+        #expect(rotated.sealed != record.sealed)
+        #expect(rotated.recipients.count == 2)
+        let oldKey = try record.key(id: id, vaultID: before.header.vaultID, opener: other)
+        let newKey = try rotated.key(id: id, vaultID: before.header.vaultID, opener: device)
+        #expect(oldKey != newKey)
+    }
 }

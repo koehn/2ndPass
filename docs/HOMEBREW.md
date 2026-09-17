@@ -1,5 +1,13 @@
 # Installing with Homebrew
 
+> **Legacy 0.3.0 distribution only.** The current development backend requires
+> a signed, provisioned app bundle. The ad-hoc source formula below cannot access
+> its keys, including with `--HEAD`. Use the [signed source build](../README.md#signed-source-build).
+> Do not publish this backend using the existing source-archive release script;
+> a future Homebrew distribution must preserve the signed/provisioned bundle
+> (for example, a signed release cask). CI's formula checks cover compilation and
+> non-secret CLI behavior only, not the new installation/security model.
+
 mop requires macOS 15 or later and Xcode 16 or later to build. To access secrets,
 you also need Secure Enclave hardware and an interactive login session.
 

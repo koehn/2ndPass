@@ -8,9 +8,9 @@ import subprocess
 import sys
 import tempfile
 
-binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/mop').resolve()
+binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app/Contents/MacOS/mop').resolve()
 brew_prefix = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
-share = brew_prefix / 'share' if brew_prefix else binary.parent / 'share'
+share = brew_prefix / 'share' if brew_prefix else (binary.parents[3] / 'share' if binary.parent.name == 'MacOS' else binary.parent / 'share')
 bash_script = (brew_prefix / 'etc/bash_completion.d/mop' if brew_prefix
                else share / 'bash-completion/completions/mop')
 scripts = {'bash': bash_script,
@@ -21,7 +21,7 @@ env = os.environ | {'MOP_VAULT_FILE': '/nonexistent/mop-completion-test',
 for shell, path in scripts.items():
     generated = subprocess.check_output([str(binary), 'completion', shell], env=env)
     assert generated == path.read_bytes()
-    assert b'vault-file' in generated and b'fingerprint' in generated and b'no-masking' in generated
+    assert b'vault-file' in generated and b'fingerprint' in generated and b'no-masking' in generated and b'strict-biometrics' in generated
     executable = shutil.which(shell)
     if executable:
         subprocess.run([executable, '-n', str(path)], check=True, env=env)

@@ -2,16 +2,17 @@
 set -euo pipefail
 umask 077
 cd "$(dirname "$0")/.."
-[[ $# -le 1 ]] || { echo 'Usage: scripts/install.sh [built-mop-executable]' >&2; exit 2; }
-source_binary=${1:-"$PWD/dist/mop"}
+[[ $# -le 1 ]] || { echo 'Usage: scripts/install.sh [signed-Mop.app]' >&2; exit 2; }
+source_app=${1:-"$PWD/dist/Mop.app"}
 prefix=${MOP_INSTALL_ROOT:-"$HOME/.local"}
 bin_dir="$prefix/bin"
 lib_dir="$prefix/lib/mop"
-target="$lib_dir/mop"
+target="$lib_dir/Mop.app/Contents/MacOS/mop"
 link="$bin_dir/mop"
-[[ -f "$source_binary" ]] || { echo 'Run scripts/package.sh first.' >&2; exit 7; }
-codesign --verify --strict "$source_binary"
-source_share="$(dirname "$source_binary")/share"
+[[ -d "$source_app" && -f "$source_app/Contents/embedded.provisionprofile" && -f "$source_app/Contents/MacOS/mop" ]] || { echo 'Run scripts/package.sh first.' >&2; exit 7; }
+codesign --verify --strict "$source_app"
+"$source_app/Contents/MacOS/mop" device identity
+source_share="$(dirname "$source_app")/share"
 resources=(man/man1/mop.1 bash-completion/completions/mop zsh/site-functions/_mop fish/vendor_completions.d/mop.fish)
 # Preflight every destination before replacing the executable or any resource.
 for resource in "${resources[@]}"; do
@@ -32,7 +33,7 @@ done
 if [[ -e "$link" || -L "$link" ]]; then
     [[ -L "$link" ]] || { echo 'Refusing to replace an unrelated executable.' >&2; exit 7; }
     previous=$(readlink "$link")
-    [[ "$previous" == "$target" || "$previous" == "$HOME/Applications/Mop.app/Contents/MacOS/mop" ]] || exit 7
+    [[ "$previous" == "$target" || "$previous" == "$lib_dir/mop" || "$previous" == "$HOME/Applications/Mop.app/Contents/MacOS/mop" ]] || exit 7
 fi
 if [[ -e "$lib_dir" || -L "$lib_dir" ]]; then
     [[ ! -L "$lib_dir" && -f "$lib_dir/.mop-install" ]] || exit 7
@@ -45,15 +46,18 @@ done
 chmod 700 "$lib_dir"
 stage=$(mktemp -d "$lib_dir/.install.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT
-cp "$source_binary" "$stage/mop"
-chmod 700 "$stage/mop"
-codesign --verify --strict "$stage/mop"
+cp -R "$source_app" "$stage/Mop.app"
+codesign --verify --strict "$stage/Mop.app"
 for resource in "${resources[@]}"; do
     mkdir -p "$stage/share/$(dirname "$resource")"
     cp "$source_share/$resource" "$stage/share/$resource"
     chmod 644 "$stage/share/$resource"
 done
-mv -f "$stage/mop" "$target"
+if [[ -e "$lib_dir/Mop.app" || -L "$lib_dir/Mop.app" ]]; then
+    [[ -d "$lib_dir/Mop.app" && ! -L "$lib_dir/Mop.app" ]] || exit 7
+    mv "$lib_dir/Mop.app" "$stage/previous.app"
+fi
+mv "$stage/Mop.app" "$lib_dir/Mop.app"
 for resource in "${resources[@]}"; do
     mv -f "$stage/share/$resource" "$lib_dir/share/$resource"
     ln -sfn "$lib_dir/share/$resource" "$prefix/share/$resource"

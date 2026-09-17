@@ -21,6 +21,10 @@ jobs:
       HOMEBREW_NO_ANALYTICS: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Test record encryption and signing configuration
+        run: |
+          swift test
+          python3 scripts/test-signing-config.py
       - name: Test release preparation
         run: python3 scripts/test-homebrew-release.py
       - name: Stage a local tap and the exact checkout under test

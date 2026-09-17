@@ -1,5 +1,13 @@
 # Releasing mop
 
+> **Legacy 0.3.0 distribution only.** The current development backend requires
+> a signed, provisioned app bundle. The ad-hoc source formula below cannot access
+> its keys, including with `--HEAD`. Use the [signed source build](../README.md#signed-source-build).
+> Do not publish this backend using the existing source-archive release script;
+> a future Homebrew distribution must preserve the signed/provisioned bundle
+> (for example, a signed release cask). CI's formula checks cover compilation and
+> non-secret CLI behavior only, not the new installation/security model.
+
 Run the commands in this guide from a source checkout. Release scripts and tests
 are repository tools, not part of the installed CLI.
 

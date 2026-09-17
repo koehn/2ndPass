@@ -6,22 +6,24 @@ import subprocess
 import sys
 import tempfile
 
-binary = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/mop').resolve())
+app = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app').resolve()
 root = pathlib.Path(__file__).resolve().parent.parent
 with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
     prefix = pathlib.Path(directory) / 'prefix'
     environment = os.environ | {'MOP_INSTALL_ROOT': str(prefix)}
-    command = [str(root / 'scripts/install.sh'), binary]
+    command = [str(root / 'scripts/install.sh'), str(app)]
     subprocess.run(command, env=environment, check=True, capture_output=True)
     link = prefix / 'bin/mop'
     assert link.is_symlink()
+    assert (prefix / 'lib/mop/Mop.app/Contents/embedded.provisionprofile').is_file()
+    subprocess.run([str(link), 'device', 'identity'], check=True, capture_output=True)
     assert subprocess.check_output([str(link), '--version']).strip() == b'0.3.0'
     resources = ['man/man1/mop.1', 'bash-completion/completions/mop',
                  'zsh/site-functions/_mop', 'fish/vendor_completions.d/mop.fish']
     for resource in resources:
         installed = prefix / 'share' / resource
         assert installed.is_symlink() and installed.is_file()
-        assert installed.read_bytes() == (pathlib.Path(binary).parent / 'share' / resource).read_bytes()
+        assert installed.read_bytes() == (app.parent / 'share' / resource).read_bytes()
     subprocess.run(command, env=environment, check=True, capture_output=True)
     for resource in resources:
         installed = prefix / 'share' / resource

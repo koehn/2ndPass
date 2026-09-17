@@ -17,7 +17,7 @@ For licensing inquiries, contact Koehn Consulting, Inc.
 
 See the [copyright notice](LICENSE). Build, installation, and operational instructions in this repository are for the copyright holder and separately authorized users; they do not grant permission. Third-party dependencies retain their own licenses.
 
-Version 0.3.0.
+Development version (breaking vault format v3; CLI version 0.3.0).
 
 [Usage examples](docs/EXAMPLES.md) · [Security and key management](docs/SECURITY.md)
 
@@ -26,41 +26,38 @@ protect access. Use it to pass credentials to commands, fill in configuration
 files, and share a vault between your Macs. Each command that accesses a secret
 requires Touch ID or your system password.
 
-Requires macOS 15 or later, Secure Enclave hardware, and an interactive login
-session.
+Requires macOS 15 or later, Secure Enclave hardware, an interactive login
+session, and a signed, provisioned application bundle.
 
 ## Install
 
-### Homebrew
+### Signed source build
 
-```sh
-brew tap koehn/mop https://github.com/koehn/2ndPass
-brew install koehn/mop/mop
-```
-
-The Homebrew package builds from source and requires Xcode 16 or later. It includes
-the manpage and Bash, zsh, and Fish completions. See the [Homebrew guide](docs/HOMEBREW.md)
-for upgrades and uninstalling.
-
-### From source
+This development version requires an Apple signing identity and an **explicit
+macOS provisioning profile** for your bundle identifier, permitting its own
+Keychain access group. Ad-hoc and unprovisioned builds fail closed for secret
+access. The existing Homebrew formula packages the older 0.3.0 design; it is not
+a distribution path for this new security model.
 
 With Xcode 16 or later installed:
 
 ```sh
-git clone https://github.com/koehn/2ndPass.git
-cd mop
+export MOP_SIGN_IDENTITY='Apple Development: Your Name (TEAMID)'
+export MOP_PROVISION_PROFILE=/path/to/mop.provisionprofile
+export MOP_BUNDLE_ID=net.koehn.mop # must match your explicit profile
 scripts/package.sh
 scripts/install.sh
 export PATH="$HOME/.local/bin:$PATH"
 export MANPATH="$HOME/.local/share/man:${MANPATH:-}"
 ```
 
-The installer puts the executable in `~/.local/lib/mop/mop` and links it from
-`~/.local/bin/mop`. Set `MOP_INSTALL_ROOT` to use a different prefix. It refuses to
-replace unrelated files or symlinks. You can also run `swift run mop ...` from the
-checkout. Add the `PATH` and `MANPATH` settings to your shell's startup file to
-keep them in new terminals; adjust both paths if you use a custom prefix. The
-trailing colon in `MANPATH` preserves the system's default manpage directories.
+The package is `dist/Mop.app`; the installer preserves the complete signed bundle
+under `~/.local/lib/mop/Mop.app` and links its executable from `~/.local/bin/mop`.
+Set `MOP_INSTALL_ROOT` to choose a different prefix. Keep the same application
+identifier and signing team across upgrades to retain Keychain access. Moving
+only the executable out of its bundle breaks secret access. `swift run mop` can
+exercise help, completions, and commands without secret references, but cannot
+open device keys.
 
 ### Check the installation
 
@@ -69,6 +66,7 @@ With either installation method, check that your shell can find mop:
 ```sh
 command -v mop
 mop --version
+mop device identity # verifies signing and Keychain entitlement without Touch ID
 ```
 
 All usage examples below run the `mop` on your `PATH`. If you have installed more
@@ -89,8 +87,9 @@ never accepts a secret as an argument. Every command accessing secrets requires
 fresh Touch ID or system password authentication. There is no software-key
 fallback when the Secure Enclave is unavailable.
 
-The default vault is `~/.mop/.mopfile`. The opaque device-key record is
-`~/.mop/device.json`, with owner-only permissions. Local vault-key fingerprints live
+The default vault is `~/.mop/.mopfile`. The public device metadata is
+`~/.mop/device.json`, with owner-only permissions. The opaque enclave key blob is
+stored in the application-specific, nonsynchronizing Data Protection Keychain. Local vault-key fingerprints live
 in `~/.mop/trust/`; keep this directory on the Mac, outside cloud sync. Initialization
 pins the newly created vault key automatically and prints its fingerprint. Save that
 fingerprint with your offline recovery material. **Keep the recovery key offline,
@@ -100,8 +99,23 @@ against losing all enrolled devices. Initialization never overwrites existing
 vaults or recovery files; if a later initialization step fails, any recovery file
 already written is retained.
 
-Keep `~/.mop/device.json` and `~/.mop/trust/` when upgrading or reinstalling mop.
-The device key works only on the Mac that created it.
+Keep the device's Keychain item, `~/.mop/device.json`, and `~/.mop/trust/` across
+upgrades. The metadata file alone cannot restore a device key. The key works only
+on the Mac that created it and is retrieved through the provisioned application.
+
+To require Touch ID with no login-password fallback, create the device using:
+
+```sh
+mop vault init --strict-biometrics --recovery-file "$HOME/mop-recovery.key"
+# Also available on: mop device request, mop vault recover
+```
+
+This policy persists on the key. Subsequent commands do not need the flag.
+Adding/removing enrolled fingerprints invalidates access; use another enrolled
+device or offline recovery with a fresh state directory. An existing default key
+cannot be upgraded in place by passing this flag; create and enroll a replacement
+key in a new local state directory. Omitting the flag never weakens an existing
+strict key.
 
 ## Manpage and shell completions
 
@@ -192,7 +206,7 @@ remote hardware attestation: approve only requests generated on devices you trus
 mop device remove FULL_SHA256_FINGERPRINT
 ```
 
-Removing another device rotates the AES vault key and re-encrypts the current
+Removing another device rotates the index key and every record key and re-encrypts the current
 vault for remaining devices and recovery. It updates the revoking Mac's local pin
 and prints the new vault fingerprint. Every other remaining Mac must independently
 verify and pin this new fingerprint with `mop vault trust --fingerprint ...` before
@@ -373,13 +387,10 @@ untrusted synced file: doing so would accept an attacker's replacement. If neith
 trusted evidence nor a trusted copy is available, create a new vault. Losing the
 local trust records requires this same explicit verification again.
 
-Version 0.3.0 reads `mop-vault-v1` and `mop-vault-v2`. New files use v2. Existing v1
-files stay v1 during ordinary writes and upgrade atomically on their first
-successful write of a sectioned field. The prior encrypted revision is preserved;
-failed writes do not upgrade. Recovery and enrolled device keys continue to work.
-History restoration never downgrades a v2 file, even when restoring v1 contents.
-**Upgrade mop on every enrolled Mac before using sections:** older binaries cannot
-open v2 files. Update scripts that require a terminal to use `run --no-masking`.
+This development version accepts only `mop-vault-v3` and local device metadata v2.
+Earlier vaults and file-based key blobs are intentionally unsupported, with no
+migration. Use fresh vault/recovery paths and a fresh local state directory when
+starting from an older build. Existing files are not automatically deleted.
 
 ## Concurrent writes and conflicts
 
@@ -437,26 +448,31 @@ device fingerprints, vault fingerprints, and revision hashes, including
   does not detect replay of an older valid revision using the same encryption key.
 - Private file writes remove inherited ACLs before writing bytes. Private file and
   directory reads reject ACL allow entries in addition to checking owner/mode bits.
-- AES-256-GCM encrypts the entire reference/value dictionary with a fresh random
-  nonce on every update. Decoding is bounded to a 16 MiB envelope and writes to
-  less than 8 MiB of plaintext.
-- CryptoKit HPKE (`P256_SHA256_AES_GCM_256`) wraps the 32-byte vault key separately
-  for each device and recovery public key. Vault identity, recipient fingerprint,
-  role, and format are bound into HPKE context information.
-- The format header, generation, parent hash, and complete recipient table are
-  authenticated as AES-GCM associated data. Recipient names/public keys and revision
-  metadata are visible; all secret names and values are encrypted.
-- Each device's Secure Enclave P-256 key uses `WhenUnlockedThisDeviceOnly` plus
-  `.privateKeyUsage` and `.userPresence`. Its opaque representation is stored in a
-  local owner-only file. No raw device private key is exported.
-- Every secret command creates a fresh `LAContext`, disables previous biometric
-  reuse, authenticates, and then disallows additional authentication UI. Private-key
-  access must succeed under that same context; no weaker retry is attempted.
-- AES keys and decrypted values exist in process memory during the command. No
-  persistent plaintext cache is used, but Swift does not guarantee erasing all
-  copies of String/Data values. Any program possessing the local opaque key blob
-  can attempt its use on this Mac, subject to the key's authentication constraints;
-  this backend does not provide Keychain access-group isolation.
+- A random AES-256-GCM index key encrypts reference names and record IDs. Each
+  value has an independent random AES-256-GCM key; record keys are wrapped directly
+  for every device and recovery public key, not encrypted under the index key.
+- CryptoKit HPKE (`P256_SHA256_AES_GCM_256`) binds wraps to the v3 domain, vault UUID,
+  recipient role/fingerprint, and either the index or a specific record ID.
+- The index authenticates the header and a SHA-256 digest of the complete encrypted
+  record table, preventing deletion, replacement, or recipient-table tampering.
+  Individual values also authenticate their vault UUID and record ID. Reads and
+  writes are bounded to a 16 MiB encoded envelope.
+- The enclave blob is stored only in a `WhenUnlockedThisDeviceOnly` Keychain item
+  restricted to the provisioned application's own access group. The enclave key
+  requires `.privateKeyUsage` and `.userPresence`, or `.biometryCurrentSet` for
+  strict keys. The Keychain item enforces the matching authentication policy.
+- Every secret command authenticates with a fresh `LAContext`, disables previous
+  biometric reuse, and then disallows additional authentication UI. No weaker
+  retry, file-blob fallback, or software device key is provided.
+- Open/list decrypt only the index. Read decrypts the requested value. Ordinary
+  writes/deletes do not decrypt old values. Enrollment unwraps record keys without
+  decrypting values; revocation and history restoration process values one at a
+  time and re-encrypt them with fresh keys.
+- The index key and requested values/record keys exist in process memory. Swift
+  does not guarantee erasing all copies. An authenticated compromised mop process
+  can still request every record; this is not an enclave-enforced per-record ACL.
+  Application binding protects blob retrieval, not a blob exfiltrated from an
+  already compromised authorized process.
 
 The recovery file is a high-entropy P-256 private key, not a password. It is an
 intentional alternative access path. Revocation protects subsequent revisions,
@@ -478,7 +494,7 @@ Diagnostics go to stderr and exclude secret values and arbitrary OS error text.
 | 3 | Authentication denied, cancelled, unavailable, or another prompt required |
 | 4 | Secret field missing |
 | 5 | Field, device enrollment, or output file already exists (output requires --force) |
-| 6 / 8 | Reserved for legacy Keychain/signing errors |
+| 6 / 8 | Keychain failure / missing or invalid signed application identity |
 | 7 | File/input/output failure or invalid UTF-8 |
 | 9 | Vault/file missing |
 | 10 | Invalid, unsupported, or unauthentic vault |

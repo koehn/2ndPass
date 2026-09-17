@@ -2,67 +2,66 @@ import CryptoKit
 import Foundation
 import LocalAuthentication
 import MopCore
-import MopAuth
+import MopVault
+import MopKeychain
 import Security
 
-struct Fixture: Codable {
-    let blob: Data
-    let encapsulated: Data
-    let ciphertext: Data
+// Disposable, explicitly invoked hardware checks. Uses the production backend.
+private struct Probe: Codable {
+    let vaultID: UUID
+    let slot: VaultRecipient
 }
+private struct DeviceMetadata: Decodable { let keyID: UUID }
 
 do {
-    let arguments = CommandLine.arguments
-    guard arguments.count == 3, ["create", "open", "deny"].contains(arguments[1]) else {
-        print("Usage: mop-enclave-check create|open|deny FILE (disposable test data only)")
+    let args = CommandLine.arguments
+    guard args.count >= 3, ["create", "create-strict", "open", "deny", "foreign"].contains(args[1]),
+          args.count == (args[1] == "foreign" ? 4 : 3) else {
+        print("Usage: mop-enclave-check create|create-strict|open|deny DIRECTORY\n       mop-enclave-check foreign DIRECTORY OTHER_APP_ACCESS_GROUP\nUse disposable directories. Requires a signed, provisioned probe application.")
         exit(0)
     }
-    guard SecureEnclave.isAvailable else { throw MopError.authentication }
-    let url = URL(fileURLWithPath: arguments[2])
-    let info = Data("mop-provisioning-free-probe-v1".utf8)
-    if arguments[1] == "create" {
-        guard !FileManager.default.fileExists(atPath: url.path) else { throw MopError.duplicate }
-        let context = try Authentication.authorize()
-        defer { context.invalidate() }
-        let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage, .userPresence], nil)!
-        let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access, authenticationContext: context)
-        var sender = try HPKE.Sender(recipientKey: key.publicKey, ciphersuite: .P256_SHA256_AES_GCM_256, info: info)
-        let ciphertext = try sender.seal(Data("disposable probe payload".utf8))
-        let fixture = Fixture(blob: key.dataRepresentation, encapsulated: sender.encapsulatedKey, ciphertext: ciphertext)
-        try JSONEncoder().encode(fixture).write(to: url, options: .withoutOverwriting)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        print("PASS: created a protected Secure Enclave key and stored its opaque blob without provisioning.")
+    let directory = URL(fileURLWithPath: args[2], isDirectory: true)
+    let file = directory.appendingPathComponent("probe.json")
+    if args[1] == "create" || args[1] == "create-strict" {
+        guard !FileManager.default.fileExists(atPath: directory.path) else { throw MopError.duplicate }
+        let device = try LocalDevice.open(directory: directory, create: true, name: "Disposable probe",
+                                          strictBiometrics: args[1] == "create-strict")
+        defer { device.close() }
+        let id = UUID()
+        let slot = try VaultDocument.wrap(key: SymmetricKey(data: Data(repeating: 0x42, count: 32)), request: device.request, kind: "device", vaultID: id)
+        try SafeFile.write(VaultCoding.encode(Probe(vaultID: id, slot: slot)), to: file)
+        print("PASS: created an application-bound device key. device.json contains no key blob.")
+    } else if args[1] == "open" {
+        let probe = try JSONDecoder().decode(Probe.self, from: SafeFile.read(file, privateFile: true))
+        let device = try LocalDevice.open(directory: directory)
+        defer { device.close() }
+        guard try device.unwrap(probe.slot, vaultID: probe.vaultID) == SymmetricKey(data: Data(repeating: 0x42, count: 32)) else { throw MopError.invalidVault }
+        print("PASS: reopened through the application's Keychain group and authenticated enclave operation.")
     } else {
-        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
-        let context: LAContext
-        if arguments[1] == "deny" {
-            context = LAContext()
-            context.interactionNotAllowed = true
-            context.touchIDAuthenticationAllowableReuseDuration = 0
-        } else { context = try Authentication.authorize() }
+        let ownGroup = try SigningIdentity.accessGroup()
+        let group = args[1] == "foreign" ? args[3] : ownGroup
+        guard args[1] != "foreign" || group != ownGroup else { throw MopError.invalidProcess }
+        let metadata = try JSONDecoder().decode(DeviceMetadata.self, from: SafeFile.read(directory.appendingPathComponent("device.json"), privateFile: true))
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        context.touchIDAuthenticationAllowableReuseDuration = 0
         defer { context.invalidate() }
-        do {
-            let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: fixture.blob, authenticationContext: context)
-            var recipient = try HPKE.Recipient(privateKey: key, ciphersuite: .P256_SHA256_AES_GCM_256, info: info, encapsulatedKey: fixture.encapsulated)
-            let plaintext = try recipient.open(fixture.ciphertext)
-            if arguments[1] == "deny" { fputs("FAIL: private-key operation succeeded without authentication.\n", stderr); exit(1) }
-            guard plaintext == Data("disposable probe payload".utf8) else { exit(1) }
-            print("PASS: reopened the device-bound key and decrypted after authentication in a new process.")
-        } catch {
-            if arguments[1] == "deny" {
-                let ns = error as NSError
-                guard (ns.domain == NSOSStatusErrorDomain &&
-                      [Int(errSecInteractionNotAllowed), Int(errSecAuthFailed), Int(errSecUserCanceled)].contains(ns.code)) ||
-                      (ns.domain == LAError.errorDomain && ns.code == LAError.Code.notInteractive.rawValue) else {
-                    fputs("Probe failed for a reason other than authentication (domain \(ns.domain), code \(ns.code)).\n", stderr)
-                    exit(1)
-                }
-                print("PASS: Secure Enclave denied access without authentication.")
-            } else { throw error }
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecUseDataProtectionKeychain as String: true, kSecAttrSynchronizable as String: false,
+            kSecAttrAccessGroup as String: group, kSecAttrService as String: "mop.device-key.v2",
+            kSecAttrAccount as String: metadata.keyID.uuidString, kSecReturnData as String: true,
+            kSecUseAuthenticationContext as String: context]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if args[1] == "foreign" {
+            guard status == errSecMissingEntitlement else { throw MopError.keychain(status) }
+            print("PASS: the OS rejected a foreign application's Keychain access group.")
+        } else {
+            guard [errSecInteractionNotAllowed, errSecAuthFailed].contains(status) else { throw MopError.keychain(status) }
+            print("PASS: the OS denied key retrieval without authentication.")
         }
     }
 } catch {
-    let ns = error as NSError
-    fputs("Probe failed (domain \(ns.domain), code \(ns.code)).\n", stderr)
+    fputs("Probe failed: \((error as? MopError)?.errorDescription ?? "Unexpected failure").\n", stderr)
     exit(1)
 }

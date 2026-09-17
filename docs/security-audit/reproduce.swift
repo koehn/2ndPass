@@ -66,7 +66,7 @@ forgedHeader.recipients = try publicDocument.header.recipients.map { slot in
     return try VaultDocument.wrap(key: attackerKey, request: request, kind: slot.kind, vaultID: publicDocument.header.vaultID)
 }
 forgedHeader.recipients.append(try VaultDocument.wrap(key: attackerKey, request: attacker.request, kind: "device", vaultID: publicDocument.header.vaultID))
-let forged = try VaultCoding.encode(VaultDocument.seal(header: forgedHeader, secrets: [:], key: attackerKey))
+let forged = try VaultCoding.encode(VaultDocument.seal(header: forgedHeader, index: [:], records: [:], key: attackerKey))
 try SafeFile.write(forged, to: disk.url, replace: true)
 do {
     _ = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: victim)

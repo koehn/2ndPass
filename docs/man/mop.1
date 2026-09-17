@@ -16,9 +16,9 @@
 stores UTF-8 secrets in an encrypted file with a Secure Enclave key for each
 approved Mac.
 It requires macOS 15 or later, supported hardware, and an
-interactive login session.
+interactive login session and a signed, provisioned application bundle.
 Each command accessing secrets authenticates afresh
-using Touch ID or the system password.
+using Touch ID or the system password (Touch ID only for strict device keys).
 There is no persistent unlock session.
 .Pp
 Secret references use
@@ -95,7 +95,7 @@ Supports the output options below.
 All lookups complete before
 output.
 Substitution is literal, with no JSON, YAML, shell, or URL escaping.
-.It Cm vault init Fl -recovery-file Ar FILE Op Fl -name Ar NAME
+.It Cm vault init Fl -recovery-file Ar FILE Op Fl -name Ar NAME Op Fl -strict-biometrics
 Create an encrypted vault and a new offline recovery credential, without
 overwriting existing files.
 The recovery file's parent must exist.
@@ -105,6 +105,7 @@ credential offline; it is a full alternative decryption capability.
 .Cm vault recover
 .Fl -recovery-file Ar FILE
 .Op Fl -name Ar NAME
+.Op Fl -strict-biometrics
 .Op Fl -fingerprint Ar HASH | Fl -revision Ar HASH
 .Xc
 Enroll this Mac using the recovery credential and local authentication.
@@ -133,10 +134,13 @@ current
 device authorization and key.
 Preserve known versions; never merge automatically.
 Selected and current keys must satisfy local trust checks.
-.It Cm device request Fl -out Ar FILE Op Fl -name Ar NAME
+.It Cm device request Fl -out Ar FILE Op Fl -name Ar NAME Op Fl -strict-biometrics
 Create or unlock this Mac's device key, write a new public enrollment request,
 and print its fingerprint.
 Compare the fingerprint through a trusted channel.
+.It Cm device identity
+Verify application signing and OS Keychain entitlement without authentication;
+print the private Keychain access group.
 .It Cm device add Fl -request Ar FILE Fl -fingerprint Ar HASH
 Enroll the requested device after verifying its full fingerprint.
 .It Cm device list
@@ -234,6 +238,15 @@ fail before authentication.
 Use %24 for a literal dollar sign.
 Other template
 text, dotenv values, and fetched secrets are not expanded.
+.Sh BIOMETRIC POLICY
+.Fl -strict-biometrics
+on vault init, vault recover, or device request creates a device key requiring
+the current Touch ID enrollment, without login-password fallback.
+The policy persists without repeating the flag.
+Adding or removing fingerprints invalidates key access; recovery or another
+enrolled device is required.
+Existing non-strict keys cannot change policy in place: use a fresh state
+directory, enroll the replacement, then revoke the old key.
 .Sh FILES
 .Bl -tag -width indent
 .It Pa ~/.mop/.mopfile
@@ -242,15 +255,16 @@ Default AES-256-GCM encrypted vault.
 Preserved encrypted revisions.
 Keep history with the vault when syncing.
 .It Pa ~/.mop/device.json
-Owner-only opaque Secure Enclave key record, bound to this Mac.
+Owner-only public device metadata and Keychain account UUID; no key blob.
+The opaque enclave key is in the application-specific Data Protection Keychain.
 .It Pa ~/.mop/trust/
 Local vault-key trust records; never sync these with the vault.
 .El
 .Pp
-New files use format v2.
-Existing v1 files upgrade on the first successful
-sectioned write.
-Upgrade all enrolled Macs first; older binaries cannot read v2.
+Only vault format v3 and device metadata v2 are accepted.
+Older files are unsupported; create fresh vault and state paths.
+Each value has an independent key wrapped directly for each recipient.
+Open/list decrypt only the index; read decrypts only the requested value.
 File coordination is local, not a distributed lock. iCloud changes can
 conflict;
 use explicit conflict resolution.
@@ -268,7 +282,7 @@ Secret field missing.
 .It 5
 Secret, enrollment, or output file already exists.
 .It 6, 8
-Reserved for legacy Keychain/signing errors.
+Keychain failure or missing/invalid signed application identity.
 .It 7
 Input/output failure or invalid UTF-8.
 .It 9

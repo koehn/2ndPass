@@ -2,6 +2,7 @@ import ArgumentParser
 import Foundation
 import MopCore
 import MopVault
+import MopKeychain
 
 struct VaultOptions: ParsableArguments {
     @Option(help: "Encrypted vault path; defaults to MOP_VAULT_FILE or ~/.mop/.mopfile.", completion: .file()) var vaultFile: String?
@@ -34,6 +35,7 @@ struct Vault: ParsableCommand {
         @OptionGroup var storage: VaultOptions
         @Option(help: "New recovery file path. Move it to offline storage; never sync it alongside the vault.", completion: .file()) var recoveryFile: String
         @Option(help: "Name for this device when first created.") var name: String = "Mac"
+        @Flag(help: "Require current Touch ID enrollment for a new device key; no password fallback. Enrollment changes require recovery.") var strictBiometrics = false
 
         func run() throws {
             let recoveryURL = URL(fileURLWithPath: recoveryFile).standardizedFileURL
@@ -45,7 +47,7 @@ struct Vault: ParsableCommand {
                 try FileManager.default.createDirectory(at: storage.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                          attributes: [.posixPermissions: 0o700])
             } catch { throw MopError.inputOutput }
-            let device = try LocalDevice.open(directory: storage.stateURL, create: true, name: name)
+            let device = try LocalDevice.open(directory: storage.stateURL, create: true, name: name, strictBiometrics: strictBiometrics ? true : nil)
             defer { device.close() }
             let recovery = RecoveryKey()
             // Save recovery first. On a later failure keep it; never leave a vault
@@ -61,6 +63,7 @@ struct Vault: ParsableCommand {
         @OptionGroup var storage: VaultOptions
         @Option(completion: .file()) var recoveryFile: String
         @Option var name: String = "Mac"
+        @Flag(help: "Require current Touch ID enrollment for a new device key; no password fallback. Enrollment changes require recovery.") var strictBiometrics = false
         @Option(help: "Vault fingerprint obtained from a trusted Mac.") var fingerprint: String?
         @Option(help: "SHA-256 of a known-good vault backup, obtained independently.") var revision: String?
 
@@ -75,7 +78,7 @@ struct Vault: ParsableCommand {
             let disk = storage.disk
             let bytes = try disk.read()
             let recovery = try RecoveryKey(file: URL(fileURLWithPath: recoveryFile))
-            let device = try LocalDevice.open(directory: storage.stateURL, create: true, name: name)
+            let device = try LocalDevice.open(directory: storage.stateURL, create: true, name: name, strictBiometrics: strictBiometrics ? true : nil)
             defer { device.close() }
             if fingerprint != nil || revision != nil {
                 try FileSecretStore.establishTrust(disk: disk, opener: recovery, fingerprint: fingerprint, revision: revision)
@@ -148,16 +151,22 @@ struct Vault: ParsableCommand {
 
 struct Device: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Enroll or revoke Secure Enclave devices.",
-                                                     subcommands: [Request.self, Add.self, Devices.self, Remove.self])
+                                                     subcommands: [Request.self, Add.self, Devices.self, Remove.self, Identity.self])
+
+    struct Identity: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Verify application signing and show its private Keychain group without authentication.")
+        func run() throws { try IO.output(SigningIdentity.accessGroup() + "\n") }
+    }
 
     struct Request: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Create or unlock this Mac's key and export a public enrollment request.")
         @OptionGroup var storage: VaultOptions
         @Option(help: "New public request file path.", completion: .file()) var out: String
         @Option var name: String = "Mac"
+        @Flag(help: "Require current Touch ID enrollment for a new device key; no password fallback. Enrollment changes require recovery.") var strictBiometrics = false
 
         func run() throws {
-            let device = try LocalDevice.open(directory: storage.stateURL, create: true, name: name)
+            let device = try LocalDevice.open(directory: storage.stateURL, create: true, name: name, strictBiometrics: strictBiometrics ? true : nil)
             defer { device.close() }
             try SafeFile.write(VaultCoding.encode(device.request), to: URL(fileURLWithPath: out))
             try IO.output("Compare this fingerprint on the authorizing Mac:\n\(device.request.fingerprint)\n")
