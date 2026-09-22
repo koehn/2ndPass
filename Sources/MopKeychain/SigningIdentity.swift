@@ -23,9 +23,11 @@ public enum SigningIdentity {
               entitlements["com.apple.security.cs.allow-dyld-environment-variables"] as? Bool != true,
               let flags = info[kSecCodeInfoFlags as String] as? UInt32,
               flags & 0x10000 != 0, // CS_RUNTIME: require hardened runtime.
-              let bundleID = Bundle.main.bundleIdentifier,
+              let executable = info[kSecCodeInfoMainExecutable as String] as? URL,
+              let bundle = applicationBundle(for: executable),
+              let bundleID = bundle.bundleIdentifier,
               applicationID.hasSuffix("." + bundleID),
-              FileManager.default.fileExists(atPath: Bundle.main.bundleURL.appendingPathComponent("Contents/embedded.provisionprofile").path)
+              FileManager.default.fileExists(atPath: bundle.bundleURL.appendingPathComponent("Contents/embedded.provisionprofile").path)
         else { throw MopError.signing }
         // Let securityd verify the provisioned entitlement too. This query cannot
         // prompt and asks only for a nonexistent diagnostic item, never key data.
@@ -40,5 +42,18 @@ public enum SigningIdentity {
             kSecUseAuthenticationContext as String: context]
         guard SecItemCopyMatching(query as CFDictionary, nil) == errSecItemNotFound else { throw MopError.signing }
         return applicationID
+    }
+
+    // Bundle.main may describe the CLI symlink's directory. Use the executable
+    // identified by Security.framework for the validated running code instead.
+    private static func applicationBundle(for executable: URL) -> Bundle? {
+        let resolved = executable.resolvingSymlinksInPath()
+        let macOS = resolved.deletingLastPathComponent()
+        let contents = macOS.deletingLastPathComponent()
+        let root = contents.deletingLastPathComponent()
+        guard macOS.lastPathComponent == "MacOS", contents.lastPathComponent == "Contents",
+              root.pathExtension == "app", let bundle = Bundle(url: root),
+              bundle.executableURL?.resolvingSymlinksInPath() == resolved else { return nil }
+        return bundle
     }
 }

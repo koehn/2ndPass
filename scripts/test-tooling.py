@@ -16,7 +16,14 @@ with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
     link = prefix / 'bin/mop'
     assert link.is_symlink()
     assert (prefix / 'lib/mop/Mop.app/Contents/embedded.provisionprofile').is_file()
-    subprocess.run([str(link), 'device', 'identity'], check=True, capture_output=True)
+    direct = prefix / 'lib/mop/Mop.app/Contents/MacOS/mop'
+    identity = subprocess.check_output([str(direct), 'device', 'identity']).strip()
+    assert identity
+    assert subprocess.check_output([str(link), 'device', 'identity']).strip() == identity
+    # A relative symlink chain must identify the same signed application too.
+    alias = prefix / 'bin/mop-alias'
+    alias.symlink_to('mop')
+    assert subprocess.check_output([str(alias), 'device', 'identity']).strip() == identity
     assert subprocess.check_output([str(link), '--version']).strip() == b'0.3.0'
     resources = ['man/man1/mop.1', 'bash-completion/completions/mop',
                  'zsh/site-functions/_mop', 'fish/vendor_completions.d/mop.fish']

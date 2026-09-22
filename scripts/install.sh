@@ -64,6 +64,7 @@ for resource in "${resources[@]}"; do
 done
 printf '%s\n' net.koehn.mop > "$lib_dir/.mop-install"
 ln -sfn "$target" "$link"
+"$link" device identity
 echo "Installed $link. Add $bin_dir to PATH."
 echo "Manpage: $prefix/share/man/man1/mop.1"
 echo "Completions: $prefix/share/{bash-completion/completions,zsh/site-functions,fish/vendor_completions.d}"
