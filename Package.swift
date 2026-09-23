@@ -16,9 +16,10 @@ let package = Package(
         .target(name: "MopCore"),
         .target(name: "MopAuth", dependencies: ["MopCore"]),
         .target(name: "MopKeychain", dependencies: ["MopCore", "MopAuth"]),
+        .target(name: "MopCloudKit", dependencies: ["MopCore", "MopVault", "MopKeychain"]),
         .target(name: "MopVault", dependencies: ["MopCore", "MopAuth", "MopKeychain"]),
         .executableTarget(name: "MopCLI", dependencies: [
-            "MopCore", "MopVault", "MopKeychain",
+            "MopCore", "MopVault", "MopKeychain", "MopCloudKit",
             .product(name: "ArgumentParser", package: "swift-argument-parser"),
         ]),
         .executableTarget(name: "MopKeychainCheck", dependencies: ["MopCore", "MopKeychain", "MopAuth"]),
@@ -26,6 +27,7 @@ let package = Package(
         .testTarget(name: "MopCLITests", dependencies: ["MopCLI", "MopCore"]),
         .testTarget(name: "MopCoreTests", dependencies: ["MopCore"]),
         .testTarget(name: "MopKeychainTests", dependencies: ["MopKeychain", "MopCore"]),
+        .testTarget(name: "MopCloudKitTests", dependencies: ["MopCloudKit", "MopVault", "MopCore"]),
         .testTarget(name: "MopVaultTests", dependencies: ["MopVault", "MopCore"]),
     ]
 )

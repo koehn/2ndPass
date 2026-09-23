@@ -14,8 +14,7 @@ struct OutputOptions: ParsableArguments {
             return nil
         }
         return try OutputFile(url: URL(fileURLWithPath: outFile), force: force, mode: mode,
-                              protectedFiles: [storage.fileURL, storage.stateURL.appendingPathComponent("device.json")],
-                              protectedDirectories: [URL(fileURLWithPath: storage.fileURL.path + ".history"), storage.stateURL.appendingPathComponent("trust")])
+                              protectedFiles: [], protectedDirectories: [storage.stateURL])
     }
 
     func emit(_ text: String, to destination: OutputFile?) throws {

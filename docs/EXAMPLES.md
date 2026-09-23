@@ -234,7 +234,7 @@ lookup in your 1Password account or Apple's Passwords app. The familiar `read`,
 - Expand variables only inside references, not in general dotenv values.
 - Use `{{ mop://... }}` delimiters in templates; bare references remain literal.
 - Use percent-encoded names, including `%20` for spaces.
-- Select one encrypted file per command; use `--vault-file` or `MOP_VAULT_FILE`.
+- Select one independent CloudKit vault per command; use `--cloud-vault` or `MOP_CLOUD_VAULT`.
 
 See the [CLI behavior reference](../README.md#secret-commands) for the precise
 rules and [validation notes](VALIDATION.md) for what has been exercised. These

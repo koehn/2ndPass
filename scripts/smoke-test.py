@@ -15,7 +15,7 @@ import uuid
 
 mop = str(pathlib.Path(sys.argv[1]).resolve())
 environment = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8",
-               "MOP_VAULT_FILE": tempfile.gettempdir() + "/mop-missing-" + str(uuid.uuid4())}
+               "MOP_CLOUD_VAULT": str(uuid.uuid4())}
 checks = 0
 
 
@@ -31,7 +31,7 @@ def run(args, *, data=b"", code=0, output=None, env=None):
 
 
 run(["--help"])
-run(["--version"], output=b"0.3.0\n")
+run(["--version"], output=b"0.4.0\n")
 for shell in ('bash', 'zsh', 'fish'):
     script = run(['completion', shell]).stdout
     assert script and script == run(['--generate-completion-script', shell]).stdout
@@ -45,18 +45,24 @@ run(["vault", "trust"], code=2, output=b"")
 run(["vault", "trust", "--fingerprint", "invalid"], code=2, output=b"")
 run(["vault", "trust", "--fingerprint", "0" * 64, "--revision", "0" * 64], code=2, output=b"")
 run(["vault", "recover", "--recovery-file", "/unused", "--fingerprint", "invalid"], code=2, output=b"")
+run(["read", "mop://v/i/f", "--vault-file", "/unused"], code=2, output=b"")
+run(["read", "mop://v/i/f"], env={"MOP_VAULT_FILE": "/unused"}, code=2, output=b"")
+run(["write", "mop://v/i/f", "--offline"], code=2, output=b"")
+run(["delete", "mop://v/i/f", "--offline"], code=2, output=b"")
+for command in ("list", "use", "sync", "status", "import", "export"):
+    run(["vault", command, "--help"])
 run(["read", "invalid"], code=2, output=b"")
 run(["read"], code=2, output=b"")
 run(["unknown"], code=2, output=b"")
 result = run(["write", "mop://test/item/field", "accidental-secret-argument"], code=2, output=b"")
 assert b"accidental-secret-argument" not in result.stderr
-run(["read", "mop://test/item/field"], code=9, output=b"")
-run(["list", "--json"], code=9, output=b"")
-run(["delete", "mop://test/item/field"], code=9, output=b"")
-run(["write", "mop://test/item/field"], data=b"disposable\n", code=9, output=b"")
+run(["read", "mop://test/item/field"], code=8, output=b"")
+run(["list", "--json"], code=8, output=b"")
+run(["delete", "mop://test/item/field"], code=8, output=b"")
+run(["write", "mop://test/item/field"], data=b"disposable\n", code=8, output=b"")
 run(["write", "mop://test/item/field"], data=b"\xff", code=7, output=b"")
 run(["inject"], data="literal ✓ {{ other }}".encode(), output="literal ✓ {{ other }}".encode())
-run(["inject"], data=b"prefix {{mop://test/item/field}}", code=9, output=b"")
+run(["inject"], data=b"prefix {{mop://test/item/field}}", code=8, output=b"")
 run(["inject"], data=b"prefix {{mop://test/item/field", code=2, output=b"")
 run(["inject"], data=b"\xff", code=7, output=b"")
 run(["run"], code=2, output=b"")
@@ -83,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix="mop-smoke-") as directory:
     assert b"disposable-value-must-not-leak" not in result.stderr
     marker = root / "must-not-exist"
     run(["run", "--", "/usr/bin/touch", str(marker)],
-        env={"TOKEN": "mop://test/item/field"}, code=9, output=b"")
+        env={"TOKEN": "mop://test/item/field"}, code=8, output=b"")
     assert not marker.exists()
     script = root / "no-shebang"
     script.write_text("touch " + str(marker) + "\n")
@@ -102,7 +108,7 @@ for args in (["read", "mop://v/i/f", "--force"], ["inject", "--file-mode", "0600
              ["inject", "--out-file", "/tmp/unused-mop-output", "--file-mode", "4755"]):
     run(args, code=2, output=b"")
 run(["inject"], data=b"{{mop://v/i/${MISSING}}}", code=2, output=b"")
-run(["inject"], data=b"{{mop://v/i/${FIELD}}}", env={"FIELD": "token"}, code=9, output=b"")
+run(["inject"], data=b"{{mop://v/i/${FIELD}}}", env={"FIELD": "token"}, code=8, output=b"")
 run(["run", "--", "/bin/true"], env={"TOKEN": "mop://$MISSING/i/f"}, code=2, output=b"")
 for extra in ([], ["--no-masking"]):
     run(["run", *extra, "--", "/bin/cat"], data=b"direct input", output=b"direct input")
@@ -121,20 +127,20 @@ with tempfile.TemporaryDirectory(prefix="mop-output-smoke-") as directory:
     assert destination.stat().st_mode & 0o777 == 0o640
     run(["inject", "-i", str(destination), "-o", str(destination), "-f"], output=b"")
     assert destination.read_bytes() == b"second"
-    run(["inject", "-o", str(destination), "-f"], data=b"{{mop://v/i/f}}", code=9, output=b"")
+    run(["inject", "-o", str(destination), "-f"], data=b"{{mop://v/i/f}}", code=8, output=b"")
     assert destination.read_bytes() == b"second"
-    run(["read", "mop://v/i/f", "-n", "-o", str(destination), "-f"], code=9, output=b"")
+    run(["read", "mop://v/i/f", "-n", "-o", str(destination), "-f"], code=8, output=b"")
     assert destination.read_bytes() == b"second"
     missing = root / "never-created"
-    run(["inject", "-o", str(missing)], data=b"{{mop://v/i/f}}", code=9, output=b"")
+    run(["inject", "-o", str(missing)], data=b"{{mop://v/i/f}}", code=8, output=b"")
     assert not missing.exists()
     alias = root / "alias"
     alias.symlink_to(destination)
     run(["inject", "-o", str(alias), "-f"], data=b"bad", code=15, output=b"")
-    run(["inject", "--vault-file", str(destination), "-o", str(destination), "-f"], data=b"bad", code=15, output=b"")
+    run(["inject", "--vault-file", str(destination), "-o", str(destination), "-f"], data=b"bad", code=2, output=b"")
     history = root / "vault.history"
     history.mkdir()
-    run(["inject", "--vault-file", str(root / "vault"), "-o", str(history / "revision")], data=b"bad", code=15, output=b"")
+    run(["inject", "--state-directory", str(root / "vault"), "-o", str(root / "vault" / "revision")], data=b"bad", code=15, output=b"")
     state = root / "state"
     state.mkdir()
     run(["inject", "--state-directory", str(state), "-o", str(state / "device.json")], data=b"bad", code=15, output=b"")
@@ -205,7 +211,7 @@ try:
             status = candidate
             break
     assert status is not None, "Hidden-input child timed out"
-    assert os.waitstatus_to_exitcode(status) == 9, transcript
+    assert os.waitstatus_to_exitcode(status) == 8, transcript
     assert b"disposable-hidden-input" not in transcript
     assert termios.tcgetattr(terminal)[3] & termios.ECHO
     checks += 1

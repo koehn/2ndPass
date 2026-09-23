@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
     alias = prefix / 'bin/mop-alias'
     alias.symlink_to('mop')
     assert subprocess.check_output([str(alias), 'device', 'identity']).strip() == identity
-    assert subprocess.check_output([str(link), '--version']).strip() == b'0.3.0'
+    assert subprocess.check_output([str(link), '--version']).strip() == b'0.4.0'
     resources = ['man/man1/mop.1', 'bash-completion/completions/mop',
                  'zsh/site-functions/_mop', 'fish/vendor_completions.d/mop.fish']
     for resource in resources:

@@ -15,7 +15,14 @@ elif [[ $# != 0 ]]; then
 fi
 : "${MOP_SIGN_IDENTITY:?Set MOP_SIGN_IDENTITY to your Apple signing identity (not ad-hoc).}"
 : "${MOP_PROVISION_PROFILE:?Set MOP_PROVISION_PROFILE to an explicit macOS provisioning profile for this bundle ID.}"
-[[ "$MOP_SIGN_IDENTITY" != - && -f "$MOP_PROVISION_PROFILE" ]] || exit 8
+if [[ "$MOP_SIGN_IDENTITY" == - ]]; then
+    echo 'Ad-hoc signing is unsupported. Set MOP_SIGN_IDENTITY to your Apple signing identity.' >&2
+    exit 8
+fi
+if [[ ! -f "$MOP_PROVISION_PROFILE" ]]; then
+    printf 'Provisioning profile not found: %s\nSet MOP_PROVISION_PROFILE to the downloaded .provisionprofile file.\n' "$MOP_PROVISION_PROFILE" >&2
+    exit 8
+fi
 mkdir -p dist
 stage=$(mktemp -d "$PWD/dist/.package.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT

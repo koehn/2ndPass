@@ -1,39 +1,39 @@
 # Testing and validation
 
-## Current development design
+## CloudKit development design
 
-The v3 record format and application-bound Keychain backend are breaking changes.
-Earlier successful ad-hoc Secure Enclave probes do **not** validate this backend.
-No signed hardware or two-Mac acceptance result is claimed for this change.
+The CloudKit-only CLI is a breaking change from operational file storage. Import
+existing v3 vaults explicitly. Unit tests use software keys only in test targets;
+production has no software-key or unsigned-build fallback.
 
-Validated for this change on 2026-09-16: 42 Swift tests, 78 noninteractive CLI
-smoke checks, signing-profile generation/rejection checks, unsigned device
-creation rejection before writes, packaging refusal without an identity, Bash/zsh
-completion checks, and manpage rendering. Completion resources were staged in a
-temporary app-shaped directory; this does not validate signed installation.
-Fish runtime, signed packaging/installer acceptance, and hardware checks remain
-pending; no usable signing identity/profile was available to the test session.
-
-The Swift suite uses disposable software keys only for vault tests. Production
-device access has no software, ad-hoc-signing, file-blob, or no-authentication
-fallback. Tests cover independent record reads, index-only listing, ciphertext
-preservation during unrelated writes, full-table tamper detection, purpose/vault
-binding, enrollment rewrapping, all-record revocation rotation, recovery, history
-restoration retaining current authorization, local trust, and rejection of legacy
-formats. Existing parsing, masking, process, output-file, and ACL tests remain.
+The new CloudKit suite uses an injectable in-memory server with conditional saves,
+lost responses, missing zones, quota/throttle failures, and account changes. It
+covers immutable record reuse, authenticated reconstruction, interrupted commits,
+offline caches, rollback/tampering, enrollment, revocation, recovery, and restoration.
+Existing cryptographic, parsing, masking, process, output-file, and ACL tests remain.
 
 ```sh
 swift test
 python3 scripts/test-signing-config.py
 swift build
-# Substitute the path printed by swift build --show-bin-path:
-python3 scripts/smoke-test.py /path/to/debug/mop
+python3 scripts/smoke-test.py /path/from/swift-build-show-bin-path/mop
 bash -n scripts/package.sh scripts/install.sh
 ```
 
-Restricted sandboxes can block NSFileCoordinator and subprocess/PTY tests. Run
-those tests in a normal local development environment. Module-cache paths may
-need to be set to a writable directory in restricted environments.
+Restricted sandboxes can block NSFileCoordinator and pseudo-terminal tests and
+inject Python temporary-directory warnings into captured output. Run the full
+suite in a normal local development environment. Module caches may need a
+writable path in restricted environments.
+
+Local validation on 2026-09-22: successful build, 59 Swift tests, 88 unsigned CLI smoke checks,
+signing-profile generation/rejection tests, temporary packaged Bash/zsh completion
+and manpage checks, and Homebrew tooling tests. Fish runtime is unavailable;
+its generated script was compared but not executed. No real vaults were used.
+
+**No live CloudKit, signed two-Mac, or production acceptance is claimed.** Follow
+[CloudKit provisioning and acceptance](CLOUDKIT.md), record results, and promote
+the schema only after development validation. No release should be published until
+the production smoke test passes.
 
 ## Signed packaging and hardware checks
 
@@ -48,11 +48,12 @@ scripts/package.sh
 dist/Mop.app/Contents/MacOS/mop device identity
 python3 scripts/test-shell-support.py dist/Mop.app/Contents/MacOS/mop
 python3 scripts/test-tooling.py dist/Mop.app
-python3 scripts/test-hardware.py dist/Mop.app/Contents/MacOS/mop
+MOP_LIVE_CLOUD_TEST=1 python3 scripts/test-hardware.py dist/Mop.app/Contents/MacOS/mop
 ```
 
-The hardware workflow asks for seven separate authentications and uses temporary
-vaults, recovery files, and device metadata. It leaves a disposable Keychain item
+The hardware workflow requires explicit opt-in, creates a disposable cloud vault,
+and retains its local state and recovery files until you delete the test zone.
+Use a Development build and record the printed fixture directory and vault UUID. It leaves a disposable Keychain item
 (service `mop.device-key.v2`) because deleting metadata does not delete Keychain
 state. Clean up that test item in Keychain Access if desired; never remove a live
 device's item. Run once with default authentication and again with
@@ -105,7 +106,7 @@ the original key. An unsigned/ad-hoc executable's `device identity` and
 - Signed installation: app survives copying/upgrading as a complete bundle;
   copied standalone executable and differently provisioned app cannot retrieve
   its item. Missing Keychain items never cause implicit key replacement.
-- Multi-Mac enrollment, independent local trust, iCloud conflicts, revocation,
+- Multi-Mac enrollment, independent local trust, CloudKit conflicts, revocation,
   and recovery with an offline credential. Revocation requires repinning the new
   index-key fingerprint on remaining Macs. Historical ciphertext stays readable
   to former recipients. Restoring history must not reinstate their access.

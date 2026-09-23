@@ -1,355 +1,166 @@
-.Dd September 16, 2026
+.Dd September 22, 2026
 .Dt MOP 1
-.Os macOS
+.Os
 .Sh NAME
 .Nm mop
-.Nd access encrypted secrets using the Mac Secure Enclave
+.Nd access encrypted CloudKit secrets using the Mac Secure Enclave
 .Sh SYNOPSIS
 .Nm
 .Ar command
 .Op Ar options
-.Nm
-.Cm completion
-.Ar bash | zsh | fish
 .Sh DESCRIPTION
 .Nm
-stores UTF-8 secrets in an encrypted file with a Secure Enclave key for each
-approved Mac.
-It requires macOS 15 or later, supported hardware, and an
-interactive login session and a signed, provisioned application bundle.
-Each command accessing secrets authenticates afresh
-using Touch ID or the system password (Touch ID only for strict device keys).
-There is no persistent unlock session.
+stores independently encrypted secrets in a private CloudKit database.
+Each independent vault has a UUID and a custom record zone.
+Every command accessing secrets authenticates afresh with Touch ID or the
+system password. Strict biometric device keys have no password fallback.
+Private keys remain in the local Secure Enclave and nonsynchronizing Keychain.
+CloudKit receives ciphertext and public device metadata.
 .Pp
-Secret references use
-.Dl mop://vault/item/[section/]field
-Components are nonempty, case-sensitive, Unicode-normalized, and
-percent-encoded.
-A sectionless field differs from a field in a section.
-Queries and fragments are
-not supported.
-Logical vault names are namespaces; access permissions apply to
-the entire encrypted file.
-.Sh COMMANDS
+Requires macOS 15 or later, Secure Enclave hardware, an available user session,
+and a provisioned signed application with matching Keychain and CloudKit entitlements.
+.Sh VAULT SELECTION
 .Bl -tag -width indent
-.It Cm read Ar REF Op Fl n
-Print a field, appending a newline unless
-.Fl n , -no-newline
-is specified.
-Supports the output options below.
-.It Cm write Ar REF Op Fl -replace
-Create one field.
-Read its value through a hidden terminal prompt or UTF-8 stdin;
-never supply a secret as an argument.
-Stdin preserves multiline content and
-trailing newlines.
-The hidden prompt accepts one line up to 65,536 UTF-8 bytes.
-.Fl -replace
-updates an existing field and fails if it is missing.
-.It Xo
-.Cm list
-.Op Fl -vault Ar NAME
-.Op Fl -json
-.Xc
-List canonical references without values.
-The vault filter uses a decoded,
-case-sensitive name.
-JSON output is an array of reference strings.
-.It Cm delete Ar REF
-Delete exactly the referenced field after authentication.
-.It Xo
-.Cm run
-.Op Fl -env-file Ar FILE ...
-.Op Fl -no-masking
-.Fl -
-.Ar COMMAND
-.Op Ar ARGS ...
-.Xc
-Resolve environment references, then execute the supplied argument vector
-without
-an implicit shell.
-Repeated references are fetched once.
-All lookups must succeed
-before execution.
-The command's exit status is preserved.
+.It Fl -cloud-vault Ar UUID
+Select an independent CloudKit vault. Otherwise use MOP_CLOUD_VAULT, then the
+saved default for this Apple Account, container, and environment.
+.It Fl -state-directory Ar PATH
+Local metadata/cache directory. Defaults to MOP_STATE_DIRECTORY or ~/.mop.
+Never synchronize this directory.
+.It Fl -offline
+Use the last authenticated encrypted cache for read, list, run, inject, or export.
+Local authentication is still required. Cache age is printed to stderr.
+Remote revocation cannot be checked. Offline mutations are rejected.
+.El
 .Pp
-By default, separate stdout/stderr streams are filtered to replace exact,
-nonempty secret values with
-.Dq [concealed by mop] .
-Multiline values and matches crossing buffer boundaries are supported.
-Encoded
-or transformed values, direct file writes, and deliberate bypasses are not
-masked.
-Pipes affect buffering, color, and terminal detection.
-Use
-.Fl -no-masking
-for direct execution and full terminal/job-control behavior.
+Normal commands fetch current cloud state. There is no automatic offline fallback.
+The legacy --vault-file option and MOP_VAULT_FILE variable are rejected with
+migration guidance.
+.Sh SECRET COMMANDS
+.Bl -tag -width indent
+.It Cm read Ar REFERENCE
+Read a UTF-8 secret, followed by a newline unless -n is supplied.
+.It Cm write Op Fl -replace Ar REFERENCE
+Read a secret from hidden terminal input or UTF-8 stdin. Never provide a secret
+as a command argument. Ordinary writes refuse existing fields; --replace requires one.
+.It Cm list Op Fl -vault Ar NAME Op Fl -json
+List references without values. The vault filter is a logical reference namespace,
+not the independent CloudKit vault UUID.
+.It Cm delete Ar REFERENCE
+Delete a field after authentication and server confirmation.
+.It Cm run Op Fl -env-file Ar FILE Op Fl -no-masking Fl - Ar COMMAND Op Ar ARGS
+Resolve environment references and execute directly, without an implicit shell.
+Dotenv files are literal; later files override inherited and earlier variables.
+Exact nonempty fetched secrets are masked on stdout/stderr unless --no-masking is set.
 .It Cm inject Op Fl i Ar FILE
-Replace
-.Dq {{ mop://vault/item/[section/]field }}
-placeholders.
-Read stdin unless
-.Fl i , -in-file
-is supplied.
-Supports the output options below.
-All lookups complete before
-output.
-Substitution is literal, with no JSON, YAML, shell, or URL escaping.
-.It Cm vault init Fl -recovery-file Ar FILE Op Fl -name Ar NAME Op Fl -strict-biometrics
-Create an encrypted vault and a new offline recovery credential, without
-overwriting existing files.
-The recovery file's parent must exist.
-Keep this
-credential offline; it is a full alternative decryption capability.
-.It Xo
-.Cm vault recover
-.Fl -recovery-file Ar FILE
-.Op Fl -name Ar NAME
-.Op Fl -strict-biometrics
-.Op Fl -fingerprint Ar HASH | Fl -revision Ar HASH
-.Xc
-Enroll this Mac using the recovery credential and local authentication.
-When
-local trust is missing, supply independently verified evidence as described
-under
-.Cm vault trust .
+Resolve {{ mop://... }} template placeholders from stdin or a UTF-8 file.
+.El
+.Pp
+References use mop://vault/item/[section/]field with percent-encoded components.
+$NAME and ${NAME} expand reference components from the environment.
+Fetched values are never expanded recursively. Commands without secret references
+require neither cloud access nor authentication.
+.Pp
+Read and inject support -o/--out-file, -f/--force, and --file-mode OCTAL.
+Output is atomic after all references resolve, defaults to mode 0600, and cannot
+target the local state directory. Existing files require --force.
+.Sh VAULT COMMANDS
+.Bl -tag -width indent
+.It Cm vault init Fl -recovery-file Ar PATH Op Fl -name Ar NAME Op Fl -strict-biometrics
+Create a CloudKit vault and an exclusive offline recovery file. Prints the UUID
+and fingerprints. Retain any recovery file after an interrupted initialization.
+.It Cm vault list
+List independent CloudKit vault UUIDs.
+.It Cm vault use Ar UUID
+Set the account-scoped default after checking the cloud vault.
+.It Cm vault sync
+Fetch ciphertext and reconcile interrupted commits without unlocking secrets.
+.It Cm vault status
+Show cached revision, fetch time, and pending commit status.
+.It Cm vault import Fl -file Ar PATH
+Verify/import a v3 encrypted backup into an absent cloud head. Preserves UUID,
+recovery relationships, and the source file. --fingerprint or --revision can
+establish trust using independent evidence. --recovery-file enrolls a replacement
+Mac before importing if no enrolled device remains.
+.It Cm vault export Fl -out-file Ar PATH Op Fl -force Op Fl -offline
+Write a verified encrypted v3 backup. Does not export the recovery private key.
+.It Cm vault trust Fl -fingerprint Ar HASH
+Pin independently verified vault key identity. Alternatively use --revision HASH
+from a known-good backup. Never derive trust evidence solely from cloud data.
 .It Cm vault fingerprint
-Print the vault-key fingerprint after authentication and local trust
-verification.
-.It Cm vault trust Fl -fingerprint Ar HASH | Fl -revision Ar HASH
-Establish local trust using exactly one independently verified fingerprint or
-revision hash.
-Obtain the vault fingerprint from a trusted Mac, or the revision
-SHA-256 from a known-good backup.
-Evidence from only the suspect file is not
-sufficient.
-Local trust is bound to the vault path and stored outside cloud sync.
+Display the vault fingerprint after authentication and trust verification.
 .It Cm vault conflicts
-Preserve known file versions and list encrypted revision hashes.
-This operation
-inspects ciphertext metadata and does not authenticate or print secret values.
+List committed encrypted revision hashes, newest first.
 .It Cm vault resolve Fl -revision Ar HASH
-Restore the selected revision's contents after authentication, retaining
-current
-device authorization and key.
-Preserve known versions; never merge automatically.
-Selected and current keys must satisfy local trust checks.
-.It Cm device request Fl -out Ar FILE Op Fl -name Ar NAME Op Fl -strict-biometrics
-Create or unlock this Mac's device key, write a new public enrollment request,
-and print its fingerprint.
-Compare the fingerprint through a trusted channel.
+Restore historical contents under current keys and device authorization.
+.It Cm vault recover Fl -recovery-file Ar PATH
+Enroll the current Mac using offline recovery and local authentication.
+Accepts --name, --strict-biometrics, and independent --fingerprint/--revision evidence.
+.El
+.Sh DEVICE COMMANDS
+.Bl -tag -width indent
 .It Cm device identity
-Verify application signing and OS Keychain entitlement without authentication;
-print the private Keychain access group.
-.It Cm device add Fl -request Ar FILE Fl -fingerprint Ar HASH
-Enroll the requested device after verifying its full fingerprint.
+Verify application signing and display its private Keychain group without prompting.
+.It Cm device request Op Fl -name Ar NAME Op Fl -strict-biometrics
+Create/unlock the local key and publish a public enrollment request. Prints its
+request ID and fingerprint.
+.It Cm device requests
+List public requests, which are not independent trust evidence.
+.It Cm device add Ar REQUEST_ID Fl -fingerprint Ar HASH
+Approve after comparing the fingerprint through an independent trusted channel.
 .It Cm device list
-Print authenticated JSON containing device names and fingerprints.
-.It Cm device remove Ar HASH
-Revoke another device and rotate the vault key.
-Old copies remain readable by
-former recipients.
-The current device cannot revoke itself.
-Verify and pin the
-new vault fingerprint on remaining Macs before reading the updated file.
-.It Cm completion Ar bash | zsh | fish
-Print a shell completion script to stdout.
-Completes commands, flags, shell names,
-and file/directory options without authentication or inspecting vault contents.
-Secret references, device fingerprints, and revisions are not enumerated.
-The built-in
-.Fl -generate-completion-script Ar SHELL
-option also generates scripts.
+List enrolled device names and fingerprints after authentication.
+.It Cm device remove Ar FINGERPRINT
+Remove another device and rotate all encryption keys. Remaining Macs must
+independently verify the new vault fingerprint. Historical ciphertext and cached
+secrets remain decryptable by their former recipients.
 .El
-.Sh OPTIONS
-Operational subcommands accept:
-.Bl -tag -width indent
-.It Fl -vault-file Ar FILE
-Select the encrypted file; overrides
-.Ev MOP_VAULT_FILE .
-.It Fl -state-directory Ar DIRECTORY
-Select local device-key and trust storage; overrides
-.Ev MOP_STATE_DIRECTORY .
-Never place this directory in cloud storage.
-.It Fl h , -help
-Show help.
-Use
-.Nm help Ar command
-for command-specific help.
-.It Fl -version
-Print the version.
-.El
-.Pp
-.Cm read
-and
-.Cm inject
-also accept:
-.Bl -tag -width indent
-.It Fl o , -out-file Ar FILE
-Write atomically to a regular file instead of stdout.
-Resolve all secrets before
-creating output.
-Reject symlinks and protected vault, history, key, and trust paths.
-The parent directory must already exist.
-.It Fl -file-mode Ar OCTAL
-Output permissions, default 0600.
-Accept 0000 through 0777 without special bits.
-Requires
-.Fl -out-file .
-.It Fl f , -force
-Replace an existing output file without an overwrite prompt.
-Requires
-.Fl -out-file .
-Without this option existing destinations fail unchanged.
-.El
-.Sh ENVIRONMENT
-.Bl -tag -width indent
-.It Ev MOP_VAULT_FILE
-Vault path; defaults to
-.Pa ~/.mop/.mopfile .
-.It Ev MOP_STATE_DIRECTORY
-Local state directory; defaults to
-.Pa ~/.mop .
-.It Ev PATH
-Executable search path used by
-.Cm run .
-.El
-.Pp
-.Cm run
-reads inherited environment variables followed by each
-.Fl -env-file
-in order.
-Later assignments win.
-Dotenv accepts literal NAME=value assignments,
-single/double quotes, empty values, and comments; no shell execution, export
-keyword, backslash unescaping, or quoted multiline syntax.
-.Pp
-Only entire environment values beginning with mop:// are resolved.
-.Cm run
-and
-.Cm inject
-expand $NAME and ${NAME} once inside reference components.
-Run uses the final
-merged environment; inject uses the inherited environment.
-Substitutions are
-encoded as literal component text.
-Undefined variables and malformed expressions
-fail before authentication.
-Use %24 for a literal dollar sign.
-Other template
-text, dotenv values, and fetched secrets are not expanded.
-.Sh BIOMETRIC POLICY
-.Fl -strict-biometrics
-on vault init, vault recover, or device request creates a device key requiring
-the current Touch ID enrollment, without login-password fallback.
-The policy persists without repeating the flag.
-Adding or removing fingerprints invalidates key access; recovery or another
-enrolled device is required.
-Existing non-strict keys cannot change policy in place: use a fresh state
-directory, enroll the replacement, then revoke the old key.
+.Sh CONCURRENCY AND RECOVERY
+A conditional CloudKit head save publishes immutable encrypted records and a
+manifest. A stale writer fails rather than overwriting another revision.
+Retry conflicts explicitly. Exit 22 indicates an uncertain commit: run vault sync
+to reconcile before another write. Mutations are never automatically replayed.
+Missing zones are not silently recreated. Old revisions and abandoned staging
+records are retained and consume iCloud quota.
 .Sh FILES
 .Bl -tag -width indent
-.It Pa ~/.mop/.mopfile
-Default AES-256-GCM encrypted vault.
-.It Pa ~/.mop/.mopfile.history/
-Preserved encrypted revisions.
-Keep history with the vault when syncing.
 .It Pa ~/.mop/device.json
-Owner-only public device metadata and Keychain account UUID; no key blob.
-The opaque enclave key is in the application-specific Data Protection Keychain.
-.It Pa ~/.mop/trust/
-Local vault-key trust records; never sync these with the vault.
+Public local device metadata and Keychain account UUID.
+.It Pa ~/.mop/cloud/
+Account/container/environment/vault-scoped ciphertext cache, journals, and trust.
 .El
-.Pp
-Only vault format v3 and device metadata v2 are accepted.
-Older files are unsupported; create fresh vault and state paths.
-Each value has an independent key wrapped directly for each recipient.
-Open/list decrypt only the index; read decrypts only the requested value.
-File coordination is local, not a distributed lock. iCloud changes can
-conflict;
-use explicit conflict resolution.
-Trust pins do not prevent all old-file replays.
 .Sh EXIT STATUS
-.Bl -tag -width "126, 127"
-.It 0
-Success.
+.Bl -tag -width indent
 .It 2
-Invalid CLI, reference, dotenv, template, process, or output options.
+Invalid arguments, legacy file configuration, or unsupported offline mutation.
 .It 3
-Authentication failed, cancelled, or unavailable.
+Authentication failure.
 .It 4
-Secret field missing.
+Missing secret.
 .It 5
-Secret, enrollment, or output file already exists.
-.It 6, 8
-Keychain failure or missing/invalid signed application identity.
-.It 7
-Input/output failure or invalid UTF-8.
-.It 9
-Vault file missing.
-.It 10
-Invalid, unsupported, or unauthentic vault.
-.It 11
-Stale write or unresolved version conflict.
-.It 12
-Secure Enclave unavailable.
-.It 13
-Device not enrolled or initialized.
-.It 14
-Invalid device, fingerprint, request, or recovery credential.
-.It 15
-Unsafe file type, permissions, or protected output path.
-.It 16
-Missing or mismatched local vault-key trust.
-.It 126, 127
-Program cannot execute, or cannot be found.
+Duplicate secret/vault or existing output.
+.It 6 / 8
+Keychain failure / invalid signed identity or provisioning.
+.It 7 / 15
+I/O failure / unsafe file or protected output path.
+.It 9 / 10 / 11
+Missing vault/default / invalid vault / concurrent write conflict.
+.It 12 / 13 / 14 / 16
+Unavailable enclave / unenrolled device / invalid device or recovery / untrusted vault.
+.It 17 / 18 / 19 / 20 / 21 / 22
+Cloud unavailable / account unavailable / quota / throttling / permission / uncertain commit.
+.It 126 / 127
+Cannot launch command / executable missing.
 .El
 .Pp
-After successful execution,
-.Cm run
-returns the child's exit status.
-Diagnostics go to stderr without secret values.
-.Sh EXAMPLES
-Read a token without an appended newline:
-.Bd -literal -offset indent
-mop read mop://personal/github/token --no-newline
-.Ed
-.Pp
-Run GitHub CLI with an ephemeral token environment:
-.Bd -literal -offset indent
-GH_TOKEN=mop://personal/github/token mop run -- gh repo list
-.Ed
-.Pp
-Generate an owner-only configuration:
-.Bd -literal -offset indent
-mop inject -i config.template -o config.generated --file-mode 0600
-.Ed
-.Pp
-In Bash or zsh, pass a single-line password to sshpass on descriptor 3:
-.Bd -literal -offset indent
-sshpass -d 3 ssh sshprofile 3< <(mop read mop://personal/sshprofile/password)
-.Ed
-.Pp
-This avoids a long-lived password environment variable.
-Process substitution is
-asynchronous: SSH can start before authentication finishes, and its exit status
-does not report the substitution's status.
-.Pp
-Generate completions without accessing secrets:
-.Bd -literal -offset indent
-mop completion bash
-mop completion zsh
-mop completion fish
-.Ed
+Otherwise child exit status or termination signal is propagated.
+.Sh SECURITY
+Recovery credentials are a full alternate decryption capability; store offline.
+Local decrypted keys and values enter process memory. Masking cannot hide
+transformed secrets or deliberate child-process bypasses. Freshness is limited by
+observed state; offline reads cannot detect remote revocation or unseen account changes.
+CloudKit sharing with other Apple Accounts is not implemented in this version.
 .Sh SEE ALSO
-.Xr bash 1 ,
-.Xr fish 1 ,
-.Xr ssh 1 ,
-.Xr sshpass 1 ,
-.Xr zsh 1
+.Nm mop Cm --help
 .Pp
-Installation and completion setup:
-.Lk https://github.com/koehn/mop#readme
-.Pp
-Usage examples:
-.Lk https://github.com/koehn/mop/blob/main/docs/EXAMPLES.md
+README.md, docs/CLOUDKIT.md, and docs/VALIDATION.md in the source distribution.

@@ -44,6 +44,25 @@ public enum SigningIdentity {
         return applicationID
     }
 
+    public static func cloudConfiguration() throws -> (container: String, environment: String) {
+        let appID = try accessGroup()
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        var information: CFDictionary?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any],
+              let ent = info[kSecCodeInfoEntitlementsDict as String] as? [String: Any],
+              let dot = appID.firstIndex(of: "."),
+              let environment = ent["com.apple.developer.icloud-container-environment"] as? String,
+              ["Development", "Production"].contains(environment) else { throw MopError.signing }
+        let container = "iCloud." + appID[appID.index(after: dot)...]
+        guard ent["com.apple.developer.icloud-container-identifiers"] as? [String] == [container],
+              ent["com.apple.developer.icloud-services"] as? [String] == ["CloudKit"] else { throw MopError.signing }
+        return (container, environment)
+    }
+
     // Bundle.main may describe the CLI symlink's directory. Use the executable
     // identified by Security.framework for the validated running code instead.
     private static func applicationBundle(for executable: URL) -> Bundle? {

@@ -2,6 +2,7 @@
 """Validate a provisioning profile and emit least-privilege signing inputs."""
 import datetime
 import fnmatch
+import os
 import plistlib
 import sys
 from pathlib import Path
@@ -18,12 +19,46 @@ if profile.get('ExpirationDate', datetime.datetime.min) <= datetime.datetime.now
     sys.exit('The provisioning profile has expired.')
 if not any(fnmatch.fnmatchcase(app_id, group) for group in entitlements.get('keychain-access-groups', [])):
     sys.exit('The provisioning profile must permit the application-specific Keychain group.')
+output = {'com.apple.application-identifier': app_id,
+          'com.apple.developer.team-identifier': team,
+          'keychain-access-groups': [app_id]}
+if executable == 'mop':
+    container = 'iCloud.' + bundle_id
+    environment = os.environ.get('MOP_CLOUD_ENVIRONMENT', 'Production')
+    if environment not in ('Development', 'Production'):
+        sys.exit('MOP_CLOUD_ENVIRONMENT must be Development or Production.')
+    # Profiles describe allowed values (often arrays or wildcards); the app's
+    # signature must contain the single concrete environment/container we use.
+    def allowed_values(key):
+        value = entitlements.get(key)
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return value
+        return []
+
+    def permits(key, requested):
+        return any(fnmatch.fnmatchcase(requested, pattern) for pattern in allowed_values(key))
+
+    required = [('com.apple.developer.icloud-container-identifiers', container),
+                ('com.apple.developer.icloud-services', 'CloudKit'),
+                ('com.apple.developer.icloud-container-environment', environment)]
+    problems = []
+    for key, requested in required:
+        if not permits(key, requested):
+            permitted = ', '.join(allowed_values(key)) or '(missing)'
+            problems.append(f'  {key}: requires {requested}; profile permits {permitted}')
+    if problems:
+        sys.exit('CloudKit provisioning does not authorize this build:\n' + '\n'.join(problems)
+                 + f'\nEnable CloudKit for {bundle_id}, associate {container}, then regenerate/download its profile.'
+                 + '\nMOP_CLOUD_ENVIRONMENT selects Development or Production (default Production); the profile must permit it.')
+    output.update({'com.apple.developer.icloud-container-identifiers': [container],
+                   'com.apple.developer.icloud-services': ['CloudKit'],
+                   'com.apple.developer.icloud-container-environment': environment})
 with open(entitlements_path, 'wb') as f:
-    plistlib.dump({'com.apple.application-identifier': app_id,
-                  'com.apple.developer.team-identifier': team,
-                  'keychain-access-groups': [app_id]}, f)
+    plistlib.dump(output, f)
 with open(info_path, 'wb') as f:
     plistlib.dump({'CFBundleIdentifier': bundle_id, 'CFBundleExecutable': executable,
                   'CFBundleName': 'mop', 'CFBundlePackageType': 'APPL',
-                  'CFBundleVersion': '0.3.0', 'CFBundleShortVersionString': '0.3.0',
+                  'CFBundleVersion': '0.4.0', 'CFBundleShortVersionString': '0.4.0',
                   'LSMinimumSystemVersion': '15.0'}, f)

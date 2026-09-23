@@ -16,12 +16,12 @@ bash_script = (brew_prefix / 'etc/bash_completion.d/mop' if brew_prefix
 scripts = {'bash': bash_script,
            'zsh': share / 'zsh/site-functions/_mop',
            'fish': share / 'fish/vendor_completions.d/mop.fish'}
-env = os.environ | {'MOP_VAULT_FILE': '/nonexistent/mop-completion-test',
+env = os.environ | {'MOP_CLOUD_VAULT': '00000000-0000-0000-0000-000000000000',
                     'MOP_STATE_DIRECTORY': '/nonexistent/mop-completion-state'}
 for shell, path in scripts.items():
     generated = subprocess.check_output([str(binary), 'completion', shell], env=env)
     assert generated == path.read_bytes()
-    assert b'vault-file' in generated and b'fingerprint' in generated and b'no-masking' in generated and b'strict-biometrics' in generated
+    assert b'cloud-vault' in generated and b'fingerprint' in generated and b'no-masking' in generated and b'strict-biometrics' in generated
     executable = shutil.which(shell)
     if executable:
         subprocess.run([executable, '-n', str(path)], check=True, env=env)

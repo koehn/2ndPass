@@ -17,503 +17,267 @@ For licensing inquiries, contact Koehn Consulting, Inc.
 
 See the [copyright notice](LICENSE). Build, installation, and operational instructions in this repository are for the copyright holder and separately authorized users; they do not grant permission. Third-party dependencies retain their own licenses.
 
-Development version (breaking vault format v3; CLI version 0.3.0).
+mop is a macOS command-line secret manager with CloudKit synchronization and
+Secure Enclave-protected access. It supplies credentials to commands and templates
+using references such as `mop://personal/service/token`.
 
-[Usage examples](docs/EXAMPLES.md) · [Security and key management](docs/SECURITY.md)
+**CloudKit implementation: signed two-Mac and production acceptance are still
+required before release.** See [validation](docs/VALIDATION.md).
 
-mop stores secrets in an encrypted file and uses your Mac's [Secure Enclave](https://support.apple.com/guide/security/the-secure-enclave-sec59b0b31ff/web) to
-protect access. Use it to pass credentials to commands, fill in configuration
-files, and share a vault between your Macs. Each command that accesses a secret
-requires Touch ID or your system password.
+Requires macOS 15+, a Secure Enclave, a logged-in macOS user, an Apple Account
+with iCloud access, and a provisioned signed application. There is no software-key
+or unsigned-build fallback for secret access.
 
-Requires macOS 15 or later, Secure Enclave hardware, an interactive login
-session, and a signed, provisioned application bundle.
+## Storage and authentication
 
-## Install
+mop encrypts the index and each secret locally using the existing `mop-vault-v3`
+format. Each secret has an independent AES-256-GCM key. HPKE wraps the index and
+secret keys separately for every enrolled Mac and for an offline recovery key.
+CloudKit stores individual immutable encrypted records and revision manifests;
+a conditional head update publishes a complete revision. Unchanged secret records
+are reused. Concurrent writers fail explicitly rather than overwrite changes.
 
-### Signed source build
+Every secret command authenticates afresh with Touch ID or the system password.
+`--strict-biometrics` on initial device creation requires the current Touch ID
+set with no password fallback. Changing biometric enrollment then requires
+recovery. The Secure Enclave key and its Keychain item enforce the policy;
+there is no synchronizing private key or app-only authentication gate.
 
-This development version requires an Apple signing identity and an **explicit
-macOS provisioning profile** for your bundle identifier, permitting its own
-Keychain access group. Ad-hoc and unprovisioned builds fail closed for secret
-access. The existing Homebrew formula packages the older 0.3.0 design; it is not
-a distribution path for this new security model.
+An independent CloudKit vault has its own UUID, zone, enrollment list, recovery
+credential, and trust fingerprint. Logical names such as `personal` in a
+`mop://personal/service/token` reference remain namespaces *inside* that vault.
+Multiple independent vaults are supported. Cross-account sharing is not yet
+implemented; each zone is private to its owner's Apple Account.
 
-With Xcode 16 or later installed:
+## Build and provision
+
+These instructions require separate authorization from Koehn Consulting, Inc. The published source grants inspection and analysis rights only.
 
 ```sh
-export MOP_SIGN_IDENTITY='Apple Development: Your Name (TEAMID)'
-export MOP_PROVISION_PROFILE=/path/to/mop.provisionprofile
-export MOP_BUNDLE_ID=net.koehn.mop # must match your explicit profile
+swift build
+swift test
+```
+
+Unsigned builds support help, completions, and commands without secret references.
+Operational access requires a signed bundle. Keep the application identifier,
+signing team, and CloudKit container stable across upgrades.
+
+1. Register an explicit macOS App ID (default `net.koehn.mop`). Enable iCloud with
+   CloudKit and the application-specific Keychain access group.
+2. Associate the container `iCloud.<bundle identifier>` with the App ID.
+3. Generate a provisioning profile authorizing that container and the selected
+   CloudKit environment. Create the schema described in [CloudKit setup](docs/CLOUDKIT.md).
+4. Package the application:
+
+```sh
+export MOP_SIGN_IDENTITY='Your Apple signing identity'
+export MOP_PROVISION_PROFILE='/path/to/profile.provisionprofile'
+export MOP_BUNDLE_ID='net.koehn.mop'
+export MOP_CLOUD_ENVIRONMENT='Development' # Production for release builds
 scripts/package.sh
-scripts/install.sh
-export PATH="$HOME/.local/bin:$PATH"
-export MANPATH="$HOME/.local/share/man:${MANPATH:-}"
+scripts/install.sh dist/Mop.app
+mop device identity
 ```
 
-The package is `dist/Mop.app`; the installer preserves the complete signed bundle
-under `~/.local/lib/mop/Mop.app` and links its executable from `~/.local/bin/mop`.
-Set `MOP_INSTALL_ROOT` to choose a different prefix. Keep the same application
-identifier and signing team across upgrades to retain Keychain access. Moving
-only the executable out of its bundle breaks secret access. `swift run mop` can
-exercise help, completions, and commands without secret references, but cannot
-open device keys.
+Packaging defaults to `Production` and rejects profiles without the matching
+CloudKit environment/container. It emits only the narrow Keychain and CloudKit
+entitlements, without debugging exceptions. Moving the executable out of its app
+bundle breaks access; the installer uses a symlink to the bundled executable.
+Developer profiles/environments are distinct from production data.
 
-### Check the installation
-
-With either installation method, check that your shell can find mop:
+## Create and select a vault
 
 ```sh
-command -v mop
-mop --version
-mop device identity # verifies signing and Keychain entitlement without Touch ID
+mop vault init --recovery-file "$HOME/mop-recovery.key" --name 'First Mac'
+mop vault list
+mop vault use VAULT_UUID
 ```
 
-All usage examples below run the `mop` on your `PATH`. If you have installed more
-than one copy, use `type -a mop` to see which takes precedence.
+Initialization prints the vault UUID, device fingerprint, and vault fingerprint.
+Move the recovery file offline and retain the vault fingerprint with it. The
+recovery credential is a full alternative decryption capability: never put it
+in CloudKit or keep it next to a synchronized backup. A failed initialization
+retains any recovery file already written.
 
-## Create a vault
+The first successfully created/imported vault becomes the local account default.
+Choose a vault with `--cloud-vault UUID`, then `MOP_CLOUD_VAULT`, then the saved
+default, in that order. A missing default is an error, not an arbitrary selection.
+A new Mac can run `vault list`, then `vault use UUID` before enrollment.
 
-Choose a new recovery-file path in an existing directory:
+Local metadata defaults to `~/.mop`, overridden by `--state-directory` or
+`MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains public
+device metadata, account-scoped ciphertext caches, commit journals, and local
+trust pins. The private enclave key blob lives only in the application's
+nonsynchronizing Data Protection Keychain. Keep both metadata and the Keychain
+item across upgrades. Secret output cannot target the state directory.
+
+## Enroll another Mac
+
+Install the same provisioned application on both Macs and sign into the same
+Apple Account. On the new Mac:
 
 ```sh
-mop vault init --recovery-file "$HOME/mop-recovery.key" --name "My Mac"
-mop write mop://personal/github/token
-mop read mop://personal/github/token
+mop vault list
+mop vault use VAULT_UUID
+mop device request --name 'Second Mac'
 ```
 
-`write` reads a hidden terminal prompt, or UTF-8 stdin for multiline values. It
-never accepts a secret as an argument. Every command accessing secrets requires
-fresh Touch ID or system password authentication. There is no software-key
-fallback when the Secure Enclave is unavailable.
-
-The default vault is `~/.mop/.mopfile`. The public device metadata is
-`~/.mop/device.json`, with owner-only permissions. The opaque enclave key blob is
-stored in the application-specific, nonsynchronizing Data Protection Keychain. Local vault-key fingerprints live
-in `~/.mop/trust/`; keep this directory on the Mac, outside cloud sync. Initialization
-pins the newly created vault key automatically and prints its fingerprint. Save that
-fingerprint with your offline recovery material. **Keep the recovery key offline,
-separate from the vault.** It is a full alternative decryption capability, without
-the original Mac's Secure Enclave or Touch ID. Moving it off the Mac protects
-against losing all enrolled devices. Initialization never overwrites existing
-vaults or recovery files; if a later initialization step fails, any recovery file
-already written is retained.
-
-Keep the device's Keychain item, `~/.mop/device.json`, and `~/.mop/trust/` across
-upgrades. The metadata file alone cannot restore a device key. The key works only
-on the Mac that created it and is retrieved through the provisioned application.
-
-To require Touch ID with no login-password fallback, create the device using:
+On an enrolled Mac:
 
 ```sh
-mop vault init --strict-biometrics --recovery-file "$HOME/mop-recovery.key"
-# Also available on: mop device request, mop vault recover
-```
-
-This policy persists on the key. Subsequent commands do not need the flag.
-Adding/removing enrolled fingerprints invalidates access; use another enrolled
-device or offline recovery with a fresh state directory. An existing default key
-cannot be upgraded in place by passing this flag; create and enroll a replacement
-key in a new local state directory. Omitting the flag never weakens an existing
-strict key.
-
-## Manpage and shell completions
-
-Run `man mop` for the command reference or `mop --help` for a command summary.
-Use `mop <command> --help` for details about a particular command.
-
-Load completions from `mop` in your shell's startup file. These instructions work
-for both Homebrew and source installations, as long as `mop` is on your `PATH`.
-
-For **zsh**, add this to `~/.zshrc` after your existing `compinit` call:
-
-```zsh
-eval "$(mop completion zsh)"
-```
-
-If your configuration or shell framework doesn't already initialize completions,
-add `autoload -Uz compinit` and `compinit` before that line.
-
-For **Bash**, add this to `~/.bashrc` (or `~/.bash_profile` for a macOS login shell):
-
-```bash
-eval "$(mop completion bash)"
-```
-
-For **Fish**, add this to `~/.config/fish/config.fish`:
-
-```fish
-mop completion fish | source
-```
-
-Open a new shell or run the corresponding command in your current shell.
-Completions cover commands, options, and file paths. Generating them does not
-access your vault or prompt for authentication.
-
-## iCloud Drive and other Macs
-
-Select a file within your existing iCloud Drive folder:
-
-```sh
-export MOP_VAULT_FILE="$HOME/Library/Mobile Documents/com~apple~CloudDocs/mop/.mopfile"
-mop vault init --recovery-file "$HOME/mop-icloud-recovery.key" --name "First Mac"
-```
-
-Initialize only once. On other Macs, select the same **synced file**, and enroll
-their own keys instead of initializing another vault. `--vault-file PATH` overrides
-`MOP_VAULT_FILE` on any operational subcommand. The local-key directory can be
-selected using `--state-directory PATH` or `MOP_STATE_DIRECTORY`; never point it
-at a cloud-synced directory. Device keys cannot be copied to another Mac.
-
-On the new Mac:
-
-```sh
-mop device request --out "$HOME/new-mac-request.json" --name "Second Mac"
-```
-
-Transfer this public request to an authorized Mac. Compare the full displayed
-fingerprint through a trusted channel, such as reading it directly from the new
-Mac's screen. Then, on the authorized Mac:
-
-```sh
-mop device add --request new-mac-request.json --fingerprint FULL_SHA256_FINGERPRINT
-mop device list
-```
-
-On the authorizing Mac, obtain the **vault** fingerprint (distinct from the device
-fingerprint):
-
-```sh
+mop device requests
+mop device add REQUEST_ID --fingerprint FINGERPRINT_FROM_NEW_MAC
 mop vault fingerprint
 ```
 
-After the updated file reaches the new Mac, compare that fingerprint through a
-trusted channel, then pin it locally:
+Compare the full device fingerprint using an independent trusted channel. The
+request list is untrusted public metadata, not evidence of identity. Then, on the
+new Mac, compare and pin the vault fingerprint from the trusted Mac:
 
 ```sh
-mop vault trust --fingerprint FULL_VAULT_FINGERPRINT
+mop vault trust --fingerprint VAULT_FINGERPRINT_FROM_TRUSTED_MAC
 ```
 
-The new Mac can then read the vault with its own Touch ID/password. Missing or
-mismatched local trust fails closed with code 16; decryptability alone does not
-prove that the vault came from an authorized writer.
-
-Device requests contain a public key and device name, not secret data; the device
-fingerprint check guards against substitution. A request does not constitute
-remote hardware attestation: approve only requests generated on devices you trust.
+Requests remain available for auditing/retry; approval does not delete them.
+A pending request never grants access by itself.
 
 ```sh
-mop device remove FULL_SHA256_FINGERPRINT
+mop device list
+mop device remove DEVICE_FINGERPRINT
 ```
 
-Removing another device rotates the index key and every record key and re-encrypts the current
-vault for remaining devices and recovery. It updates the revoking Mac's local pin
-and prints the new vault fingerprint. Every other remaining Mac must independently
-verify and pin this new fingerprint with `mop vault trust --fingerprint ...` before
-opening the updated vault. Save the new fingerprint with offline recovery material.
-Removal does not erase old copies or make previously learned secrets unknown. You cannot remove the current device through
-this command. There is a maximum of 63 devices plus one recovery recipient.
+Removal rotates the index key and every secret key. Verify and pin the newly
+printed vault fingerprint on remaining Macs. Old ciphertext, backups, and offline
+caches remain decryptable by their former recipients. Remote removal cannot erase
+secrets already learned. You cannot remove the device executing the command.
 
-## Recovery
-
-On a replacement Mac, select the synced vault and restore the offline recovery
-file with owner-only permissions (`chmod 600`), then:
+## Read, write, run, and inject
 
 ```sh
-mop vault recover --recovery-file /path/to/mop-recovery.key --fingerprint FULL_VAULT_FINGERPRINT --name "Replacement Mac"
+mop write mop://personal/service/token              # hidden prompt or UTF-8 stdin
+mop write --replace mop://personal/service/token
+mop read mop://personal/service/token
+mop read -n -o /private/tmp/token mop://personal/service/token
+mop list --vault personal --json
+mop delete mop://personal/service/token
+
+TOKEN=mop://personal/service/token mop run -- your-command arg
+mop run --env-file ./development.env -- your-command
+printf '%s' '{{ mop://personal/service/token }}' | mop inject
+mop inject -i template.conf -o generated.conf
 ```
 
-Recovery enrolls this Mac's Secure Enclave key and requires local authentication.
-The fingerprint must come from a trusted Mac or your offline records, and must
-match the current encryption key (it changes after device removal). If instead you
-have a known-good vault backup, restore that copy and use `--revision SHA256` with
-its independently recorded SHA-256 hash. The recovery private key alone cannot
-prove the authenticity of a replaceable vault: anyone can encrypt to its public key.
-Recovery refuses to implicitly trust a file just because it decrypts.
-Return the recovery file to offline storage afterward. A device record from an
-erased or different Mac may be unusable; preserve it elsewhere and use a new,
-local `--state-directory` for recovery. The tool never silently replaces an
-existing device record. Losing every usable device key **and** the recovery key
-makes the vault unrecoverable.
+Secrets are never accepted as positional arguments. `write --replace` requires an
+existing field; ordinary `write` refuses to overwrite one. Reads add a newline
+unless `-n` is set. File output is atomic, defaults to mode `0600`, and requires
+`--force` to replace an existing regular file. `--file-mode` accepts octal modes.
+References support `mop://vault/item/[section/]field`; percent-encode components.
 
-## Secret commands
+`run` reads literal dotenv files in order, overriding inherited variables. Values
+starting with `mop://` resolve once; `$NAME` and `${NAME}` reference components
+expand from the merged environment. `inject` expands `{{ mop://… }}` placeholders.
+Fetched secrets are not recursively expanded. All references resolve before a
+child starts or output is written. Repeated references are fetched once per command.
+Commands and literal templates with no references need neither CloudKit nor Touch ID.
+
+`run` masks exact nonempty fetched secret byte strings on stdout and stderr with
+`[concealed by mop]`, including across stream chunks. `--no-masking` uses direct
+execution and preserves terminal behavior. Masking cannot hide transformed secrets,
+files or `/dev/tty` written by children, or deliberate bypasses. See
+[examples](docs/EXAMPLES.md) for more command workflows.
+
+## Offline operation and synchronization
+
+Online commands fetch the current head before opening the vault. Writes succeed
+only after server confirmation. No mutations are queued offline.
 
 ```sh
-mop write mop://personal/github/token
-mop write mop://personal/github/token --replace
-secure-secret-source | mop write mop://personal/service/credential
-mop read mop://personal/github/token --no-newline
-mop list --vault personal
-mop list --json
-mop delete mop://personal/github/token
+mop vault sync
+mop vault status
+mop read --offline mop://personal/service/token
+mop run --offline -- your-command
+mop vault export --offline --out-file /path/to/backup.mopfile
 ```
 
-`read` supports `-n/--no-newline`. Both `read` and `inject` support
-`-o/--out-file PATH`, `--file-mode OCTAL` (default `0600`), and `-f/--force`.
-File-only options require `--out-file`; permissions may range from `0000` through
-`0777`, without special bits. Existing files require `--force`; there is no overwrite
-prompt. Files are written atomically only after all secrets resolve. Destination
-symlinks, non-regular files, and the selected vault/history/device record/local trust
-directory are rejected.
-For deliberate in-place template replacement, specify the same input/output file
-and `--force`. Plain shell redirection does not provide these safeguards.
+Only `read`, `list`, `run`, `inject`, and encrypted `export` accept offline mode.
+They use the last authenticated cache, require local authentication, and print its
+fetch time to stderr. There is no implicit fallback after network errors. A sync
+without authentication downloads ciphertext but does not promote it to the
+verified offline snapshot. Offline use cannot detect remote revocation or an
+account change not yet observed locally. An observed sign-out invalidates the
+account binding; caches and defaults are isolated by account, container, environment,
+and vault UUID.
+
+Concurrent writes return exit code 11; rerun against current state. If a response
+is lost, exit code 22 means the outcome is uncertain. Run `vault sync` online to
+reconcile its recorded revision against committed ancestry before another write.
+A live local writer holds a process lock. Interrupted staging is never exposed as
+a committed vault and is never automatically replayed.
+
+## Migration, backups, history, and recovery
+
+Operational `--vault-file` and `MOP_VAULT_FILE` have been removed. Unset the old
+environment variable, retain your device state, and explicitly import:
 
 ```sh
-mop read mop://personal/github/token -n -o token.txt
-mop inject -i config.template -o config.generated --file-mode 0600
-mop inject -i config.generated -o config.generated --force
+unset MOP_VAULT_FILE
+mop vault import --file /path/to/existing.mopfile
+mop vault export --out-file /path/to/backup.mopfile
 ```
 
-`write` creates only; `--replace` updates only. Stdin preserves UTF-8 values exactly,
-including empty values and trailing newlines. The hidden prompt takes one line,
-up to 65,536 UTF-8 bytes. `read` appends one newline unless `--no-newline` is set.
-`list --json` emits an array of references without values.
-
-References have three or four case-sensitive, nonempty components:
-`mop://vault/item/[section/]field`. A sectionless field and a field in a section
-are distinct; for example, `mop://v/i/token` and `mop://v/i/api/token`.
-Use letters, digits, `-._~` literally; percent-encode other UTF-8 bytes (for example,
-`mop://personal/GitHub%20API/token`). Decode occurs once; names normalize to Unicode
-NFC. Query strings, fragments, NUL, invalid UTF-8, and raw spaces are rejected.
-Logical vault names are namespaces within the same encrypted file.
-
-### Run and inject
-
-```dotenv
-GITHUB_TOKEN=mop://personal/github/token
-APP_MODE=development
-```
-
-```sh
-mop run --env-file dev.env -- your-program --its-option
-mop run --env-file base.env --env-file local.env -- your-program
-GITHUB_TOKEN=mop://personal/github/token mop run -- your-program
-mop inject --in-file config.template > config.generated
-```
-
-Later dotenv files override earlier files and inherited variables; the last
-assignment wins. Supported syntax is line-oriented `NAME=value`, single/double
-quoted literal values, empty values, and comments. Inline comments start after
-whitespace. There is no shell evaluation, general variable expansion, backslash unescaping,
-`export` keyword, or quoted multiline syntax. Values starting with `mop://` must be
-complete references; embedded references in larger environment values stay literal.
-NUL cannot be placed in a process environment.
-
-Templates use `{{ mop://personal/github/token }}`. Unrelated placeholders are
-preserved. Replacement is literal, not JSON/YAML/shell escaping, and replacement
-values are not recursively evaluated. Without `--in-file`, input comes from stdin.
-
-Inside references only, `run` and `inject` expand `$NAME` and `${NAME}` once:
-
-```dotenv
-APP_ENV=development
-TOKEN=mop://${APP_ENV}/github/api/token
-```
-
-`run` uses the merged environment after all dotenv overrides. `inject` uses the
-inherited environment. Expansion applies to references even if the dotenv value
-was quoted; other dotenv values remain literal. Substitutions are literal component
-text: a variable containing `/` cannot change the reference's structure. Undefined
-variables, malformed expressions, and empty resulting components fail before
-authentication. There are no shell operators, defaults, recursive substitutions,
-or expansion of fetched secrets. Use `%24` for a literal dollar sign in a reference.
-Keep references shell-quoted when the expansion should happen inside mop.
-
-All references resolve before output or child execution; repeats are fetched once.
-Masking patterns retain distinct UTF-8 encodings even when Unicode strings are
-canonically equivalent.
-`run` requires `--` and never adds an implicit shell. By default it supervises the
-child with inherited stdin and separate stdout/stderr pipes. Exact occurrences of
-resolved, nonempty secret values become `[concealed by mop]`, including multiline
-values and matches spanning reads. Matching is leftmost-longest and byte-based;
-replacement text is not scanned again. Only fetched secret values are masked, not
-arbitrary inherited environment values. Empty secrets are ignored, and short
-secrets can conceal ordinary text too. Secret values remain in mop's process memory
-while filtering output; the authentication context is closed before launch.
-
-Pipes change `isatty`, buffering, color, and interactive program behavior. Use
-`mop run --no-masking -- COMMAND` for direct `execve` execution with full terminal
-and job-control behavior. Both modes preserve command arguments and exit status;
-masked execution forwards termination signals to the immediate child. It does not
-manage detached descendants. Masking cannot protect transformed/encoded secrets,
-secrets written directly to files or `/dev/tty`, or deliberate bypasses by a child.
-
-Shell output redirection can create/truncate a file before mop starts, even if mop
-subsequently fails without producing output. Prefer `--out-file` for read/inject.
-
-## Examples
-
-The [usage examples](docs/EXAMPLES.md) cover: GitHub CLI tokens, local application dotenv files, Docker login through stdin,
-temporary npm configuration, SSH passwords, and multiline private keys.
-
-For `sshpass`, Bash/zsh process substitution supplies the password on a file
-descriptor without exporting a long-lived password environment variable:
-
-```bash
-sshpass -d 3 ssh sshprofile 3< <(mop read mop://personal/sshprofile/password)
-```
-
-See [the sshpass recipe](docs/EXAMPLES.md#give-sshpass-a-password-through-file-descriptor-3)
-for setup, descriptor lifetime, and asynchronous authentication behavior.
-
-## File boundaries and upgrades
-
-If you used an earlier `Mop.app` installation, the source installer can update its
-command symlink. The old app and Keychain entries remain in place; Keychain secrets
-are not automatically migrated to the encrypted vault.
-
-Each `.mopfile` has its own encryption key, recipient list, recovery credential,
-and history. Logical vault names within that file are namespaces, not permissions.
-Every enrolled device can access the entire file. Use different files for independent
-access boundaries, selecting one file per command:
-
-```sh
-mop vault init --vault-file /path/to/personal.mopfile --recovery-file /offline/personal.key
-mop vault init --vault-file /path/to/work.mopfile --recovery-file /offline/work.key
-mop device add --vault-file /path/to/work.mopfile --request second-mac.json --fingerprint FULL_SHA256_FINGERPRINT
-mop run --vault-file /path/to/work.mopfile --env-file work.env -- your-program
-```
-
-A device enrolled only in the work file receives no access to the personal file,
-even if references have identical names. The same local device record may be used
-with multiple independently enrolled files. There is no automatic cross-file routing.
-
-The security update requires local trust for every file path. New vaults establish
-it during initialization. There is no automatic trust-on-first-use for old files,
-new state directories, or relocated vaults. A trusted Mac can provide the vault
-fingerprint; alternatively, explicitly pin a known-good backup with
-`mop vault trust --revision SHA256`. Never compute this approval hash only from the
-untrusted synced file: doing so would accept an attacker's replacement. If neither
-trusted evidence nor a trusted copy is available, create a new vault. Losing the
-local trust records requires this same explicit verification again.
-
-This development version accepts only `mop-vault-v3` and local device metadata v2.
-Earlier vaults and file-based key blobs are intentionally unsupported, with no
-migration. Use fresh vault/recovery paths and a fresh local state directory when
-starting from an older build. Existing files are not automatically deleted.
-
-## Concurrent writes and conflicts
-
-Reads and writes use macOS `NSFileCoordinator`; writes compare the exact encrypted
-snapshot originally read and atomically replace it. A stale command fails with
-code 11 rather than overwrite a newer value. Every update preserves the old and
-new encrypted revisions in `.mopfile.history` beside the vault. Keep that directory
-with the vault when moving or syncing it; it contains encrypted data only.
-
-Known unresolved macOS file versions block ordinary reads and writes. To preserve
-and examine candidate versions:
+Import requires the source's established local trust, or `--fingerprint` /
+`--revision` evidence obtained independently. It accepts v3 only, preserves vault
+identity and recovery relationships, refuses an existing destination head, and
+never deletes or modifies the source file. Export creates a verified encrypted v3
+backup; it does not include the recovery private key. Preserve the printed UUID.
 
 ```sh
 mop vault conflicts
-# Each output line is a full revision hash. Inspect a candidate using normal commands.
-# A history file has its own path: first trust its key using an independently
-# recorded vault fingerprint for that revision (not a hash of the candidate itself).
-mop vault trust --vault-file /path/to/.mopfile.history/HASH.moprevision --fingerprint TRUSTED_VAULT_FINGERPRINT
-mop list --vault-file /path/to/.mopfile.history/HASH.moprevision
-mop read mop://personal/github/token --vault-file /path/to/.mopfile.history/HASH.moprevision
-mop vault resolve --revision HASH
+mop vault resolve --revision COMMITTED_REVISION_HASH
+mop vault recover --recovery-file /offline/recovery.key --name 'Replacement Mac' \
+  --fingerprint INDEPENDENT_VAULT_FINGERPRINT
 ```
 
-Resolution authenticates and verifies both the current and selected snapshots,
-restores the selected contents, and keeps the current recipient list and vault
-key. The selected revision's key must also appear in this Mac's current or previous
-trusted pins. History encrypted under an unknown key is rejected. It preserves
-every known conflicting version before marking those versions
-resolved. It does not automatically merge competing values. Never edit history
-files directly; read them or explicitly restore their contents.
+History lists only committed ancestry, never abandoned uploads. Restoration keeps
+current recipients and keys. Imported history starts at the imported snapshot;
+external `.history` directories are not uploaded. Immutable cloud revisions and
+abandoned staged records are retained in this version and count toward quota.
 
-File coordination is **local**, not a distributed lock. iCloud sync is eventual;
-offline Macs may independently create competing revisions. The implementation
-handles conflicts reported through `NSFileVersion` and keeps immutable encrypted
-history, but cannot guarantee detection of every provider's silent replacement or
-of a malicious replay of an older, valid file. Conflict handling across multiple Macs has not been fully validated. Sync the vault and its history and verify that both appear
-on the other Mac before relying on them. History currently has no automatic pruning.
+Recovery enrolls the current Mac after local authentication and trust verification.
+For a deleted cloud zone, explicitly import an encrypted export. If no enrolled
+device remains, use `vault import --file BACKUP --recovery-file KEY --fingerprint
+FINGERPRINT` to verify the backup and enroll the new Mac before publication.
+The source backup remains unchanged.
+Missing zones are never silently recreated by ordinary commands.
 
-## Cryptographic design
+## Security limits and diagnostics
 
-See [Security and key management](docs/SECURITY.md) for the complete security model,
-key/file inventory, authentication lifecycle, and device enrollment, revocation,
-recovery, and replacement procedures. It also explains the difference between
-device fingerprints, vault fingerprints, and revision hashes, including
-[trust errors after an upgrade](docs/SECURITY.md#trust-errors-after-upgrades-or-moving-files).
+CloudKit's encryption supplements mop's encryption; secret confidentiality does
+not depend on Advanced Data Protection being enabled. The service can observe
+record sizes, update timing, and public device metadata. It can delete data or
+withhold changes. Local key pins and verified generation/digest watermarks reject
+observed rollback and substitution, but a new device needs independent trust
+and cannot infer global freshness from the service alone.
 
+Requested plaintext and unwrapped symmetric keys enter mop's process memory.
+Compromised authorized code could request other secrets. Recovery remains an
+alternative to the hardware authentication path. There is no guarantee of secure
+erasure from Swift-managed memory or from historical copies.
 
-- A local SHA-256 commitment to the vault UUID and 256-bit AES key is required
-  before opening a vault, including recovery and conflict resolution. It contains
-  no decryption key. An attacker controlling only the synced vault cannot replace
-  the encryption key and have subsequent writes accepted. Pins are indexed by
-  canonical file path in the private local state directory, so changing the UUID
-  or moving a file cannot silently establish new trust. Key rotation updates the
-  local pin; other Macs need an explicit trusted fingerprint comparison. The pin
-  does not detect replay of an older valid revision using the same encryption key.
-- Private file writes remove inherited ACLs before writing bytes. Private file and
-  directory reads reject ACL allow entries in addition to checking owner/mode bits.
-- A random AES-256-GCM index key encrypts reference names and record IDs. Each
-  value has an independent random AES-256-GCM key; record keys are wrapped directly
-  for every device and recovery public key, not encrypted under the index key.
-- CryptoKit HPKE (`P256_SHA256_AES_GCM_256`) binds wraps to the v3 domain, vault UUID,
-  recipient role/fingerprint, and either the index or a specific record ID.
-- The index authenticates the header and a SHA-256 digest of the complete encrypted
-  record table, preventing deletion, replacement, or recipient-table tampering.
-  Individual values also authenticate their vault UUID and record ID. Reads and
-  writes are bounded to a 16 MiB encoded envelope.
-- The enclave blob is stored only in a `WhenUnlockedThisDeviceOnly` Keychain item
-  restricted to the provisioned application's own access group. The enclave key
-  requires `.privateKeyUsage` and `.userPresence`, or `.biometryCurrentSet` for
-  strict keys. The Keychain item enforces the matching authentication policy.
-- Every secret command authenticates with a fresh `LAContext`, disables previous
-  biometric reuse, and then disallows additional authentication UI. No weaker
-  retry, file-blob fallback, or software device key is provided.
-- Open/list decrypt only the index. Read decrypts the requested value. Ordinary
-  writes/deletes do not decrypt old values. Enrollment unwraps record keys without
-  decrypting values; revocation and history restoration process values one at a
-  time and re-encrypt them with fresh keys.
-- The index key and requested values/record keys exist in process memory. Swift
-  does not guarantee erasing all copies. An authenticated compromised mop process
-  can still request every record; this is not an enclave-enforced per-record ACL.
-  Application binding protects blob retrieval, not a blob exfiltrated from an
-  already compromised authorized process.
+Diagnostics go to stderr without secret values or arbitrary CloudKit error text.
+Exit codes: 2 invalid arguments/offline mutation/legacy file options; 3 authentication;
+4 missing secret; 5 duplicate/output exists; 6 Keychain; 7 I/O; 8 signing;
+9 missing vault/default; 10 invalid vault; 11 conflict; 12 unavailable enclave;
+13 unenrolled device; 14 invalid device/recovery; 15 unsafe file;
+16 untrusted vault/rollback; 17 cloud unavailable; 18 cloud account;
+19 quota; 20 throttling; 21 cloud permission; 22 uncertain commit;
+126 launch failure; 127 executable missing. Child status is otherwise propagated.
 
-The recovery file is a high-entropy P-256 private key, not a password. It is an
-intentional alternative access path. Revocation protects subsequent revisions,
-not historical ciphertext. The design uses CryptoKit primitives; it has not had
-an independent security audit.
+```sh
+mop completion bash
+mop completion zsh
+mop completion fish
+```
 
-See [Apple's Secure Enclave description](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave),
-[CryptoKit key-blob clarification](https://developer.apple.com/forums/thread/786223),
-and [iCloud file coordination](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/iCloud/iCloud.html).
-
-## Exit codes
-
-Diagnostics go to stderr and exclude secret values and arbitrary OS error text.
-
-| Code | Meaning |
-|---|---|
-| 0 | Success |
-| 2 | Invalid CLI/reference/dotenv/template/process/output options |
-| 3 | Authentication denied, cancelled, unavailable, or another prompt required |
-| 4 | Secret field missing |
-| 5 | Field, device enrollment, or output file already exists (output requires --force) |
-| 6 / 8 | Keychain failure / missing or invalid signed application identity |
-| 7 | File/input/output failure or invalid UTF-8 |
-| 9 | Vault/file missing |
-| 10 | Invalid, unsupported, or unauthentic vault |
-| 11 | Stale write or unresolved version conflict |
-| 12 | Secure Enclave unavailable |
-| 13 | Device not enrolled or not initialized |
-| 14 | Invalid device/request/fingerprint/recovery key |
-| 15 | Unsafe file type/permissions or protected output path |
-| 16 | Missing or mismatched local vault-key trust |
-| 126 / 127 | Program cannot execute / not found |
-
-After successful `run`, the child program's status applies.
-
-## Development
-
-See [testing and validation](docs/VALIDATION.md) for automated tests, hardware
-checks, and known validation gaps, and [releasing](docs/RELEASING.md) for the
-Homebrew release process.
-
-## License
-
-[Copyright notice](LICENSE)
+See [CloudKit provisioning](docs/CLOUDKIT.md) and [validation](docs/VALIDATION.md)
+before distributing a production build.
