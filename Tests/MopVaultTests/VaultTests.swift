@@ -369,7 +369,7 @@ private final class CountingOpener: VaultKeyOpener {
     let spy = CountingOpener(device)
     let store = try FileSecretStore(disk: disk, snapshot: disk.read(), opener: spy)
     defer { store.close() }
-    for name in ["a", "b"] { try store.write(SecretReference("mop://v/i/" + name), value: name, replace: false) }
+    for name in ["a", "b"] { try store.write(SecretReference("mop://v/i/" + name), value: SecretBytes(utf8: name), replace: false) }
     let before = try VaultDocument.decode(disk.read())
     let other = TestDevice()
     try store.enroll(other.request, expectedFingerprint: other.request.fingerprint)

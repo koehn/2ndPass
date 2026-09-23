@@ -59,7 +59,7 @@ public final class FileSecretStore: SecretStore {
         return key
     }
 
-    public func read(_ reference: SecretReference) throws -> String {
+    public func read(_ reference: SecretReference) throws -> SecretBytes {
         _ = try requireKey()
         guard let id = index[reference.description], let record = document.records[id] else { throw MopError.notFound }
         return try record.read(id: id, vaultID: document.header.vaultID, opener: requireOpener())
@@ -70,7 +70,7 @@ public final class FileSecretStore: SecretStore {
         return opener
     }
 
-    public func write(_ reference: SecretReference, value: String, replace: Bool) throws {
+    public func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) throws {
         _ = try requireKey()
         let exists = index[reference.description] != nil
         if exists && !replace { throw MopError.duplicate }

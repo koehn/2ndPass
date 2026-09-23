@@ -14,8 +14,7 @@ private func relayTermination(_ number: Int32) {
 }
 
 enum MaskedExecute {
-    static func run(_ arguments: [String], environment: [String: String], secrets: [String]) throws -> Never {
-        let status = try execute(arguments, environment: environment, secrets: secrets)
+    static func exitWithStatus(_ status: Int32) -> Never {
         let terminatingSignal = status & 0x7f
         if terminatingSignal != 0 {
             signal(terminatingSignal, SIG_DFL)
@@ -27,7 +26,7 @@ enum MaskedExecute {
 
     // Descriptor injection permits pipeline tests without changing the test
     // process's standard streams or introducing a CLI authentication bypass.
-    static func execute(_ arguments: [String], environment: [String: String], secrets: [String],
+    static func execute(_ arguments: [String], environment: [String: SecretBytes], secrets: [SecretBytes],
                         input: Int32 = STDIN_FILENO, output: Int32 = STDOUT_FILENO,
                         errorOutput: Int32 = STDERR_FILENO) throws -> Int32 {
         try Execute.validate(arguments)
@@ -81,16 +80,18 @@ enum MaskedExecute {
               posix_spawnattr_setsigmask(&attributes, &mask) == 0,
               posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK)) == 0 else { throw MopError.launch }
         let argv = arguments.map { strdup($0) }
-        let envp = environment.keys.sorted().map { strdup($0 + "=" + environment[$0]!) }
-        defer { (argv + envp).forEach { free($0) } }
-        guard (argv + envp).allSatisfy({ $0 != nil }) else { throw MopError.launch }
+        defer { argv.forEach { free($0) } }
+        let environmentBlock = try EnvironmentBlock(environment)
+        guard argv.allSatisfy({ $0 != nil }) else { throw MopError.launch }
         var child: pid_t = 0
         var denied = false
         var spawned = false
         for path in Execute.paths(arguments[0], environment: environment) {
             let code = (argv + [nil]).withUnsafeBufferPointer { args in
-                (envp + [nil]).withUnsafeBufferPointer { env in
-                    posix_spawn(&child, path, &actions, &attributes, args.baseAddress!, env.baseAddress!)
+                environmentBlock.withPointers { env in
+                    path.withUnsafeBytes { bytes in
+                        posix_spawn(&child, bytes.baseAddress!.assumingMemoryBound(to: CChar.self), &actions, &attributes, args.baseAddress!, env)
+                    }
                 }
             }
             if code == 0 { spawned = true; break }
@@ -134,21 +135,11 @@ enum MaskedExecute {
 
     private static func pump(source: Int32, destination: Int32, patterns: MaskPatterns) throws {
         var masker = SecretMasker(patterns: patterns)
-        var buffer = [UInt8](repeating: 0, count: 16_384)
         while true {
-            let count = Darwin.read(source, &buffer, buffer.count)
-            if count < 0 && errno == EINTR { continue }
-            guard count >= 0 else { throw MopError.inputOutput }
-            let result = masker.consume(Data(buffer.prefix(count)), final: count == 0)
-            try result.withUnsafeBytes { bytes in
-                var offset = 0
-                while offset < bytes.count {
-                    let written = Darwin.write(destination, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-                    if written < 0 && errno == EINTR { continue }
-                    guard written > 0 else { throw MopError.inputOutput }
-                    offset += written
-                }
-            }
+            let buffer = SecretBuilder()
+            let count = try buffer.readChunk(descriptor: source)
+            let result = masker.consume(buffer.finish(), final: count == 0)
+            try result.write(descriptor: destination)
             if count == 0 { return }
         }
     }

@@ -1,3 +1,4 @@
+import MopCore
 import Foundation
 import Testing
 @testable import MopAppSupport
@@ -19,7 +20,7 @@ struct CLIClientTests {
         let executable = try fixture("exit 3\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         do {
-            _ = try await CLIClient(executable: executable).run([], input: String(repeating: "x", count: 1_000_000))
+            _ = try await CLIClient(executable: executable).run([], input: SecretBytes(utf8: String(repeating: "x", count: 1_000_000)))
             Issue.record("Expected rejection")
         } catch { #expect(error.localizedDescription.contains("Authentication")) }
     }
@@ -31,16 +32,16 @@ struct CLIClientTests {
         let executable = try fixture("printf '%s\\n' \"$@\" >&2\ncat\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let secret = "first line\n$(do-not-execute) ' \"\nlast line\n"
-        let result = try await CLIClient(executable: executable).run(["write", "mop://personal/item/token"], input: secret)
+        let result = try await CLIClient(executable: executable).run(["write", "mop://personal/item/token"], input: SecretBytes(utf8: secret))
         #expect(result.text == secret)
-        #expect(!result.diagnostic.contains(secret))
+        #expect(!String(decoding: result.diagnostic, as: UTF8.self).contains(secret))
         #expect(result.diagnostic == "write\nmop://personal/item/token\n")
     }
     @Test func drainsBothPipesWhileWritingLargeInput() async throws {
         let executable = try fixture("head -c 262144 /dev/zero >&2\ncat\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let input = String(repeating: "secret", count: 100_000)
-        let result = try await CLIClient(executable: executable).run([], input: input)
+        let result = try await CLIClient(executable: executable).run([], input: SecretBytes(utf8: input))
         #expect(result.text == input)
         #expect(result.diagnostic.utf8.count == 262_144)
     }
@@ -56,12 +57,12 @@ struct CLIClientTests {
         }
     }
     @Test func parsesOnlyValidOfflineTimestamp() throws {
-        let result = CLIResult(output: Data("[]".utf8), diagnostic: "mop: offline cache from 2026-09-22T09:41:00Z; remote revocation cannot be checked.\n")
+        let result = CLIResult(output: "[]", diagnostic: "mop: offline cache from 2026-09-22T09:41:00Z; remote revocation cannot be checked.\n")
         #expect(result.offlineDate == "2026-09-22T09:41:00Z")
         #expect(try result.decode([String].self) == [])
-        #expect(CLIResult(output: Data(), diagnostic: "mop: offline cache from untrusted text").offlineDate == nil)
+        #expect(CLIResult(output: "", diagnostic: "mop: offline cache from untrusted text").offlineDate == nil)
     }
     @Test func malformedJSONFailsClosed() {
-        #expect(throws: (any Error).self) { try CLIResult(output: Data("invalid".utf8), diagnostic: "").decode([String].self) }
+        #expect(throws: (any Error).self) { try CLIResult(output: "invalid", diagnostic: "").decode([String].self) }
     }
 }

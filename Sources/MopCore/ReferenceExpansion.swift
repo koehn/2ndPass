@@ -4,6 +4,10 @@ import Foundation
 /// values are encoded as literal component text and are never interpreted again.
 public enum ReferenceExpansion {
     public static func resolve(_ token: String, variables: [String: String]) throws -> SecretReference {
+        try resolve(token) { variables[$0] }
+    }
+
+    static func resolve(_ token: String, value: (String) -> String?) throws -> SecretReference {
         guard token.hasPrefix("mop://") else { throw MopError.invalidReference }
         var output = "mop://"
         let text = String(token.dropFirst(6))
@@ -28,7 +32,7 @@ public enum ReferenceExpansion {
                 }
                 name = String(text[start..<cursor])
             }
-            guard DotEnv.validKey(name), let value = variables[name], !value.contains("\0") else { throw MopError.invalidReference }
+            guard DotEnv.validKey(name), let value = value(name), !value.contains("\0") else { throw MopError.invalidReference }
             output += SecretReference.encode(value)
         }
         return try SecretReference(output)

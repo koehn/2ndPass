@@ -2,33 +2,29 @@ import Foundation
 
 /// A literal, line-oriented subset of dotenv. Never executes or expands input.
 public enum DotEnv {
-    public static func parse(_ text: String) throws -> [String: String] {
-        var values: [String: String] = [:]
-        for (index, raw) in text.components(separatedBy: "\n").enumerated() {
-            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty || line.hasPrefix("#") { continue }
-            guard let equals = line.firstIndex(of: "=") else {
-                throw MopError.invalidEnvironment(line: index + 1)
-            }
-            let key = line[..<equals].trimmingCharacters(in: .whitespaces)
+    public static func parse(_ text: SecretBytes) throws -> [String: SecretBytes] {
+        _ = try text.validatedUTF8()
+        var values: [String: SecretBytes] = [:]
+        for (index, raw) in text.split(separator: 10, omittingEmptySubsequences: false).enumerated() {
+            let line = SecretParsing.trim(raw)
+            if line.isEmpty || line.first == 35 { continue }
+            guard let equals = line.firstIndex(of: 61) else { throw MopError.invalidEnvironment(line: index + 1) }
+            let key = String(decoding: SecretParsing.trim(line[..<equals], newlines: false), as: UTF8.self)
             guard validKey(key) else { throw MopError.invalidEnvironment(line: index + 1) }
-            let value = line[line.index(after: equals)...].trimmingCharacters(in: .whitespaces)
-            guard !value.contains("\0") else { throw MopError.invalidEnvironment(line: index + 1) }
-            if let quote = value.first, quote == "\"" || quote == "'" {
+            let value = SecretParsing.trim(line[(equals + 1)...], newlines: false)
+            guard !value.contains(0) else { throw MopError.invalidEnvironment(line: index + 1) }
+            if let quote = value.first, quote == 34 || quote == 39 {
                 let body = value.dropFirst()
-                guard let close = body.firstIndex(of: quote) else {
-                    throw MopError.invalidEnvironment(line: index + 1)
-                }
-                let trailing = body[body.index(after: close)...].trimmingCharacters(in: .whitespaces)
-                guard trailing.isEmpty || trailing.hasPrefix("#") else {
-                    throw MopError.invalidEnvironment(line: index + 1)
-                }
-                values[key] = String(body[..<close])
+                guard let close = body.firstIndex(of: quote) else { throw MopError.invalidEnvironment(line: index + 1) }
+                let trailing = SecretParsing.trim(body[(close + 1)...], newlines: false)
+                guard trailing.isEmpty || trailing.first == 35 else { throw MopError.invalidEnvironment(line: index + 1) }
+                values[key] = SecretBytes(copying: body[..<close])
             } else {
-                // Inline comments start only after whitespace. '#' within a value is literal.
-                let chars = Array(value)
-                let comment = chars.indices.first { chars[$0] == "#" && ($0 == 0 || chars[$0 - 1].isWhitespace) }
-                values[key] = String(chars[..<(comment ?? chars.count)]).trimmingCharacters(in: .whitespaces)
+                let comment = value.indices.first { position in
+                    value[position] == 35 && (position == value.startIndex ||
+                        SecretParsing.commentWhitespace.contains { value[..<position].suffix($0.count).elementsEqual($0) })
+                }
+                values[key] = SecretBytes(copying: SecretParsing.trim(value[..<(comment ?? value.endIndex)], newlines: false))
             }
         }
         return values

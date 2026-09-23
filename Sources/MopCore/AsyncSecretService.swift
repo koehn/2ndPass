@@ -2,8 +2,8 @@ import Foundation
 
 /// An authenticated command-scoped store. close() invalidates its authorization.
 public protocol AsyncSecretStore: AnyObject {
-    func read(_ reference: SecretReference) async throws -> String
-    func write(_ reference: SecretReference, value: String, replace: Bool) async throws
+    func read(_ reference: SecretReference) async throws -> SecretBytes
+    func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) async throws
     func list(vault: String?) async throws -> [SecretReference]
     func delete(_ reference: SecretReference) async throws
     func close()
@@ -20,11 +20,11 @@ public struct AsyncSecretService {
         return try await body(store)
     }
 
-    public func read(_ reference: SecretReference) async throws -> String {
+    public func read(_ reference: SecretReference) async throws -> SecretBytes {
         try await withStore { try await $0.read(reference) }
     }
 
-    public func write(_ reference: SecretReference, value: String, replace: Bool) async throws {
+    public func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) async throws {
         try await withStore { try await $0.write(reference, value: value, replace: replace) }
     }
 
@@ -36,10 +36,10 @@ public struct AsyncSecretService {
         try await withStore { try await $0.delete(reference) }
     }
 
-    private func resolve(_ references: [SecretReference]) async throws -> [SecretReference: String] {
+    private func resolve(_ references: [SecretReference]) async throws -> [SecretReference: SecretBytes] {
         if references.isEmpty { return [:] }
         return try await withStore { store in
-            var values: [SecretReference: String] = [:]
+            var values: [SecretReference: SecretBytes] = [:]
             for reference in references where values[reference] == nil {
                 values[reference] = try await store.read(reference)
             }
@@ -47,66 +47,26 @@ public struct AsyncSecretService {
         }
     }
 
-    public func environment(inherited: [String: String], files: [String]) async throws -> [String: String] {
+    public func environment(inherited: [String: String], files: [SecretBytes]) async throws -> [String: SecretBytes] {
         try await resolvedEnvironment(inherited: inherited, files: files).variables
     }
 
-    public func resolvedEnvironment(inherited: [String: String], files: [String]) async throws -> ResolvedEnvironment {
-        var environment = inherited
+    public func resolvedEnvironment(inherited: [String: String], files: [SecretBytes]) async throws -> ResolvedEnvironment {
+        var environment = inherited.mapValues { SecretBytes(utf8: $0) }
         for file in files { environment.merge(try DotEnv.parse(file)) { _, new in new } }
-        guard environment.allSatisfy({ !$0.key.isEmpty && !$0.key.contains("=") && !$0.key.contains("\0") && !$0.value.contains("\0") }) else {
-            throw MopError.invalidProcess
-        }
-        var references: [String: SecretReference] = [:]
-        for key in environment.keys.sorted() {
-            if let value = environment[key], value.hasPrefix("mop://") {
-                references[key] = try ReferenceExpansion.resolve(value, variables: environment)
-            }
-        }
+        let references = try SecretParsing.references(in: environment)
         let values = try await resolve(references.keys.sorted().compactMap { references[$0] })
         for (key, reference) in references {
-            guard let value = values[reference], !value.contains("\0") else { throw MopError.invalidProcess }
+            guard let value = values[reference], !value.contains(0) else { throw MopError.invalidProcess }
             environment[key] = value
         }
         return ResolvedEnvironment(variables: environment, secrets: Array(values.values))
     }
 
-    public func inject(_ template: String, variables: [String: String] = [:]) async throws -> String {
-        var cursor = template.startIndex
-        var placeholders: [(Range<String.Index>, SecretReference)] = []
-        while let opening = template.range(of: "{{", range: cursor..<template.endIndex) {
-            guard let closing = Self.placeholderEnd(in: template, from: opening.upperBound) else {
-                if template[opening.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("mop://") {
-                    throw MopError.invalidTemplate
-                }
-                break
-            }
-            let token = template[opening.upperBound..<closing.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-            if token.hasPrefix("mop://") {
-                placeholders.append((opening.lowerBound..<closing.upperBound, try ReferenceExpansion.resolve(token, variables: variables)))
-            }
-            cursor = closing.upperBound
-        }
+    public func inject(_ template: SecretBytes, variables: [String: String] = [:]) async throws -> SecretBytes {
+        _ = try template.validatedUTF8()
+        let placeholders = try SecretParsing.placeholders(template, variables: variables)
         let values = try await resolve(placeholders.map(\.1))
-        var output = template
-        for (range, reference) in placeholders.reversed() {
-            output.replaceSubrange(range, with: values[reference]!)
-        }
-        return output
+        return SecretParsing.render(template, placeholders: placeholders, values: values)
     }
-
-    // A variable's closing brace is not the first brace of the template delimiter.
-    private static func placeholderEnd(in text: String, from start: String.Index) -> Range<String.Index>? {
-        var cursor = start
-        while cursor < text.endIndex {
-            if text[cursor...].hasPrefix("${") {
-                guard let end = text[text.index(cursor, offsetBy: 2)...].firstIndex(of: "}") else { return nil }
-                cursor = text.index(after: end)
-            } else if text[cursor...].hasPrefix("}}") {
-                return cursor..<text.index(cursor, offsetBy: 2)
-            } else { cursor = text.index(after: cursor) }
-        }
-        return nil
-    }
-
 }

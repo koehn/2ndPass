@@ -17,8 +17,8 @@ struct OutputOptions: ParsableArguments {
                               protectedFiles: [], protectedDirectories: [storage.stateURL])
     }
 
-    func emit(_ text: String, to destination: OutputFile?) throws {
-        if let destination { try destination.write(Data(text.utf8)) }
+    func emit(_ text: SecretBytes, to destination: OutputFile?) throws {
+        if let destination { try destination.write(text) }
         else { try IO.output(text) }
     }
 }

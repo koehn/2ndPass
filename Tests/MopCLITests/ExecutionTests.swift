@@ -6,7 +6,7 @@ import MopCore
 
 // The runner temporarily installs process-wide signal handlers.
 @Suite(.serialized) struct ExecutionTests {
-    private func execute(_ command: [String], secrets: [String] = [], input: Data = Data()) throws -> (Int32, Data, Data) {
+    private func execute(_ command: [String], secrets: [SecretBytes] = [], input: Data = Data(), environment: [String: SecretBytes] = ["PATH": "/usr/bin:/bin"]) throws -> (Int32, Data, Data) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-process-test-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -18,7 +18,7 @@ import MopCore
         let outfd = open(outURL.path, O_WRONLY | O_CREAT | O_CLOEXEC, 0o600)
         let errfd = open(errURL.path, O_WRONLY | O_CREAT | O_CLOEXEC, 0o600)
         defer { [infd, outfd, errfd].forEach { _ = close($0) } }
-        let status = try MaskedExecute.execute(command, environment: ["PATH": "/usr/bin:/bin"], secrets: secrets,
+        let status = try MaskedExecute.execute(command, environment: environment, secrets: secrets,
                                                 input: infd, output: outfd, errorOutput: errfd)
         return (status, try Data(contentsOf: outURL), try Data(contentsOf: errURL))
     }
@@ -48,6 +48,18 @@ import MopCore
         #expect(out == Data("literal".utf8))
         #expect(throws: MopError.executableNotFound) { try execute(["mop-no-such-executable"]) }
         #expect(throws: MopError.launch) { try execute(["/etc/hosts"]) }
+    }
+
+    @Test func ownedEnvironmentPreservesExactBytesAndRejectsNUL() throws {
+        let value: SecretBytes = "é-e\u{301}-🔒\nquotes'\"=end"
+        let environment: [String: SecretBytes] = ["PATH": "/usr/bin:/bin", "TOKEN": value, "EMPTY": ""]
+        let (status, out, _) = try execute(["/bin/sh", "-c", "printf '%s' \"$TOKEN\""], environment: environment)
+        #expect(status == 0)
+        #expect(out.elementsEqual(value))
+        let (_, masked, _) = try execute(["/bin/sh", "-c", "printf '%s' \"$TOKEN\""], secrets: [value], environment: environment)
+        #expect(masked == Data("[concealed by mop]".utf8))
+        #expect(throws: MopError.invalidProcess) { try EnvironmentBlock(["TOKEN": "a\0b"]) }
+        #expect(throws: MopError.invalidProcess) { try EnvironmentBlock(["BAD=NAME": "value"]) }
     }
 
     @Test func brokenOutputPipeTerminatesAndReapsChild() throws {

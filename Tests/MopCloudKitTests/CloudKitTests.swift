@@ -425,7 +425,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     let originalFiles = try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path).sorted()
     for attempt in 0..<8 {
         let before = session.snapshot
-        try session.write(ref, value: String(repeating: "x", count: 4096) + String(attempt), replace: attempt > 0)
+        try session.write(ref, value: SecretBytes(utf8: String(repeating: "x", count: 4096) + String(attempt)), replace: attempt > 0)
         try await f.vault.commit(expected: before, replacement: session.snapshot)
         await f.cloud.resetCounters()
         #expect(try await f.vault.sync() == session.snapshot)

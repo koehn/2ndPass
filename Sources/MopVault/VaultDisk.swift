@@ -3,7 +3,7 @@ import Foundation
 import MopCore
 
 public enum SafeFile {
-    public static func read(_ url: URL, privateFile: Bool = false, limit: Int = VaultCoding.maximumFileSize) throws -> Data {
+    private static func withReadDescriptor<T>(_ url: URL, privateFile: Bool, limit: Int, body: (Int32) throws -> T) throws -> T {
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard fd >= 0 else { throw errno == ENOENT ? MopError.vaultMissing : MopError.inputOutput }
         defer { Darwin.close(fd) }
@@ -14,12 +14,35 @@ public enum SafeFile {
             try PrivateACL.validate(fd)
         }
         guard status.st_size >= 0, status.st_size <= limit else { throw MopError.invalidVault }
-        do {
-            let data = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: limit + 1) ?? Data()
-            guard data.count <= limit else { throw MopError.invalidVault }
-            return data
-        } catch let error as MopError { throw error }
-          catch { throw MopError.inputOutput }
+        return try body(fd)
+    }
+
+    public static func read(_ url: URL, privateFile: Bool = false, limit: Int = VaultCoding.maximumFileSize) throws -> Data {
+        try withReadDescriptor(url, privateFile: privateFile, limit: limit) { fd in
+            do {
+                let data = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: limit + 1) ?? Data()
+                guard data.count <= limit else { throw MopError.invalidVault }
+                return data
+            } catch let error as MopError { throw error }
+              catch { throw MopError.inputOutput }
+        }
+    }
+
+    static func readKeyMaterial(_ url: URL, limit: Int) throws -> KeyBuffer {
+        try withReadDescriptor(url, privateFile: true, limit: limit) { fd in
+            let buffer = KeyBuffer(capacity: limit + 1)
+            try buffer.withStorage { bytes in
+                while buffer.count < bytes.count {
+                    let amount = Darwin.read(fd, bytes.baseAddress!.advanced(by: buffer.count), bytes.count - buffer.count)
+                    if amount < 0 && errno == EINTR { continue }
+                    guard amount >= 0 else { throw MopError.inputOutput }
+                    if amount == 0 { break }
+                    buffer.count += amount
+                }
+            }
+            guard buffer.count <= limit else { throw MopError.invalidVault }
+            return buffer
+        }
     }
 
     public static func privateDirectory(_ url: URL, ownerOnly: Bool = true) throws {
@@ -43,7 +66,7 @@ public enum SafeFile {
 
     /// Ciphertext for vault/history; public device metadata or recovery material for local files.
     /// New files are exclusive. Replacements require external coordination.
-    public static func write(_ data: Data, to url: URL, replace: Bool = false) throws {
+    public static func write<Bytes: ContiguousBytes>(_ data: Bytes, to url: URL, replace: Bool = false) throws {
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".mop-write-" + UUID().uuidString)
         let fd = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw MopError.inputOutput }

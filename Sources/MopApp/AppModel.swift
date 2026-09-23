@@ -38,7 +38,7 @@ final class AppModel {
     var revoking: MacRecord?
     var offline = false
     var authenticated = false
-    var revealed: String?
+    var revealed: SecretBytes?
     var busy = false
     var error: String?
     var notice: String?
@@ -135,10 +135,10 @@ final class AppModel {
             let result = try await self.client.run(["read", "--no-newline", selected.description], vault: self.selectedVault, offline: self.offline)
             guard self.current(token), self.selected == selected, NSApplication.shared.isActive else { return }
             if copy {
-                self.clipboard.copy(result.text)
+                self.clipboard.copy(result.output)
                 self.notice = "Value copied. Mop clears its clipboard entry after 30 seconds."
             } else {
-                self.revealed = result.text
+                self.revealed = result.output
                 self.concealTask = Task { [weak self = self] in
                     try? await Task.sleep(for: .seconds(30))
                     guard !Task.isCancelled else { return }; self?.conceal()
@@ -149,6 +149,7 @@ final class AppModel {
     }
     func write(reference: SecretReference, value: String, replace: Bool) {
         guard !offline else { return }
+        let value = SecretBytes(utf8: value)
         perform { token in
             _ = try await self.client.run(["write", reference.description] + (replace ? ["--replace"] : []), vault: self.selectedVault, input: value)
             guard self.current(token) else { return }
@@ -182,7 +183,7 @@ final class AppModel {
     func management(_ command: [String], input: String? = nil) {
         guard !offline else { return }
         perform { token in
-            let result = try await self.client.run(command, vault: self.selectedVault, input: input)
+            let result = try await self.client.run(command, vault: self.selectedVault, input: input.map { SecretBytes(utf8: $0) })
             guard self.current(token) else { return }
             self.sheet = nil; self.notice = result.text
             self.requests = []; self.devices = []

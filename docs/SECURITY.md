@@ -118,6 +118,240 @@ The index key is an integrity authority: its holder can forge a header/index and
 insert chosen records, though it cannot alone decrypt existing independent record
 keys. There are no per-user signatures or enclave-enforced per-field allowlists.
 
+## Security operation sequences
+
+These sequences describe the operational CloudKit backend. The native app invokes
+the same CLI commands. `Device key / CryptoKit` represents the authenticated
+Keychain/enclave path together with CryptoKit's HPKE handling: the private device
+key stays hardware-backed, but unwrapped symmetric keys and requested plaintext
+exist in Mop's process memory. CloudKit receives ciphertext and public metadata.
+
+The diagrams use two shared steps:
+
+- **Open authenticated session:** validate signing and account/vault selection;
+  fetch and reconstruct the current cloud revision (reusing cached ciphertext),
+  reject observed rollback, and save the downloaded snapshot. Authenticate afresh,
+  retrieve the protected device blob, prove enclave access, and unwrap the index
+  key. Verify the local vault/key pin, authenticate the index and entire encrypted
+  record table, then advance the verified watermark/snapshot. A pending rotation
+  can finish trust using a fingerprint already recorded by a local operation;
+  cloud-supplied metadata never establishes trust on its own.
+- **Publish revision:** increment the generation, set the parent to the previous
+  snapshot's digest, and reseal the index with associated data binding the new
+  header/record table. Check that the server head still matches the opened
+  snapshot, acquire the local writer lease, and journal the proposed revision.
+  Upload changed encrypted records and the manifest, recheck the account, then
+  conditionally update the head using its server version. Only server confirmation
+  allows normal local completion: save the downloaded snapshot, finish any local
+  rotation pin, and advance the verified watermark/snapshot.
+
+All mutations require online access. Authentication, trust, or integrity failure
+stops the operation. Concurrent head changes return a conflict rather than
+silently overwriting another revision. If the publication response is lost, the
+outcome is uncertain: retain the journal and run `vault sync` to reconcile, rather
+than replaying the mutation. Uploaded records alone do not publish a revision.
+
+### Reading a secret
+
+`mop read mop://personal/service/token` authenticates the index and record table,
+then unwraps and decrypts only the requested value. Other values remain encrypted.
+The verified snapshot records index/table authentication; it does not mean every
+individual value has been decrypted successfully.
+
+```mermaid
+sequenceDiagram
+    actor U as User / caller
+    participant M as Mop
+    participant C as CloudKit
+    participant L as Local trust and cache
+    participant K as Device key / CryptoKit
+    U->>M: read reference
+    alt Online
+        M->>C: Check account, fetch head, manifest, missing encrypted records
+        C-->>M: Current encrypted revision
+        M->>M: Validate structure and revision digest
+        M->>L: Check rollback watermark, save downloaded snapshot
+    else Explicit --offline
+        M->>L: Load verified snapshot, check digest and watermark
+        L-->>M: Encrypted snapshot and fetch time
+        M-->>U: Report offline age and revocation limitation
+    end
+    M->>K: Fresh authentication, retrieve device blob, prove key access
+    M->>K: Unwrap index key for this device and vault
+    K-->>M: Index key in process memory
+    M->>L: Verify local vault/key trust
+    M->>M: Authenticate and decrypt index, authenticate encrypted record table
+    M->>L: Record verified revision, promote matching downloaded snapshot
+    M->>M: Resolve reference to record ID
+    M->>K: Unwrap only the requested record key
+    K-->>M: Record key in process memory
+    M->>M: Authenticate and decrypt requested value
+    M->>K: Close session and invalidate authorization
+    M-->>U: Requested plaintext to selected output
+```
+
+Offline mode also checks the local account binding and any locally observable
+sign-out. It never falls back from a failed online read, and cannot detect remote
+revocation that happened after the cached revision. File-output validation occurs
+before authentication; a failed read emits no secret output.
+
+### Writing a new secret
+
+`mop write mop://personal/service/token` reads the value from a hidden prompt or
+stdin, then requires the reference to be absent. It generates a new record ID and
+value key; the existing index key and other records remain unchanged.
+
+```mermaid
+sequenceDiagram
+    actor U as User / caller
+    participant M as Mop
+    participant C as CloudKit
+    participant L as Local trust and cache
+    U->>M: write reference, value through hidden prompt or stdin
+    M->>M: Open authenticated session
+    M->>M: Require reference to be absent, otherwise reject duplicate
+    M->>M: Generate random record ID and AES-256 value key
+    M->>M: HPKE-wrap value key for every device and recovery recipient
+    M->>M: AES-GCM encrypt value with vault ID and record ID as context
+    M->>M: Add reference-to-record mapping, reseal index and table commitment
+    M->>L: Acquire writer lease, record commit journal
+    M->>C: Publish revision with new encrypted record and manifest
+    C-->>M: Conditional head update confirmed
+    M->>L: Finish journal, advance verified watermark and snapshot
+    M->>M: Close session and invalidate authorization
+    M-->>U: Success
+    Note over M,C: No plaintext value or unwrapped symmetric key is uploaded
+```
+
+Wrapping uses recipients' public keys, so creating a record does not require
+unwrapping any existing value key. Only the new encrypted record and new manifest
+need uploading; unchanged records are reused by hash.
+
+### Replacing a secret
+
+`mop write --replace mop://personal/service/token` requires the reference to exist.
+It creates a fresh record ID/key and redirects the reference to the replacement;
+it does not decrypt or modify the old record in place.
+
+```mermaid
+sequenceDiagram
+    actor U as User / caller
+    participant M as Mop
+    participant C as CloudKit
+    participant L as Local trust and cache
+    U->>M: write --replace reference, new value through prompt or stdin
+    M->>M: Open authenticated session
+    M->>M: Require reference to exist, otherwise reject missing field
+    M->>M: Remove old record from the next in-memory table
+    M->>M: Generate fresh record ID and AES-256 value key
+    M->>M: Wrap new key for current devices and recovery recipient
+    M->>M: Encrypt new value, redirect reference to new record ID
+    M->>M: Reseal index with new header and record-table commitment
+    M->>L: Acquire writer lease, record commit journal
+    M->>C: Publish replacement record and manifest with conditional head update
+    C-->>M: Publication confirmed
+    M->>L: Finish journal, advance verified watermark and snapshot
+    M->>M: Close session and invalidate authorization
+    M-->>U: Success
+    Note over M,C: Old record keys and plaintext are not opened during replacement
+    Note over C,L: Historical revisions, backups, and older caches may retain the old value
+```
+
+Failure before publication leaves the committed field unchanged. A lost publication
+response can still mean the replacement committed; use the shared reconciliation
+procedure. Replacing a vault value does not revoke the corresponding credential
+at its external service.
+
+### Adding a device
+
+Enrollment has two independent trust decisions: an enrolled Mac approves the new
+Mac's device key, then the new Mac verifies the vault key. Both comparisons use
+fingerprints obtained through a trusted channel independent of CloudKit.
+
+```mermaid
+sequenceDiagram
+    actor U as User / trusted channel
+    participant N as New Mac
+    participant A as Enrolled Mac
+    participant C as CloudKit
+    U->>N: device request --name NewMac
+    N->>N: Validate signing, authenticate, create or open device key
+    N->>N: Prove private-key access, keep protected blob in local Keychain
+    N->>C: Publish public name and device key in enrollment request
+    N-->>U: Request ID and device fingerprint
+    U->>A: device add REQUEST_ID --fingerprint independently verified value
+    A->>C: Fetch enrollment request
+    C-->>A: Untrusted public request
+    A->>A: Validate request and compare full device fingerprint
+    A->>A: Open authenticated session, reject duplicate or recipient limit
+    A->>A: Wrap existing index key for the new device
+    loop Each current encrypted record
+        A->>A: Unwrap record key using enrolled device authorization
+        A->>A: Add HPKE wrap for new device, keep value ciphertext unchanged
+    end
+    A->>C: Publish updated record wraps and manifest with conditional head update
+    C-->>A: Publication confirmed
+    A->>A: Finish local journal and verified snapshot
+    A-->>U: Enrollment complete, authenticated vault fingerprint
+    U->>N: vault trust --fingerprint independently verified value
+    N->>C: Fetch current encrypted revision
+    C-->>N: Revision containing new device wraps
+    N->>N: Fresh authentication, unwrap index key, compare vault fingerprint
+    N->>N: Authenticate index/table, save local pin and verified snapshot
+    Note over N,A: Each command closes its own authentication session
+```
+
+Enrollment does not decrypt values or rotate existing symmetric keys. Record blobs
+change because their recipient wraps change, even though value ciphertext stays
+the same. Publishing a request alone grants no access, and successful approval
+does not delete the request. The new device receives access to current records;
+it does not automatically gain wraps in historical revisions.
+
+### Removing a device
+
+`mop device remove DEVICE_FINGERPRINT` must run on another enrolled Mac. Simply
+removing recipient slots would leave previously learned keys useful, so Mop rotates
+the index key and every current value key before publishing.
+
+```mermaid
+sequenceDiagram
+    actor U as User / trusted channel
+    participant A as Remaining Mac performing removal
+    participant C as CloudKit
+    participant L as Initiating Mac local trust and cache
+    participant R as Other remaining Mac
+    U->>A: device remove target fingerprint
+    A->>A: Open authenticated session
+    A->>A: Require enrolled target different from this device
+    A->>A: Generate fresh index key, exclude target from recipients
+    A->>A: Wrap new index key for remaining devices and recovery recipient
+    loop Each current record
+        A->>A: Unwrap old record key, decrypt value
+        A->>A: Generate fresh value key and encrypt value with fresh nonce
+        A->>A: Wrap new value key only for remaining devices and recovery
+    end
+    A->>A: Keep record IDs, reseal index under new index key
+    A->>L: Journal proposed revision and locally computed new fingerprint
+    A->>C: Publish all rotated records and manifest with conditional head update
+    C-->>A: Publication confirmed
+    A->>L: Pin new index key, advance verified watermark and snapshot
+    A-->>U: New vault fingerprint for independent distribution
+    U->>R: vault trust --fingerprint independently verified new value
+    R->>C: Fetch rotated revision
+    C-->>R: New encrypted snapshot
+    R->>R: Fresh authentication, unwrap new index key, compare fingerprint
+    R->>R: Authenticate index/table, update local pin and verified snapshot
+    Note over A,R: Close authorization after each command
+    Note over C,R: Removed device can still decrypt historical ciphertext it could access before
+```
+
+The recovery recipient remains authorized. Remaining Macs fail ordinary opens
+under their old pins until they independently trust the rotated key. The initiating
+Mac can reconcile an interrupted rotation using the fingerprint in its local
+journal; it must not derive approval from cloud metadata. New-key revisions exclude
+the removed device, but offline copies and previously learned secrets cannot be
+recalled. Rotate external credentials if that device may have exposed them.
+
 ## Trust and rollback
 
 Public-key encryption alone does not authenticate a vault. Anyone with public
@@ -256,8 +490,49 @@ target the local state directory. `--force` permits replacement of a regular out
 file; explicit `--file-mode` controls exported plaintext permissions. Shell
 redirection can truncate files before Mop starts and is outside these checks.
 
-Requested plaintext and unwrapped symmetric keys enter process memory. Swift does
-not guarantee complete zeroization. `run` passes resolved secrets to the selected
+Requested plaintext and unwrapped symmetric keys enter process memory. CryptoKit
+owns the live cryptographic keys and zeroizes its key storage on release. Mop
+passes borrowed key bytes directly to HPKE and hashes trust fingerprints
+incrementally, avoiding additional raw-key `Data` copies in those paths.
+Recovery files are read and assembled in fixed, explicitly owned buffers whose
+entire allocation is wiped with `memset_s` on cleanup. Recovery encoding and
+decoding no longer create strings containing key material. Temporary `Data`
+returned by HPKE opening, private-key export, and base64 conversion is wiped in
+`defer` blocks, including validation and I/O failure paths.
+
+Secret values use immutable `SecretBytes` allocations through vault/Keychain
+storage, synchronous and asynchronous services, CLI input/output, dotenv parsing,
+template rendering, child environments, and GUI subprocess transport. Sharing a
+value retains the same allocation rather than copying its plaintext. The last
+owner wipes the entire allocation with `memset_s` before freeing it. Mutable
+builders wipe old allocations when growing and transfer ownership on completion;
+normal error unwinding also releases and wipes their storage. The output masker's
+trie, pending prefixes, and stream buffers receive the same treatment. C child
+environment entries and executable paths are assembled directly from owned bytes.
+The masked runner releases its command scope before calling `exit`.
+
+The GUI keeps revealed-value state in owned buffers and converts it to text only
+for rendering. Text-entry controls still supply Swift strings; submission copies
+these into owned buffers and clears the form. Clipboard exports cross into
+AppKit-owned storage. CryptoKit decryption and Keychain reads return framework
+`Data`, which Mop copies into owned storage and then wipes on a best-effort basis.
+No vault, recovery-file, trust-fingerprint, or CLI output format changes are needed.
+Internal store APIs now accept and return `SecretBytes` rather than `String`.
+
+These measures reduce plaintext retention; they do not promise complete
+process-memory erasure. Foundation copy-on-write, cryptographic internals,
+SwiftUI/AppKit rendering, clipboard consumers, OS I/O buffers, and child processes
+can retain copies outside Mop's control. Inherited environment strings already
+exist in the process before Mop copies them. References and variable names remain
+metadata strings; values explicitly expanded into reference components become
+metadata too. Registers, swap/crash capture, and the Secure Enclave's opaque key
+representation are not explicitly wiped by Mop. Abrupt process termination does
+not run Swift cleanup. Buffers are not page-locked. Wiping has a linear cost in
+allocation capacity; assembly and framework boundaries can temporarily require
+multiple owned copies. Sharing is immutable so cleanup cannot invalidate another
+owner still using a value.
+
+`run` passes resolved secrets to the selected
 child environment and closes authentication first. Exact nonempty fetched byte
 strings are masked on stdout/stderr, including across chunks; transformed output,
 files, `/dev/tty`, or deliberately malicious children can bypass masking. No shell

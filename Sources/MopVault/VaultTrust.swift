@@ -21,9 +21,10 @@ public struct VaultTrust {
     }
 
     public static func fingerprint(document: VaultDocument, key: SymmetricKey) -> String {
-        var bytes = Data("mop-vault-trust-v1:\(document.header.vaultID.uuidString):".utf8)
-        key.withUnsafeBytes { bytes.append(contentsOf: $0) }
-        return VaultCoding.digest(bytes)
+        var hash = SHA256()
+        hash.update(data: Data("mop-vault-trust-v1:\(document.header.vaultID.uuidString):".utf8))
+        key.withUnsafeBytes { hash.update(bufferPointer: $0) }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private func load() throws -> Record {

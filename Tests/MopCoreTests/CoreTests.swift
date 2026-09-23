@@ -3,15 +3,15 @@ import Testing
 @testable import MopCore
 
 private final class MemoryStore: SecretStore {
-    var values: [SecretReference: String] = [:]
+    var values: [SecretReference: SecretBytes] = [:]
     var reads: [SecretReference] = []
     var closes = 0
-    func read(_ reference: SecretReference) throws -> String {
+    func read(_ reference: SecretReference) throws -> SecretBytes {
         reads.append(reference)
         guard let value = values[reference] else { throw MopError.notFound }
         return value
     }
-    func write(_ reference: SecretReference, value: String, replace: Bool) throws {
+    func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) throws {
         if replace && values[reference] == nil { throw MopError.notFound }
         if !replace && values[reference] != nil { throw MopError.duplicate }
         values[reference] = value
@@ -59,7 +59,7 @@ func invalidReferences(_ token: String) {
 
 @Test(arguments: ["A", "export A=x", "1A=x", "A-B=x", "A='unterminated", "A=\"x\"junk", "A=\0"])
 func rejectsInvalidDotenv(_ input: String) {
-    #expect(throws: MopError.invalidEnvironment(line: 1)) { try DotEnv.parse(input) }
+    #expect(throws: MopError.invalidEnvironment(line: 1)) { try DotEnv.parse(SecretBytes(utf8: input)) }
 }
 
 @Test func serviceCRUDAndSessionLifetimes() throws {
@@ -111,11 +111,11 @@ func rejectsInvalidDotenv(_ input: String) {
     let store = MemoryStore()
     store.values[try SecretReference("mop://v/i/a")] = "must not escape"
     let service = SecretService { store }
-    var output: String?
+    var output: SecretBytes?
     #expect(throws: MopError.notFound) { output = try service.inject("{{mop://v/i/a}}{{mop://v/i/b}}") }
     #expect(output == nil)
     #expect(store.closes == 1)
-    var environment: [String: String]?
+    var environment: [String: SecretBytes]?
     #expect(throws: MopError.notFound) {
         environment = try service.environment(inherited: ["A": "mop://v/i/a", "B": "mop://v/i/b"], files: [])
     }
@@ -203,5 +203,5 @@ func rejectsInvalidDotenv(_ input: String) {
     #expect(Set(result.secrets.map { Data($0.utf8) }).count == 2)
     var masker = SecretMasker(patterns: MaskPatterns(secrets: result.secrets))
     let input = Data((result.variables["A"]! + "|" + result.variables["B"]!).utf8)
-    #expect(masker.consume(input, final: true) == Data("[concealed by mop]|[concealed by mop]".utf8))
+    #expect(masker.consume(SecretBytes(copying: input), final: true) == "[concealed by mop]|[concealed by mop]")
 }

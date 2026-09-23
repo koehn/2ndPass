@@ -63,7 +63,7 @@ public final class OutputFile {
         guard force else { throw MopError.outputExists }
     }
 
-    public func write(_ data: Data) throws {
+    public func write<Bytes: ContiguousBytes>(_ data: Bytes) throws {
         try validateDestination()
         let temporary = ".mop-output-" + UUID().uuidString
         let fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)

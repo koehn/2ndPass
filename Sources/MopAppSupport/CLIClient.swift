@@ -4,17 +4,17 @@ import MopCore
 import Synchronization
 
 public struct CLIResult: Sendable {
-    public let output: Data
-    public let diagnostic: String
+    public let output: SecretBytes
+    public let diagnostic: SecretBytes
     public var text: String { String(decoding: output, as: UTF8.self) }
     public func decode<T: Decodable>(_ type: T.Type) throws -> T {
-        do { return try JSONDecoder().decode(type, from: output) }
+        do { return try output.withFoundationData { try JSONDecoder().decode(type, from: $0) } }
         catch { throw CLIError.malformedResponse }
     }
     public var offlineDate: String? {
         let prefix = "mop: offline cache from "
-        guard let line = diagnostic.split(separator: "\n").first(where: { $0.hasPrefix(prefix) }) else { return nil }
-        let date = String(line.dropFirst(prefix.count).prefix(20))
+        guard let line = diagnostic.split(separator: 10).first(where: { $0.starts(with: prefix.utf8) }) else { return nil }
+        let date = String(decoding: line.dropFirst(prefix.utf8.count).prefix(20), as: UTF8.self)
         return ISO8601DateFormatter().date(from: date) == nil ? nil : date
     }
 }
@@ -55,13 +55,13 @@ public struct CLIClient: Sendable {
     }
 
     public func run(_ command: [String], vault: String? = nil, offline: Bool = false,
-                    input: String? = nil) async throws -> CLIResult {
+                    input: SecretBytes? = nil) async throws -> CLIResult {
         let args = Self.arguments(command, vault: vault, offline: offline)
         // LocalAuthentication in the CLI blocks its own process, never the UI thread.
         return try await Task.detached { try execute(args, input: input) }.value
     }
 
-    private func execute(_ args: [String], input: String?) throws -> CLIResult {
+    private func execute(_ args: [String], input: SecretBytes?) throws -> CLIResult {
             guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw CLIError.missingExecutable }
             let process = Process()
             process.executableURL = executable
@@ -71,16 +71,16 @@ public struct CLIClient: Sendable {
             let stdout = Pipe(), stderr = Pipe(), stdin = Pipe()
             process.standardOutput = stdout; process.standardError = stderr; process.standardInput = stdin
             do { try process.run() } catch { throw CLIError.launch }
-            let buffers = Mutex((out: Data(), err: Data()))
+            let buffers = Mutex((out: Result<SecretBytes, Error>.success(""), err: Result<SecretBytes, Error>.success("")))
             let readers = DispatchGroup()
             readers.enter()
             DispatchQueue.global().async {
-                let bytes = stdout.fileHandleForReading.readDataToEndOfFile()
+                let bytes = Result { try SecretBytes.read(descriptor: stdout.fileHandleForReading.fileDescriptor) }
                 buffers.withLock { $0.out = bytes }; readers.leave()
             }
             readers.enter()
             DispatchQueue.global().async {
-                let bytes = stderr.fileHandleForReading.readDataToEndOfFile()
+                let bytes = Result { try SecretBytes.read(descriptor: stderr.fileHandleForReading.fileDescriptor) }
                 buffers.withLock { $0.err = bytes }; readers.leave()
             }
             // A child can reject arguments before reading stdin. Do not let that
@@ -88,13 +88,13 @@ public struct CLIClient: Sendable {
             _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
             // Secrets travel only through stdin, never arguments, files, or logging.
             do {
-                if let input { try stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8)) }
+                if let input { try input.write(descriptor: stdin.fileHandleForWriting.fileDescriptor) }
             } catch { /* The child exit status determines the authoritative outcome. */ }
             try? stdin.fileHandleForWriting.close()
             process.waitUntilExit(); readers.wait()
             guard process.terminationReason == .exit, process.terminationStatus == 0 else {
                 throw CLIError.failed(process.terminationReason == .exit ? process.terminationStatus : 22)
             }
-            return buffers.withLock { CLIResult(output: $0.out, diagnostic: String(decoding: $0.err, as: UTF8.self)) }
+            return try buffers.withLock { CLIResult(output: try $0.out.get(), diagnostic: try $0.err.get()) }
     }
 }

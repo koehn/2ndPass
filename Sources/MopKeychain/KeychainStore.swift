@@ -45,24 +45,29 @@ public final class KeychainStore: SecretStore {
         return query
     }
 
-    public func read(_ reference: SecretReference) throws -> String {
+    public func read(_ reference: SecretReference) throws -> SecretBytes {
         var query = try query(reference)
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = true
         var result: CFTypeRef?
         try Self.check(SecItemCopyMatching(query as CFDictionary, &result))
-        guard let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
+        guard var data = result as? Data else {
             throw MopError.invalidUTF8
         }
-        return value
+        result = nil
+        defer { SecretBytes.wipe(&data) }
+        return try SecretBytes(copying: data).validatedUTF8()
     }
 
-    public func write(_ reference: SecretReference, value: String, replace: Bool) throws {
+    public func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) throws {
+        _ = try value.validatedUTF8()
         var query = try query(reference)
         if replace {
             // Reading first requires the existing item's OS access control, too.
             _ = try read(reference)
-            try Self.check(SecItemUpdate(query as CFDictionary, [kSecValueData as String: Data(value.utf8)] as CFDictionary))
+            try value.withFoundationData { data in
+                try Self.check(SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary))
+            }
         } else {
             var error: Unmanaged<CFError>?
             guard let access = SecAccessControlCreateWithFlags(
@@ -72,8 +77,11 @@ public final class KeychainStore: SecretStore {
                 throw MopError.keychain(errSecParam)
             }
             query[kSecAttrAccessControl as String] = access
-            query[kSecValueData as String] = Data(value.utf8)
-            try Self.check(SecItemAdd(query as CFDictionary, nil))
+            try value.withFoundationData { data in
+                query[kSecValueData as String] = data
+                defer { query.removeValue(forKey: kSecValueData as String) }
+                try Self.check(SecItemAdd(query as CFDictionary, nil))
+            }
         }
     }
 

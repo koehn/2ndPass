@@ -13,7 +13,7 @@ public final class CloudSecretStore: AsyncSecretStore {
         self.vault = vault; self.offline = offline
         session = try vault.authenticatedSession(snapshot: snapshot, opener: opener, offline: offline, onClose: onClose)
     }
-    public func read(_ reference: SecretReference) throws -> String { try session.read(reference) }
+    public func read(_ reference: SecretReference) throws -> SecretBytes { try session.read(reference) }
     public func list(vault: String?) throws -> [SecretReference] { try session.list(vault: vault) }
     public func fingerprint() throws -> String { try session.fingerprint() }
     public func recipients() throws -> [DeviceRequest] { try session.recipients() }
@@ -28,7 +28,7 @@ public final class CloudSecretStore: AsyncSecretStore {
             try vault.finishCommittedSession(session, rotation: rotation)
         } catch { close(); throw error }
     }
-    public func write(_ reference: SecretReference, value: String, replace: Bool) async throws {
+    public func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) async throws {
         try await mutate { try session.write(reference, value: value, replace: replace) }
     }
     public func delete(_ reference: SecretReference) async throws { try await mutate { try session.delete(reference) } }

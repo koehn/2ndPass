@@ -1,4 +1,5 @@
 import AppKit
+import MopCore
 
 /// All value copies use one device-local, expiring pasteboard entry. Explicit
 /// reference copies use their separate non-value path.
@@ -13,12 +14,14 @@ import AppKit
         self.lifetime = lifetime
     }
 
-    func copy(_ value: String) {
+    func copy(_ value: SecretBytes) {
         expiry?.cancel()
         pasteboard.prepareForNewContents(with: [.currentHostOnly])
         // Cooperative clipboard managers can honor this marker. It is not an ACL.
         pasteboard.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
-        pasteboard.setString(value, forType: .string)
+        var data = Data(value)
+        defer { SecretBytes.wipe(&data) }
+        pasteboard.setData(data, forType: .string)
         change = pasteboard.changeCount
         let lifetime = lifetime
         expiry = Task { [weak self] in

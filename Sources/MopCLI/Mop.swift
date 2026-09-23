@@ -41,7 +41,7 @@ struct Read: AsyncParsableCommand {
     func run() async throws {
         let destination = try output.destination(storage: storage)
         let value = try await storage.service.read(SecretReference(reference))
-        try output.emit(value + (noNewline ? "" : "\n"), to: destination)
+        try output.emit(value + (noNewline ? SecretBytes(utf8: "") : SecretBytes(utf8: "\n")), to: destination)
     }
 }
 
@@ -96,10 +96,15 @@ struct Run: AsyncParsableCommand {
 
     func run() async throws {
         try Execute.validate(command)
-        let files = try envFile.map { try IO.input(file: $0) }
-        let environment = try await storage.service.resolvedEnvironment(inherited: ProcessInfo.processInfo.environment, files: files)
-        if noMasking { try Execute.run(command, environment: environment.variables) }
-        try MaskedExecute.run(command, environment: environment.variables, secrets: environment.secrets)
+        func executeResolved() async throws -> Int32 {
+            let files = try envFile.map { try IO.input(file: $0) }
+            let environment = try await storage.service.resolvedEnvironment(inherited: ProcessInfo.processInfo.environment, files: files)
+            if noMasking { try Execute.run(command, environment: environment.variables) }
+            return try MaskedExecute.execute(command, environment: environment.variables, secrets: environment.secrets)
+        }
+        // Release owned plaintext before exit(), which does not unwind Swift scopes.
+        let status = try await executeResolved()
+        MaskedExecute.exitWithStatus(status)
     }
 }
 

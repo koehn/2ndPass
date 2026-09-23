@@ -155,7 +155,7 @@ struct ContentView: View {
             GroupBox {
                 VStack(alignment: .leading, spacing: 16) {
                     Text([ref.section, ref.field].compactMap { $0 }.joined(separator: " / ")).font(.headline)
-                    Text(model.revealed ?? "••••••••••••••••••••").font(.system(.body, design: .monospaced))
+                    Text(model.revealed.map { String(decoding: $0, as: UTF8.self) } ?? "••••••••••••••••••••").font(.system(.body, design: .monospaced))
                         .textSelection(.disabled).frame(maxWidth: .infinity, alignment: .leading)
                     HStack {
                         Button("Copy reference") { model.copyReference() }.buttonStyle(.borderedProminent)

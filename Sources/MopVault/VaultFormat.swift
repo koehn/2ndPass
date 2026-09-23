@@ -97,7 +97,7 @@ public struct VaultDocument: Codable, Sendable {
         let publicKey = try P256.KeyAgreement.PublicKey(x963Representation: request.publicKey)
         var sender = try HPKE.Sender(recipientKey: publicKey, ciphersuite: .P256_SHA256_AES_GCM_256,
                                      info: info(vaultID: vaultID, fingerprint: request.fingerprint, kind: kind, purpose: purpose))
-        let wrapped = try key.withUnsafeBytes { try sender.seal(Data($0)) }
+        let wrapped = try key.withUnsafeBytes { try sender.seal($0) }
         return VaultRecipient(kind: kind, name: request.name, publicKey: request.publicKey,
                               encapsulatedKey: sender.encapsulatedKey, wrappedKey: wrapped, purpose: purpose)
     }
@@ -110,7 +110,8 @@ public struct VaultDocument: Codable, Sendable {
         var recipient = try HPKE.Recipient(privateKey: privateKey, ciphersuite: .P256_SHA256_AES_GCM_256,
                                            info: info(vaultID: vaultID, fingerprint: slot.fingerprint, kind: slot.kind, purpose: slot.purpose),
                                            encapsulatedKey: slot.encapsulatedKey)
-        let bytes = try recipient.open(slot.wrappedKey)
+        var bytes = try recipient.open(slot.wrappedKey)
+        defer { KeyMaterial.wipe(&bytes) }
         guard bytes.count == 32 else { throw MopError.invalidVault }
         return SymmetricKey(data: bytes)
     }
@@ -156,13 +157,14 @@ public struct VaultRecord: Codable, Equatable, Sendable {
         Data("mop-record-v3:\(vaultID.uuidString):\(id)".utf8)
     }
 
-    public static func create(value: String, id: String, header: VaultHeader) throws -> VaultRecord {
+    public static func create(value: SecretBytes, id: String, header: VaultHeader) throws -> VaultRecord {
+        _ = try value.validatedUTF8()
         let key = SymmetricKey(size: .bits256)
         let recipients = try header.recipients.map {
             try VaultDocument.wrap(key: key, request: DeviceRequest(name: $0.name, publicKey: $0.publicKey),
                                    kind: $0.kind, vaultID: header.vaultID, purpose: "record:" + id)
         }
-        let box = try AES.GCM.seal(Data(value.utf8), using: key, authenticating: context(vaultID: header.vaultID, id: id))
+        let box = try value.withUnsafeBytes { try AES.GCM.seal($0, using: key, authenticating: context(vaultID: header.vaultID, id: id)) }
         guard let combined = box.combined else { throw MopError.invalidVault }
         return VaultRecord(recipients: recipients, sealed: combined)
     }
@@ -173,13 +175,13 @@ public struct VaultRecord: Codable, Equatable, Sendable {
         return try opener.unwrap(slot, vaultID: vaultID)
     }
 
-    public func read(id: String, vaultID: UUID, opener: any VaultKeyOpener) throws -> String {
+    public func read(id: String, vaultID: UUID, opener: any VaultKeyOpener) throws -> SecretBytes {
         let key = try key(id: id, vaultID: vaultID, opener: opener)
         do {
-            let bytes = try AES.GCM.open(AES.GCM.SealedBox(combined: sealed), using: key,
+            var bytes = try AES.GCM.open(AES.GCM.SealedBox(combined: sealed), using: key,
                                          authenticating: Self.context(vaultID: vaultID, id: id))
-            guard let value = String(data: bytes, encoding: .utf8) else { throw MopError.invalidVault }
-            return value
+            defer { SecretBytes.wipe(&bytes) }
+            return try SecretBytes(copying: bytes).validatedUTF8()
         } catch { throw MopError.invalidVault }
     }
 
