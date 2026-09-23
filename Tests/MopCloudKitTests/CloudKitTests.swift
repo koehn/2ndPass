@@ -394,3 +394,73 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     let reopened = try await f.store(); defer { reopened.close() }
     #expect(try reopened.fingerprint() == fingerprint)
 }
+
+@Test func rejectedDownloadsLeaveNoPersistentBlobsOrSnapshotChanges() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let parts = try JSONSerialization.jsonObject(with: f.initial) as! [String: Any]
+    let digest = String(repeating: "0", count: 64)
+    for attempt in 0..<3 {
+        let invalid = Data(repeating: UInt8(65 + attempt), count: 65_536)
+        let hash = VaultCoding.digest(invalid)
+        let manifest: [String: Any] = ["format": "mop-cloud-manifest-v1", "header": parts["header"]!,
+            "sealed": parts["sealed"]!, "records": [UUID().uuidString: hash]]
+        await f.cloud.replace("head", vault: f.vault.id,
+            bytes: try VaultCoding.encode(CloudHead(revision: digest, root: digest)))
+        await f.cloud.replace("m-" + digest, vault: f.vault.id,
+            bytes: try JSONSerialization.data(withJSONObject: manifest))
+        await f.cloud.replace("s-" + hash, vault: f.vault.id, bytes: invalid)
+        await #expect(throws: MopError.invalidVault) { try await f.vault.sync() }
+        #expect(try f.vault.cached().0 == f.initial)
+        #expect(try f.vault.status()["downloadedRevision"] == VaultCoding.digest(f.initial))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path)
+            .filter { $0.hasSuffix(".blob") }.isEmpty)
+    }
+}
+
+@Test func snapshotReuseBoundsRetentionWithoutPromotingUnverifiedDownloads() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let session = try VaultSession(snapshot: f.initial, trust: f.vault.trust, opener: f.device)
+    defer { session.close() }
+    let ref = try SecretReference("mop://fixture/item/token")
+    let originalFiles = try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path).sorted()
+    for attempt in 0..<8 {
+        let before = session.snapshot
+        try session.write(ref, value: String(repeating: "x", count: 4096) + String(attempt), replace: attempt > 0)
+        try await f.vault.commit(expected: before, replacement: session.snapshot)
+        await f.cloud.resetCounters()
+        #expect(try await f.vault.sync() == session.snapshot)
+        #expect(await f.cloud.fetches.filter { $0.hasPrefix("s-") }.isEmpty)
+        #expect(try f.vault.cached().0 == f.initial)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path).sorted() == originalFiles)
+    }
+}
+
+@Test func legacyBlobCleanupPreservesOfflineSnapshotAndCommitJournal() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let payload = Data("obsolete rejected download".utf8)
+    let file = f.vault.cache.directory.appendingPathComponent(VaultCoding.digest(payload) + ".blob")
+    try SafeFile.write(payload, to: file)
+    let journal = CommitJournal(expected: VaultCoding.digest(f.initial), proposed: String(repeating: "1", count: 64),
+        root: VaultCoding.digest(f.initial), rotationFingerprint: nil)
+    try f.vault.cache.locked { try f.vault.cache.write(journal, "journal.json") }
+    let reopened = try CloudCache(directory: f.vault.cache.directory)
+    #expect(!FileManager.default.fileExists(atPath: file.path))
+    #expect(try f.vault.cached().0 == f.initial)
+    #expect(try reopened.locked { try reopened.read("journal.json", as: CommitJournal.self)?.proposed } == journal.proposed)
+}
+
+@Test func validRecordsInARejectedRevisionDoNotLeaveCacheFiles() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let store = try await f.store(); defer { store.close() }
+    try await store.write(SecretReference("mop://fixture/item/token"), value: "fixture-value", replace: false)
+    let doc = try VaultDocument.decode(store.snapshot)
+    let wrongDigest = String(repeating: "a", count: 64)
+    await f.cloud.replace("m-" + wrongDigest, vault: f.vault.id, bytes: try VaultCoding.encode(CloudManifest(document: doc)))
+    await f.cloud.replace("head", vault: f.vault.id,
+        bytes: try VaultCoding.encode(CloudHead(revision: wrongDigest, root: wrongDigest)))
+    let cache = try CloudCache(directory: f.directory.appendingPathComponent("fresh"))
+    let vault = CloudVault(id: f.vault.id, cache: cache, transport: f.cloud, accountID: "account-a")
+    await #expect(throws: MopError.invalidVault) { try await vault.sync() }
+    #expect(try FileManager.default.contentsOfDirectory(atPath: cache.directory.path).sorted() == ["lock", "writer.lock"])
+    #expect(throws: MopError.vaultMissing) { try vault.cached() }
+}

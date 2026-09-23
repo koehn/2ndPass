@@ -47,13 +47,12 @@ private actor AuditCloud: CloudTransport {
                 fatalError("Expected malformed record rejection")
             } catch MopError.invalidVault {}
             let cached = root.appendingPathComponent(hash + ".blob")
-            let persisted = try Data(contentsOf: cached)
-            precondition(persisted == invalid)
+            precondition(!FileManager.default.fileExists(atPath: cached.path))
         }
         let files = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "blob" }
         let retained = try files.reduce(0) { try $0 + Data(contentsOf: $1).count }
-        precondition(files.count == 3 && retained == 196_608)
-        print("CONFIRMED: three rejected syncs retained \(files.count) malformed blobs, \(retained) bytes, without authentication.")
+        precondition(files.isEmpty && retained == 0)
+        print("PASS: three rejected syncs retained \(files.count) malformed blobs, \(retained) bytes, without authentication.")
     }
 }

@@ -9,10 +9,9 @@ struct MopApplication: App {
             ContentView(model: model)
                 .frame(minWidth: 820, minHeight: 540)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
-                    model.conceal()
-                    // Authentication dialogs temporarily deactivate the app.
-                    if !model.busy { model.lock(clearClipboard: false) }
+                    model.deactivate()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.activate() }
                 .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidResignActiveNotification)) { _ in model.lock() }
                 .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in model.lock() }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in model.lock() }

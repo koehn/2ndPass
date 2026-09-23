@@ -124,6 +124,12 @@ struct AppSheetView: View {
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(model.busy || !canSubmit)
             }
         }.padding(28).frame(width: 500).disabled(model.busy)
+        .opacity(model.isActive ? 1 : 0)
+        .allowsHitTesting(model.isActive)
+        .accessibilityHidden(!model.isActive)
+        .overlay {
+            if !model.isActive { Label("Locked", systemImage: "lock") }
+        }
         .interactiveDismissDisabled(model.busy)
         .onAppear { namespace = model.namespace ?? "personal" }
         .onDisappear { value = "" }

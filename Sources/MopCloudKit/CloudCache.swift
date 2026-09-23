@@ -9,6 +9,17 @@ public final class CloudCache: @unchecked Sendable {
     public init(directory: URL) throws {
         self.directory = directory
         try SafeFile.privateDirectory(directory)
+        // Older versions retained every downloaded blob, including rejected input.
+        // Snapshots contain complete records; journals reconcile against the server.
+        try locked {
+            for name in try FileManager.default.contentsOfDirectory(atPath: directory.path)
+                where name.hasSuffix(".blob") && VaultTrust.validFingerprint(String(name.dropLast(5))) {
+                let path = directory.appendingPathComponent(name).path
+                var st = stat()
+                guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFREG,
+                      st.st_uid == getuid(), unlink(path) == 0 else { throw MopError.filePermissions }
+            }
+        }
     }
 
     public func locked<T>(_ action: () throws -> T) throws -> T {
@@ -35,7 +46,9 @@ public final class CloudCache: @unchecked Sendable {
 
     func write<T: Encodable>(_ value: T, _ name: String) throws {
         let url = directory.appendingPathComponent(name)
-        try SafeFile.write(VaultCoding.encode(value), to: url, replace: FileManager.default.fileExists(atPath: url.path))
+        let bytes = try VaultCoding.encode(value)
+        guard bytes.count <= VaultCoding.maximumFileSize * 2 else { throw MopError.invalidVault }
+        try SafeFile.write(bytes, to: url, replace: FileManager.default.fileExists(atPath: url.path))
     }
 
     func remove(_ name: String) throws {
@@ -45,19 +58,23 @@ public final class CloudCache: @unchecked Sendable {
         }
     }
 
-    func blob(_ digest: String) throws -> Data? {
-        guard VaultTrust.validFingerprint(digest) else { throw MopError.invalidVault }
-        let url = directory.appendingPathComponent(digest + ".blob")
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let bytes = try SafeFile.read(url, privateFile: true)
-        guard VaultCoding.digest(bytes) == digest else { throw MopError.invalidVault }
-        return bytes
+    /// Reuse only records embedded in the two bounded snapshots. Downloads are
+    /// assembled in memory and never create a persistent per-record cache.
+    /// Caller holds the cache lock; at most two 16 MiB documents are examined.
+    func recordBlobs() throws -> [String: Data] {
+        var result: [String: Data] = [:]
+        for name in ["snapshot.json", "downloaded.json"] {
+            guard let snapshot = try read(name, as: CachedSnapshot.self) else { continue }
+            guard VaultCoding.digest(snapshot.document) == snapshot.revision else { throw MopError.invalidVault }
+            let document = try VaultDocument.decode(snapshot.document)
+            for record in document.records.values {
+                let bytes = try VaultCoding.encode(record)
+                result[VaultCoding.digest(bytes)] = bytes
+            }
+        }
+        return result
     }
 
-    func putBlob(_ bytes: Data) throws {
-        let digest = VaultCoding.digest(bytes)
-        if try blob(digest) == nil { try SafeFile.write(bytes, to: directory.appendingPathComponent(digest + ".blob")) }
-    }
 }
 
 struct CachedSnapshot: Codable, Sendable {

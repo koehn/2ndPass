@@ -23,6 +23,8 @@ enum AppSheet: String, Identifiable { case createSecret, replaceSecret, createVa
 @MainActor @Observable
 final class AppModel {
     let client: CLIClient
+    let clipboard: SecretClipboard
+    var isActive = true
     var vaults: [String] = []
     var vault = ""
     var page = AppPage.secrets
@@ -44,14 +46,13 @@ final class AppModel {
     var sheet: AppSheet?
     var deleteConfirmation = false
     private var generation = 0
-    private var clipboardChange: Int?
     private var concealTask: Task<Void, Never>?
-    private var clipboardTask: Task<Void, Never>?
 
-    init(client: CLIClient? = nil) {
+    init(client: CLIClient? = nil, clipboard: SecretClipboard? = nil) {
         let executable = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("mop")
             ?? URL(fileURLWithPath: "/nonexistent/mop")
         self.client = client ?? CLIClient(executable: executable)
+        self.clipboard = clipboard ?? SecretClipboard()
     }
     var namespaces: [String] { Array(Set(references.map(\.vault))).sorted() }
     var filtered: [SecretReference] {
@@ -60,10 +61,15 @@ final class AppModel {
     var selectedVault: String? { vault.isEmpty ? nil : vault }
 
     func conceal() { revealed = nil; concealTask?.cancel() }
-    func clearClipboard() {
-        if let clipboardChange, NSPasteboard.general.changeCount == clipboardChange { NSPasteboard.general.clearContents() }
-        clipboardChange = nil; clipboardTask?.cancel()
+    func clearClipboard() { clipboard.clear() }
+    func deactivate() {
+        isActive = false
+        conceal()
+        // The view hides all metadata immediately. A temporary authentication
+        // dialog may return focus before the command completes.
+        if !busy { lock(clearClipboard: false) }
     }
+    func activate() { isActive = true }
     func lock(clearClipboard: Bool = true) {
         generation += 1
         conceal(); if clearClipboard { self.clearClipboard() }; references = []; selected = nil; devices = []; requests = []
@@ -77,7 +83,10 @@ final class AppModel {
         busy = true; error = nil; notice = nil
         let token = generation
         Task {
-            defer { busy = false }
+            defer {
+                busy = false
+                if !isActive { lock(clearClipboard: false) }
+            }
             do { try await action(token) }
             catch {
                 if token == generation { if case CLIError.failed(let code) = error, [8, 10, 13, 16, 18].contains(code) { self.lock() }
@@ -85,7 +94,7 @@ final class AppModel {
             }
         }
     }
-    func current(_ token: Int) -> Bool { token == generation }
+    func current(_ token: Int) -> Bool { token == generation && isActive }
 
     func discover() {
         perform { token in
@@ -126,14 +135,7 @@ final class AppModel {
             let result = try await self.client.run(["read", "--no-newline", selected.description], vault: self.selectedVault, offline: self.offline)
             guard self.current(token), self.selected == selected, NSApplication.shared.isActive else { return }
             if copy {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(result.text, forType: .string)
-                self.clipboardChange = NSPasteboard.general.changeCount
-                self.clipboardTask?.cancel()
-                self.clipboardTask = Task { [weak self = self] in
-                    try? await Task.sleep(for: .seconds(30))
-                    guard !Task.isCancelled else { return }; self?.clearClipboard()
-                }
+                self.clipboard.copy(result.text)
                 self.notice = "Value copied. Mop clears its clipboard entry after 30 seconds."
             } else {
                 self.revealed = result.text

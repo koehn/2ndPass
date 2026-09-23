@@ -5,6 +5,17 @@ import MopCore
 struct ContentView: View {
     @Bindable var model: AppModel
     var body: some View {
+        content
+            .opacity(model.isActive ? 1 : 0)
+            .allowsHitTesting(model.isActive)
+            .accessibilityHidden(!model.isActive)
+            .overlay {
+                if !model.isActive {
+                    ContentUnavailableView("Locked", systemImage: "lock", description: Text("Return to mop to authenticate."))
+                }
+            }
+    }
+    private var content: some View {
         NavigationSplitView {
             VStack(alignment: .leading, spacing: 12) {
                 Text("CLOUD VAULT").font(.caption).foregroundStyle(.secondary)
@@ -145,7 +156,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     Text([ref.section, ref.field].compactMap { $0 }.joined(separator: " / ")).font(.headline)
                     Text(model.revealed ?? "••••••••••••••••••••").font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.disabled).frame(maxWidth: .infinity, alignment: .leading)
                     HStack {
                         Button("Copy reference") { model.copyReference() }.buttonStyle(.borderedProminent)
                         if model.revealed == nil { Button("Reveal…") { model.read(copy: false) } }

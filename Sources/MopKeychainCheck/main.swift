@@ -64,7 +64,6 @@ func suite() throws {
         _ = try foreign.read(first)
         throw MopError.keychain(errSecInternalError)
     } catch MopError.signing { }
-      catch MopError.notFound { }
 
     try store.delete(first)
     remaining.remove(first)

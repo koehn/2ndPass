@@ -35,6 +35,17 @@ its generated script was compared but not executed. No real vaults were used.
 the schema only after development validation. No release should be published until
 the production smoke test passes.
 
+Security remediation validation on 2026-09-23: all 81 Swift tests and 88 unsigned
+CLI smoke checks passed, including
+new tests for background completion/authentication focus return, device-local
+clipboard helper expiration and ownership (using unique test pasteboards),
+rejected cloud downloads, bounded snapshot reuse, and legacy blob cleanup that
+preserves offline snapshots and uncertain-commit journals. Signing configuration,
+the three release-tooling tests, and shell syntax checks passed. The standalone
+cloud audit probe now confirms zero retained blobs after failed syncs.
+These checks do not exercise Universal Clipboard across real devices or native
+Touch ID focus transitions; include those in GUI acceptance before release.
+
 ## Signed packaging and hardware checks
 
 Configure `MOP_SIGN_IDENTITY`, `MOP_PROVISION_PROFILE`, and optionally

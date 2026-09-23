@@ -34,6 +34,9 @@ continues to create a symlink to `Contents/MacOS/mop`.
 - Secret input uses stdin, never process arguments or temporary files. Reveal
   and clipboard values expire after 30 seconds. Clipboard clearing checks the
   pasteboard change count so another application's newer content is retained.
+  Secret copies are restricted to this Mac and carry a confidential-content
+  marker for cooperative clipboard managers. Revealed values do not allow native
+  text-selection copying; use **Copy value** so expiration applies to every copy.
   Switching apps hides the index and values but allows the copied value to be
   pasted until its timer expires. Explicit lock, sleep, and session deactivation
   also clear mop's clipboard entry. Clipboard history tools may retain copies.
@@ -51,7 +54,10 @@ continues to create a symlink to `Contents/MacOS/mop`.
 
 The app does not keep an authenticated CLI session alive. It serializes commands,
 keeps the UI responsive during authentication/network requests, and discards
-results for a view that was locked while a command was in flight. Locking does
+results for a view that was locked while a command was in flight. Inactive windows
+and sheets immediately hide sensitive content from display and accessibility.
+Authentication can return focus before completion; a command that finishes while
+the app is inactive leaves it locked and does not publish visible results. Locking does
 not cancel a submitted mutation: it may still commit. Reconcile an uncertain
 outcome with **Sync** before issuing another mutation. Subprocess failures are
 mapped to fixed error messages; arbitrary stdout/stderr is never shown as an

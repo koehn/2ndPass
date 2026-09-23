@@ -45,15 +45,15 @@ public final class CloudVault {
 
     public func revision(_ digest: String) async throws -> Data {
         let manifest = try await manifest(digest)
+        let reusable = try cache.locked { try cache.recordBlobs() }
         var records: [String: VaultRecord] = [:]
         var total = 0
         for (recordID, hash) in manifest.records.sorted(by: { $0.key < $1.key }) {
             let bytes: Data
-            if let cached = try cache.locked({ try cache.blob(hash) }) { bytes = cached }
+            if let cached = reusable[hash] { bytes = cached }
             else {
                 guard let object = try await transport.fetch("s-" + hash, vault: id), VaultCoding.digest(object.data) == hash else { throw MopError.invalidVault }
                 bytes = object.data
-                try cache.locked { try cache.putBlob(bytes) }
             }
             total += bytes.count
             guard total <= VaultCoding.maximumFileSize else { throw MopError.invalidVault }
@@ -238,7 +238,6 @@ public final class CloudVault {
                 let bytes = try VaultCoding.encode(record)
                 let hash = VaultCoding.digest(bytes)
                 if !previousHashes.contains(hash) { try await upload("s-" + hash, bytes: bytes) }
-                try cache.locked { try cache.putBlob(bytes) }
             }
             try await upload("m-" + digest, bytes: VaultCoding.encode(CloudManifest(document: doc)))
             try await checkAccount()

@@ -43,6 +43,42 @@ import MopAppSupport
         try await finish(model)
         #expect(model.error?.contains("Authentication") == true)
     }
+    @Test func backgroundCompletionLocksAndDiscardsIndex() async throws {
+        let (model, directory) = try fixture("sleep 0.1\nprintf '[\"mop://personal/github/token\"]'\n")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.unlock()
+        model.deactivate()
+        #expect(!model.isActive)
+        try await finish(model)
+        #expect(model.references.isEmpty)
+        #expect(!model.authenticated)
+        model.activate()
+        #expect(model.status == "Locked")
+        #expect(model.references.isEmpty)
+    }
+    @Test func authenticationFocusReturnAllowsPendingResult() async throws {
+        let (model, directory) = try fixture("sleep 0.1\nprintf '[\"mop://personal/github/token\"]'\n")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.unlock()
+        model.deactivate()
+        model.activate()
+        try await finish(model)
+        #expect(model.authenticated)
+        #expect(model.references.count == 1)
+    }
+    @Test func backgroundMutationFinishesButDoesNotRestoreVisibleState() async throws {
+        let (model, directory) = try fixture("sleep 0.1\ncat > /dev/null\ntouch \"$(dirname \"$0\")/committed\"\n")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.references = [try SecretReference("mop://personal/github/token")]
+        model.authenticated = true
+        model.write(reference: model.references[0], value: "fixture", replace: true)
+        model.deactivate()
+        try await finish(model)
+        #expect(FileManager.default.fileExists(atPath: directory.appendingPathComponent("committed").path))
+        #expect(!model.authenticated)
+        #expect(model.references.isEmpty)
+        #expect(model.notice == nil)
+    }
     @Test func successfulIndexContainsNoValuesAndFiltersNamespaces() async throws {
         let (model, directory) = try fixture("printf '[\"mop://personal/github/token\",\"mop://work/db/password\"]'\n")
         defer { try? FileManager.default.removeItem(at: directory) }
