@@ -17,7 +17,7 @@ For licensing inquiries, contact Koehn Consulting, Inc.
 
 See the [copyright notice](LICENSE). Build, installation, and operational instructions in this repository are for the copyright holder and separately authorized users; they do not grant permission. Third-party dependencies retain their own licenses.
 
-mop is a macOS command-line secret manager with CloudKit synchronization and
+mop is a macOS secret manager with a native Mac app, a command-line interface, CloudKit synchronization, and
 Secure Enclave-protected access. It supplies credentials to commands and templates
 using references such as `mop://personal/service/token`.
 
@@ -27,6 +27,17 @@ required before release.** See [validation](docs/VALIDATION.md).
 Requires macOS 15+, a Secure Enclave, a logged-in macOS user, an Apple Account
 with iCloud access, and a provisioned signed application. There is no software-key
 or unsigned-build fallback for secret access.
+
+## Native Mac app
+
+Open the packaged `Mop.app` to browse secrets, copy references, manage trusted
+Macs, create vaults, and export encrypted backups. Values authenticate separately;
+offline browsing is explicit and read only. The app uses the bundled CLI and the
+same existing device state. See [the Mac app guide](docs/GUI.md).
+
+```sh
+open dist/Mop.app
+```
 
 ## Storage and authentication
 

@@ -71,8 +71,21 @@ public enum SigningIdentity {
         let contents = macOS.deletingLastPathComponent()
         let root = contents.deletingLastPathComponent()
         guard macOS.lastPathComponent == "MacOS", contents.lastPathComponent == "Contents",
-              root.pathExtension == "app", let bundle = Bundle(url: root),
-              bundle.executableURL?.resolvingSymlinksInPath() == resolved else { return nil }
+              root.pathExtension == "app", let bundle = Bundle(url: root) else { return nil }
+        // Foundation may report the running nested helper as the bundle's
+        // executable. Read the declared entry point from the sealed plist instead.
+        guard let data = try? Data(contentsOf: contents.appendingPathComponent("Info.plist")),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let main = plist["CFBundleExecutable"] as? String,
+              !main.contains("/"),
+              main == resolved.lastPathComponent || (main == "MopApp" && resolved.lastPathComponent == "mop") else { return nil }
+        // Validate the enclosing seal for both main executables and CLI helpers;
+        // checking only the running Mach-O does not validate its bundle metadata.
+        var enclosing: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(root as CFURL, [], &enclosing) == errSecSuccess,
+              let enclosing,
+              SecStaticCodeCheckValidity(enclosing,
+                  SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckNestedCode), nil) == errSecSuccess else { return nil }
         return bundle
     }
 }

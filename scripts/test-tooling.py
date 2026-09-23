@@ -2,6 +2,9 @@
 """Exercise local installation under temporary prefixes; no real user install."""
 import os
 import pathlib
+import plistlib
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -16,6 +19,9 @@ with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
     link = prefix / 'bin/mop'
     assert link.is_symlink()
     assert (prefix / 'lib/mop/Mop.app/Contents/embedded.provisionprofile').is_file()
+    info = plistlib.loads((prefix / 'lib/mop/Mop.app/Contents/Info.plist').read_bytes())
+    assert info['CFBundleExecutable'] == 'MopApp'
+    assert (prefix / 'lib/mop/Mop.app/Contents/MacOS/MopApp').is_file()
     direct = prefix / 'lib/mop/Mop.app/Contents/MacOS/mop'
     identity = subprocess.check_output([str(direct), 'device', 'identity']).strip()
     assert identity
@@ -45,6 +51,18 @@ with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
         assert installed.readlink() == pathlib.Path('/dev/null')
         installed.unlink()
         installed.symlink_to(expected)
+    # The nested CLI must reject a tampered enclosing app even though its own
+    # executable signature has not changed.
+    tampered = pathlib.Path(directory) / 'Tampered.app'
+    shutil.copytree(app, tampered)
+    info_path = tampered / 'Contents/Info.plist'
+    info = plistlib.loads(info_path.read_bytes())
+    info['CFBundleDisplayName'] = 'Tampered'
+    info_path.write_bytes(plistlib.dumps(info))
+    rejected = subprocess.run([str(tampered / 'Contents/MacOS/mop'), 'device', 'identity'], capture_output=True)
+    # macOS may kill the process before our own signing check can return 8.
+    assert rejected.returncode in (8, -signal.SIGKILL), (rejected.returncode, rejected.stderr)
+    assert not rejected.stdout
     link.unlink()
     link.write_text('unrelated file')
     assert subprocess.run(command, env=environment, capture_output=True).returncode == 7
@@ -53,4 +71,4 @@ with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
     link.symlink_to('/bin/echo')
     assert subprocess.run(command, env=environment, capture_output=True).returncode == 7
     assert link.readlink() == pathlib.Path('/bin/echo')
-print('PASS: fresh install, executable link, upgrade, file collision, and symlink collision, including manpage and completions.')
+print('PASS: fresh install, executable link, upgrade, file collision, and symlink collision, including native app, tampered-bundle rejection, manpage, and completions.')

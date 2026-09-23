@@ -34,6 +34,14 @@ cp "$MOP_PROVISION_PROFILE" "$app/Contents/embedded.provisionprofile"
 swift build -c release --product "$product"
 bin_dir=$(swift build -c release --show-bin-path)
 cp "$bin_dir/$product" "$app/Contents/MacOS/$product"
+if [[ "$product" == mop ]]; then
+    swift build -c release --product MopApp
+    cp "$bin_dir/MopApp" "$app/Contents/MacOS/MopApp"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable MopApp' "$app/Contents/Info.plist"
+    # Sign the CLI helper with the same identity, CloudKit container, and Keychain group.
+    codesign --force --sign "$MOP_SIGN_IDENTITY" --identifier "$bundle_id" --options runtime --timestamp \
+        --entitlements "$stage/entitlements.plist" "$app/Contents/MacOS/mop"
+fi
 codesign --force --sign "$MOP_SIGN_IDENTITY" --options runtime --timestamp \
     --entitlements "$stage/entitlements.plist" "$app"
 codesign --verify --strict "$app"

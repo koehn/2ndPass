@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .executable(name: "mop", targets: ["MopCLI"]),
+        .executable(name: "MopApp", targets: ["MopApp"]),
         .executable(name: "mop-keychain-check", targets: ["MopKeychainCheck"]),
         .executable(name: "mop-enclave-check", targets: ["MopEnclaveCheck"]),
     ],
@@ -14,6 +15,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "MopCore"),
+        .target(name: "MopAppSupport", dependencies: ["MopCore"]),
+        .executableTarget(name: "MopApp", dependencies: ["MopAppSupport", "MopCore"]),
+        .testTarget(name: "MopAppSupportTests", dependencies: ["MopAppSupport", "MopCore"]),
+        .testTarget(name: "MopAppTests", dependencies: ["MopApp", "MopAppSupport", "MopCore"]),
         .target(name: "MopAuth", dependencies: ["MopCore"]),
         .target(name: "MopKeychain", dependencies: ["MopCore", "MopAuth"]),
         .target(name: "MopCloudKit", dependencies: ["MopCore", "MopVault", "MopKeychain"]),
