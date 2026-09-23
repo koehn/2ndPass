@@ -11,6 +11,7 @@ public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConve
         let parts = token.dropFirst(6).split(separator: "/", omittingEmptySubsequences: false)
         guard [3, 4].contains(parts.count) else { throw MopError.invalidReference }
         let decoded = try parts.map { try Self.decode(String($0)) }
+        try VaultName.validate(decoded[0])
         vault = decoded[0]
         item = decoded[1]
         section = decoded.count == 4 ? decoded[2] : nil
@@ -21,7 +22,8 @@ public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConve
         guard ([vault, item, field] + (section.map { [$0] } ?? [])).allSatisfy({ !$0.isEmpty && !$0.contains("\0") }) else {
             throw MopError.invalidReference
         }
-        self.vault = vault.precomposedStringWithCanonicalMapping
+        try VaultName.validate(vault)
+        self.vault = vault
         self.item = item.precomposedStringWithCanonicalMapping
         self.section = section?.precomposedStringWithCanonicalMapping
         self.field = field.precomposedStringWithCanonicalMapping
@@ -55,6 +57,15 @@ public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConve
 
     public static func encode(_ value: String) -> String {
         value.utf8.map { unreserved($0) ? String(UnicodeScalar($0)) : String(format: "%%%02X", $0) }.joined()
+    }
+
+    public var relativePath: String {
+        ([item] + (section.map { [$0] } ?? []) + [field]).map(Self.encode).joined(separator: "/")
+    }
+
+    public init(vault: String, relativePath: String) throws {
+        try self.init("mop://" + vault + "/" + relativePath)
+        guard self.relativePath == relativePath else { throw MopError.invalidReference }
     }
 
     public var description: String {

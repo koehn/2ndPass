@@ -16,7 +16,7 @@ struct Enrollment: Decodable, Identifiable {
 }
 
 enum AppPage: String, CaseIterable { case secrets = "Secrets", devices = "Trusted Macs" }
-enum AppSheet: String, Identifiable { case createSecret, replaceSecret, createVault, request, trust, approve, selectVault, recover, revoke
+enum AppSheet: String, Identifiable { case createSecret, addField, replaceSecret, createVault, renameVault, deleteVault, request, trust, approve, selectVault, recover, revoke
     var id: String { rawValue }
 }
 
@@ -25,10 +25,10 @@ final class AppModel {
     let client: CLIClient
     let clipboard: SecretClipboard
     var isActive = true
-    var vaults: [String] = []
+    var vaults: [VaultDescriptor] = []
     var vault = ""
     var page = AppPage.secrets
-    var namespace: String?
+    var selectedItem: String?
     var references: [SecretReference] = []
     var selected: SecretReference?
     var search = ""
@@ -54,9 +54,18 @@ final class AppModel {
         self.client = client ?? CLIClient(executable: executable)
         self.clipboard = clipboard ?? SecretClipboard()
     }
-    var namespaces: [String] { Array(Set(references.map(\.vault))).sorted() }
+    var selectedVaultDescriptor: VaultDescriptor? { vaults.first { $0.id == vault } }
+    var canExportBackup: Bool { !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
+    var vaultName: String { references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "" }
     var filtered: [SecretReference] {
-        references.filter { (namespace == nil || $0.vault == namespace) && (search.isEmpty || $0.description.localizedCaseInsensitiveContains(search)) }
+        references.filter { search.isEmpty || $0.description.localizedCaseInsensitiveContains(search) }
+    }
+    var items: [String] { Array(Set(filtered.map(\.item))).sorted() }
+    var itemFields: [SecretReference] { references.filter { $0.item == selectedItem }.sorted() }
+    func selectField(_ reference: SecretReference) { if selected != reference { conceal() }; selected = reference }
+    func vaultLabel(_ descriptor: VaultDescriptor) -> String {
+        guard let name = descriptor.name else { return "Legacy · " + descriptor.id }
+        return vaults.filter { $0.name == name }.count > 1 ? name + " · " + descriptor.id : name
     }
     var selectedVault: String? { vault.isEmpty ? nil : vault }
 
@@ -73,7 +82,7 @@ final class AppModel {
     func lock(clearClipboard: Bool = true) {
         generation += 1
         conceal(); if clearClipboard { self.clearClipboard() }; references = []; selected = nil; devices = []; requests = []
-        enrollment = nil; revoking = nil; namespace = nil; authenticated = false; sheet = nil; notice = nil
+        enrollment = nil; revoking = nil; selectedItem = nil; authenticated = false; sheet = nil; notice = nil
         status = "Locked"
     }
     func changedContext() { lock(); status = offline ? "Offline mode · unlock a verified snapshot" : "Ready to authenticate" }
@@ -98,10 +107,11 @@ final class AppModel {
 
     func discover() {
         perform { token in
-            let result = try await self.client.run(["vault", "list"])
-            let ids = try result.decode([String].self).filter { UUID(uuidString: $0) != nil }
+            let result = try await self.client.run(["vault", "list", "--json"], offline: self.offline)
+            let rows = try result.decode([VaultDescriptor].self)
+            let ids = rows.map(\.id)
             guard self.current(token) else { return }
-            self.vaults = ids
+            self.vaults = rows
             // Use the repository's account-scoped default, never an arbitrary vault.
             if self.vault.isEmpty {
                 if let result = try? await self.client.run(["vault", "status"]),
@@ -119,6 +129,16 @@ final class AppModel {
             let refs = try result.decode([String].self).map { try SecretReference($0) }.sorted()
             guard self.current(token) else { return }
             self.references = refs; self.authenticated = true
+            if let name = refs.first?.vault {
+                self.vaults.removeAll { $0.id == self.vault }
+                self.vaults.append(VaultDescriptor(id: self.vault, name: name, format: "mop-vault-v4", enrolled: true))
+            } else if self.vaultName.isEmpty {
+                let discovery = try await self.client.run(["vault", "list", "--json"], offline: self.offline)
+                let rows = try discovery.decode([VaultDescriptor].self)
+                guard self.current(token) else { return }
+                self.vaults = rows
+            }
+            if let item = self.selectedItem, !refs.contains(where: { $0.item == item }) { self.selectedItem = nil }
             if let selected = self.selected, !refs.contains(selected) { self.selected = nil }
             self.status = self.offline ? "Read only · verified cache from \(result.offlineDate ?? "unknown time")" : "Index authenticated · values concealed"
         }
@@ -154,7 +174,7 @@ final class AppModel {
             _ = try await self.client.run(["write", reference.description] + (replace ? ["--replace"] : []), vault: self.selectedVault, input: value)
             guard self.current(token) else { return }
             if !self.references.contains(reference) { self.references.append(reference); self.references.sort() }
-            self.selected = reference; self.namespace = reference.vault; self.authenticated = true
+            self.selected = reference; self.selectedItem = reference.item; self.authenticated = true
             self.sheet = nil; self.conceal(); self.notice = "Secret saved to iCloud."
         }
     }
@@ -164,6 +184,7 @@ final class AppModel {
             _ = try await self.client.run(["delete", selected.description], vault: self.selectedVault)
             guard self.current(token) else { return }
             self.references.removeAll { $0 == selected }; self.selected = nil; self.conceal()
+            if self.itemFields.isEmpty { self.selectedItem = nil }
             self.notice = "Secret deleted. Historical encrypted copies remain."
         }
     }
@@ -197,23 +218,60 @@ final class AppModel {
             self.status = "Ciphertext synchronized · unlock to verify the offline snapshot"
         }
     }
-    func createVault(name: String, strict: Bool, recovery: URL) {
+    func createVault(name: String, deviceName: String, strict: Bool, recovery: URL) {
         guard !offline, !busy else { return }
         conceal(); references = []; selected = nil; devices = []; requests = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
-            self.vault = id; self.vaults.append(id)
+            self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v4", enrolled: true))
             self.status = "Creating vault \(id) · retain any recovery file written"
-            let result = try await self.client.run(["vault", "init", "--name", name, "--recovery-file", recovery.path] + (strict ? ["--strict-biometrics"] : []), vault: id)
+            let result = try await self.client.run(["vault", "init", name, "--device-name", deviceName, "--recovery-file", recovery.path] + (strict ? ["--strict-biometrics"] : []), vault: id)
             guard self.current(token) else { return }
             self.references = []; self.selected = nil; self.authenticated = true; self.sheet = nil
             self.notice = result.text; self.status = "Vault created · move the recovery credential offline"
         }
     }
-    func exportBackup(to url: URL) {
+    func renameVault(to name: String) {
+        guard !offline, !vault.isEmpty else { return }
+        let id = vault
         perform { token in
-            _ = try await self.client.run(["vault", "export", "--out-file", url.path], vault: self.selectedVault, offline: self.offline)
+            _ = try await self.client.run(["vault", "rename", id, name], vault: id)
+            guard self.current(token), self.vault == id else { return }
+            self.lock()
+            if let index = self.vaults.firstIndex(where: { $0.id == id }) {
+                let old = self.vaults[index]
+                self.vaults[index] = VaultDescriptor(id: id, name: name, format: old.format, enrolled: old.enrolled)
+            }
+            self.notice = "Vault renamed. Update existing references; unlock to refresh items."
+        }
+    }
+    func deleteVault(target: VaultDescriptor, confirmation: String) {
+        guard !offline, !busy, vault == target.id, confirmation == (target.name ?? target.id) else { return }
+        conceal(); clearClipboard(); references = []; selected = nil; selectedItem = nil; authenticated = false
+        perform { token in
+            _ = try await self.client.run(["vault", "delete", target.id, "--yes"], vault: target.id)
+            guard self.current(token), self.vault == target.id else { return }
+            self.lock()
+            self.vaults.removeAll { $0.id == target.id }
+            self.vault = ""
+            self.notice = "Vault deleted. Backups and caches on other Macs remain."
+            self.status = "Vault deleted"
+        }
+    }
+
+    func chooseExportBackup() {
+        guard canExportBackup, !busy else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = (vaultName.isEmpty ? "vault" : vaultName) + ".mopfile"
+        panel.title = "Export encrypted backup"
+        if panel.runModal() == .OK, let url = panel.url { exportBackup(to: url) }
+    }
+    func exportBackup(to url: URL) {
+        guard canExportBackup, !busy else { return }
+        let id = vault
+        perform { token in
+            _ = try await self.client.run(["vault", "export", "--out-file", url.path], vault: id, offline: self.offline)
             guard self.current(token) else { return }; self.notice = "Encrypted backup exported. Keep your recovery key separately."
         }
     }

@@ -2,16 +2,10 @@ import CryptoKit
 import Foundation
 import MopCore
 
-/// Storage-independent name for new integrations; FileSecretStore remains the legacy adapter API.
-public typealias VaultSession = FileSecretStore
-
 /// Only the index is decrypted at open. Record keys and values are opened on demand.
-/// The legacy disk adapter compares snapshots under filesystem coordination;
-/// cloud callers publish the resulting snapshot with their own conditional commit.
-public final class FileSecretStore: SecretStore {
+/// Mutations produce in-memory snapshots; CloudKit publishes them conditionally.
+public final class VaultSession: SecretStore {
     private let trust: VaultTrust
-    private let persist: (Data, Data) throws -> Void
-    private let pinAfterCommit: Bool
     public private(set) var snapshot: Data
     private var document: VaultDocument
     private var key: SymmetricKey?
@@ -19,24 +13,16 @@ public final class FileSecretStore: SecretStore {
     private var opener: (any VaultKeyOpener)?
     private var onClose: (() -> Void)?
 
-    public convenience init(disk: VaultDisk, snapshot: Data, opener: any VaultKeyOpener, onClose: @escaping () -> Void = {}) throws {
-        try self.init(snapshot: snapshot, trust: disk.trust, opener: opener,
-                      persist: { try disk.commit(expected: $0, replacement: $1) }, pinAfterCommit: true, onClose: onClose)
-    }
-
     /// Cryptographic session independent of storage. Cloud commits are published
     /// asynchronously by the caller; trust is advanced only after confirmation.
     public init(snapshot: Data, trust: VaultTrust, opener: any VaultKeyOpener,
-                persist: @escaping (Data, Data) throws -> Void = { _, _ in },
-                pinAfterCommit: Bool = false, onClose: @escaping () -> Void = {}) throws {
+                onClose: @escaping () -> Void = {}) throws {
         let document = try VaultDocument.decode(snapshot)
         guard let slot = document.header.recipients.first(where: { $0.publicKey == opener.publicKey }) else { throw MopError.deviceNotEnrolled }
         let key = try opener.unwrap(slot, vaultID: document.header.vaultID)
         try trust.verify(document: document, key: key)
         let index = try document.decryptIndex(key: key)
         self.trust = trust
-        self.persist = persist
-        self.pinAfterCommit = pinAfterCommit
         self.snapshot = snapshot
         self.document = document
         self.key = key
@@ -45,23 +31,28 @@ public final class FileSecretStore: SecretStore {
         self.onClose = onClose
     }
 
-    public static func open(file: URL, stateDirectory: URL) throws -> FileSecretStore {
-        let disk = VaultDisk(url: file, trustDirectory: stateDirectory.appendingPathComponent("trust"))
-        let snapshot = try disk.read()
-        _ = try VaultDocument.decode(snapshot)
-        let device = try LocalDevice.open(directory: stateDirectory)
-        do { return try FileSecretStore(disk: disk, snapshot: snapshot, opener: device, onClose: { device.close() }) }
-        catch { device.close(); throw error }
-    }
-
     private func requireKey() throws -> SymmetricKey {
         guard let key else { throw MopError.authentication }
         return key
     }
 
+    public var name: String { document.header.name }
+
+    private func check(_ reference: SecretReference) throws {
+        guard reference.vault == name else { throw MopError.vaultSelectionMismatch }
+    }
+
+    public func rename(_ name: String) throws {
+        try VaultName.validate(name)
+        var header = document.header
+        header.name = name
+        try commit(index: index, records: document.records, header: header)
+    }
+
     public func read(_ reference: SecretReference) throws -> SecretBytes {
         _ = try requireKey()
-        guard let id = index[reference.description], let record = document.records[id] else { throw MopError.notFound }
+        try check(reference)
+        guard let id = index[reference.relativePath], let record = document.records[id] else { throw MopError.notFound }
         return try record.read(id: id, vaultID: document.header.vaultID, opener: requireOpener())
     }
 
@@ -72,22 +63,24 @@ public final class FileSecretStore: SecretStore {
 
     public func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) throws {
         _ = try requireKey()
-        let exists = index[reference.description] != nil
+        try check(reference)
+        let exists = index[reference.relativePath] != nil
         if exists && !replace { throw MopError.duplicate }
         if !exists && replace { throw MopError.notFound }
         var index = self.index
         var records = document.records
-        if let old = index[reference.description] { records.removeValue(forKey: old) }
+        if let old = index[reference.relativePath] { records.removeValue(forKey: old) }
         let id = UUID().uuidString
-        index[reference.description] = id
+        index[reference.relativePath] = id
         records[id] = try VaultRecord.create(value: value, id: id, header: document.header)
         try commit(index: index, records: records)
     }
 
     public func delete(_ reference: SecretReference) throws {
         _ = try requireKey()
+        try check(reference)
         var index = self.index
-        guard let id = index.removeValue(forKey: reference.description) else { throw MopError.notFound }
+        guard let id = index.removeValue(forKey: reference.relativePath) else { throw MopError.notFound }
         var records = document.records
         records.removeValue(forKey: id)
         try commit(index: index, records: records)
@@ -95,7 +88,7 @@ public final class FileSecretStore: SecretStore {
 
     public func list(vault: String?) throws -> [SecretReference] {
         _ = try requireKey()
-        return try index.keys.map { try SecretReference($0) }.filter { vault == nil || $0.vault == vault }.sorted()
+        return try index.keys.map { try SecretReference(vault: document.header.name, relativePath: $0) }.filter { vault == nil || $0.vault == vault }.sorted()
     }
 
     public func recipients() throws -> [DeviceRequest] {
@@ -147,58 +140,10 @@ public final class FileSecretStore: SecretStore {
         next.recipients.sort { $0.fingerprint < $1.fingerprint }
         let document = try VaultDocument.seal(header: next, index: index, records: records, key: selectedKey)
         let bytes = try VaultCoding.encode(document)
-        try persist(snapshot, bytes)
-        if newKey != nil && pinAfterCommit { try trust.pin(document: document, key: selectedKey) }
         self.document = document
         self.snapshot = bytes
         self.index = index
         self.key = selectedKey
-    }
-
-    @discardableResult
-    public static func initialize(disk: VaultDisk, device: DeviceRequest, recovery: RecoveryKey) throws -> String {
-        let id = UUID()
-        let key = SymmetricKey(size: .bits256)
-        let recipients = try [
-            VaultDocument.wrap(key: key, request: device, kind: "device", vaultID: id),
-            VaultDocument.wrap(key: key, request: recovery.request, kind: "recovery", vaultID: id),
-        ].sorted { $0.fingerprint < $1.fingerprint }
-        let header = VaultHeader(format: "mop-vault-v3", vaultID: id, generation: 1, parent: nil, recipients: recipients)
-        let document = try VaultDocument.seal(header: header, index: [:], records: [:], key: key)
-        try disk.create(VaultCoding.encode(document))
-        try disk.trust.pin(document: document, key: key)
-        return VaultTrust.fingerprint(document: document, key: key)
-    }
-
-    public static func resolve(disk: VaultDisk, revision: String, opener: any VaultKeyOpener) throws {
-        let selected = try disk.revision(revision)
-        try disk.resolve(selected: selected) { selected, current in
-            var document = try VaultDocument.decode(selected)
-            let currentDocument = try VaultDocument.decode(current)
-            guard document.header.vaultID == currentDocument.header.vaultID,
-                  let selectedSlot = document.header.recipients.first(where: { $0.publicKey == opener.publicKey }),
-                  let currentSlot = currentDocument.header.recipients.first(where: { $0.publicKey == opener.publicKey && $0.kind == "device" }) else {
-                throw MopError.deviceNotEnrolled
-            }
-            // A revoked device cannot authorize restoring itself from an old snapshot.
-            let currentKey = try opener.unwrap(currentSlot, vaultID: currentDocument.header.vaultID)
-            try disk.trust.verify(document: currentDocument, key: currentKey)
-            _ = try currentDocument.decryptIndex(key: currentKey)
-            let selectedKey = try opener.unwrap(selectedSlot, vaultID: document.header.vaultID)
-            try disk.trust.verify(document: document, key: selectedKey, historical: true)
-            let index = try document.decryptIndex(key: selectedKey)
-            guard max(document.header.generation, currentDocument.header.generation) < UInt64.max else { throw MopError.invalidVault }
-            document.header.generation = max(document.header.generation, currentDocument.header.generation) + 1
-            document.header.parent = VaultCoding.digest(current)
-            // Keep the current recipient authorization and key, restoring only selected contents.
-            document.header.recipients = currentDocument.header.recipients
-            var records: [String: VaultRecord] = [:]
-            for (id, record) in document.records {
-                let value = try record.read(id: id, vaultID: document.header.vaultID, opener: opener)
-                records[id] = try VaultRecord.create(value: value, id: id, header: document.header)
-            }
-            return try VaultCoding.encode(VaultDocument.seal(header: document.header, index: index, records: records, key: currentKey))
-        }
     }
 
     public func close() {
@@ -213,38 +158,21 @@ public final class FileSecretStore: SecretStore {
         VaultTrust.fingerprint(document: document, key: try requireKey())
     }
 
-    /// Bootstrap trust only with evidence supplied through an independent trusted
-    /// channel. Never derive that evidence from the currently untrusted file.
-    public static func establishTrust(disk: VaultDisk, opener: any VaultKeyOpener,
-                                      fingerprint: String? = nil, revision: String? = nil) throws {
-        guard (fingerprint == nil) != (revision == nil),
-              VaultTrust.validFingerprint(fingerprint ?? revision ?? "") else { throw MopError.vaultUntrusted }
-        let bytes = try disk.read()
-        if let revision { guard VaultCoding.digest(bytes) == revision else { throw MopError.vaultUntrusted } }
-        let document = try VaultDocument.decode(bytes)
-        guard let slot = document.header.recipients.first(where: { $0.publicKey == opener.publicKey }) else { throw MopError.deviceNotEnrolled }
-        let key = try opener.unwrap(slot, vaultID: document.header.vaultID)
-        if let fingerprint {
-            guard VaultTrust.fingerprint(document: document, key: key) == fingerprint else { throw MopError.vaultUntrusted }
-        }
-        _ = try document.decryptIndex(key: key)
-        try disk.trust.pin(document: document, key: key)
-    }
-
     public func pinCommittedKey() throws {
         try trust.pin(document: document, key: requireKey())
     }
 
-    public static func createSnapshot(id: UUID = UUID(), device: DeviceRequest, recovery: RecoveryKey) throws -> Data {
+    public static func createSnapshot(id: UUID = UUID(), name: String, device: DeviceRequest, recovery: RecoveryKey) throws -> Data {
         let key = SymmetricKey(size: .bits256)
         let recipients = try [
             VaultDocument.wrap(key: key, request: device, kind: "device", vaultID: id),
             VaultDocument.wrap(key: key, request: recovery.request, kind: "recovery", vaultID: id)
         ].sorted { $0.fingerprint < $1.fingerprint }
-        let header = VaultHeader(format: "mop-vault-v3", vaultID: id, generation: 1, parent: nil, recipients: recipients)
+        let header = VaultHeader(format: "mop-vault-v4", vaultID: id, name: name, generation: 1, parent: nil, recipients: recipients)
         return try VaultCoding.encode(VaultDocument.seal(header: header, index: [:], records: [:], key: key))
     }
 
+    /// Bootstrap trust only with independently obtained fingerprint or revision evidence.
     public static func trustSnapshot(_ bytes: Data, trust: VaultTrust, opener: any VaultKeyOpener,
                                      fingerprint: String? = nil, revision: String? = nil) throws {
         guard (fingerprint == nil) != (revision == nil),

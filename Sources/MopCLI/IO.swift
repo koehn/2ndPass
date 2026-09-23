@@ -13,6 +13,15 @@ enum IO {
         return try SecretBytes.read(descriptor: descriptor).validatedUTF8()
     }
 
+    static func requireDeletionConfirmation(_ target: VaultDescriptor, yes: Bool) throws {
+        diagnostic("Delete vault \(target.name ?? "(unnamed or legacy)") [\(target.id)]?\nAll cloud contents and history will be deleted. This Mac's vault cache will be removed. Backups and other Macs' caches remain.\n")
+        guard !yes else { return }
+        guard isatty(STDIN_FILENO) != 0 else { throw MopError.confirmationRequired }
+        let expected = target.name ?? target.id
+        diagnostic("Type \(expected) to delete: ")
+        guard readLine() == expected else { throw MopError.operationCancelled }
+    }
+
     static func secret() throws -> SecretBytes {
         if isatty(STDIN_FILENO) == 0 { return try input() }
         let count = 65_538

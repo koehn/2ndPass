@@ -66,10 +66,17 @@ public final class AppleCloudTransport: CloudTransport, @unchecked Sendable {
     public func zones() async throws -> [UUID] {
         let values: [CKRecordZone] = try await withCheckedThrowingContinuation { continuation in
             let result = Mutex<[CKRecordZone]>([])
+            let failure = Mutex<MopError?>(nil)
             let op = CKFetchRecordZonesOperation.fetchAllRecordZonesOperation()
             configure(op)
-            op.perRecordZoneResultBlock = { _, value in if case .success(let zone) = value { result.withLock { $0.append(zone) } } }
+            op.perRecordZoneResultBlock = { _, value in
+                switch value {
+                case .success(let zone): result.withLock { $0.append(zone) }
+                case .failure(let error): failure.withLock { $0 = Self.map(error) }
+                }
+            }
             op.fetchRecordZonesResultBlock = { value in
+                if let error = failure.withLock({ $0 }) { continuation.resume(throwing: error); return }
                 switch value { case .success: continuation.resume(returning: result.withLock { $0 })
                 case .failure(let error): continuation.resume(throwing: Self.map(error)) }
             }
@@ -84,6 +91,20 @@ public final class AppleCloudTransport: CloudTransport, @unchecked Sendable {
             configure(op)
             op.modifyRecordZonesResultBlock = { value in
                 switch value { case .success: continuation.resume(); case .failure(let error): continuation.resume(throwing: Self.map(error)) }
+            }
+            database.add(op)
+        }
+    }
+
+    public func deleteZone(_ vault: UUID) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let op = CKModifyRecordZonesOperation(recordZonesToSave: nil, recordZoneIDsToDelete: [zone(vault)])
+            configure(op)
+            op.modifyRecordZonesResultBlock = { value in
+                switch value {
+                case .success: continuation.resume()
+                case .failure(let error): continuation.resume(throwing: Self.map(error))
+                }
             }
             database.add(op)
         }

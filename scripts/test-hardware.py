@@ -15,22 +15,25 @@ mop = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app/Contents/MacO
 if os.environ.get('MOP_LIVE_CLOUD_TEST') != '1':
     raise SystemExit('Set MOP_LIVE_CLOUD_TEST=1 to create a disposable vault in the signed build CloudKit environment.')
 # Retain recovery material and state until the operator deletes the remote test zone.
-directory = tempfile.mkdtemp(prefix='mop-cloud-hardware-040-')
+directory = tempfile.mkdtemp(prefix='mop-cloud-hardware-050-')
 root = Path(directory)
 vault_id = str(uuid.uuid4())
 environment = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
-               'MOP_CLOUD_VAULT': vault_id,
                'MOP_STATE_DIRECTORY': str(root / 'state')}
 print(f'Disposable cloud vault: {vault_id}; retained local fixtures: {root}', flush=True)
 first = b'disposable-multiline-value\nsecond line'
 second = b'disposable-other-token'
-ref_a = 'mop://test/service/api/token'
-ref_b = 'mop://test/service/password'
+vault_name = 'test-' + vault_id
+ref_a = f'mop://{vault_name}/service/api/token'
+ref_b = f'mop://{vault_name}/service/password'
 
 def command(label, args, data=b'', extra=None, code=0):
     print(label + ': authenticate when prompted.', flush=True)
     try:
-        result = subprocess.run([mop, *args], input=data, capture_output=True,
+        routed = list(args)
+        position = routed.index('--') if '--' in routed else len(routed)
+        routed[position:position] = ['--vault', vault_id]
+        result = subprocess.run([mop, *routed], input=data, capture_output=True,
                                 env=environment | (extra or {}), timeout=120)
     except subprocess.TimeoutExpired:
         raise SystemExit(f'{label}: authentication/command timed out; local fixtures are retained for recovery.')
@@ -38,8 +41,8 @@ def command(label, args, data=b'', extra=None, code=0):
         raise SystemExit(f'{label} failed with code {result.returncode}; expected {code}')
     return result
 
-command('Initialize disposable vault', ['vault', 'init', '--recovery-file', str(root / 'recovery.key'),
-                                       '--name', 'Disposable mop v3 test'] + (['--strict-biometrics'] if os.environ.get('MOP_TEST_STRICT_BIOMETRICS') == '1' else []))
+command('Initialize disposable vault', ['vault', 'init', vault_name, '--recovery-file', str(root / 'recovery.key'),
+                                       '--device-name', 'Disposable mop v4 test'] + (['--strict-biometrics'] if os.environ.get('MOP_TEST_STRICT_BIOMETRICS') == '1' else []))
 command('Write sectioned multiline field', ['write', ref_a], first)
 command('Write second field', ['write', ref_b], second)
 # Hash assertions verify delivery without placing secret values in argv.
@@ -49,9 +52,9 @@ child = ("import os,hashlib; "
          f"assert hashlib.sha256(os.environ['B'].encode()).hexdigest() == '{hashlib.sha256(second).hexdigest()}'; "
          "os.write(1,os.environ['A'].encode()); os.write(2,os.environ['B'].encode())")
 result = command('Run with two fields and a repeated reference', ['run', '--', sys.executable, '-c', child],
-                 extra={'A': 'mop://$VAULT/service/api/token', 'REPEAT': ref_a, 'B': ref_b, 'VAULT': 'test'})
+                 extra={'A': 'mop://$VAULT/service/api/token', 'REPEAT': ref_a, 'B': ref_b, 'VAULT': vault_name})
 assert result.stdout == b'[concealed by mop]' and result.stderr == b'[concealed by mop]', 'Masking failed'
-template = ('{{' + ref_a + '}}|{{mop://test/service/${FIELD}}}|{{' + ref_a + '}}').encode()
+template = ('{{' + ref_a + '}}|{{mop://' + vault_name + '/service/${FIELD}}}|{{' + ref_a + '}}').encode()
 output = root / 'config'
 result = command('Inject atomically with expanded references', ['inject', '-o', str(output)], template,
                  extra={'FIELD': 'password'})
@@ -63,6 +66,6 @@ read_file = root / 'read'
 command('Read multiline field without appended newline', ['read', ref_a, '-n', '-o', str(read_file)])
 assert read_file.read_bytes() == first, 'Read output differed'
 result = command('Reject partial template output for a missing field', ['inject', '-o', str(output), '-f'],
-                 ('{{' + ref_a + '}}{{mop://test/missing/field}}').encode(), code=4)
+                 ('{{' + ref_a + '}}{{mop://' + vault_name + '/missing/field}}').encode(), code=4)
 assert result.stdout == b'' and output.read_bytes() == expected, 'Failed lookup altered output'
 print('PASS: release hardware CRUD, sections, expansion, masking, repeated references, atomic output, and failure without partial output.', flush=True)

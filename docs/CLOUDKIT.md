@@ -27,7 +27,7 @@ zones during normal reads/writes.
 The `payload` asset already contains mop ciphertext, or public metadata for
 requests. A manifest contains the existing authenticated header and encrypted
 index plus a map from secret record UUID to ciphertext hash. Reconstructing the
-canonical v3 document authenticates the complete record table. A manifest's ID is
+canonical v4 document authenticates the complete record table. A manifest's ID is
 the hash of that complete document, not the hash of the manifest bytes.
 
 Only the small head record is mutable. Its save uses the fetched record's system
@@ -42,7 +42,7 @@ Apple Account. Use the same signing identity/App ID on both Macs, and isolated
 `MOP_STATE_DIRECTORY` locations. Keep all recovery material offline after testing;
 record the test vault UUIDs for deliberate cleanup in CloudKit Console.
 
-1. On A run `vault init`, write at least two secrets, export a v3 backup, and verify
+1. On A run `vault init personal`, write at least two secrets, export a v4 backup, and verify
    the values. Inspect CloudKit Console: it must contain no plaintext secret value
    or secret reference. Note the authenticated vault fingerprint independently.
 2. On B list/use the UUID, publish `device request`. On A approve it after comparing
@@ -84,15 +84,32 @@ walks the committed chain to distinguish success from an abandoned mutation.
 If the head is absent it records `head-missing`, clears the interrupted journal,
 and still reports a missing vault; only explicit creation/import can recreate it.
 Initialization prints its target UUID before publication so this can be reconciled
-with `vault sync --cloud-vault UUID` even if no default was saved.
+with `vault sync --vault UUID` even if no default was saved.
 Authentication and explicit trust are still required before reading staged or
 cached contents. A locally generated pending fingerprint permits finishing our
 own interrupted initialization/key rotation, never trusting a fingerprint fetched
 from CloudKit.
 
-Exports are encrypted v3 documents and can be imported only into an absent head.
+Exports are encrypted v4 documents and can be imported only into an absent head.
 An import is an explicit creation operation; it may recreate a previously deleted
 zone after verification. Import does not bring along older external history files.
 There is no automatic history/staging garbage collector yet. Delete disposable
 zones in CloudKit Console after acceptance and remove only their isolated local
 state/Keychain items. Never delete a live device's key as test cleanup.
+
+## Named vaults (0.5)
+
+New manifests use `mop-cloud-manifest-v2`, containing `mop-vault-v4` headers
+with a required name. The encrypted index maps relative `item/[section/]field`
+paths to record IDs. UUID-based zones and record encryption remain unchanged;
+the existing v3 cryptographic domain strings are retained because their key-wrap
+and value-encryption protocols are unchanged. Header names are included in index
+associated data, so changing an unauthenticated discovery name cannot authorize
+access. Rename publishes a normal revision without uploading new secret blobs.
+Restoring history retains the current name and authorization.
+
+Discovery reads committed heads/manifests without decrypting secrets. Legacy
+manifests are reported but not opened. Creation/import/rename check current name
+availability; separate-zone races can still create duplicates and resolution then
+fails explicitly. UUID selection remains available to repair names. No global
+name registry or cross-zone transaction is introduced.

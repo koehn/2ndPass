@@ -19,6 +19,7 @@ public protocol CloudTransport: Sendable {
     func validateOfflineAccount() async throws
     func zones() async throws -> [UUID]
     func createZone(_ vault: UUID) async throws
+    func deleteZone(_ vault: UUID) async throws
     func fetch(_ id: String, vault: UUID) async throws -> CloudObject?
     func save(_ id: String, kind: CloudKind, data: Data, vault: UUID, expected: Data?) async throws -> CloudObject
     func requests(vault: UUID) async throws -> [String]
@@ -36,15 +37,15 @@ struct CloudManifest: Codable, Sendable {
     let records: [String: String]
 
     init(document: VaultDocument) throws {
-        format = "mop-cloud-manifest-v1"
+        format = "mop-cloud-manifest-v2"
         header = document.header
         sealed = document.sealed
         records = try document.records.mapValues { VaultCoding.digest(try VaultCoding.encode($0)) }
     }
 
     func document(records values: [String: VaultRecord]) throws -> VaultDocument {
-        guard format == "mop-cloud-manifest-v1", Set(records.keys) == Set(values.keys) else { throw MopError.invalidVault }
-        // Decode through the existing v3 validator, including its size limit.
+        guard format == "mop-cloud-manifest-v2", Set(records.keys) == Set(values.keys) else { throw MopError.invalidVault }
+        // Decode through the v4 validator, including its size limit.
         struct Parts: Encodable { let header: VaultHeader; let sealed: Data; let records: [String: VaultRecord] }
         return try VaultDocument.decode(VaultCoding.encode(Parts(header: header, sealed: sealed, records: values)))
     }

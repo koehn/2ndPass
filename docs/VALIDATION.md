@@ -2,8 +2,7 @@
 
 ## CloudKit development design
 
-The CloudKit-only CLI is a breaking change from operational file storage. Import
-existing v3 vaults explicitly. Unit tests use software keys only in test targets;
+Version 0.5 requires fresh v4 named vaults; legacy formats have no migration. Unit tests use software keys only in test targets;
 production has no software-key or unsigned-build fallback.
 
 The new CloudKit suite uses an injectable in-memory server with conditional saves,
@@ -20,7 +19,7 @@ python3 scripts/smoke-test.py /path/from/swift-build-show-bin-path/mop
 bash -n scripts/package.sh scripts/install.sh
 ```
 
-Restricted sandboxes can block NSFileCoordinator and pseudo-terminal tests and
+Restricted sandboxes can block compiler plugins and pseudo-terminal tests and
 inject Python temporary-directory warnings into captured output. Run the full
 suite in a normal local development environment. Module caches may need a
 writable path in restricted environments.
@@ -126,3 +125,32 @@ Per-record encryption is not an enclave-enforced allowlist: compromised
 already-authorized mop code could unwrap other records. Keys and requested
 plaintext still enter ordinary memory. An independent cryptographic and OS
 integration audit remains outstanding.
+
+## Named-vault release acceptance
+
+Use two signed Macs and disposable vaults. Create `personal` on A; discover its
+name without unlocking on B, enroll B using independently compared fingerprints,
+and verify `mop://personal/mycloud/sshd` resolves on both. Add multiple fields
+including a section and confirm a single GUI item row. Create another named vault
+and verify cross-vault `run`/`inject` and all-vault listing.
+
+Rename `personal` on A. Verify the UUID, fingerprint, recovery access, and values
+are unchanged; online B must reject the old name and discover the new name.
+Before syncing B, explicitly test its verified offline snapshot with the old name.
+Exercise duplicate names from concurrent clients, repair by UUID, and verify
+legacy vaults remain unchanged. Export/import a v4 backup into an absent head,
+and restore pre-rename history while retaining the current name.
+
+These are manual release gates; passing software-key unit tests does not establish
+signed CloudKit, Secure Enclave, or two-Mac acceptance.
+
+## Vault deletion acceptance
+
+On disposable signed vaults, exercise CLI typed confirmation, cancellation,
+`--yes` with authentication cancellation, and GUI typed confirmation. Export from
+the GUI before deleting; confirm the backup is readable with its recovery key.
+Delete a named vault and a legacy vault by UUID, and confirm only those CloudKit
+zones disappear. Verify the current Mac's scoped cache/default are removed while
+other vaults and shared device keys still work. A second Mac's offline cache must
+remain until separately removed. Test a lost delete response and retry the same
+UUID; no successful deletion should be reported without verified remote absence.

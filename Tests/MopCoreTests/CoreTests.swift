@@ -23,14 +23,14 @@ private final class MemoryStore: SecretStore {
     func close() { closes += 1 }
 }
 
-@Test func referencesAreCaseSensitiveAndUnambiguous() throws {
-    let ref = try SecretReference("mop://Personal/an%2Fitem/%E2%9C%93%20token")
-    #expect(ref.vault == "Personal")
+@Test func referenceItemsAreCaseSensitiveAndUnambiguous() throws {
+    let ref = try SecretReference("mop://personal/an%2Fitem/%E2%9C%93%20token")
+    #expect(ref.vault == "personal")
     #expect(ref.item == "an/item")
     #expect(ref.field == "✓ token")
-    #expect(ref.description == "mop://Personal/an%2Fitem/%E2%9C%93%20token")
+    #expect(ref.description == "mop://personal/an%2Fitem/%E2%9C%93%20token")
     #expect(try SecretReference("mop://v/i/%74oken") == SecretReference("mop://v/i/token"))
-    #expect(try SecretReference("mop://v/i/token") != SecretReference("mop://V/i/token"))
+    #expect(try SecretReference("mop://v/i/token") != SecretReference("mop://v/I/token"))
     #expect(try SecretReference("mop://v/i/%252F").field == "%2F")
     let composed = try SecretReference("mop://v/%C3%A9/f")
     let decomposed = try SecretReference("mop://v/e%CC%81/f")
@@ -151,9 +151,9 @@ func rejectsInvalidDotenv(_ input: String) {
     #expect(section.section == "s")
     #expect(section.description == "mop://v/i/s/f")
     let expanded = try ReferenceExpansion.resolve("mop://$VAULT/i/${SECTION}/pre-${FIELD}", variables: [
-        "VAULT": "a/b", "SECTION": "多 行", "FIELD": "${LITERAL}?/#"
+        "VAULT": "a-b", "SECTION": "多 行", "FIELD": "${LITERAL}?/#"
     ])
-    #expect(expanded.vault == "a/b")
+    #expect(expanded.vault == "a-b")
     #expect(expanded.section == "多 行")
     #expect(expanded.field == "pre-${LITERAL}?/#")
     #expect(try ReferenceExpansion.resolve("mop://v/i/%24NAME", variables: [:]).field == "$NAME")
@@ -204,4 +204,17 @@ func rejectsInvalidDotenv(_ input: String) {
     var masker = SecretMasker(patterns: MaskPatterns(secrets: result.secrets))
     let input = Data((result.variables["A"]! + "|" + result.variables["B"]!).utf8)
     #expect(masker.consume(SecretBytes(copying: input), final: true) == "[concealed by mop]|[concealed by mop]")
+}
+
+@Test func namedVaultValidationAndRelativePaths() throws {
+    for name in ["personal", "work-prod", "1", String(repeating: "a", count: 63)] {
+        try VaultName.validate(name)
+    }
+    for name in ["", "Personal", "a b", "a/b", "-a", "a-", "a--b", "é", "a\n", String(repeating: "a", count: 64)] {
+        #expect(throws: MopError.invalidVaultName) { try VaultName.validate(name) }
+    }
+    let ref = try SecretReference("mop://personal/my%2Fcloud/a%20section/%E2%9C%93")
+    #expect(ref.relativePath == "my%2Fcloud/a%20section/%E2%9C%93")
+    #expect(try SecretReference(vault: "private", relativePath: ref.relativePath).vault == "private")
+    #expect(throws: MopError.invalidReference) { try SecretReference(vault: "personal", relativePath: "item/%74oken") }
 }

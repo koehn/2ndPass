@@ -31,7 +31,7 @@ def run(args, *, data=b"", code=0, output=None, env=None):
 
 
 run(["--help"])
-run(["--version"], output=b"0.4.0\n")
+run(["--version"], output=b"0.5.0\n")
 for shell in ('bash', 'zsh', 'fish'):
     script = run(['completion', shell]).stdout
     assert script and script == run(['--generate-completion-script', shell]).stdout
@@ -41,12 +41,27 @@ for command in ("read", "write", "list", "delete", "run", "inject", "vault", "de
     run([command, "--help"])
 run(["vault", "trust", "--help"])
 run(["vault", "fingerprint", "--help"])
+run(["vault", "rename", "--help"])
+run(["vault", "delete", "--help"])
+run(["vault", "delete", "personal"], code=2, output=b"")
+run(["vault", "delete", "personal", "--yes", "--offline"], code=2, output=b"")
+run(["vault", "delete", "personal", "--yes"], code=8, output=b"")
+run(["vault", "list", "--json", "--help"])
+run(["vault", "init", "--recovery-file", "/unused"], code=2, output=b"")
+run(["vault", "init", "Invalid", "--recovery-file", "/unused"], code=23, output=b"")
+run(["vault", "rename", "personal", "Invalid"], code=23, output=b"")
+run(["vault", "rename", "personal", "private", "--offline"], code=2, output=b"")
+run(["list", "--cloud-vault", str(uuid.uuid4())], code=2, output=b"")
 run(["vault", "trust"], code=2, output=b"")
 run(["vault", "trust", "--fingerprint", "invalid"], code=2, output=b"")
 run(["vault", "trust", "--fingerprint", "0" * 64, "--revision", "0" * 64], code=2, output=b"")
 run(["vault", "recover", "--recovery-file", "/unused", "--fingerprint", "invalid"], code=2, output=b"")
 run(["read", "mop://v/i/f", "--vault-file", "/unused"], code=2, output=b"")
-run(["read", "mop://v/i/f"], env={"MOP_VAULT_FILE": "/unused"}, code=2, output=b"")
+legacy = run(["read", "mop://v/i/f"], env={"MOP_VAULT_FILE": "/sensitive-path-not-for-output"}, code=2, output=b"")
+assert b"Unset MOP_VAULT_FILE" in legacy.stderr
+assert b"sensitive-path-not-for-output" not in legacy.stderr
+confirmation = run(["vault", "delete", "personal"], code=2, output=b"")
+assert b"interactive confirmation or --yes" in confirmation.stderr
 run(["write", "mop://v/i/f", "--offline"], code=2, output=b"")
 run(["delete", "mop://v/i/f", "--offline"], code=2, output=b"")
 for command in ("list", "use", "sync", "status", "import", "export"):

@@ -24,7 +24,7 @@ let package = Package(
         .target(name: "MopCloudKit", dependencies: ["MopCore", "MopVault", "MopKeychain"]),
         .target(name: "MopVault", dependencies: ["MopCore", "MopAuth", "MopKeychain"]),
         .executableTarget(name: "MopCLI", dependencies: [
-            "MopCore", "MopVault", "MopKeychain", "MopCloudKit",
+            "MopCore", "MopVault", "MopKeychain", "MopCloudKit", "MopAuth",
             .product(name: "ArgumentParser", package: "swift-argument-parser"),
         ]),
         .executableTarget(name: "MopKeychainCheck", dependencies: ["MopCore", "MopKeychain", "MopAuth"]),

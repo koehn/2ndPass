@@ -25,7 +25,7 @@ struct CLIClientTests {
         } catch { #expect(error.localizedDescription.contains("Authentication")) }
     }
     @Test func explicitSelectionAndOfflineArguments() {
-        #expect(CLIClient.arguments(["list", "--json"], vault: "uuid", offline: true) == ["list", "--json", "--cloud-vault", "uuid", "--offline"])
+        #expect(CLIClient.arguments(["list", "--json"], vault: "uuid", offline: true) == ["list", "--json", "--vault", "uuid", "--offline"])
         #expect(CLIClient.arguments(["vault", "list"], vault: nil, offline: false) == ["vault", "list"])
     }
     @Test func valueUsesStdinPreservesBytesAndDoesNotUseShell() async throws {

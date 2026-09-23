@@ -100,3 +100,22 @@ Official bottles are generated through Homebrew's submission workflow.
 See the [formula cookbook](https://docs.brew.sh/Formula-Cookbook),
 [formula requirements](https://docs.brew.sh/Acceptable-Formulae), and
 [package acceptance policy](https://docs.brew.sh/Package-Acceptance-Policy).
+
+## 0.5.0 breaking format change
+
+Named vaults replace the separate cloud-vault/namespace model. The reference's
+first component now selects the encrypted vault; the GUI groups fields by item.
+Fresh v4 vaults and v2 manifests are required. No migration or automatic deletion
+is provided; preserve old vaults and use an older client to read them.
+
+The legacy file-vault backend and filesystem history/conflict APIs are removed.
+CloudKit uses an in-memory `VaultSession`; encrypted v4 backup import/export,
+recovery files, and verified offline caches remain supported. Obsolete file-vault
+options are rejected with a diagnostic.
+
+Vault names are discoverable metadata. Renames keep UUIDs, keys, enrollment, and
+records but invalidate old references; no aliases are retained. `mop list` spans
+enrolled vaults, `run`/`inject` support multiple vaults, and `--vault` replaces
+`--cloud-vault`. `MOP_CLOUD_VAULT` no longer selects a vault. Initialization now
+requires a positional vault name and uses `--device-name` for the Mac's name.
+Complete the named-vault two-Mac checks in VALIDATION.md before publishing.

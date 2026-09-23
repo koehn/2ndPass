@@ -29,20 +29,28 @@ decryption capability; it does not require the original Mac, enclave, or biometr
 ## Storage and account binding
 
 Operational storage is CloudKit. `--vault-file` and `MOP_VAULT_FILE` are rejected;
-use explicit `vault import --file` to migrate a v3 file. Select an independent vault
-by `--cloud-vault UUID`, then `MOP_CLOUD_VAULT`, then the account-scoped saved default.
-The logical vault name inside `mop://personal/service/token` is a namespace within
-that selected independent vault, not a separate CloudKit authorization boundary.
+use explicit `vault import --file` for v4 backups. Older formats are rejected;
+there is no migration, and existing remote data is not modified.
+The first reference component selects the actual encrypted vault by name.
+`--vault NAME-OR-UUID` constrains reference commands; saved defaults apply only
+to management. Names are public, authenticated header metadata, discovered before
+unlocking and checked against the authenticated snapshot before secret access.
+Discovery is not trust evidence. Item/section/field paths are encrypted relative
+index keys. Renames preserve keys and record ciphertext and invalidate old names.
+Name collisions fail explicitly; use UUID selection to resolve them. Offline
+name lookup uses verified snapshots, which can lag remote renames.
+
 
 | Material | Location and handling |
 |---|---|
+| Vault names | Discoverable authenticated header metadata visible to CloudKit and locally cached with snapshots. |
 | Encrypted records and manifests | Private CloudKit zone per independent vault UUID. Immutable encrypted records are referenced by revision manifests; a conditional head update publishes a revision. |
 | Index and value keys | Random AES-256 keys, independently wrapped per device and recovery recipient. Only requested record keys are unwrapped during ordinary reads. |
 | Device private-key representation | Application-specific Data Protection Keychain, service `mop.device-key.v2`. Opaque enclave blob; nonsynchronizing, authentication protected, this-device-only. |
 | Device metadata | `~/.mop/device.json`: public key, display name, Keychain account UUID, and authentication policy. No private-key blob. |
 | Local account binding, trust, snapshots, journals | Under `~/.mop/cloud/`, scoped by container, environment, account, and vault UUID. Never synchronize the state directory. Its integrity matters even though it contains no plaintext secrets or recovery private key. |
 | Recovery credential | User-selected file containing `mop-recovery-v1:` plus an exportable P-256 private key in Base64. Base64 is not encryption. Move offline and keep separate from synchronized ciphertext/backups. |
-| Encrypted export | User-selected `.mopfile` from `vault export`. Complete encrypted v3 snapshot, without the recovery private key. Retain independent trust evidence and the vault UUID. |
+| Encrypted export | User-selected `.mopfile` from `vault export`. Complete encrypted v4 snapshot, without the recovery private key. Retain independent trust evidence and the vault UUID. |
 
 `--state-directory` or `MOP_STATE_DIRECTORY` overrides `~/.mop`. Preserve the device
 metadata, Keychain item, and local trust across upgrades. A new directory does not
@@ -383,7 +391,7 @@ and watermarks; they are not hardware-sealed monotonic counters.
 Initialize and retain the printed vault UUID and fingerprint independently:
 
 ```sh
-mop vault init --recovery-file /offline/mop-recovery.key --name 'First Mac'
+mop vault init personal --recovery-file /offline/mop-recovery.key --device-name 'First Mac'
 mop vault list
 mop vault use VAULT_UUID
 ```
@@ -471,15 +479,17 @@ mop vault resolve --revision COMMITTED_REVISION_HASH
 Import verifies established source-path trust or independent evidence, preserves
 vault identity/recovery relationships, refuses an existing destination head, and
 leaves the source untouched. A replacement Mac can add `--recovery-file` to import
-and enroll before publication. Imports do not upload legacy `.history` directories.
+and enroll before publication. Imports accept encrypted v4 backups only.
 Restoration selects only committed ancestry and retains current recipients/keys,
 re-encrypting historical values for them. It cannot reinstate a revoked device.
 Local trust completion and server publication are separate transactions; preserve
 trusted evidence and reconcile if publication succeeds but local completion fails.
 
-`VaultDisk`/`FileSecretStore` remain legacy adapter APIs for tests and migration.
-Their path-scoped pins, filesystem coordination, `.history` files, and lack of
-same-key generation watermarks do not describe the operational CloudKit backend.
+The legacy `VaultDisk`/`FileSecretStore` backend, filesystem conflict resolution,
+and `.history` storage have been removed. `VaultSession` operates on encrypted
+snapshots in memory; CloudKit handles publication and committed history. `SafeFile`
+still protects backup, recovery, and local cache files. Older vault formats are
+rejected, with no migration or modification of their data.
 
 ## Plaintext, files, and the native app
 
@@ -553,3 +563,22 @@ discards visible results. Explicit lock, session deactivation, and sleep also cl
 owned clipboard contents. Ordinary app switching allows pasting until expiration.
 Submitted mutations can still complete after locking; reconcile uncertain results
 with Sync. The app does not persist plaintext in preferences or logs.
+
+## Vault deletion
+
+`vault delete NAME-OR-UUID` requires explicit typed confirmation (`--yes` in
+noninteractive callers), a valid signed client, and fresh device-owner
+Touch ID/password authentication. This operation uses the Apple Account's private
+CloudKit database authority; it does not require vault decryption or enrollment,
+so it can remove legacy or damaged vaults. It does not unwrap secret keys and is
+not governed by a vault device key's strict-biometric setting. The GUI confirms
+the same fixed UUID and calls this CLI path.
+
+Deletion removes a whole UUID zone, including history and staging. A readback in
+the same account must confirm zone absence before clearing scoped local snapshots,
+trust, journals, and the matching management default. Per-zone discovery errors
+fail closed. An active local writer blocks deletion. A small deletion marker and
+lock files remain to prevent an already-open session from repopulating its offline
+snapshot; explicit backup import can restore that UUID. Shared device identity,
+Keychain entries, exports, and other Macs' caches are not removed. This is logical
+deletion, not a secure-erasure guarantee for prior filesystem or cloud copies.

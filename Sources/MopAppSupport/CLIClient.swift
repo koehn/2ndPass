@@ -33,7 +33,8 @@ public enum CLIError: LocalizedError, Sendable {
                 10: .invalidVault, 11: .vaultConflict, 12: .deviceUnavailable, 13: .deviceNotEnrolled,
                 14: .invalidDevice, 15: .filePermissions, 16: .vaultUntrusted, 17: .cloudUnavailable,
                 18: .cloudAccount, 19: .cloudQuota, 20: .cloudThrottled, 21: .cloudPermission,
-                22: .cloudUncertain]
+                22: .cloudUncertain, 23: .invalidVaultName, 24: .ambiguousVault,
+                25: .vaultSelectionMismatch, 26: .legacyVault, 27: .vaultDeleteUncertain, 28: .vaultDeleteCleanup]
             return errors[code]?.errorDescription ?? "The command did not complete successfully."
         }
     }
@@ -44,7 +45,7 @@ public struct CLIClient: Sendable {
     public init(executable: URL) { self.executable = executable }
 
     public static func arguments(_ command: [String], vault: String?, offline: Bool) -> [String] {
-        command + (vault.map { ["--cloud-vault", $0] } ?? []) + (offline ? ["--offline"] : [])
+        command + (vault.map { ["--vault", $0] } ?? []) + (offline ? ["--offline"] : [])
     }
 
     public static func environment(_ inherited: [String: String]) -> [String: String] {

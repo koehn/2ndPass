@@ -28,7 +28,19 @@ private actor MemoryCloud: CloudTransport {
     var barrier = false
     var waiter: CheckedContinuation<Void, Never>?
     func account() throws -> String { if let accountError { throw accountError }; return user }
-    func zones() -> [UUID] { Array(data.keys) }
+    var zonesError: MopError?
+    var readbackError: MopError?
+    func zones() throws -> [UUID] { if let zonesError { throw zonesError }; return Array(data.keys) }
+    func setReadbackError(_ error: MopError?) { readbackError = error; zonesError = nil }
+    func deleteZone(_ id: UUID) throws {
+        if let deleteError, !deleteDespiteError { throw deleteError }
+        data.removeValue(forKey: id); deletions.append(id); zonesError = readbackError
+        if let deleteError { throw deleteError }
+    }
+    var deleteError: MopError?
+    var deleteDespiteError = false
+    var deletions: [UUID] = []
+    func configureDeletion(_ error: MopError?, despiteError: Bool = false) { deleteError = error; deleteDespiteError = despiteError }
     func createZone(_ id: UUID) { if data[id] == nil { data[id] = [:] } }
     func fetch(_ id: String, vault: UUID) throws -> CloudObject? {
         fetches.append(id)
@@ -84,7 +96,7 @@ private func fixture() async throws -> Fixture {
     let repo = try await CloudRepository.open(transport: cloud, state: directory)
     let device = TestDevice()
     let recovery = RecoveryKey()
-    let bytes = try FileSecretStore.createSnapshot(device: device.request, recovery: recovery)
+    let bytes = try VaultSession.createSnapshot(name: "v", device: device.request, recovery: recovery)
     let doc = try VaultDocument.decode(bytes)
     let key = try device.unwrap(doc.header.recipients.first { $0.publicKey == device.publicKey }!, vaultID: doc.header.vaultID)
     let vault = try await repo.create(bytes, fingerprint: VaultTrust.fingerprint(document: doc, key: key))
@@ -96,8 +108,8 @@ private func fixture() async throws -> Fixture {
 @Test func cloudRoundTripAndIncrementalRecords() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
-    let a = try SecretReference("mop://personal/github/token")
-    let b = try SecretReference("mop://work/database/password")
+    let a = try SecretReference("mop://v/github/token")
+    let b = try SecretReference("mop://v/database/password")
     try await store.write(a, value: "UNIQUE-SECRET", replace: false)
     try await store.write(b, value: "second", replace: false)
     await f.cloud.resetCounters()
@@ -110,14 +122,14 @@ private func fixture() async throws -> Fixture {
     let opened = try await f.store(); defer { opened.close() }
     #expect(try opened.read(a) == "replacement")
     #expect(try opened.read(b) == "second")
-    #expect(try VaultDocument.decode(opened.snapshot).header.format == "mop-vault-v3")
+    #expect(try VaultDocument.decode(opened.snapshot).header.format == "mop-vault-v4")
     let remote = await f.cloud.data[f.vault.id]!
     for item in remote.values {
         let text = String(decoding: item.data, as: UTF8.self)
         #expect(!text.contains("UNIQUE-SECRET"))
         #expect(!text.contains(a.description))
     }
-    let legacy = try FileSecretStore(snapshot: opened.snapshot, trust: f.vault.trust, opener: f.device)
+    let legacy = try VaultSession(snapshot: opened.snapshot, trust: f.vault.trust, opener: f.device)
     defer { legacy.close() }
     #expect(try legacy.read(b) == "second")
 }
@@ -246,7 +258,7 @@ private func fixture() async throws -> Fixture {
     lease.close()
     await f.cloud.removeZone(f.vault.id)
     await #expect(throws: MopError.vaultMissing) { try await f.vault.sync() }
-    #expect(await f.cloud.zones().isEmpty)
+    #expect(try await f.cloud.zones().isEmpty)
 }
 
 @Test func asynchronousExpansionNeedsNoCloudForLiteralInputs() async throws {
@@ -321,7 +333,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
 @Test func multipleVaultDefaultsImportAndRecoveryPreserveIdentity() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let second = TestDevice()
-    let bytes = try VaultSession.createSnapshot(device: second.request, recovery: f.recovery)
+    let bytes = try VaultSession.createSnapshot(name: "second", device: second.request, recovery: f.recovery)
     let doc = try VaultDocument.decode(bytes)
     let key = try second.unwrap(doc.header.recipients.first { $0.publicKey == second.publicKey }!, vaultID: doc.header.vaultID)
     let fingerprint = VaultTrust.fingerprint(document: doc, key: key)
@@ -358,7 +370,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     let cloud = MemoryCloud()
     let repo = try await CloudRepository.open(transport: cloud, state: directory)
     let device = TestDevice()
-    let bytes = try VaultSession.createSnapshot(device: device.request, recovery: RecoveryKey())
+    let bytes = try VaultSession.createSnapshot(name: "v", device: device.request, recovery: RecoveryKey())
     let doc = try VaultDocument.decode(bytes)
     let slot = doc.header.recipients.first { $0.publicKey == device.publicKey }!
     let fingerprint = try VaultTrust.fingerprint(document: doc, key: device.unwrap(slot, vaultID: doc.header.vaultID))
@@ -402,7 +414,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     for attempt in 0..<3 {
         let invalid = Data(repeating: UInt8(65 + attempt), count: 65_536)
         let hash = VaultCoding.digest(invalid)
-        let manifest: [String: Any] = ["format": "mop-cloud-manifest-v1", "header": parts["header"]!,
+        let manifest: [String: Any] = ["format": "mop-cloud-manifest-v2", "header": parts["header"]!,
             "sealed": parts["sealed"]!, "records": [UUID().uuidString: hash]]
         await f.cloud.replace("head", vault: f.vault.id,
             bytes: try VaultCoding.encode(CloudHead(revision: digest, root: digest)))
@@ -421,7 +433,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     let f = try await fixture(); defer { f.cleanup() }
     let session = try VaultSession(snapshot: f.initial, trust: f.vault.trust, opener: f.device)
     defer { session.close() }
-    let ref = try SecretReference("mop://fixture/item/token")
+    let ref = try SecretReference("mop://v/item/token")
     let originalFiles = try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path).sorted()
     for attempt in 0..<8 {
         let before = session.snapshot
@@ -452,7 +464,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
 @Test func validRecordsInARejectedRevisionDoNotLeaveCacheFiles() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
-    try await store.write(SecretReference("mop://fixture/item/token"), value: "fixture-value", replace: false)
+    try await store.write(SecretReference("mop://v/item/token"), value: "fixture-value", replace: false)
     let doc = try VaultDocument.decode(store.snapshot)
     let wrongDigest = String(repeating: "a", count: 64)
     await f.cloud.replace("m-" + wrongDigest, vault: f.vault.id, bytes: try VaultCoding.encode(CloudManifest(document: doc)))
@@ -463,4 +475,270 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     await #expect(throws: MopError.invalidVault) { try await vault.sync() }
     #expect(try FileManager.default.contentsOfDirectory(atPath: cache.directory.path).sorted() == ["lock", "writer.lock"])
     #expect(throws: MopError.vaultMissing) { try vault.cached() }
+}
+
+private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
+    let bytes = try VaultSession.createSnapshot(name: name, device: f.device.request, recovery: f.recovery)
+    let doc = try VaultDocument.decode(bytes)
+    let key = try f.device.unwrap(doc.header.recipients.first { $0.publicKey == f.device.publicKey }!, vaultID: doc.header.vaultID)
+    let vault = try await f.repo.create(bytes, fingerprint: VaultTrust.fingerprint(document: doc, key: key))
+    let store = try CloudSecretStore(vault: vault, snapshot: bytes, opener: f.device)
+    store.close()
+    return vault
+}
+
+@Test func namesDiscoverRenameAndResolveAcrossVerifiedOfflineSnapshots() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let initial = try await f.repo.descriptors(publicKey: f.device.publicKey)
+    #expect(initial == [VaultDescriptor(id: f.vault.id.uuidString, name: "v", format: "mop-vault-v4", enrolled: true)])
+    #expect(try await f.repo.named("v").id == f.vault.id)
+    await #expect(throws: MopError.duplicate) { try await f.repo.ensureAvailable("v") }
+    let store = try await f.store(); defer { store.close() }
+    try await store.write(SecretReference("mop://v/mycloud/sshd"), value: "secret", replace: false)
+    let before = try VaultDocument.decode(store.snapshot)
+    let offline = try await CloudRepository.open(transport: f.cloud, state: f.directory, offline: true)
+    await f.cloud.resetCounters()
+    #expect(try await offline.named("v").id == f.vault.id)
+    #expect(await f.cloud.fetches.isEmpty)
+    try await store.rename("personal")
+    let after = try VaultDocument.decode(store.snapshot)
+    #expect(before.records == after.records)
+    #expect(try await f.repo.named("personal").id == f.vault.id)
+    await #expect(throws: MopError.vaultMissing) { _ = try await f.repo.named("v") }
+    #expect(try await offline.named("personal").id == f.vault.id)
+    let cached = try CloudSecretStore(vault: f.vault, snapshot: f.vault.cached().0, opener: f.device, offline: true)
+    defer { cached.close() }
+    await #expect(throws: MopError.offlineWrite) { try await cached.rename("other") }
+}
+
+@Test func multiVaultRoutingIgnoresDefaultAndClosesSessionsAfterFailures() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let second = try await addVault(f, name: "personal")
+    let one = try await f.store()
+    try await one.write(SecretReference("mop://v/item/token"), value: "first", replace: false); one.close()
+    let two = try CloudSecretStore(vault: second, snapshot: await second.sync(), opener: f.device)
+    try await two.write(SecretReference("mop://personal/item/token"), value: "second", replace: false); two.close()
+    try f.repo.use(second.id)
+    let rows = try await f.repo.descriptors(publicKey: f.device.publicKey)
+    var opens = 0, closes = 0
+    func router(_ selection: String? = nil) -> RoutedSecretStore {
+        RoutedSecretStore(repository: f.repo, rows: rows, selection: selection) { row in
+            opens += 1
+            let vault = try f.repo.vault(UUID(uuidString: row.id)!)
+            return try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.device, onClose: { closes += 1 })
+        }
+    }
+    let service = AsyncSecretService { router() }
+    #expect(try await service.inject("{{mop://v/item/token}} {{mop://personal/item/token}} {{mop://v/item/token}}") == "first second first")
+    #expect(opens == 2 && closes == 2)
+    #expect(try await service.list(vault: nil).map(\.vault) == ["personal", "v"])
+    #expect(opens == 4 && closes == 4)
+    await #expect(throws: MopError.notFound) { try await service.inject("{{mop://v/item/token}}{{mop://personal/item/missing}}") }
+    #expect(opens == 6 && closes == 6)
+    let constrained = AsyncSecretService { router(second.id.uuidString) }
+    await #expect(throws: MopError.vaultSelectionMismatch) { try await constrained.read(SecretReference("mop://v/item/token")) }
+    #expect(opens == 6)
+    await #expect(throws: MopError.vaultMissing) { try await service.read(SecretReference("mop://unknown/item/token")) }
+    #expect(opens == 6)
+}
+
+@Test func concurrentDuplicateNamesRequireUUIDAndTamperedNamesCannotRouteSecrets() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let other = try await addVault(f, name: "other")
+    await #expect(throws: MopError.duplicate) { try await f.repo.ensureAvailable("v", excluding: other.id) }
+    // Simulate two clients passing availability checks before either commits.
+    let store = try CloudSecretStore(vault: other, snapshot: await other.sync(), opener: f.device)
+    try await store.rename("v"); store.close()
+    await #expect(throws: MopError.ambiguousVault) { _ = try await f.repo.named("v") }
+    #expect(try await f.repo.named(other.id.uuidString).id == other.id)
+    let repair = try CloudSecretStore(vault: other, snapshot: await other.sync(), opener: f.device)
+    try await repair.rename("other"); repair.close()
+    let original = try await f.vault.sync()
+    var tampered = try VaultDocument.decode(original)
+    tampered.header.name = "forged"
+    let replacement = try VaultCoding.encode(tampered)
+    let digest = VaultCoding.digest(replacement)
+    await f.cloud.replace("m-" + digest, vault: f.vault.id, bytes: try VaultCoding.encode(CloudManifest(document: tampered)))
+    await f.cloud.replace("head", vault: f.vault.id, bytes: try VaultCoding.encode(CloudHead(revision: digest, root: digest)))
+    let rows = try await f.repo.descriptors(publicKey: f.device.publicKey)
+    #expect(rows.contains { $0.name == "forged" }) // discovery is explicitly unverified
+    let service = AsyncSecretService {
+        RoutedSecretStore(repository: f.repo, rows: rows, selection: nil) { row in
+            let vault = try f.repo.vault(UUID(uuidString: row.id)!)
+            return try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.device)
+        }
+    }
+    await #expect(throws: (any Error).self) { try await service.read(SecretReference("mop://forged/item/token")) }
+    #expect(try f.vault.cached().0 == original)
+}
+
+@Test func legacyDiscoveryDoesNotModifyRemoteData() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    var metadata = try JSONSerialization.jsonObject(with: VaultCoding.encode(CloudManifest(document: VaultDocument.decode(f.initial)))) as! [String: Any]
+    var header = metadata["header"] as! [String: Any]
+    header["format"] = "mop-vault-v3"; header.removeValue(forKey: "name")
+    metadata["header"] = header; metadata["format"] = "mop-cloud-manifest-v1"
+    await f.cloud.replace("m-" + VaultCoding.digest(f.initial), vault: f.vault.id, bytes: try JSONSerialization.data(withJSONObject: metadata))
+    await f.cloud.resetCounters()
+    let rows = try await f.repo.descriptors(publicKey: f.device.publicKey)
+    #expect(rows.count == 1 && !rows[0].supported && rows[0].name == nil)
+    await #expect(throws: MopError.legacyVault) { _ = try await f.repo.named(f.vault.id.uuidString) }
+    #expect(await f.cloud.saves.isEmpty)
+}
+
+@Test func offlineNamesRemainAtLastAuthenticatedRevisionOnAnotherMac() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let secondState = f.directory.appendingPathComponent("second-mac")
+    let secondRepo = try await CloudRepository.open(transport: f.cloud, state: secondState)
+    let secondVault = try secondRepo.vault(f.vault.id)
+    let bytes = try await secondVault.sync()
+    try secondVault.establishTrust(bytes, opener: f.device, fingerprint: nil, revision: VaultCoding.digest(bytes))
+    let secondSession = try CloudSecretStore(vault: secondVault, snapshot: bytes, opener: f.device)
+    secondSession.close()
+    let first = try await f.store(); defer { first.close() }
+    try await first.rename("renamed")
+    let offline = try await CloudRepository.open(transport: f.cloud, state: secondState, offline: true)
+    #expect(try await offline.named("v").id == f.vault.id)
+    await #expect(throws: MopError.vaultMissing) { _ = try await offline.named("renamed") }
+    #expect(try await secondRepo.named("renamed").id == f.vault.id)
+    // Downloading new metadata must not promote the offline name.
+    _ = try await secondVault.sync()
+    #expect(try await offline.named("v").id == f.vault.id)
+    let refreshed = try CloudSecretStore(vault: secondVault, snapshot: await secondVault.sync(), opener: f.device)
+    refreshed.close()
+    #expect(try await offline.named("renamed").id == f.vault.id)
+}
+
+@Test func listingSkipsUnenrolledAndFailsRatherThanReturningPartialResults() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    _ = try await addVault(f, name: "other")
+    let rows = try await f.repo.descriptors(publicKey: f.device.publicKey)
+    var diagnostics: [String] = []
+    let excluded = rows.map { VaultDescriptor(id: $0.id, name: $0.name, format: $0.format, enrolled: $0.name == "v") }
+    let service = AsyncSecretService {
+        RoutedSecretStore(repository: f.repo, rows: excluded, selection: nil, diagnostic: { diagnostics.append($0) }) { row in
+            #expect(row.name == "v")
+            return try await f.store()
+        }
+    }
+    #expect(try await service.list(vault: nil).isEmpty)
+    #expect(diagnostics.count == 1 && diagnostics[0].contains("not enrolled"))
+    let failing = AsyncSecretService {
+        RoutedSecretStore(repository: f.repo, rows: rows, selection: nil) { row in
+            if row.name == "v" { throw MopError.authentication }
+            let vault = try f.repo.vault(UUID(uuidString: row.id)!)
+            return try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.device)
+        }
+    }
+    await #expect(throws: MopError.authentication) { try await failing.list(vault: nil) }
+}
+
+@Test func deletePurgesOnlyTargetAndPreventsOfflineResurrection() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let other = try await addVault(f, name: "other")
+    let otherSnapshot = try other.cached().0
+    let store = try await f.store(); defer { store.close() }
+    let live = store.snapshot
+    let target = try await f.repo.deletionTarget("v")
+    #expect(target.id == f.vault.id.uuidString)
+    try await f.repo.delete(f.vault.id)
+    #expect(try await f.cloud.zones() == [other.id])
+    #expect(try other.cached().0 == otherSnapshot)
+    #expect(throws: MopError.vaultMissing) { try f.repo.selected(nil) }
+    #expect(throws: MopError.vaultMissing) { try f.vault.cached() }
+    #expect(throws: MopError.vaultMissing) { try f.vault.verified(live) }
+    #expect(try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path).sorted() == ["deleted.json", "lock", "writer.lock"])
+    await #expect(throws: MopError.vaultMissing) {
+        try await store.write(SecretReference("mop://v/item/field"), value: "late", replace: false)
+    }
+    #expect(try other.cached().0 == otherSnapshot)
+}
+
+@Test func deletionPreservesUnrelatedDefaultAndAllowsExplicitBackupImport() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let other = try await addVault(f, name: "other")
+    try f.repo.use(other.id)
+    let before = try await f.store()
+    let fingerprint = try before.fingerprint(); before.close()
+    try await f.repo.delete(f.vault.id)
+    #expect(try f.repo.selected(nil).id == other.id)
+    let restored = try await f.repo.create(f.initial, fingerprint: fingerprint)
+    let store = try CloudSecretStore(vault: restored, snapshot: f.initial, opener: f.device)
+    defer { store.close() }
+    #expect(try restored.cached().0 == f.initial)
+}
+
+@Test func legacyDeletionByUUIDNeedsNoDecryptableManifest() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    await f.cloud.replace("m-" + VaultCoding.digest(f.initial), vault: f.vault.id, bytes: Data("legacy-unreadable".utf8))
+    let target = try await f.repo.deletionTarget(f.vault.id.uuidString)
+    #expect(target.id == f.vault.id.uuidString && target.name == nil)
+    try await f.repo.delete(f.vault.id)
+    #expect(try await f.cloud.zones().isEmpty)
+    // Retrying the same UUID finishes cleanup even after the remote zone is gone.
+    let retry = try await f.repo.deletionTarget(f.vault.id.uuidString)
+    #expect(retry.id == target.id)
+    try await f.repo.delete(f.vault.id)
+}
+
+@Test func deletionLostResponseChecksRemoteBeforeCleaningCache() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    await f.cloud.configureDeletion(.cloudUnavailable, despiteError: true)
+    try await f.repo.delete(f.vault.id)
+    #expect(await f.cloud.deletions == [f.vault.id])
+    #expect(throws: MopError.vaultMissing) { try f.vault.cached() }
+}
+
+@Test func uncertainOrDeniedDeletionPreservesCacheAndDefault() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    await f.cloud.configureDeletion(.cloudUnavailable)
+    await #expect(throws: MopError.vaultDeleteUncertain) { try await f.repo.delete(f.vault.id) }
+    #expect(try f.vault.cached().0 == f.initial)
+    #expect(try f.repo.selected(nil).id == f.vault.id)
+    await f.cloud.configureDeletion(.cloudPermission)
+    await #expect(throws: MopError.cloudPermission) { try await f.repo.delete(f.vault.id) }
+    #expect(try f.vault.cached().0 == f.initial)
+    await f.cloud.configureDeletion(nil)
+    await f.cloud.setReadbackError(.cloudUnavailable)
+    await #expect(throws: MopError.vaultDeleteUncertain) { try await f.repo.delete(f.vault.id) }
+    #expect(try f.vault.cached().0 == f.initial)
+    #expect(try f.repo.selected(nil).id == f.vault.id)
+    await f.cloud.setReadbackError(nil)
+    try await f.repo.delete(f.vault.id)
+    #expect(throws: MopError.vaultMissing) { try f.vault.cached() }
+}
+
+@Test func deletionRejectsOfflineAccountChangeAndActiveWriter() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let offline = try await CloudRepository.open(transport: f.cloud, state: f.directory, offline: true)
+    await #expect(throws: MopError.offlineWrite) { try await offline.delete(f.vault.id) }
+    await f.cloud.setAccount("other")
+    await #expect(throws: MopError.cloudAccount) { try await f.repo.delete(f.vault.id) }
+    await f.cloud.setAccount("account-a")
+    let lease = try WriterLease(directory: f.vault.cache.directory)
+    defer { lease.close() }
+    await #expect(throws: MopError.cloudUncertain) { try await f.repo.delete(f.vault.id) }
+    #expect(await f.cloud.deletions.isEmpty)
+    #expect(try f.vault.cached().0 == f.initial)
+}
+
+@Test func deletionCleanupFailureCanBeRetriedBySameUUID() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    try f.repo.scope.locked { try f.repo.scope.write(123, "default.json") }
+    await #expect(throws: MopError.vaultDeleteCleanup) { try await f.repo.delete(f.vault.id) }
+    #expect(try await f.cloud.zones().isEmpty)
+    #expect(throws: MopError.vaultMissing) { try f.vault.cached() }
+    try f.repo.scope.locked { try f.repo.scope.remove("default.json") }
+    try await f.repo.delete(f.vault.id)
+}
+
+@Test func deletionKeepsResolvedUUIDWhenNameIsReassigned() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let target = try await f.repo.deletionTarget("v")
+    let store = try await f.store(); defer { store.close() }
+    try await store.rename("renamed")
+    let replacement = try await addVault(f, name: "v")
+    try await f.repo.delete(UUID(uuidString: target.id)!)
+    #expect(try await f.cloud.zones() == [replacement.id])
+    #expect(try await f.repo.named("v").id == replacement.id)
 }

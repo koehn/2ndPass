@@ -5,10 +5,10 @@ import MopCore
 @testable import MopKeychain
 
 @Test func keychainIdentifiersDoNotCollide() throws {
-    let a = try SecretReference(vault: "a/b", item: "c", field: "token")
+    let a = try SecretReference(vault: "a-b", item: "c", field: "token")
     let b = try SecretReference(vault: "a", item: "b/c", field: "token")
     #expect(KeychainStore.service(for: a) != KeychainStore.service(for: b))
-    #expect(KeychainStore.service(for: a) == "mop.v1/a%2Fb/c")
+    #expect(KeychainStore.service(for: a) == "mop.v1/a-b/c")
 }
 
 @Test func statusErrorsHaveStableCodesWithoutOSDescriptions() {

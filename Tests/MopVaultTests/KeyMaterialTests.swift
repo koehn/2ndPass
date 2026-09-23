@@ -64,7 +64,7 @@ import MopCore
     let key = SymmetricKey(data: raw)
     let slot = try VaultDocument.wrap(key: key, request: request, kind: "device", vaultID: vaultID)
     #expect(try VaultDocument.unwrap(slot, vaultID: vaultID, privateKey: privateKey) == key)
-    let document = VaultDocument(header: VaultHeader(format: "mop-vault-v3", vaultID: vaultID,
+    let document = VaultDocument(header: VaultHeader(format: "mop-vault-v4", vaultID: vaultID, name: "v",
         generation: 1, parent: nil, recipients: [slot]), sealed: Data())
     let legacy = VaultCoding.digest(Data("mop-vault-trust-v1:\(vaultID.uuidString):".utf8) + raw)
     #expect(VaultTrust.fingerprint(document: document, key: key) == legacy)

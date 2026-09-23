@@ -3,6 +3,8 @@ import Foundation
 /// Deliberately contains no secret values, OS error descriptions, or user input.
 public enum MopError: Error, LocalizedError, Equatable {
     case cloudUnavailable, cloudAccount, cloudQuota, cloudThrottled, cloudPermission, cloudUncertain, offlineWrite, fileMigration
+    case invalidVaultName, ambiguousVault, vaultSelectionMismatch, legacyVault
+    case vaultDeleteUncertain, vaultDeleteCleanup, confirmationRequired, operationCancelled
     case invalidOutput
     case outputExists
     case invalidReference
@@ -30,6 +32,13 @@ public enum MopError: Error, LocalizedError, Equatable {
 
     public var exitCode: Int32 {
         switch self {
+        case .vaultDeleteUncertain: 27
+        case .vaultDeleteCleanup: 28
+        case .confirmationRequired, .operationCancelled: 2
+        case .invalidVaultName: 23
+        case .ambiguousVault: 24
+        case .vaultSelectionMismatch: 25
+        case .legacyVault: 26
         case .cloudUnavailable: 17
         case .cloudAccount: 18
         case .cloudQuota: 19
@@ -59,6 +68,14 @@ public enum MopError: Error, LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
+        case .vaultDeleteUncertain: "Vault deletion could not be confirmed. Local data was retained. Retry mop vault delete with the same UUID to reconcile."
+        case .vaultDeleteCleanup: "The cloud vault was deleted, but local cleanup failed. Retry mop vault delete with the same UUID to finish cleanup."
+        case .confirmationRequired: "Vault deletion requires interactive confirmation or --yes. Authentication is still required with --yes."
+        case .operationCancelled: "Operation cancelled; no vault was deleted."
+        case .invalidVaultName: "Invalid vault name; use 1–63 lowercase letters or digits separated by single hyphens."
+        case .ambiguousVault: "Multiple vaults have this name. Select a UUID and rename the conflicting vault."
+        case .vaultSelectionMismatch: "The reference does not match the selected vault or its authenticated name."
+        case .legacyVault: "Legacy vault format is unsupported. Use an older Mop client to access it; no migration is provided."
         case .cloudUnavailable: "CloudKit is unavailable. Retry online or explicitly select --offline for cached reads."
         case .cloudAccount: "An available iCloud account matching this local binding is required."
         case .cloudQuota: "The iCloud storage quota is exceeded."
@@ -66,7 +83,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .cloudPermission: "CloudKit access was denied; verify provisioning and account permissions."
         case .cloudUncertain: "The commit outcome is uncertain. Run mop vault sync online to reconcile before writing again."
         case .offlineWrite: "This command requires online CloudKit access; offline writes are not supported."
-        case .fileMigration: "File storage is no longer operational. Use mop vault import --file PATH, then --cloud-vault UUID."
+        case .fileMigration: "Legacy file storage is not supported. Unset MOP_VAULT_FILE and remove --vault-file; references now select named CloudKit vaults. Only v4 backups can be imported; legacy formats require an older client."
         case .invalidOutput: "Invalid output options; use --out-file with --force or an octal --file-mode through 0777."
         case .outputExists: "Output file already exists; use --force to replace it."
         case .invalidReference: "Invalid secret reference; use mop://vault/item/[section/]field with percent-encoded components."
@@ -82,7 +99,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .invalidProcess: "Invalid command arguments or environment."
         case .executableNotFound: "Executable not found."
         case .launch: "Unable to execute the requested program."
-        case .vaultMissing: "Cloud vault not found. Use mop vault init or select --cloud-vault UUID."
+        case .vaultMissing: "Vault not found. Use mop vault init or select --vault NAME-OR-UUID."
         case .invalidVault: "Vault is invalid, unsupported, or failed integrity verification."
         case .vaultConflict: "Vault changed concurrently. No committed changes were overwritten; retry the command."
         case .vaultUntrusted: "Vault key is not trusted in this local binding. Use 'mop vault trust' with a fingerprint from a trusted Mac or a revision hash of a known-good backup. Never trust a hash obtained only from the suspect file."

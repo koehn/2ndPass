@@ -5,7 +5,7 @@ import MopCore
 struct AppSheetView: View {
     @Bindable var model: AppModel
     let kind: AppSheet
-    @State private var namespace = "personal"
+    @State private var vaultName = "personal"
     @State private var item = ""
     @State private var section = ""
     @State private var field = "token"
@@ -16,17 +16,22 @@ struct AppSheetView: View {
     @State private var confirmed = false
     @State private var recoveryURL: URL?
     @State private var vaultID = ""
+    @State private var deletionTarget: VaultDescriptor?
+    @State private var deletionConfirmation = ""
 
     private var reference: SecretReference? {
         if kind == .replaceSecret { return model.selected }
-        return try? SecretReference(vault: namespace, item: item, section: section.isEmpty ? nil : section, field: field)
+        return try? SecretReference(vault: model.vaultName, item: kind == .addField ? (model.selectedItem ?? "") : item, section: section.isEmpty ? nil : section, field: field)
     }
     private var validFingerprint: Bool {
         fingerprint.count == 64 && fingerprint.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
     private var title: String {
         switch kind {
-        case .createSecret: "New secret"
+        case .createSecret: "New item"
+        case .addField: "Add field"
+        case .renameVault: "Rename vault"
+        case .deleteVault: "Delete vault"
         case .replaceSecret: "Replace value"
         case .createVault: "Create a vault"
         case .request: "Enroll this Mac"
@@ -39,8 +44,10 @@ struct AppSheetView: View {
     }
     private var canSubmit: Bool {
         switch kind {
-        case .createSecret, .replaceSecret: reference != nil
-        case .createVault: !name.isEmpty && recoveryURL != nil && confirmed
+        case .createSecret, .addField, .replaceSecret: reference != nil
+        case .createVault: (try? VaultName.validate(vaultName)) != nil && !name.isEmpty && recoveryURL != nil && confirmed
+        case .renameVault: (try? VaultName.validate(vaultName)) != nil
+        case .deleteVault: deletionTarget != nil && !model.offline && deletionConfirmation == (deletionTarget?.name ?? deletionTarget?.id)
         case .request: !name.isEmpty
         case .trust: validFingerprint
         case .approve: validFingerprint && confirmed && model.enrollment != nil
@@ -53,11 +60,12 @@ struct AppSheetView: View {
         VStack(alignment: .leading, spacing: 20) {
             Text(title).font(.title2).fontWeight(.semibold)
             switch kind {
-            case .createSecret, .replaceSecret:
-                if kind == .createSecret {
+            case .createSecret, .addField, .replaceSecret:
+                if kind == .createSecret || kind == .addField {
                     Form {
-                        TextField("Namespace", text: $namespace)
-                        TextField("Item", text: $item)
+                        Text(model.vaultName).font(.caption)
+                        if kind == .createSecret { TextField("Item", text: $item) }
+                        else { Text(model.selectedItem ?? "") }
                         TextField("Section (optional)", text: $section)
                         TextField("Field", text: $field)
                     }
@@ -66,7 +74,8 @@ struct AppSheetView: View {
                 SecureField("Secret value", text: $value)
                 Text("The value is sent privately to mop after you choose Save. Empty values are allowed.").font(.caption).foregroundStyle(.secondary)
             case .createVault:
-                Text("Create an independent encrypted vault in your private iCloud account. Namespaces such as personal live inside this vault.")
+                Text("Create a named encrypted vault in your private iCloud account. Vault names are visible to CloudKit; item and field names remain encrypted.")
+                TextField("Vault name", text: $vaultName)
                 TextField("This Mac’s name", text: $name)
                 Toggle("Require Touch ID without password fallback", isOn: $strict)
                 Text("This policy applies when first creating this Mac’s key. Changing Touch ID enrollment under strict policy requires recovery.").font(.caption).foregroundStyle(.secondary)
@@ -78,9 +87,25 @@ struct AppSheetView: View {
                 if let recoveryURL { Text(recoveryURL.path).font(.caption).textSelection(.enabled) }
                 Toggle("I will move the recovery key offline and retain the vault fingerprint separately.", isOn: $confirmed)
                 Text("The recovery key grants full access. Keep it out of iCloud and away from encrypted backups. If creation fails after writing the key, the file is retained.").font(.caption).foregroundStyle(.secondary)
+            case .deleteVault:
+                if let target = deletionTarget {
+                    Text(target.name ?? "Legacy or unnamed vault").font(.headline)
+                    Text(target.id).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    Text("Permanently delete all cloud contents and history, and this Mac’s cached vault data. Backups and caches on other Macs remain. This cannot be undone without a backup.")
+                    if model.canExportBackup {
+                        Button("Export backup…") { model.chooseExportBackup() }
+                        Text("The backup is encrypted. Keep its recovery key separately.").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("To export a legacy vault, use an older Mop client before deleting it.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    TextField("Type \(target.name ?? target.id) to delete", text: $deletionConfirmation)
+                }
+            case .renameVault:
+                Text("Renaming changes references. Update scripts and configuration; the old name will no longer work.")
+                TextField("New vault name", text: $vaultName)
             case .selectVault:
-                Text("Enter the independent cloud vault UUID. Use this to select an existing verified snapshot while offline.")
-                TextField("Cloud vault UUID", text: $vaultID)
+                Text("Enter the vault UUID. Use this to select an existing verified snapshot while offline.")
+                TextField("Vault UUID", text: $vaultID)
             case .recover:
                 Text("Enroll this Mac with an offline recovery key and a vault fingerprint obtained independently. Return the key offline afterward.")
                 TextField("This Mac’s name", text: $name)
@@ -116,11 +141,12 @@ struct AppSheetView: View {
                     Text("After approval, verify the vault fingerprint on the new Mac. Approval does not delete the request.").font(.caption).foregroundStyle(.secondary)
                 }
             }
+            if kind == .deleteVault, let notice = model.notice { Text(notice).font(.callout) }
             if model.busy { HStack { ProgressView().controlSize(.small); Text("Waiting for authentication or iCloud…").font(.caption) } }
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { value = ""; model.sheet = nil }.keyboardShortcut(.cancelAction).disabled(model.busy)
-                Button(kind == .createSecret || kind == .replaceSecret ? "Save" : "Continue") { submit() }
+                Button(kind == .deleteVault ? "Delete vault" : (kind == .createSecret || kind == .addField || kind == .replaceSecret ? "Save" : "Continue"), role: kind == .deleteVault ? .destructive : nil) { submit() }
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(model.busy || !canSubmit)
             }
         }.padding(28).frame(width: 500).disabled(model.busy)
@@ -131,7 +157,12 @@ struct AppSheetView: View {
             if !model.isActive { Label("Locked", systemImage: "lock") }
         }
         .interactiveDismissDisabled(model.busy)
-        .onAppear { namespace = model.namespace ?? "personal" }
+        .onAppear {
+            if kind == .renameVault { vaultName = model.vaultName }
+            if kind == .deleteVault, !model.vault.isEmpty {
+                deletionTarget = model.selectedVaultDescriptor ?? VaultDescriptor(id: model.vault, name: nil, format: "unknown", enrolled: false)
+            }
+        }
         .onDisappear { value = "" }
         .alert("Operation not completed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
@@ -139,17 +170,21 @@ struct AppSheetView: View {
     }
     private func submit() {
         switch kind {
-        case .createSecret, .replaceSecret:
+        case .createSecret, .addField, .replaceSecret:
             if let reference { model.write(reference: reference, value: value, replace: kind == .replaceSecret); value = "" }
         case .createVault:
-            if let recoveryURL { model.createVault(name: name, strict: strict, recovery: recoveryURL) }
+            if let recoveryURL { model.createVault(name: vaultName, deviceName: name, strict: strict, recovery: recoveryURL) }
+        case .deleteVault:
+            if let deletionTarget { model.deleteVault(target: deletionTarget, confirmation: deletionConfirmation) }
+        case .renameVault:
+            model.renameVault(to: vaultName)
         case .request:
             model.management(["device", "request", "--name", name] + (strict ? ["--strict-biometrics"] : []))
         case .trust:
             model.management(["vault", "trust", "--fingerprint", fingerprint])
         case .selectVault:
             if let id = UUID(uuidString: vaultID)?.uuidString {
-                if !model.vaults.contains(id) { model.vaults.append(id) }
+                if !model.vaults.contains(where: { $0.id == id }) { model.vaults.append(VaultDescriptor(id: id, name: nil, format: "unknown", enrolled: false)) }
                 model.vault = id; model.sheet = nil
             }
         case .recover:

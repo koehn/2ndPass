@@ -33,6 +33,16 @@ public final class LocalDevice: VaultKeyOpener {
         self.context = context
     }
 
+    /// Public enrollment metadata only; never unlocks the private key.
+    public static func savedPublicKey(directory: URL) throws -> Data? {
+        let path = directory.appendingPathComponent("device.json")
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        let saved = try JSONDecoder().decode(Record.self, from: SafeFile.read(path, privateFile: true, limit: 64 * 1024))
+        guard saved.format == "mop-local-device-v2" else { throw MopError.invalidDevice }
+        _ = try DeviceRequest(name: saved.name, publicKey: saved.publicKey)
+        return saved.publicKey
+    }
+
     public static func open(directory: URL, create: Bool = false, name: String = "Mac", strictBiometrics: Bool? = nil) throws -> LocalDevice {
         let group = try SigningIdentity.accessGroup()
         guard SecureEnclave.isAvailable else { throw MopError.deviceUnavailable }

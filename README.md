@@ -41,7 +41,7 @@ open dist/Mop.app
 
 ## Storage and authentication
 
-mop encrypts the index and each secret locally using the existing `mop-vault-v3`
+mop encrypts the index and each secret locally using the `mop-vault-v4`
 format. Each secret has an independent AES-256-GCM key. HPKE wraps the index and
 secret keys separately for every enrolled Mac and for an offline recovery key.
 CloudKit stores individual immutable encrypted records and revision manifests;
@@ -54,10 +54,12 @@ set with no password fallback. Changing biometric enrollment then requires
 recovery. The Secure Enclave key and its Keychain item enforce the policy;
 there is no synchronizing private key or app-only authentication gate.
 
-An independent CloudKit vault has its own UUID, zone, enrollment list, recovery
-credential, and trust fingerprint. Logical names such as `personal` in a
-`mop://personal/service/token` reference remain namespaces *inside* that vault.
-Multiple independent vaults are supported. Cross-account sharing is not yet
+Each named vault has its own stable UUID, CloudKit zone, enrollment list, recovery
+credential, and trust fingerprint. In `mop://personal/service/token`, `personal`
+selects that encrypted vault, `service` is an item, and `token` is a field.
+Vault names are discoverable metadata visible to CloudKit; item/field names and
+values remain encrypted. Names use 1–63 lowercase ASCII letters/digits with
+single internal hyphens. Multiple independent vaults are supported. Cross-account sharing is not yet
 implemented; each zone is private to its owner's Apple Account.
 
 ## Build and provision
@@ -99,7 +101,7 @@ Developer profiles/environments are distinct from production data.
 ## Create and select a vault
 
 ```sh
-mop vault init --recovery-file "$HOME/mop-recovery.key" --name 'First Mac'
+mop vault init personal --recovery-file "$HOME/mop-recovery.key" --device-name 'First Mac'
 mop vault list
 mop vault use VAULT_UUID
 ```
@@ -110,10 +112,55 @@ recovery credential is a full alternative decryption capability: never put it
 in CloudKit or keep it next to a synchronized backup. A failed initialization
 retains any recovery file already written.
 
-The first successfully created/imported vault becomes the local account default.
-Choose a vault with `--cloud-vault UUID`, then `MOP_CLOUD_VAULT`, then the saved
-default, in that order. A missing default is an error, not an arbitrary selection.
-A new Mac can run `vault list`, then `vault use UUID` before enrollment.
+References select their vault by name, independent of any saved default.
+`mop list` lists all enrolled named vaults; `mop list --vault personal` selects one.
+Use `--vault NAME-OR-UUID` to constrain a reference command or select a management
+command's vault. `vault use` saves an account-scoped default for management only.
+A missing or ambiguous name is an error, never a fallback to another vault.
+`--cloud-vault` has been removed; `MOP_CLOUD_VAULT` no longer selects a vault.
+A new Mac can discover names with `vault list`, then use a name or UUID to enroll.
+`vault list --json` returns descriptors with `id`, `name`, `format`, and `enrolled`.
+Discovery names/enrollment claims are unverified until authentication.
+
+```sh
+mop vault rename personal private
+mop vault rename VAULT_UUID personal   # also resolves a duplicate-name conflict
+```
+
+Renaming keeps the UUID, keys, records, and recovery credentials. Update references
+in scripts and configuration: there are no old-name aliases. Offline reads use
+names from verified snapshots and may retain an old name until reconnecting.
+Concurrent creation/rename on separate Macs can produce duplicate names; select
+by UUID to rename one. Name availability checks do not provide a global lock.
+
+Version 0.5 uses new vault/manifest formats and has **no migration** from previous
+versions. Create fresh named vaults. Existing cloud data is left untouched; use
+an older client to access it. Older clients cannot open the new format.
+
+### Delete a vault
+
+```sh
+mop vault delete personal       # type its name, then authenticate
+mop vault delete LEGACY_UUID    # type the UUID for an unnamed legacy vault
+mop vault delete VAULT_UUID --yes  # skip typing; authentication still required
+```
+
+Deletion permanently removes the entire cloud zone, including history and staged
+records. It also clears that vault's local cache/trust and its saved default, if
+selected. Shared device identity and Keychain keys are preserved. Exported backups
+and caches on other Macs remain. Offline deletion is refused. Legacy deletion by
+UUID does not require decrypting the old format or enrolling in that vault.
+
+The GUI offers **Export backup…** and **Delete vault…** under **Vault actions**.
+The delete dialog requires typing the name (UUID for legacy vaults) and offers
+backup export for supported vaults. Use an older client to back up legacy data.
+No backup is forced. Exported backups remain encrypted; retain recovery credentials.
+
+`--yes` is required without a terminal and only bypasses typed confirmation. If
+the outcome is uncertain, local data is retained; retry with the same UUID to
+reconcile. Exit 27 means remote deletion could not be confirmed; exit 28 means
+remote deletion succeeded but local cleanup needs retrying. Mop checks remote
+absence before local cleanup and never automatically repeats a delete request.
 
 Local metadata defaults to `~/.mop`, overridden by `--state-directory` or
 `MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains public
@@ -182,7 +229,8 @@ Secrets are never accepted as positional arguments. `write --replace` requires a
 existing field; ordinary `write` refuses to overwrite one. Reads add a newline
 unless `-n` is set. File output is atomic, defaults to mode `0600`, and requires
 `--force` to replace an existing regular file. `--file-mode` accepts octal modes.
-References support `mop://vault/item/[section/]field`; percent-encode components.
+References support `mop://vault/item/[section/]field`; percent-encode item, section, and field components.
+`run` and `inject` can resolve references from multiple vaults in one command.
 
 `run` reads literal dotenv files in order, overriding inherited variables. Values
 starting with `mop://` resolve once; `$NAME` and `${NAME}` reference components
@@ -228,7 +276,8 @@ a committed vault and is never automatically replayed.
 ## Migration, backups, history, and recovery
 
 Operational `--vault-file` and `MOP_VAULT_FILE` have been removed. Unset the old
-environment variable, retain your device state, and explicitly import:
+environment variable and remove any export from your shell startup configuration.
+Retain your device state. References select named vaults; import accepts v4 backups only:
 
 ```sh
 unset MOP_VAULT_FILE
@@ -237,9 +286,9 @@ mop vault export --out-file /path/to/backup.mopfile
 ```
 
 Import requires the source's established local trust, or `--fingerprint` /
-`--revision` evidence obtained independently. It accepts v3 only, preserves vault
+`--revision` evidence obtained independently. It accepts v4 only, preserves vault
 identity and recovery relationships, refuses an existing destination head, and
-never deletes or modifies the source file. Export creates a verified encrypted v3
+never deletes or modifies the source file. Export creates a verified encrypted v4
 backup; it does not include the recovery private key. Preserve the printed UUID.
 
 ```sh
@@ -250,8 +299,9 @@ mop vault recover --recovery-file /offline/recovery.key --name 'Replacement Mac'
 ```
 
 History lists only committed ancestry, never abandoned uploads. Restoration keeps
-current recipients and keys. Imported history starts at the imported snapshot;
-external `.history` directories are not uploaded. Immutable cloud revisions and
+the current vault name, recipients, and keys. Imported history starts at the imported snapshot;
+file-vault backends and external `.history` directories are no longer supported.
+Encrypted v4 backup import/export remains supported. Immutable cloud revisions and
 abandoned staged records are retained in this version and count toward quota.
 
 Recovery enrolls the current Mac after local authentication and trust verification.

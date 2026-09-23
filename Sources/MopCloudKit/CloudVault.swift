@@ -36,8 +36,10 @@ public final class CloudVault {
 
     private func manifest(_ digest: String) async throws -> CloudManifest {
         guard VaultTrust.validFingerprint(digest), let object = try await transport.fetch("m-" + digest, vault: id) else { throw MopError.invalidVault }
+        struct Version: Decodable { let format: String }
+        if try decodeCloud(Version.self, object.data).format == "mop-cloud-manifest-v1" { throw MopError.legacyVault }
         let value = try decodeCloud(CloudManifest.self, object.data)
-        guard value.format == "mop-cloud-manifest-v1", value.header.vaultID == id,
+        guard value.format == "mop-cloud-manifest-v2", value.header.vaultID == id,
               value.records.count <= VaultCoding.maximumFileSize / 28,
               value.records.values.allSatisfy(VaultTrust.validFingerprint) else { throw MopError.invalidVault }
         return value
@@ -86,6 +88,7 @@ public final class CloudVault {
 
     public func cached() throws -> (Data, Date) {
         try cache.locked {
+            guard try cache.read("deleted.json", as: Bool.self) != true else { throw MopError.vaultMissing }
             guard let cached = try cache.read("snapshot.json", as: CachedSnapshot.self) else { throw MopError.vaultMissing }
             try checkWatermark(cached.document)
             guard VaultCoding.digest(cached.document) == cached.revision else { throw MopError.invalidVault }
@@ -103,6 +106,7 @@ public final class CloudVault {
     }
 
     private func recordVerified(_ bytes: Data) throws {
+        guard try cache.read("deleted.json", as: Bool.self) != true else { throw MopError.vaultMissing }
         try checkWatermark(bytes)
         let doc = try VaultDocument.decode(bytes)
         try cache.write(Watermark(generation: doc.header.generation, revision: VaultCoding.digest(bytes)), "verified.json")
@@ -244,6 +248,7 @@ public final class CloudVault {
             publishing = true
             let saved = try await transport.save("head", kind: .head, data: VaultCoding.encode(CloudHead(revision: digest, root: root)), vault: id, expected: current?.version)
             try cache.locked {
+                if expected == nil { try cache.remove("deleted.json") } // Explicit import can restore a deleted UUID.
                 try cache.write(CachedSnapshot(revision: digest, root: root, version: saved.version, fetched: Date(), document: replacement), "downloaded.json")
                 if let rotationFingerprint { try cache.write(rotationFingerprint, "pending-trust.json") }
                 try cache.remove("journal.json")

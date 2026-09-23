@@ -6,6 +6,7 @@ public final class CloudSecretStore: AsyncSecretStore {
     public let vault: CloudVault
     private let session: VaultSession
     private let offline: Bool
+    public var name: String { session.name }
     public var snapshot: Data { session.snapshot }
 
     public init(vault: CloudVault, snapshot: Data, opener: any VaultKeyOpener, offline: Bool = false,
@@ -32,6 +33,7 @@ public final class CloudSecretStore: AsyncSecretStore {
         try await mutate { try session.write(reference, value: value, replace: replace) }
     }
     public func delete(_ reference: SecretReference) async throws { try await mutate { try session.delete(reference) } }
+    public func rename(_ name: String) async throws { try await mutate { try session.rename(name) } }
     public func enroll(_ request: DeviceRequest, fingerprint: String) async throws {
         try await mutate { try session.enroll(request, expectedFingerprint: fingerprint) }
     }

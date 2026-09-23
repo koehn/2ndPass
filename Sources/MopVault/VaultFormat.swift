@@ -51,6 +51,7 @@ public struct VaultRecipient: Codable, Equatable, Sendable {
 public struct VaultHeader: Codable, Equatable, Sendable {
     public var format: String
     public let vaultID: UUID
+    public var name: String
     public var generation: UInt64
     public var parent: String?
     public var recipients: [VaultRecipient]
@@ -64,8 +65,11 @@ public struct VaultDocument: Codable, Sendable {
     public static func decode(_ bytes: Data) throws -> VaultDocument {
         do {
             guard bytes.count <= VaultCoding.maximumFileSize else { throw MopError.invalidVault }
+            struct Version: Decodable { struct Header: Decodable { let format: String }; let header: Header }
+            if let version = try? JSONDecoder().decode(Version.self, from: bytes), version.header.format == "mop-vault-v3" { throw MopError.legacyVault }
             let document = try JSONDecoder().decode(Self.self, from: bytes)
-            guard document.header.format == "mop-vault-v3", document.header.generation > 0,
+            try VaultName.validate(document.header.name)
+            guard document.header.format == "mop-vault-v4", document.header.generation > 0,
                   document.header.recipients.count <= 64,
                   document.header.recipients.filter({ $0.kind == "recovery" }).count == 1,
                   document.header.recipients.contains(where: { $0.kind == "device" }),
@@ -89,7 +93,8 @@ public struct VaultDocument: Codable, Sendable {
                 guard parent.count == 64, parent.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { throw MopError.invalidVault }
             }
             return document
-        } catch { throw MopError.invalidVault }
+        } catch MopError.legacyVault { throw MopError.legacyVault }
+          catch { throw MopError.invalidVault }
     }
 
     public static func wrap(key: SymmetricKey, request: DeviceRequest, kind: String, vaultID: UUID, purpose: String = "index") throws -> VaultRecipient {
@@ -142,7 +147,7 @@ public struct VaultDocument: Codable, Sendable {
             let index = try JSONDecoder().decode([String: String].self, from: plaintext)
             guard Set(index.values).count == index.count, Set(index.values) == Set(records.keys) else { throw MopError.invalidVault }
             for reference in index.keys {
-                guard try SecretReference(reference).description == reference else { throw MopError.invalidVault }
+                guard try SecretReference(vault: header.name, relativePath: reference).relativePath == reference else { throw MopError.invalidVault }
             }
             return index
         } catch { throw MopError.invalidVault }
