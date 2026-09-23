@@ -9,7 +9,7 @@ struct Mop: AsyncParsableCommand {
         commandName: "mop",
         abstract: "Read and manage an encrypted vault using your Mac's Secure Enclave.",
         version: "0.5.0",
-        subcommands: [Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Device.self, Completion.self]
+        subcommands: [Item.self, Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Device.self, Completion.self]
     )
 
     /// ArgumentParser wraps errors thrown by option-group validation. Match only
@@ -129,5 +129,27 @@ struct Inject: AsyncParsableCommand {
         let destination = try output.destination(storage: storage)
         let result = try await storage.service.inject(IO.input(file: inFile), variables: ProcessInfo.processInfo.environment)
         try output.emit(result, to: destination)
+    }
+}
+
+struct Item: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(abstract: "List typed items or atomically save an item from JSON stdin.", subcommands: [Catalog.self, Save.self])
+    struct Catalog: AsyncParsableCommand {
+        @OptionGroup var storage: VaultOptions
+        func run() async throws {
+            let store = try await storage.open(); defer { store.close() }
+            try IO.output(String(decoding: JSONEncoder().encode(store.catalog()), as: UTF8.self) + "\n")
+        }
+    }
+    struct Save: AsyncParsableCommand {
+        @OptionGroup var storage: VaultOptions
+        func run() async throws {
+            try storage.requireOnline()
+            let input = try IO.secret()
+            let edit = try input.withFoundationData { try JSONDecoder().decode(ItemEdit.self, from: $0) }
+            let store = try await storage.open(); defer { store.close() }
+            try await store.saveItem(edit)
+            try IO.output(String(decoding: JSONEncoder().encode(store.catalog()), as: UTF8.self) + "\n")
+        }
     }
 }

@@ -8,26 +8,35 @@ struct MopApplication: App {
         Window("mop", id: "main") {
             ContentView(model: model)
                 .frame(minWidth: 820, minHeight: 540)
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
-                    model.deactivate()
-                }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.activate() }
-                .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidResignActiveNotification)) { _ in model.lock() }
-                .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in model.lock() }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in model.lock() }
+                .onAppear { model.startMonitoringActivity() }
         }
         .defaultSize(width: 1060, height: 680)
         .commands {
             CommandGroup(after: .newItem) {
-                Button("New Secret…") { model.sheet = .createSecret }
-                    .keyboardShortcut("n").disabled(model.busy || model.offline || model.vault.isEmpty)
+                Button("New Item") { model.beginCreatingItem() }
+                    .keyboardShortcut("n").disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil || model.page != .secrets)
                 Button("New Vault…") { model.sheet = .createVault }.disabled(model.busy || model.offline)
             }
             CommandMenu("Vault") {
                 Button("Unlock / Refresh") { model.unlock() }.keyboardShortcut("r").disabled(model.busy)
                 Button("Lock") { model.lock() }.keyboardShortcut("l", modifiers: [.command, .shift])
-                Button("Synchronize") { model.sync() }.disabled(model.busy || model.offline)
+                Button("Synchronize") { model.sync() }.disabled(model.busy || model.offline || model.allVaults)
             }
         }
+        Settings {
+            SessionSettings(model: model)
+                .onAppear { model.startMonitoringActivity() }
+        }
+    }
+}
+
+private struct SessionSettings: View {
+    @Bindable var model: AppModel
+    var body: some View {
+        Form {
+            Stepper("Lock after \(model.autoLockMinutes) minutes of inactivity", value: $model.autoLockMinutes, in: 1...60)
+            Text("Activity in Mop keeps your session open. Switching apps conceals secrets. Locking your Mac, sleeping, or quitting Mop ends the session immediately.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.padding(24).frame(width: 430)
     }
 }

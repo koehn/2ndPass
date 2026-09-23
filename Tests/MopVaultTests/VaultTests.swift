@@ -401,3 +401,238 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: original, trust: trust, opener: device) }
     #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("local-trust").path))
 }
+
+@Test func typedItemsPreserveOrderAndSeparateVisibleValuesFromSecrets() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let opener = CountingOpener(device)
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: opener)
+    let item = VaultItem(name: "login", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "VISIBLE_USERNAME"),
+        ItemField(path: "password", type: .password, value: "HIDDEN_PASSWORD"),
+        ItemField(path: "otp", type: .otp, value: "HIDDEN_OTP")
+    ])
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true))
+    #expect(!String(decoding: store.snapshot, as: UTF8.self).contains("VISIBLE_USERNAME"))
+    #expect(!String(decoding: store.snapshot, as: UTF8.self).contains("HIDDEN_PASSWORD"))
+    let reopened = try VaultSession(snapshot: store.snapshot, trust: trust, opener: opener)
+    opener.allowRecords = false
+    var listed = try #require(reopened.catalog().items.first)
+    #expect(listed.type == .login)
+    #expect(listed.fields.map(\.value) == ["VISIBLE_USERNAME", nil, nil])
+    listed.fields.reverse()
+    // Reordering preserves concealed values without opening their keys.
+    try reopened.saveItem(ItemEdit(revision: reopened.catalog().revision, item: listed, create: false))
+    #expect(try reopened.catalog().items[0].fields.map(\.path) == ["otp", "password", "username"])
+    opener.allowRecords = true
+    #expect(try reopened.read(SecretReference("mop://v/login/password")) == "HIDDEN_PASSWORD")
+    #expect(try reopened.read(SecretReference("mop://v/login/otp")) == "HIDDEN_OTP")
+    // CLI replacements and deletions keep visible metadata consistent.
+    try reopened.write(SecretReference("mop://v/login/username"), value: "new-user", replace: true)
+    #expect(try reopened.catalog().items[0].fields.last?.value == "new-user")
+    try reopened.delete(SecretReference("mop://v/login/username"))
+    #expect(try reopened.catalog().items[0].fields.map(\.path) == ["otp", "password"])
+    try reopened.write(SecretReference("mop://v/login/new"), value: "new-secret", replace: false)
+    try reopened.delete(SecretReference("mop://v/login/otp"))
+    try reopened.delete(SecretReference("mop://v/login/password"))
+    #expect(try reopened.catalog().items[0].type == .login)
+    #expect(try reopened.catalog().items[0].fields == [ItemField(path: "new")])
+    reopened.close()
+    #expect(throws: MopError.authentication) { try reopened.catalog() }
+}
+
+@Test func itemEditsAreAtomicAndRejectStaleOrInvalidInput() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    let ref = try SecretReference("mop://v/legacy/secret")
+    try store.write(ref, value: "keep-me", replace: false)
+    var item = try #require(store.catalog().items.first)
+    #expect(item.type == .custom && item.fields[0].type == .concealed)
+    let revision = try store.catalog().revision
+    item.fields.append(ItemField(path: "other", type: .text, value: "new"))
+    item.fields.append(ItemField(path: "invalid/too/many/parts", value: "bad"))
+    let before = store.snapshot
+    #expect(throws: (any Error).self) { try store.saveItem(ItemEdit(revision: revision, item: item, create: false)) }
+    #expect(store.snapshot == before)
+    item.fields.removeLast()
+    try store.saveItem(ItemEdit(revision: revision, item: item, create: false))
+    #expect(throws: MopError.vaultConflict) { try store.saveItem(ItemEdit(revision: revision, item: item, create: false)) }
+    #expect(try store.read(ref) == "keep-me")
+    item = try #require(store.catalog().items.first)
+    item.fields[0].type = .username
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false))
+    #expect(try store.catalog().items[0].fields[0].value == "keep-me")
+    item = try #require(store.catalog().items.first)
+    item.fields[0].type = .password
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false))
+    #expect(try store.catalog().items[0].fields[0].value == nil)
+    #expect(try store.read(ref) == "keep-me")
+}
+
+@Test func itemMetadataSurvivesRenameRestoreEnrollmentAndRotation() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    let ref = try SecretReference(vault: "v", item: "My 登录 / account", section: "用户", field: "user/name")
+    try store.write(ref, value: "alice", replace: false)
+    var item = try #require(store.catalog().items.first)
+    item.type = .login; item.fields[0].type = .username
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false))
+    let saved = store.snapshot
+    let other = TestDevice()
+    try store.enroll(other.request, expectedFingerprint: other.request.fingerprint)
+    try store.revoke(other.request.fingerprint, currentDevice: device.publicKey)
+    try store.pinCommittedKey()
+    #expect(try store.catalog().items[0].fields[0].value == "alice")
+    try store.rename("renamed")
+    try store.restore(saved)
+    #expect(try store.catalog().vault == "renamed")
+    #expect(try store.catalog().items[0].name == ref.item)
+    #expect(try store.catalog().items[0].fields[0].value == "alice")
+    let restored = try VaultSession(snapshot: store.snapshot, trust: trust, opener: device)
+    #expect(try restored.read(SecretReference(vault: "renamed", item: ref.item, section: ref.section, field: ref.field)) == "alice")
+}
+
+@Test func renameItemAtomicallyPreservesConcealedRecordsAndOrder() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let opener = CountingOpener(device)
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: opener)
+    defer { store.close() }
+    let item = VaultItem(name: "old", type: .login, fields: [
+        ItemField(path: "password", type: .password, value: "secret"),
+        ItemField(path: "username", type: .username, value: "alice")
+    ])
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true))
+    var edit = try store.catalog().items[0]
+    edit.name = "New / 登录"
+    edit.fields.reverse()
+    opener.allowRecords = false
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: edit, create: false, originalName: "old"))
+    #expect(try store.catalog().items.map(\.name) == ["New / 登录"])
+    #expect(try store.catalog().items[0].fields.map(\.path) == ["username", "password"])
+    #expect(throws: MopError.notFound) { try store.read(SecretReference(vault: "v", item: "old", field: "password")) }
+    let reopened = try VaultSession(snapshot: store.snapshot, trust: trust, opener: device)
+    defer { reopened.close() }
+    #expect(try reopened.read(SecretReference(vault: "v", item: "New / 登录", field: "password")) == "secret")
+}
+@Test func renameCollisionsAndStaleRevisionLeaveSnapshotUnchanged() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    defer { store.close() }
+    for name in ["one", "two"] {
+        try store.write(SecretReference(vault: "v", item: name, field: "password"), value: "secret", replace: false)
+    }
+    let snapshot = store.snapshot, revision = try store.catalog().revision
+    var item = try store.catalog().items.first { $0.name == "one" }!
+    item.name = "two"
+    #expect(throws: MopError.duplicate) { try store.saveItem(ItemEdit(revision: revision, item: item, create: false, originalName: "one")) }
+    item.name = "three"
+    #expect(throws: MopError.vaultConflict) { try store.saveItem(ItemEdit(revision: "stale", item: item, create: false, originalName: "one")) }
+    #expect(store.snapshot == snapshot)
+}
+@Test func renameAndMakeConcealedFieldVisibleReadsOriginalReference() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    defer { store.close() }
+    try store.write(SecretReference("mop://v/old/field"), value: "kept", replace: false)
+    var item = try store.catalog().items[0]; item.name = "new"; item.fields[0].type = .text
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false, originalName: "old"))
+    #expect(try store.catalog().items[0].fields[0].value == "kept")
+}
+
+@Test func passwordQualityPersistsWithoutOpeningRecordsAndRefreshesOnWrite() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let opener = CountingOpener(device)
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: opener)
+    defer { store.close() }
+    var field = ItemField(path: "password", type: .password, value: "password")
+    field.passwordQuality = .veryStrong // Caller-supplied scores are ignored.
+    try store.saveItem(ItemEdit(revision: store.catalog().revision,
+        item: VaultItem(name: "login", fields: [field]), create: true))
+    opener.allowRecords = false
+    var item = try store.catalog().items.first { $0.name == "login" }!
+    #expect(item.fields[0].passwordQuality == .veryWeak)
+    #expect(item.fields[0].value == nil)
+    item.fields[0].passwordQuality = .veryStrong
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false))
+    let reopened = try VaultSession(snapshot: store.snapshot, trust: trust, opener: opener)
+    defer { reopened.close() }
+    #expect(try reopened.catalog().items.first { $0.name == "login" }?.fields[0].passwordQuality == .veryWeak)
+    try store.write(SecretReference(vault: "v", item: "login", field: "password"),
+                    value: "g8#Qx2!Wm7@Lp9$Rv4", replace: true)
+    #expect(try store.catalog().items.first { $0.name == "login" }?.fields[0].passwordQuality == .veryStrong)
+}
+
+@Test func trashAndRestorePreserveCiphertextAndHideOrdinaryReferences() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let opener = CountingOpener(device)
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: opener)
+    defer { store.close() }
+    let ref = try SecretReference("mop://v/login/password")
+    try store.write(ref, value: "secret", replace: false)
+    let before = try VaultDocument.decode(store.snapshot)
+    opener.allowRecords = false
+    let date = Date(timeIntervalSince1970: 1_000_000)
+    try store.trashItem(name: "login", revision: store.catalog().revision, at: date)
+    let deleted = try #require(store.recentlyDeleted(at: date).items.first)
+    #expect(deleted.deletion?.originalName == "login")
+    #expect(try store.catalog().items.isEmpty && store.list(vault: nil).isEmpty)
+    #expect(try VaultDocument.decode(store.snapshot).records == before.records)
+    #expect(try VaultDocument.decode(store.snapshot).header.recipients == before.header.recipients)
+    #expect(throws: MopError.notFound) { try store.read(ref) }
+    #expect(throws: MopError.notFound) { try store.read(SecretReference(vault: "v", item: deleted.name, field: "password")) }
+    let reopened = try VaultSession(snapshot: store.snapshot, trust: trust, opener: opener)
+    defer { reopened.close() }
+    try reopened.restoreItem(id: #require(deleted.deletion?.id), revision: reopened.catalog().revision, at: date)
+    #expect(try reopened.catalog().items.map(\.name) == ["login"])
+    #expect(try VaultDocument.decode(reopened.snapshot).records == before.records)
+    opener.allowRecords = true
+    #expect(try reopened.read(ref) == "secret")
+}
+
+@Test func deletedItemsExpireAndPurgeOnlyTheirRecords() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    defer { store.close() }
+    let date = Date(timeIntervalSince1970: 1_000_000)
+    try store.write(SecretReference("mop://v/old/password"), value: "old", replace: false)
+    try store.write(SecretReference("mop://v/keep/password"), value: "keep", replace: false)
+    try store.trashItem(name: "old", revision: store.catalog().revision, at: date)
+    let deleted = try #require(store.recentlyDeleted(at: date).items.first?.deletion)
+    let snapshot = store.snapshot
+    #expect(try !store.purgeExpiredItems(at: deleted.expiresAt.addingTimeInterval(-1)))
+    #expect(store.snapshot == snapshot)
+    #expect(try store.recentlyDeleted(at: deleted.expiresAt).items.isEmpty)
+    #expect(throws: MopError.notFound) { try store.restoreItem(id: deleted.id, revision: store.catalog().revision, at: deleted.expiresAt) }
+    #expect(try store.purgeExpiredItems(at: deleted.expiresAt))
+    #expect(try VaultDocument.decode(store.snapshot).records.count == 1)
+    #expect(try store.read(SecretReference("mop://v/keep/password")) == "keep")
+    #expect(try store.recentlyDeleted(at: .distantPast).items.isEmpty)
+}
+
+@Test func trashConflictsAndRestoreNameCollisionsLeaveSnapshotIntact() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    defer { store.close() }
+    let ref = try SecretReference("mop://v/login/password"), date = Date()
+    try store.write(ref, value: "old", replace: false)
+    let snapshot = store.snapshot
+    #expect(throws: MopError.vaultConflict) { try store.trashItem(name: "login", revision: "stale", at: date) }
+    #expect(store.snapshot == snapshot)
+    try store.trashItem(name: "login", revision: store.catalog().revision, at: date)
+    let id = try #require(store.recentlyDeleted(at: date).items.first?.deletion?.id)
+    try store.write(ref, value: "new", replace: false)
+    let collision = store.snapshot
+    #expect(throws: MopError.duplicate) { try store.restoreItem(id: id, revision: store.catalog().revision, at: date) }
+    #expect(store.snapshot == collision)
+    try store.trashItem(name: "login", revision: store.catalog().revision, at: date)
+    #expect(try store.recentlyDeleted(at: date).items.count == 2)
+}

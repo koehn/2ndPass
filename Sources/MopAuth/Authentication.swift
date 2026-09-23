@@ -4,8 +4,9 @@ import MopCore
 import Synchronization
 
 public enum Authentication {
-    public static func authorize(strictBiometrics: Bool = false, reason: String = "access secrets for this mop command") throws -> LAContext {
+    public static func authorize(strictBiometrics: Bool = false, reason: String = "access secrets for this mop command", contextCreated: (LAContext) throws -> Void = { _ in }) throws -> LAContext {
         let context = LAContext()
+        do { try contextCreated(context) } catch { context.invalidate(); throw error }
         context.touchIDAuthenticationAllowableReuseDuration = 0
         context.localizedReason = reason
         let policy: LAPolicy = strictBiometrics ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication

@@ -27,6 +27,7 @@ public enum CLIError: LocalizedError, Sendable {
         case .malformedResponse: return "The command returned an unreadable response."
         case .launch: return "The bundled command could not be started."
         case .failed(let code):
+            if code == 17 { return "CloudKit could not complete the operation. Check your connection and retry. Refreshing trusted Macs and enrollment requests requires online access." }
             // Never display arbitrary subprocess diagnostics or secret output.
             let errors: [Int32: MopError] = [2: .invalidProcess, 3: .authentication, 4: .notFound,
                 5: .duplicate, 6: .keychain(0), 7: .inputOutput, 8: .signing, 9: .vaultMissing,
@@ -34,7 +35,8 @@ public enum CLIError: LocalizedError, Sendable {
                 14: .invalidDevice, 15: .filePermissions, 16: .vaultUntrusted, 17: .cloudUnavailable,
                 18: .cloudAccount, 19: .cloudQuota, 20: .cloudThrottled, 21: .cloudPermission,
                 22: .cloudUncertain, 23: .invalidVaultName, 24: .ambiguousVault,
-                25: .vaultSelectionMismatch, 26: .legacyVault, 27: .vaultDeleteUncertain, 28: .vaultDeleteCleanup]
+                25: .vaultSelectionMismatch, 26: .legacyVault, 27: .vaultDeleteUncertain, 28: .vaultDeleteCleanup,
+                29: .cloudInvalidRequest]
             return errors[code]?.errorDescription ?? "The command did not complete successfully."
         }
     }

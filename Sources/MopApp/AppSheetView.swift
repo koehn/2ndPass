@@ -6,10 +6,6 @@ struct AppSheetView: View {
     @Bindable var model: AppModel
     let kind: AppSheet
     @State private var vaultName = "personal"
-    @State private var item = ""
-    @State private var section = ""
-    @State private var field = "token"
-    @State private var value = ""
     @State private var name = Host.current().localizedName ?? "Mac"
     @State private var fingerprint = ""
     @State private var strict = false
@@ -19,20 +15,13 @@ struct AppSheetView: View {
     @State private var deletionTarget: VaultDescriptor?
     @State private var deletionConfirmation = ""
 
-    private var reference: SecretReference? {
-        if kind == .replaceSecret { return model.selected }
-        return try? SecretReference(vault: model.vaultName, item: kind == .addField ? (model.selectedItem ?? "") : item, section: section.isEmpty ? nil : section, field: field)
-    }
     private var validFingerprint: Bool {
         fingerprint.count == 64 && fingerprint.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
     private var title: String {
         switch kind {
-        case .createSecret: "New item"
-        case .addField: "Add field"
         case .renameVault: "Rename vault"
         case .deleteVault: "Delete vault"
-        case .replaceSecret: "Replace value"
         case .createVault: "Create a vault"
         case .request: "Enroll this Mac"
         case .trust: "Verify vault trust"
@@ -44,7 +33,6 @@ struct AppSheetView: View {
     }
     private var canSubmit: Bool {
         switch kind {
-        case .createSecret, .addField, .replaceSecret: reference != nil
         case .createVault: (try? VaultName.validate(vaultName)) != nil && !name.isEmpty && recoveryURL != nil && confirmed
         case .renameVault: (try? VaultName.validate(vaultName)) != nil
         case .deleteVault: deletionTarget != nil && !model.offline && deletionConfirmation == (deletionTarget?.name ?? deletionTarget?.id)
@@ -60,19 +48,6 @@ struct AppSheetView: View {
         VStack(alignment: .leading, spacing: 20) {
             Text(title).font(.title2).fontWeight(.semibold)
             switch kind {
-            case .createSecret, .addField, .replaceSecret:
-                if kind == .createSecret || kind == .addField {
-                    Form {
-                        Text(model.vaultName).font(.caption)
-                        if kind == .createSecret { TextField("Item", text: $item) }
-                        else { Text(model.selectedItem ?? "") }
-                        TextField("Section (optional)", text: $section)
-                        TextField("Field", text: $field)
-                    }
-                }
-                if let reference { Text(reference.description).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
-                SecureField("Secret value", text: $value)
-                Text("The value is sent privately to mop after you choose Save. Empty values are allowed.").font(.caption).foregroundStyle(.secondary)
             case .createVault:
                 Text("Create a named encrypted vault in your private iCloud account. Vault names are visible to CloudKit; item and field names remain encrypted.")
                 TextField("Vault name", text: $vaultName)
@@ -145,17 +120,11 @@ struct AppSheetView: View {
             if model.busy { HStack { ProgressView().controlSize(.small); Text("Waiting for authentication or iCloud…").font(.caption) } }
             HStack {
                 Spacer()
-                Button("Cancel", role: .cancel) { value = ""; model.sheet = nil }.keyboardShortcut(.cancelAction).disabled(model.busy)
-                Button(kind == .deleteVault ? "Delete vault" : (kind == .createSecret || kind == .addField || kind == .replaceSecret ? "Save" : "Continue"), role: kind == .deleteVault ? .destructive : nil) { submit() }
+                Button("Cancel", role: .cancel) { model.sheet = nil }.keyboardShortcut(.cancelAction).disabled(model.busy)
+                Button(kind == .deleteVault ? "Delete vault" : "Continue", role: kind == .deleteVault ? .destructive : nil) { submit() }
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(model.busy || !canSubmit)
             }
         }.padding(28).frame(width: 500).disabled(model.busy)
-        .opacity(model.isActive ? 1 : 0)
-        .allowsHitTesting(model.isActive)
-        .accessibilityHidden(!model.isActive)
-        .overlay {
-            if !model.isActive { Label("Locked", systemImage: "lock") }
-        }
         .interactiveDismissDisabled(model.busy)
         .onAppear {
             if kind == .renameVault { vaultName = model.vaultName }
@@ -163,15 +132,13 @@ struct AppSheetView: View {
                 deletionTarget = model.selectedVaultDescriptor ?? VaultDescriptor(id: model.vault, name: nil, format: "unknown", enrolled: false)
             }
         }
-        .onDisappear { value = "" }
+        .onChange(of: model.editorGeneration) { _, _ in fingerprint = "" }
         .alert("Operation not completed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
         } message: { Text(model.error ?? "") }
     }
     private func submit() {
         switch kind {
-        case .createSecret, .addField, .replaceSecret:
-            if let reference { model.write(reference: reference, value: value, replace: kind == .replaceSecret); value = "" }
         case .createVault:
             if let recoveryURL { model.createVault(name: vaultName, deviceName: name, strict: strict, recovery: recoveryURL) }
         case .deleteVault:
@@ -179,20 +146,20 @@ struct AppSheetView: View {
         case .renameVault:
             model.renameVault(to: vaultName)
         case .request:
-            model.management(["device", "request", "--name", name] + (strict ? ["--strict-biometrics"] : []))
+            model.management(.request(name: name, strict: strict))
         case .trust:
-            model.management(["vault", "trust", "--fingerprint", fingerprint])
+            model.management(.trust(fingerprint: fingerprint))
         case .selectVault:
             if let id = UUID(uuidString: vaultID)?.uuidString {
                 if !model.vaults.contains(where: { $0.id == id }) { model.vaults.append(VaultDescriptor(id: id, name: nil, format: "unknown", enrolled: false)) }
-                model.vault = id; model.sheet = nil
+                model.sheet = nil; model.chooseVault(id)
             }
         case .recover:
-            if let recoveryURL { model.management(["vault", "recover", "--recovery-file", recoveryURL.path, "--name", name, "--fingerprint", fingerprint]) }
+            if let recoveryURL { model.management(.recover(file: recoveryURL, name: name, fingerprint: fingerprint)) }
         case .revoke:
-            if let device = model.revoking { model.management(["device", "remove", device.fingerprint]) }
+            if let device = model.revoking { model.management(.revoke(fingerprint: device.fingerprint)) }
         case .approve:
-            if let request = model.enrollment { model.management(["device", "add", request.request, "--fingerprint", fingerprint]) }
+            if let request = model.enrollment { model.management(.approve(request: request.request, fingerprint: fingerprint)) }
         }
     }
 }

@@ -70,13 +70,18 @@ not automatically pruned and continue to count toward the cloud quota.
 
 ## Authentication and signing
 
-Every command that accesses secrets or authenticated metadata creates a fresh
+Every CLI command that accesses secrets or authenticated metadata creates a fresh
 `LAContext`, sets Touch ID reuse duration to zero, and evaluates owner
 authentication. Additional prompting on that context is disabled after success.
 The same authorization must satisfy the Keychain item and Secure Enclave key ACLs;
 there is no software-key fallback or weaker retry. Opening a local device performs
 a test wrap/unwrap to prove private-key access even for public device management.
-Contexts are invalidated when the command closes or authentication fails.
+CLI contexts are invalidated when the command closes or authentication fails.
+The GUI retains one authenticated context across enrolled vaults until its inactivity
+deadline or a lock event. A vault store does not own the shared context; the native
+session service invalidates it for all stores, including pending authentication.
+The inactivity setting is 1–60 minutes, default 5. This deliberately extends the
+period during which the GUI process can access secrets without another prompt.
 
 The default key and item use `WhenUnlockedThisDeviceOnly` and user presence; the
 enclave key also requires private-key usage. Touch ID or the login password may
@@ -105,6 +110,19 @@ Public enrollment metadata is not authenticated identity evidence.
 ## Encryption and integrity
 
 An AES-256-GCM index key encrypts canonical reference names and random record IDs.
+The optional extended index also contains item types, ordered field types, and
+visible values (username, website, email, text, notes). These values become plaintext
+in app memory after index authentication but remain encrypted in cloud objects,
+local snapshots, and exports. Password, OTP, and concealed values never enter the
+index; they retain separate record-key authentication. Legacy fields default to
+concealed. Changing a concealed field to a visible type opens its record before
+including the value in the index. Making a field concealed again removes its index
+copy from the new revision; older revisions retain the historical encrypted copy.
+Typed edits check the expected snapshot digest and publish one conditional cloud
+commit. Reordering unchanged fields preserves all record ciphertexts. Enrollment,
+rotation, rename, restore, and ordinary CLI writes/deletes preserve or update item
+metadata. Old clients cannot decode the extended index and fail closed; update
+all clients before writing typed items.
 Every secret has an independent random AES-256-GCM value key. CryptoKit HPKE
 `P256_SHA256_AES_GCM_256` wraps the index key and each value key separately for each
 enrolled device and one offline recovery recipient.
@@ -128,8 +146,9 @@ keys. There are no per-user signatures or enclave-enforced per-field allowlists.
 
 ## Security operation sequences
 
-These sequences describe the operational CloudKit backend. The native app invokes
-the same CLI commands. `Device key / CryptoKit` represents the authenticated
+These sequences describe the operational CloudKit backend. The native app calls
+the same vault libraries, reusing device authorization until session lock. The
+diagrams below show CLI command lifetimes; GUI stores close on session lock. `Device key / CryptoKit` represents the authenticated
 Keychain/enclave path together with CryptoKit's HPKE handling: the private device
 key stays hardware-backed, but unwrapped symmetric keys and requested plaintext
 exist in Mop's process memory. CloudKit receives ciphertext and public metadata.
@@ -512,7 +531,7 @@ returned by HPKE opening, private-key export, and base64 conversion is wiped in
 
 Secret values use immutable `SecretBytes` allocations through vault/Keychain
 storage, synchronous and asynchronous services, CLI input/output, dotenv parsing,
-template rendering, child environments, and GUI subprocess transport. Sharing a
+template rendering, child environments, and native GUI service results. Sharing a
 value retains the same allocation rather than copying its plaintext. The last
 owner wipes the entire allocation with `memset_s` before freeing it. Mutable
 builders wipe old allocations when growing and transfer ownership on completion;
@@ -548,21 +567,38 @@ strings are masked on stdout/stderr, including across chunks; transformed output
 files, `/dev/tty`, or deliberately malicious children can bypass masking. No shell
 is implicitly invoked, and reference expansion does not recursively expand secrets.
 
-The native app invokes the bundled CLI for fresh authentication per operation;
-values travel through stdin/stdout pipes, not arguments or temporary files. Secret
-copies use a device-local pasteboard entry, a cooperative confidential-content
+The native app uses a serialized in-process service and typed operations. It retains
+an authenticated device context and vault stores scoped to the account and UUID.
+Each online sensitive operation refreshes the snapshot before use, including
+checking current recipients; revisions still use conditional cloud commits. Failed
+mutations discard stores, and subsequent refresh reconciles uncertain publication.
+
+Concealed-field copies use a device-local pasteboard entry, a cooperative confidential-content
 marker, and a 30-second expiry. Revealed text cannot be copied through native text
 selection; use Copy value. Clearing checks the pasteboard change count to avoid
 erasing another application's newer content. Clipboard readers can still capture
 an intentionally copied value; cooperative markers are not access controls.
+Non-concealed field copies remain device-local but have no confidential marker,
+expiry, or clear-on-lock ownership. Classification comes from the refreshed native
+read result; missing field metadata defaults to concealed. Replacing a secret copy
+with a visible value cancels its pending expiry.
 
-App deactivation immediately hides sensitive content from display and accessibility
-and conceals values. If authentication returns focus before completion, its result
-can be displayed. A command completing while inactive leaves the app locked and
-discards visible results. Explicit lock, session deactivation, and sleep also clear
-owned clipboard contents. Ordinary app switching allows pasting until expiration.
-Submitted mutations can still complete after locking; reconcile uncertain results
-with Sync. The app does not persist plaintext in preferences or logs.
+App deactivation leaves metadata, editor drafts, and sheets visible; there is no
+privacy cover. It conceals explicitly revealed values and closes generator popovers,
+but does not end authorization. Only input inside Mop resets
+the inactivity timer; background work and authentication dialogs do not. Timeout,
+manual lock, sleep, screen/session lock, termination, account changes, and mode
+changes invalidate authorization and clear UI data, editor drafts, and owned
+concealed clipboard contents. Returning to the app checks session expiry.
+A reveal/copy completing after loss of focus is discarded.
+
+Lock invalidates the context without waiting for network I/O or authentication.
+Session generations reject late results and queued operations. Worker cleanup
+closes stores when an in-flight operation yields its operation permit; transient
+cryptographic state held by that operation can remain until it returns. Submitted
+mutations can still commit after locking; reconcile uncertain results with Sync.
+The app does not persist plaintext in preferences or logs. Swift strings and
+CryptoKit keys retain the best-effort memory-erasure limitations described above.
 
 ## Vault deletion
 
@@ -572,7 +608,9 @@ Touch ID/password authentication. This operation uses the Apple Account's privat
 CloudKit database authority; it does not require vault decryption or enrollment,
 so it can remove legacy or damaged vaults. It does not unwrap secret keys and is
 not governed by a vault device key's strict-biometric setting. The GUI confirms
-the same fixed UUID and calls this CLI path.
+the same fixed UUID and calls the native repository deletion path. It reuses an
+already authenticated app session; when locked, deletion obtains a temporary
+device-owner authorization, including for legacy or unenrolled vaults.
 
 Deletion removes a whole UUID zone, including history and staging. A readback in
 the same account must confirm zone absence before clearing scoped local snapshots,
@@ -582,3 +620,66 @@ lock files remain to prevent an already-open session from repopulating its offli
 snapshot; explicit backup import can restore that UUID. Shared device identity,
 Keychain entries, exports, and other Macs' caches are not removed. This is logical
 deletion, not a secure-erasure guarantee for prior filesystem or cloud copies.
+
+## GUI password quality and item renaming
+
+The GUI automatically attempts to unlock enrolled vaults on initial launch, using
+the normal device authentication policy. Cancellation does not cause a prompt loop.
+All Vaults keeps catalogs keyed by vault UUID and item name, so duplicate display
+names cannot route reads or writes to a different vault. Lock clears all catalogs.
+
+Password quality is computed locally when a password value is saved, and committed
+atomically with the record in the encrypted, authenticated item metadata. Catalog
+reads expose only the rating, without decrypting password records. Unchanged fields
+retain their rating; older unrated fields remain unrated until a password is set.
+Callers cannot override ratings through item edits. Direct writes also refresh them.
+The pinned native zxcvbn dependency receives temporary Swift strings, which have
+Swift's memory-erasure limitations. No passwords are sent to an external estimator.
+Live editing uses the same local estimator, bounded to a 100-character prefix and
+not a breach check. Lock clears catalog ratings and drafts from the UI.
+
+The generator uses SecRandomCopyBytes with rejection sampling and fails closed on
+random-source errors. Random mode includes each selected character class and shuffles
+its output. Pronounceable mode uses random alternating consonants/vowels, reducing
+the search space; its live estimate helps choose sufficient length. Candidates remain
+in transient GUI strings, are never automatically copied or saved, and are discarded
+on dismissal, focus loss, or locking. Generator previews display cleartext until dismissed or hidden. Only generation
+settings, never generated passwords, are persisted in local preferences.
+
+Item renames use the original item name and expected catalog revision. Colliding
+names and stale revisions are rejected. All reference paths and item metadata are
+updated in one conditional commit, preserving record IDs and ciphertext for
+untouched values. Old references cease to resolve; vault formats are unchanged.
+
+## Recently Deleted retention
+
+Deleted-item identifiers, original names, and timestamps are authenticated inside
+the encrypted vault index. Moving an item rewrites its index paths to an opaque
+archive identifier and commits metadata and references together using the existing
+conditional cloud commit. The record ciphertext and recipient lists stay unchanged;
+no password is opened and no cross-vault copy or expanded access is introduced.
+Ordinary list, catalog, read, write, and field-delete operations exclude or reject
+archived items. Restore is a separate revision-checked operation and refuses name
+collisions and expired items. GUI templates do not prevent deleting a whole item.
+
+Expiration uses the local wall clock and 30 elapsed days. Online catalog refreshes
+and unlocked-session maintenance purge expired index entries and current records,
+without opening record keys. Offline views hide expired items but cannot publish a
+purge. Mutations use the same conflict, uncertain-commit reconciliation, and failed
+store disposal rules as edits. Lock clears deleted catalogs and ignores late results.
+Historical snapshots and exported backups are not erased by this retention policy;
+older Mop versions may expose archived paths because they predate deletion metadata.
+
+The GUI retains unlocked catalog metadata across navigation without reopening
+vaults. Sensitive native operations still synchronize and validate the current
+account, trust, and recipients. An unchanged snapshot reuses its existing
+cryptographic session; reading one secret unwraps only that record key, not the
+index or other records. A changed snapshot opens and authenticates a new index.
+
+CLI multi-vault operations, including `mop list`, lazily open one LocalDevice and
+reuse its authenticated context for the command. Vault stores borrow this context;
+closing one does not invalidate the others. The routed command closes every store
+before invalidating its shared authorization, including after partial failure.
+Empty or entirely skipped listings do not prompt. Each vault still synchronizes and
+passes its own enrollment and trust checks; authorization is not retained between
+separate CLI invocations.

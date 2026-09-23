@@ -22,6 +22,9 @@ with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
     info = plistlib.loads((prefix / 'lib/mop/Mop.app/Contents/Info.plist').read_bytes())
     assert info['CFBundleExecutable'] == 'MopApp'
     assert (prefix / 'lib/mop/Mop.app/Contents/MacOS/MopApp').is_file()
+    resources_dir = prefix / 'lib/mop/Mop.app/Contents/Resources'
+    assert (resources_dir / 'zxcvbn_zxcvbn.bundle').is_dir()
+    assert (resources_dir / 'zxcvbn-LICENSE.txt').is_file()
     direct = prefix / 'lib/mop/Mop.app/Contents/MacOS/mop'
     identity = subprocess.check_output([str(direct), 'device', 'identity']).strip()
     assert identity

@@ -13,6 +13,11 @@ class Mop < Formula
   def install
     system "swift", "build", *std_swift_args, "--disable-sandbox", "--force-resolved-versions", "--product", "mop"
     bin.install ".build/release/mop"
+    # Older stable releases lack the estimator; HEAD needs its SwiftPM resources.
+    if File.directory?(".build/release/zxcvbn_zxcvbn.bundle")
+      bin.install ".build/release/zxcvbn_zxcvbn.bundle"
+      (share/"licenses/mop").install ".build/checkouts/zxcvbn-swift/LICENSE" => "zxcvbn-LICENSE.txt"
+    end
     system "/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime", "--timestamp=none", bin/"mop"
     system "/usr/bin/codesign", "--verify", "--strict", bin/"mop"
     man1.install "docs/man/mop.1"

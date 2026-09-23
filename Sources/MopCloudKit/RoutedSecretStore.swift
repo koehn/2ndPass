@@ -8,16 +8,20 @@ public final class RoutedSecretStore: AsyncSecretStore {
     private let selection: String?
     private let open: (VaultDescriptor) async throws -> CloudSecretStore
     private let diagnostic: (String) -> Void
+    private var onClose: (() -> Void)?
+    private var closed = false
     private var stores: [String: CloudSecretStore] = [:]
 
     public init(repository: CloudRepository, rows: [VaultDescriptor], selection: String?,
                 diagnostic: @escaping (String) -> Void = { _ in },
+                onClose: @escaping () -> Void = {},
                 open: @escaping (VaultDescriptor) async throws -> CloudSecretStore) {
         self.repository = repository; self.rows = rows; self.selection = selection
-        self.open = open; self.diagnostic = diagnostic
+        self.open = open; self.diagnostic = diagnostic; self.onClose = onClose
     }
 
     private func store(_ row: VaultDescriptor) async throws -> CloudSecretStore {
+        guard !closed else { throw MopError.authentication }
         if let store = stores[row.id] { return store }
         let store = try await open(row)
         guard store.name == row.name else { store.close(); throw MopError.vaultSelectionMismatch }
@@ -60,6 +64,12 @@ public final class RoutedSecretStore: AsyncSecretStore {
         for row in included { result += try await store(row).list(vault: nil) }
         return result.sorted()
     }
-    public func close() { for store in stores.values { store.close() }; stores.removeAll() }
+    public func close() {
+        guard !closed else { return }
+        closed = true
+        for store in stores.values { store.close() }
+        stores.removeAll()
+        onClose?(); onClose = nil
+    }
     deinit { close() }
 }

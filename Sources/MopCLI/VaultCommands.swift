@@ -56,13 +56,17 @@ struct VaultOptions: ParsableArguments {
         AsyncSecretService {
             let repo = try await self.repository()
             let rows = try await repo.descriptors(publicKey: LocalDevice.savedPublicKey(directory: self.stateURL))
+            let authorization = CommandVaultAuthorization {
+                let device = try LocalDevice.open(directory: self.stateURL)
+                return (device, { device.close() })
+            }
             return RoutedSecretStore(repository: repo, rows: rows, selection: self.selection,
-                diagnostic: { IO.diagnostic("mop: " + $0 + "\n") }) { row in
+                diagnostic: { IO.diagnostic("mop: " + $0 + "\n") },
+                onClose: { authorization.close() }) { row in
                     let vault = try repo.vault(UUID(uuidString: row.id)!)
                     let bytes = try await self.snapshot(vault)
-                    let device = try LocalDevice.open(directory: self.stateURL)
-                    do { return try CloudSecretStore(vault: vault, snapshot: bytes, opener: device, offline: self.offline, onClose: { device.close() }) }
-                    catch { device.close(); throw error }
+                    let device = try authorization.opener()
+                    return try CloudSecretStore(vault: vault, snapshot: bytes, opener: device, offline: self.offline)
                 }
         }
     }

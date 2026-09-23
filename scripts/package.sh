@@ -38,6 +38,12 @@ if [[ "$product" == mop ]]; then
     swift build -c release --product MopApp
     cp "$bin_dir/MopApp" "$app/Contents/MacOS/MopApp"
     /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable MopApp' "$app/Contents/Info.plist"
+    mkdir -p "$app/Contents/Resources"
+    # SwiftPM resources used by the in-process password-strength estimator.
+    cp -R "$bin_dir/zxcvbn_zxcvbn.bundle" "$app/Contents/Resources/"
+    cp .build/checkouts/zxcvbn-swift/LICENSE "$app/Contents/Resources/zxcvbn-LICENSE.txt"
+    cp assets/Mop.icns "$app/Contents/Resources/Mop.icns"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string Mop.icns' "$app/Contents/Info.plist"
     # Sign the CLI helper with the same identity, CloudKit container, and Keychain group.
     codesign --force --sign "$MOP_SIGN_IDENTITY" --identifier "$bundle_id" --options runtime --timestamp \
         --entitlements "$stage/entitlements.plist" "$app/Contents/MacOS/mop"
@@ -65,4 +71,11 @@ if [[ -e "dist/$bundle_name.app" ]]; then
     mv "dist/$bundle_name.app" "$stage/previous.app"
 fi
 mv "$app" "dist/$bundle_name.app"
+# Notify Launch Services after replacing the bundle at the same path. Otherwise
+# Finder and the Dock can retain icon metadata from the previous build.
+touch "dist/$bundle_name.app"
+if ! /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$PWD/dist/$bundle_name.app"; then
+    echo 'Warning: macOS application registration could not be refreshed.' >&2
+fi
 echo "Signed application: $PWD/dist/$bundle_name.app"

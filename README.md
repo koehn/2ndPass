@@ -31,13 +31,42 @@ or unsigned-build fallback for secret access.
 ## Native Mac app
 
 Open the packaged `Mop.app` to browse secrets, copy references, manage trusted
-Macs, create vaults, and export encrypted backups. Values authenticate separately;
-offline browsing is explicit and read only. The app uses the bundled CLI and the
-same existing device state. See [the Mac app guide](docs/GUI.md).
+Macs, create vaults, and export encrypted backups. The app authenticates once per
+session across enrolled vaults and locks after configurable inactivity (1–60
+minutes, default 5). It calls the native vault libraries using the existing device
+state. On first opening it prompts to unlock enrolled vaults. A collapsible vault
+sidebar and All Vaults view keep items organized; editing supports inline item
+renaming and password-strength indicators. Offline browsing is explicit and read only. See [the Mac app guide](docs/GUI.md).
 
 ```sh
 open dist/Mop.app
 ```
+
+## Item templates and field types
+
+**New item** offers Login, Password, API credential, Secure note, Database, and
+Custom templates. **Edit item** changes the item/field types, adds or removes fields,
+and moves fields up or down. Order is saved with the item and synchronized across Macs.
+
+Username, website, email, text, and notes fields are visible after unlocking the
+index. Password, OTP, and concealed fields remain hidden until explicitly read. The CLI
+authenticates each command; the GUI reuses its unlocked session.
+All values remain encrypted in storage, backups, and iCloud. OTP currently stores
+an OTP seed or `otpauth` URL; it does not generate codes.
+
+Existing fields default to concealed in a Custom item. Upgrade all Macs before
+saving typed items: older clients cannot read the extended encrypted index. Existing
+v4 vaults and backups remain readable by the updated client without migration.
+
+`mop item catalog --vault personal` returns JSON with the current revision, item
+and field types, saved order, and visible values (never concealed values).
+`mop item save --vault personal` accepts an `ItemEdit` JSON object through stdin:
+`revision`, `create` (boolean), and `item` (`name`, `type`, ordered `fields`). Each
+field has `path` (canonical percent-encoded `field` or `section/field`), `type`, and
+an optional `value`. An omitted/null value preserves an existing value; an empty
+string replaces it with empty text. Fields omitted from an existing item's edit
+are deleted. Stale revisions fail without overwriting another writer. Ordinary
+`mop list --json` still returns references only.
 
 ## Storage and authentication
 
@@ -48,7 +77,7 @@ CloudKit stores individual immutable encrypted records and revision manifests;
 a conditional head update publishes a complete revision. Unchanged secret records
 are reused. Concurrent writers fail explicitly rather than overwrite changes.
 
-Every secret command authenticates afresh with Touch ID or the system password.
+Every CLI secret command authenticates afresh with Touch ID or the system password.
 `--strict-biometrics` on initial device creation requires the current Touch ID
 set with no password fallback. Changing biometric enrollment then requires
 recovery. The Secure Enclave key and its Keychain item enforce the policy;
@@ -113,7 +142,8 @@ in CloudKit or keep it next to a synchronized backup. A failed initialization
 retains any recovery file already written.
 
 References select their vault by name, independent of any saved default.
-`mop list` lists all enrolled named vaults; `mop list --vault personal` selects one.
+`mop list` lists all enrolled named vaults with one authentication per command;
+`mop list --vault personal` selects one.
 Use `--vault NAME-OR-UUID` to constrain a reference command or select a management
 command's vault. `vault use` saves an account-scoped default for management only.
 A missing or ambiguous name is an error, never a fallback to another vault.
@@ -258,7 +288,7 @@ mop run --offline -- your-command
 mop vault export --offline --out-file /path/to/backup.mopfile
 ```
 
-Only `read`, `list`, `run`, `inject`, and encrypted `export` accept offline mode.
+Only `read`, `list`, `item catalog`, `run`, `inject`, and encrypted `export` accept offline mode.
 They use the last authenticated cache, require local authentication, and print its
 fetch time to stderr. There is no implicit fallback after network errors. A sync
 without authentication downloads ciphertext but does not promote it to the

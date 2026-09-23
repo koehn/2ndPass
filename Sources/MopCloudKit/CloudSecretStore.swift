@@ -16,6 +16,21 @@ public final class CloudSecretStore: AsyncSecretStore {
     }
     public func read(_ reference: SecretReference) throws -> SecretBytes { try session.read(reference) }
     public func list(vault: String?) throws -> [SecretReference] { try session.list(vault: vault) }
+    public func catalog() throws -> ItemCatalog { try session.catalog() }
+    public func saveItem(_ edit: ItemEdit) async throws { try await mutate { try session.saveItem(edit) } }
+    public func recentlyDeleted(at date: Date) throws -> ItemCatalog { try session.recentlyDeleted(at: date) }
+    public func trashItem(name: String, revision: String, at date: Date) async throws {
+        try await mutate { try session.trashItem(name: name, revision: revision, at: date) }
+    }
+    public func restoreItem(id: UUID, revision: String, at date: Date) async throws {
+        try await mutate { try session.restoreItem(id: id, revision: revision, at: date) }
+    }
+    public func purgeExpiredItems(at date: Date) async throws {
+        // Avoid publishing a new revision when there is nothing to remove.
+        let all = try session.recentlyDeleted(at: .distantPast).items
+        guard all.contains(where: { $0.deletion?.isExpired(at: date) == true }) else { return }
+        try await mutate { _ = try session.purgeExpiredItems(at: date) }
+    }
     public func fingerprint() throws -> String { try session.fingerprint() }
     public func recipients() throws -> [DeviceRequest] { try session.recipients() }
 

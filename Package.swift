@@ -12,10 +12,11 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.8.2"),
+        .package(url: "https://github.com/DeVitoC/zxcvbn-swift.git", revision: "2d0c1137bab12e2c1dc13f167c650256bf60d0b8"),
     ],
     targets: [
-        .target(name: "MopCore"),
-        .target(name: "MopAppSupport", dependencies: ["MopCore"]),
+        .target(name: "MopCore", dependencies: [.product(name: "zxcvbn", package: "zxcvbn-swift")]),
+        .target(name: "MopAppSupport", dependencies: ["MopCore", "MopCloudKit", "MopVault", "MopAuth", "MopKeychain"]),
         .executableTarget(name: "MopApp", dependencies: ["MopAppSupport", "MopCore"]),
         .testTarget(name: "MopAppSupportTests", dependencies: ["MopAppSupport", "MopCore"]),
         .testTarget(name: "MopAppTests", dependencies: ["MopApp", "MopAppSupport", "MopCore"]),
@@ -29,7 +30,7 @@ let package = Package(
         ]),
         .executableTarget(name: "MopKeychainCheck", dependencies: ["MopCore", "MopKeychain", "MopAuth"]),
         .executableTarget(name: "MopEnclaveCheck", dependencies: ["MopCore", "MopAuth", "MopVault", "MopKeychain"]),
-        .testTarget(name: "MopCLITests", dependencies: ["MopCLI", "MopCore"]),
+        .testTarget(name: "MopCLITests", dependencies: ["MopCLI", "MopCore", "MopVault"]),
         .testTarget(name: "MopCoreTests", dependencies: ["MopCore"]),
         .testTarget(name: "MopKeychainTests", dependencies: ["MopKeychain", "MopCore"]),
         .testTarget(name: "MopCloudKitTests", dependencies: ["MopCloudKit", "MopVault", "MopCore"]),

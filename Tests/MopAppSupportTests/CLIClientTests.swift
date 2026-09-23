@@ -66,3 +66,9 @@ struct CLIClientTests {
         #expect(throws: (any Error).self) { try CLIResult(output: "invalid", diagnostic: "").decode([String].self) }
     }
 }
+
+
+@Test func cloudErrorsUseAppInstructionsAndPreserveConfigurationFailure() {
+    #expect(!(CLIError.failed(17).errorDescription ?? "").contains("--offline"))
+    #expect(CLIError.failed(29).errorDescription == MopError.cloudInvalidRequest.errorDescription)
+}

@@ -197,12 +197,12 @@ public final class AppleCloudTransport: CloudTransport, @unchecked Sendable {
                 configure(op); op.zoneID = zone(vault); op.desiredKeys = []; op.resultsLimit = 100
                 op.recordMatchedBlock = { id, result in
                     switch result { case .success: rows.withLock { $0.append(id.recordName) }
-                    case .failure(let error): failure.withLock { $0 = Self.map(error) } }
+                    case .failure(let error): failure.withLock { $0 = Self.mapQuery(error) } }
                 }
                 op.queryResultBlock = { result in
                     if let error = failure.withLock({ $0 }) { continuation.resume(throwing: error); return }
                     switch result { case .success(let cursor): continuation.resume(returning: (rows.withLock { $0 }, cursor))
-                    case .failure(let error): continuation.resume(throwing: Self.map(error)) }
+                    case .failure(let error): continuation.resume(throwing: Self.mapQuery(error)) }
                 }
                 database.add(op)
             }
@@ -212,16 +212,26 @@ public final class AppleCloudTransport: CloudTransport, @unchecked Sendable {
         return ids.sorted()
     }
 
+    // A query has no individual record target: unknownItem here means the
+    // queried record type is unavailable, rather than an absent request.
+    static func mapQuery(_ error: Error) -> MopError {
+        if let cloudError = error as? CKError, cloudError.code == .unknownItem {
+            return .cloudInvalidRequest
+        }
+        return map(error)
+    }
+
     static func map(_ error: Error) -> MopError {
         if let error = error as? MopError { return error }
         guard let error = error as? CKError else { return .cloudUnavailable }
         if error.code == .partialFailure, let errors = error.partialErrorsByItemID {
             let mapped = errors.values.map(Self.map)
-            for candidate in [MopError.vaultConflict, .cloudAccount, .cloudQuota, .cloudThrottled, .cloudPermission, .vaultMissing] {
+            for candidate in [MopError.vaultConflict, .cloudAccount, .cloudQuota, .cloudThrottled, .cloudPermission, .cloudInvalidRequest, .vaultMissing] {
                 if mapped.contains(candidate) { return candidate }
             }
         }
         switch error.code {
+        case .invalidArguments: return .cloudInvalidRequest
         case .serverRecordChanged: return .vaultConflict
         case .notAuthenticated: return .cloudAccount
         case .accountTemporarilyUnavailable: return .cloudUnavailable

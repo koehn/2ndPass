@@ -2,6 +2,7 @@ import Foundation
 
 /// Deliberately contains no secret values, OS error descriptions, or user input.
 public enum MopError: Error, LocalizedError, Equatable {
+    case cloudInvalidRequest
     case cloudUnavailable, cloudAccount, cloudQuota, cloudThrottled, cloudPermission, cloudUncertain, offlineWrite, fileMigration
     case invalidVaultName, ambiguousVault, vaultSelectionMismatch, legacyVault
     case vaultDeleteUncertain, vaultDeleteCleanup, confirmationRequired, operationCancelled
@@ -39,6 +40,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .ambiguousVault: 24
         case .vaultSelectionMismatch: 25
         case .legacyVault: 26
+        case .cloudInvalidRequest: 29
         case .cloudUnavailable: 17
         case .cloudAccount: 18
         case .cloudQuota: 19
@@ -76,6 +78,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .ambiguousVault: "Multiple vaults have this name. Select a UUID and rename the conflicting vault."
         case .vaultSelectionMismatch: "The reference does not match the selected vault or its authenticated name."
         case .legacyVault: "Legacy vault format is unsupported. Use an older Mop client to access it; no migration is provided."
+        case .cloudInvalidRequest: "CloudKit rejected the request configuration. Verify the deployed record types and query indexes in the signed CloudKit environment; enrollment queries require MopRequest with a queryable recordName index."
         case .cloudUnavailable: "CloudKit is unavailable. Retry online or explicitly select --offline for cached reads."
         case .cloudAccount: "An available iCloud account matching this local binding is required."
         case .cloudQuota: "The iCloud storage quota is exceeded."

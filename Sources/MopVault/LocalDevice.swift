@@ -22,6 +22,7 @@ public final class LocalDevice: VaultKeyOpener {
 
     public let publicKey: Data
     public let name: String
+    public let strictBiometrics: Bool
     private let key: SecureEnclave.P256.KeyAgreement.PrivateKey
     private let context: LAContext
     public var request: DeviceRequest { try! DeviceRequest(name: name, publicKey: publicKey) }
@@ -29,6 +30,7 @@ public final class LocalDevice: VaultKeyOpener {
     private init(record: Record, key: SecureEnclave.P256.KeyAgreement.PrivateKey, context: LAContext) {
         self.publicKey = record.publicKey
         self.name = record.name
+        self.strictBiometrics = record.strictBiometrics
         self.key = key
         self.context = context
     }
@@ -43,7 +45,7 @@ public final class LocalDevice: VaultKeyOpener {
         return saved.publicKey
     }
 
-    public static func open(directory: URL, create: Bool = false, name: String = "Mac", strictBiometrics: Bool? = nil) throws -> LocalDevice {
+    public static func open(directory: URL, create: Bool = false, name: String = "Mac", strictBiometrics: Bool? = nil, authorize: (Bool) throws -> LAContext = { try Authentication.authorize(strictBiometrics: $0) }) throws -> LocalDevice {
         let group = try SigningIdentity.accessGroup()
         guard SecureEnclave.isAvailable else { throw MopError.deviceUnavailable }
         let path = directory.appendingPathComponent("device.json")
@@ -62,7 +64,7 @@ public final class LocalDevice: VaultKeyOpener {
             throw MopError.invalidDevice // Never silently change an existing key's ACL.
         }
         let strict = saved?.strictBiometrics ?? strictBiometrics ?? false
-        let context = try Authentication.authorize(strictBiometrics: strict)
+        let context = try authorize(strict)
         do {
             let key: SecureEnclave.P256.KeyAgreement.PrivateKey
             let record: Record

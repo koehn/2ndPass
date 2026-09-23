@@ -1,5 +1,5 @@
 {
-  "originHash" : "f818199588582373197684a4bee88af2c7e5b4acbce42532a505d07a7d441303",
+  "originHash" : "0383daf7b7da5488239defdece0c30cc350fb34d29c455c4953fc178842fbc93",
   "pins" : [
     {
       "identity" : "swift-argument-parser",
@@ -8,6 +8,14 @@
       "state" : {
         "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
         "version" : "1.8.2"
+      }
+    },
+    {
+      "identity" : "zxcvbn-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/DeVitoC/zxcvbn-swift.git",
+      "state" : {
+        "revision" : "2d0c1137bab12e2c1dc13f167c650256bf60d0b8"
       }
     }
   ],

@@ -42,3 +42,22 @@ import Testing
         #expect(board.string(forType: .string) == nil)
     }
 }
+
+extension SecretClipboardTests {
+    @Test func visibleValueReplacesSecretAndSurvivesExpiryAndLock() async throws {
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let clipboard = SecretClipboard(pasteboard: board, lifetime: .milliseconds(50))
+        clipboard.copy("old-secret")
+        clipboard.copy("alice@example.com", concealed: false)
+        #expect(board.types?.contains(NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")) != true)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(board.string(forType: .string) == "alice@example.com")
+        let model = AppModel(clipboard: clipboard, automaticTimer: false)
+        model.lock()
+        #expect(board.string(forType: .string) == "alice@example.com")
+        clipboard.copy("new-secret")
+        model.lock()
+        #expect(board.string(forType: .string) == nil)
+    }
+}

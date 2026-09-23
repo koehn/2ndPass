@@ -44,7 +44,8 @@ Read a UTF-8 secret, followed by a newline unless -n is supplied.
 Read a secret from hidden terminal input or UTF-8 stdin. Never provide a secret
 as a command argument. Ordinary writes refuse existing fields; --replace requires one.
 .It Cm list Op Fl -vault Ar NAME Op Fl -json
-List references without values across all enrolled named vaults, or select one by
+List references without values across all enrolled named vaults using one authentication
+per command, or select one by
 name or UUID. An included vault failure produces no partial output.
 .It Cm delete Ar REFERENCE
 Delete a field after authentication and server confirmation.
@@ -165,6 +166,8 @@ Cloud unavailable / account unavailable / quota / throttling / permission / unce
 Invalid vault name / ambiguous name / selection mismatch / unsupported legacy format.
 .It 27 / 28
 Unconfirmed vault deletion / confirmed cloud deletion with incomplete local cleanup.
+.It 29
+CloudKit rejected the request configuration; verify record types and query indexes.
 .It 126 / 127
 Cannot launch command / executable missing.
 .El

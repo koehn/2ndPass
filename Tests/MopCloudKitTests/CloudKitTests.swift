@@ -1,3 +1,4 @@
+import CloudKit
 import CryptoKit
 import Foundation
 import Testing
@@ -741,4 +742,70 @@ private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
     try await f.repo.delete(UUID(uuidString: target.id)!)
     #expect(try await f.cloud.zones() == [replacement.id])
     #expect(try await f.repo.named("v").id == replacement.id)
+}
+
+
+@Test func invalidCloudRequestIsNotReportedAsOffline() {
+    let error = CKError(.invalidArguments, userInfo: [NSLocalizedDescriptionKey: "PRIVATE SERVER DETAIL"])
+    #expect(AppleCloudTransport.map(error) == .cloudInvalidRequest)
+    #expect(AppleCloudTransport.map(CKError(.networkFailure)) == .cloudUnavailable)
+    #expect(!(MopError.cloudInvalidRequest.errorDescription ?? "").contains("PRIVATE"))
+    let partial = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: ["request": error]])
+    #expect(AppleCloudTransport.map(partial) == .cloudInvalidRequest)
+}
+
+@Test func missingQueryRecordTypeIsConfigurationFailure() {
+    #expect(AppleCloudTransport.mapQuery(CKError(.unknownItem)) == .cloudInvalidRequest)
+    #expect(AppleCloudTransport.mapQuery(CKError(.networkFailure)) == .cloudUnavailable)
+    #expect(AppleCloudTransport.mapQuery(CKError(.zoneNotFound)) == .vaultMissing)
+}
+
+@Test func typedItemCloudCommitOfflineCatalogAndStaleEdit() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let store = try await f.store(); defer { store.close() }
+    let item = VaultItem(name: "login", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "visible-user"),
+        ItemField(path: "password", type: .password, value: "concealed-password")
+    ])
+    try await store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true))
+    let original = try store.catalog()
+    var reordered = original.items[0]; reordered.fields.reverse()
+    await f.cloud.resetCounters()
+    try await store.saveItem(ItemEdit(revision: original.revision, item: reordered, create: false))
+    #expect(await f.cloud.saves.filter { $0 == "head" }.count == 1)
+    #expect(await f.cloud.saves.filter { $0.hasPrefix("s-") }.isEmpty)
+    let reopened = try await f.store(); defer { reopened.close() }
+    #expect(try reopened.catalog().items[0].fields.map(\.path) == ["password", "username"])
+    #expect(try reopened.catalog().items[0].fields.map(\.value) == [nil, "visible-user"])
+    let offline = try CloudSecretStore(vault: f.vault, snapshot: f.vault.cached().0, opener: f.device, offline: true)
+    defer { offline.close() }
+    #expect(try offline.catalog().items == reopened.catalog().items)
+    await #expect(throws: MopError.offlineWrite) { try await offline.saveItem(ItemEdit(revision: original.revision, item: item, create: false)) }
+    await #expect(throws: MopError.vaultConflict) { try await reopened.saveItem(ItemEdit(revision: original.revision, item: item, create: false)) }
+}
+
+@Test func routedStoreClosesSharedAuthorizationAfterAllStoresOnSuccessAndFailure() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    _ = try await addVault(f, name: "other")
+    let rows = try await f.repo.descriptors(publicKey: f.device.publicKey)
+    for failSecond in [false, true] {
+        var stores: [CloudSecretStore] = []
+        var opened = 0, closed = 0
+        let service = AsyncSecretService {
+            RoutedSecretStore(repository: f.repo, rows: rows, selection: nil, onClose: {
+                closed += 1
+                for store in stores { #expect(throws: MopError.authentication) { try store.list(vault: nil) } }
+            }) { row in
+                opened += 1
+                if failSecond && opened == 2 { throw MopError.authentication }
+                let vault = try f.repo.vault(UUID(uuidString: row.id)!)
+                let store = try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.device)
+                stores.append(store)
+                return store
+            }
+        }
+        if failSecond { await #expect(throws: MopError.authentication) { try await service.list(vault: nil) } }
+        else { _ = try await service.list(vault: nil) }
+        #expect(opened == 2 && closed == 1)
+    }
 }

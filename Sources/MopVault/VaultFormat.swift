@@ -57,6 +57,11 @@ public struct VaultHeader: Codable, Equatable, Sendable {
     public var recipients: [VaultRecipient]
 }
 
+struct VaultIndex: Codable {
+    var references: [String: String]
+    var items: [VaultItem]
+}
+
 public struct VaultDocument: Codable, Sendable {
     public var header: VaultHeader
     public var sealed: Data
@@ -131,8 +136,9 @@ public struct VaultDocument: Codable, Sendable {
         try VaultCoding.encode(AssociatedData(header: header, recordsDigest: VaultCoding.digest(VaultCoding.encode(records))))
     }
 
-    public static func seal(header: VaultHeader, index: [String: String], records: [String: VaultRecord], key: SymmetricKey) throws -> VaultDocument {
-        let box = try AES.GCM.seal(VaultCoding.encode(index), using: key,
+    public static func seal(header: VaultHeader, index: [String: String], records: [String: VaultRecord], key: SymmetricKey, items: [VaultItem] = []) throws -> VaultDocument {
+        let plaintext = try items.isEmpty ? VaultCoding.encode(index) : VaultCoding.encode(VaultIndex(references: index, items: items))
+        let box = try AES.GCM.seal(plaintext, using: key,
                                   authenticating: associatedData(header: header, records: records))
         guard let combined = box.combined else { throw MopError.invalidVault }
         let document = VaultDocument(header: header, sealed: combined, records: records)
@@ -141,15 +147,36 @@ public struct VaultDocument: Codable, Sendable {
     }
 
     public func decryptIndex(key: SymmetricKey) throws -> [String: String] {
+        try decryptCatalog(key: key).references
+    }
+
+    func decryptCatalog(key: SymmetricKey) throws -> VaultIndex {
         do {
             let plaintext = try AES.GCM.open(AES.GCM.SealedBox(combined: sealed), using: key,
                                              authenticating: Self.associatedData(header: header, records: records))
-            let index = try JSONDecoder().decode([String: String].self, from: plaintext)
+            let catalog: VaultIndex
+            if let legacy = try? JSONDecoder().decode([String: String].self, from: plaintext) {
+                catalog = VaultIndex(references: legacy, items: [])
+            } else { catalog = try JSONDecoder().decode(VaultIndex.self, from: plaintext) }
+            let index = catalog.references
             guard Set(index.values).count == index.count, Set(index.values) == Set(records.keys) else { throw MopError.invalidVault }
             for reference in index.keys {
                 guard try SecretReference(vault: header.name, relativePath: reference).relativePath == reference else { throw MopError.invalidVault }
             }
-            return index
+            guard Set(catalog.items.map(\.name)).count == catalog.items.count else { throw MopError.invalidVault }
+            for item in catalog.items {
+                if let deletion = item.deletion {
+                    guard item.name == "mop-deleted-" + deletion.id.uuidString,
+                          !deletion.originalName.isEmpty, deletion.deletedAt.timeIntervalSince1970.isFinite else { throw MopError.invalidVault }
+                }
+                guard !item.fields.isEmpty, Set(item.fields.map(\.path)).count == item.fields.count else { throw MopError.invalidVault }
+                for field in item.fields {
+                    let ref = try SecretReference(vault: header.name, relativePath: SecretReference.encode(item.name) + "/" + field.path)
+                    guard ref.item == item.name, index[ref.relativePath] != nil,
+                          field.type.concealed ? field.value == nil : field.value != nil else { throw MopError.invalidVault }
+                }
+            }
+            return catalog
         } catch { throw MopError.invalidVault }
     }
 }

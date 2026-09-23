@@ -1,34 +1,34 @@
 import AppKit
+import CloudKit
 import SwiftUI
 import MopCore
 import MopAppSupport
 
-struct MacRecord: Decodable, Identifiable {
-    let name: String
-    let fingerprint: String
-    var id: String { fingerprint }
-}
-struct Enrollment: Decodable, Identifiable {
-    let request: String
-    let name: String
-    let fingerprint: String
-    var id: String { request }
-}
-
-enum AppPage: String, CaseIterable { case secrets = "Secrets", devices = "Trusted Macs" }
-enum AppSheet: String, Identifiable { case createSecret, addField, replaceSecret, createVault, renameVault, deleteVault, request, trust, approve, selectVault, recover, revoke
+enum AppPage: String, CaseIterable { case secrets = "Secrets", recentlyDeleted = "Recently Deleted", devices = "Trusted Macs" }
+enum AppSheet: String, Identifiable { case createVault, renameVault, deleteVault, request, trust, approve, selectVault, recover, revoke
     var id: String { rawValue }
 }
 
 @MainActor @Observable
 final class AppModel {
-    let client: CLIClient
+    let service: any VaultService
     let clipboard: SecretClipboard
     var isActive = true
     var vaults: [VaultDescriptor] = []
     var vault = ""
+    var allVaults = false
+    var catalogs: [String: ItemCatalog] = [:]
+    var deletedCatalogs: [String: ItemCatalog] = [:]
+    var selectedDeleted: ItemRow.ID?
+    var itemToDelete: ItemRow?
+    var retentionDate = Date()
+    private var nextRetentionSweep = Date.distantPast
+    @ObservationIgnored private let wallNow: () -> Date
+    var passwordQualities: [String: PasswordQuality] = [:]
+    private var launchAttempted = false
     var page = AppPage.secrets
     var selectedItem: String?
+    var catalog: ItemCatalog?
     var references: [SecretReference] = []
     var selected: SecretReference?
     var search = ""
@@ -46,22 +46,346 @@ final class AppModel {
     var sheet: AppSheet?
     var deleteConfirmation = false
     private var generation = 0
+    private var visibilityGeneration = 0
+    @ObservationIgnored private var activityMonitor: Any?
+    @ObservationIgnored private var lifecycleObservers: [(NotificationCenter, NSObjectProtocol)] = []
     private var concealTask: Task<Void, Never>?
 
-    init(client: CLIClient? = nil, clipboard: SecretClipboard? = nil) {
-        let executable = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("mop")
-            ?? URL(fileURLWithPath: "/nonexistent/mop")
-        self.client = client ?? CLIClient(executable: executable)
+    @ObservationIgnored private let now: () -> TimeInterval
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private var inactivityTask: Task<Void, Never>?
+    @ObservationIgnored private var operationTask: Task<Void, Never>?
+    private var lastActivity: TimeInterval?
+    var editorGeneration = 0
+    var itemDraft: ItemDraft?
+    var passwordGeneratorOptions = PasswordOptions() {
+        didSet {
+            if let data = try? JSONEncoder().encode(passwordGeneratorOptions) {
+                defaults.set(data, forKey: "passwordGeneratorOptions")
+            }
+        }
+    }
+    var autoLockMinutes: Int {
+        didSet {
+            let bounded = min(60, max(1, autoLockMinutes))
+            if bounded != autoLockMinutes { autoLockMinutes = bounded }
+            defaults.set(bounded, forKey: "autoLockMinutes")
+            checkExpiration()
+        }
+    }
+
+    init(service: any VaultService = NativeVaultService(), clipboard: SecretClipboard? = nil,
+         defaults: UserDefaults = .standard,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init) {
+        self.wallNow = wallNow; retentionDate = wallNow()
+        self.service = service
         self.clipboard = clipboard ?? SecretClipboard()
+        self.defaults = defaults; self.now = now
+        let saved = defaults.object(forKey: "autoLockMinutes") as? Int ?? 5
+        autoLockMinutes = min(60, max(1, saved))
+        if let data = defaults.data(forKey: "passwordGeneratorOptions"),
+           var options = try? JSONDecoder().decode(PasswordOptions.self, from: data) {
+            options.length = min(128, max(8, options.length))
+            passwordGeneratorOptions = options
+        }
+        if automaticTimer {
+            inactivityTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard !Task.isCancelled else { return }
+                    self?.checkExpiration()
+                    self?.checkRetention()
+                }
+            }
+        }
+    }
+    deinit { inactivityTask?.cancel() }
+    func checkExpiration() {
+        if let started = service.authenticatedAt {
+            if lastActivity == nil { lastActivity = started }
+            if now() - (lastActivity ?? started) >= Double(autoLockMinutes * 60) { lock() }
+        } else if lastActivity != nil { lock() }
+    }
+    func activity() {
+        checkExpiration()
+        guard isActive, service.isAuthenticated else { return }
+        lastActivity = now()
     }
     var selectedVaultDescriptor: VaultDescriptor? { vaults.first { $0.id == vault } }
-    var canExportBackup: Bool { !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
-    var vaultName: String { references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "" }
+    var canExportBackup: Bool { !allVaults && !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
+    var vaultName: String { catalog?.vault ?? references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "" }
     var filtered: [SecretReference] {
         references.filter { search.isEmpty || $0.description.localizedCaseInsensitiveContains(search) }
     }
     var items: [String] { Array(Set(filtered.map(\.item))).sorted() }
-    var itemFields: [SecretReference] { references.filter { $0.item == selectedItem }.sorted() }
+    var displayedItems: [ItemRow] {
+        let included = allVaults ? catalogs : catalog.map { [vault: $0] } ?? [:]
+        return included.flatMap { id, catalog in
+            catalog.items.compactMap { item -> ItemRow? in
+                let matches = search.isEmpty || item.name.localizedCaseInsensitiveContains(search)
+                    || catalog.vault.localizedCaseInsensitiveContains(search)
+                    || item.fields.contains {
+                        $0.path.localizedCaseInsensitiveContains(search)
+                            || (!$0.type.concealed && $0.value?.localizedCaseInsensitiveContains(search) == true)
+                    }
+                return matches ? ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item) : nil
+            }
+        }.sorted { ($0.item.name, $0.vaultName, $0.id.vault) < ($1.item.name, $1.vaultName, $1.id.vault) }
+    }
+    var deletedRows: [ItemRow] {
+        deletedCatalogs.flatMap { id, catalog in
+            catalog.items.compactMap { item -> ItemRow? in
+                guard let deletion = item.deletion, !deletion.isExpired(at: retentionDate) else { return nil }
+                let matches = search.isEmpty || deletion.originalName.localizedCaseInsensitiveContains(search)
+                    || catalog.vault.localizedCaseInsensitiveContains(search)
+                    || item.fields.contains { !$0.type.concealed && $0.value?.localizedCaseInsensitiveContains(search) == true }
+                return matches ? ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item) : nil
+            }
+        }.sorted { ($0.item.deletion?.deletedAt ?? .distantPast) > ($1.item.deletion?.deletedAt ?? .distantPast) }
+    }
+    var selectedDeletedItem: ItemRow? { deletedRows.first { $0.id == selectedDeleted } }
+    func chooseRecentlyDeleted() {
+        guard !busy else { return }
+        page = .recentlyDeleted; allVaults = false
+        changedVault()
+        if !service.isAuthenticated { unlock() }
+    }
+    func trashItem(_ row: ItemRow) {
+        guard !busy, !offline, authenticated, let source = catalogs[row.id.vault],
+              source.items.contains(where: { $0.name == row.id.name }) else { return }
+        itemToDelete = nil; cancelItemEditing(); conceal(); clearClipboard()
+        perform { token in
+            let result = try await self.service.execute(.trashItem(name: row.id.name, revision: source.revision), vault: row.id.vault, offline: false)
+            guard self.current(token) else { return }
+            try self.applyDeletionResult(result, vault: row.id.vault)
+            if self.vault == row.id.vault && self.selectedItem == row.id.name { self.selectedItem = nil; self.selected = nil }
+            self.notice = "Item moved to Recently Deleted for 30 days."
+        }
+    }
+    func restoreDeletedItem(_ row: ItemRow) {
+        guard !busy, !offline, authenticated, let deletion = row.item.deletion,
+              !deletion.isExpired(at: wallNow()), let source = deletedCatalogs[row.id.vault] else { return }
+        perform { token in
+            let result = try await self.service.execute(.restoreItem(id: deletion.id, revision: source.revision), vault: row.id.vault, offline: false)
+            guard self.current(token) else { return }
+            try self.applyDeletionResult(result, vault: row.id.vault)
+            self.selectedDeleted = nil
+            self.notice = "Item restored to " + row.vaultName + "."
+        }
+    }
+    private func applyDeletionResult(_ result: VaultResult, vault id: String) throws {
+        let catalog = try result.requireCatalog()
+        catalogs[id] = catalog; deletedCatalogs[id] = result.deletedCatalog
+        if vault == id { try applyCatalog(catalog) }
+        retentionDate = wallNow()
+    }
+    func checkRetention() {
+        let date = wallNow()
+        if date.timeIntervalSince(retentionDate) >= 1 { retentionDate = date }
+        guard authenticated, service.isAuthenticated, !offline, !busy, itemDraft == nil, date >= nextRetentionSweep else { return }
+        let ids = deletedCatalogs.filter { $0.value.items.contains { $0.deletion?.isExpired(at: date) == true } }.map(\.key)
+        guard !ids.isEmpty else { return }
+        nextRetentionSweep = date.addingTimeInterval(60)
+        perform { token in
+            for id in ids {
+                let result = try await self.service.execute(.recentlyDeleted, vault: id, offline: false)
+                guard self.current(token) else { return }
+                try self.applyDeletionResult(result, vault: id)
+            }
+        }
+    }
+
+    var selectedRow: ItemRow.ID? {
+        get { selectedItem.map { .init(vault: vault, name: $0) } }
+        set {
+            guard !busy, newValue != selectedRow else { return }
+            cancelItemEditing(); selected = nil; passwordQualities = [:]
+            guard let newValue else { selectedItem = nil; return }
+            if let cached = catalogs[newValue.vault] {
+                vault = newValue.vault
+                try? applyCatalog(cached)
+                selectedItem = newValue.name
+            }
+        }
+    }
+    func chooseVault(_ id: String) {
+        guard !busy else { return }
+        allVaults = false; page = .secrets; vault = id
+        changedVault()
+        if !service.isAuthenticated && !id.isEmpty { unlock() }
+    }
+    /// Target the row's vault without starting an unlock that could race the action.
+    func prepareVaultAction(_ id: String) -> Bool {
+        checkExpiration()
+        guard !busy, vaults.contains(where: { $0.id == id }) else { return false }
+        if allVaults || vault != id || page != .secrets {
+            let cached = service.isAuthenticated ? catalogs[id] : nil
+            clearSelection()
+            vault = id; allVaults = false; page = .secrets; authenticated = false
+            if let cached {
+                try? applyCatalog(cached)
+                authenticated = true
+            }
+            status = authenticated ? "Unlocked" : "Ready to authenticate"
+        }
+        return true
+    }
+
+    func chooseAllVaults() {
+        guard !busy else { return }
+        allVaults = true; page = .secrets
+        changedVault()
+        if !service.isAuthenticated { unlock() }
+    }
+    var sidebarSelection: String {
+        get { page == .recentlyDeleted ? "deleted" : page == .devices ? "devices" : allVaults ? "all" : "vault:" + vault }
+        set {
+            guard newValue != sidebarSelection else { return }
+            if newValue == "deleted" { chooseRecentlyDeleted() }
+            else if newValue == "all" { chooseAllVaults() }
+            else if newValue == "devices" { page = .devices }
+            else if newValue.hasPrefix("vault:") { chooseVault(String(newValue.dropFirst(6))) }
+        }
+    }
+    var selectedTypedItem: VaultItem? { catalog?.items.first { $0.name == selectedItem } }
+    var itemFields: [SecretReference] {
+        let refs = references.filter { $0.item == selectedItem }.sorted()
+        let paths = selectedTypedItem?.fields.map { SecretReference.encode(selectedItem ?? "") + "/" + $0.path } ?? []
+        return refs.sorted { (paths.firstIndex(of: $0.relativePath) ?? Int.max) < (paths.firstIndex(of: $1.relativePath) ?? Int.max) }
+    }
+    func metadata(_ ref: SecretReference) -> ItemField? {
+        catalog?.items.first { $0.name == ref.item }?.fields.first { ref.relativePath == SecretReference.encode(ref.item) + "/" + $0.path }
+    }
+    func applyCatalog(_ catalog: ItemCatalog) throws {
+        let refs = try catalog.items.flatMap { item in
+            try item.fields.map { try SecretReference(vault: catalog.vault, relativePath: SecretReference.encode(item.name) + "/" + $0.path) }
+        }
+        self.catalog = catalog; self.references = refs.sorted()
+        if !vault.isEmpty { catalogs[vault] = catalog }
+        passwordQualities = [:]
+    }
+    var itemCreationVaults: [VaultDescriptor] {
+        vaults.filter { $0.supported && $0.enrolled && catalogs[$0.id] != nil }
+            .sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
+    }
+    var preferredCreationVault: String {
+        guard allVaults else { return vault }
+        let saved = defaults.string(forKey: "allVaultsCreationVault")
+        if let saved, itemCreationVaults.contains(where: { $0.id == saved }) { return saved }
+        if itemCreationVaults.contains(where: { $0.id == vault }) { return vault }
+        return itemCreationVaults.first?.id ?? ""
+    }
+    func beginCreatingItem() {
+        guard !busy, !offline, authenticated, itemDraft == nil else { return }
+        let destination = preferredCreationVault
+        guard itemCreationVaults.contains(where: { $0.id == destination }), let catalog = catalogs[destination] else { return }
+        conceal(); selected = nil; selectedItem = nil
+        itemDraft = ItemDraft(vault: destination, revision: catalog.revision,
+            item: VaultItem(name: "", type: .login, fields: ItemType.login.template), isNew: true)
+    }
+    func chooseCreationVault(_ id: String) {
+        guard !busy, itemDraft?.isNew == true, itemCreationVaults.contains(where: { $0.id == id }) else { return }
+        itemDraft?.vault = id
+        if allVaults { defaults.set(id, forKey: "allVaultsCreationVault") }
+    }
+    func changeDraftType(_ type: ItemType) {
+        guard !busy, var draft = itemDraft else { return }
+        draft.type = type
+        if draft.isNew {
+            if draft.fields.allSatisfy({ ($0.value ?? "").isEmpty }) {
+                draft.fields = type.template.map { ItemDraft.Field($0, existing: false) }
+            } else {
+                for field in type.template where !draft.fields.contains(where: { $0.encodedPath == field.path }) {
+                    draft.fields.append(ItemDraft.Field(field, existing: false))
+                }
+            }
+        }
+        itemDraft = draft
+    }
+
+    func createItem(_ item: VaultItem, in destination: String) {
+        guard !busy, !offline, authenticated,
+              itemCreationVaults.contains(where: { $0.id == destination }),
+              let target = catalogs[destination] else { return }
+        let remember = allVaults
+        let edit = ItemEdit(revision: target.revision, item: item, create: true)
+        perform { token in
+            let result = try await self.service.execute(.save(edit), vault: destination, offline: false)
+            guard self.current(token) else { return }
+            let catalog = try result.requireCatalog()
+            self.vault = destination
+            try self.applyCatalog(catalog)
+            self.itemDraft = nil
+            self.selectedItem = item.name; self.selected = nil; self.sheet = nil
+            self.conceal(); self.notice = "Item saved to iCloud."
+            if remember { self.defaults.set(destination, forKey: "allVaultsCreationVault") }
+        }
+    }
+
+    func saveItem(_ item: VaultItem, create: Bool, revision: String? = nil, draftID: UUID? = nil, originalName: String? = nil) {
+        guard !offline, let catalog else { return }
+        if !create, let stored = catalog.items.first(where: { $0.name == (originalName ?? item.name) }) {
+            guard stored.fields.filter({ stored.isTemplateField($0) }).allSatisfy({ required in
+                item.fields.contains { $0.path == required.path }
+            }) else { return }
+        }
+        let edit = ItemEdit(revision: revision ?? catalog.revision, item: item, create: create, originalName: originalName)
+        perform { token in
+            let result = try await self.service.execute(.save(edit), vault: self.selectedVault, offline: false)
+            guard self.current(token) else { return }
+            try self.applyCatalog(result.requireCatalog())
+            self.selectedItem = item.name; self.selected = nil; self.sheet = nil
+            if self.itemDraft?.id == draftID { self.itemDraft = nil }
+            self.conceal(); self.notice = originalName != nil && originalName != item.name ? "Item renamed. Update references that use the old name." : "Item saved to iCloud."
+        }
+    }
+    func beginItemEditing(replacing path: String? = nil, addField: Bool = false) {
+        guard !busy, !offline, authenticated, itemDraft == nil, let catalog, let item = selectedTypedItem else { return }
+        guard path == nil || item.fields.contains(where: { $0.path == path }) else { return }
+        conceal()
+        itemDraft = ItemDraft(vault: vault, revision: catalog.revision, item: item,
+                              mode: path.map { .value($0) } ?? .item)
+        if addField { itemDraft?.fields.append(ItemDraft.Field(ItemField(path: "", value: ""), existing: false)) }
+        let passwords = item.fields.filter { $0.type == .password && $0.value == nil && (path == nil || $0.path == path) }
+        guard !passwords.isEmpty, let draft = itemDraft else { return }
+        let visibility = visibilityGeneration
+        perform { token in
+            do {
+                for field in passwords {
+                    let reference = try SecretReference(vault: catalog.vault,
+                        relativePath: SecretReference.encode(item.name) + "/" + field.path)
+                    let result = try await self.service.execute(.read(reference), vault: draft.vault, offline: false)
+                    guard self.current(token), self.itemDraft?.id == draft.id,
+                          self.vault == draft.vault, self.selectedItem == draft.originalName else { return }
+                    guard self.isActive, self.visibilityGeneration == visibility else {
+                        self.cancelItemEditing(); return
+                    }
+                    guard let value = result.value else { throw MopError.invalidVault }
+                    guard let index = self.itemDraft?.fields.firstIndex(where: { $0.path == field.path }) else { continue }
+                    // Preserve input if an edit was made while this read was pending.
+                    guard self.itemDraft?.fields[index].value == draft.fields.first(where: { $0.path == field.path })?.value else { continue }
+                    let password = String(decoding: value, as: UTF8.self)
+                    self.itemDraft?.fields[index].loadedPassword = password
+                    self.itemDraft?.fields[index].value = password
+                }
+            } catch {
+                if self.itemDraft?.id == draft.id { self.cancelItemEditing() }
+                throw error
+            }
+        }
+    }
+    func cancelItemEditing() { itemDraft = nil; conceal() }
+    func saveItemDraft() {
+        if let draft = itemDraft, draft.isNew {
+            guard let target = catalogs[draft.vault], draft.valid(vaultName: target.vault) else { return }
+            createItem(draft.item, in: draft.vault)
+            return
+        }
+        guard let draft = itemDraft, draft.vault == vault, draft.originalName == selectedItem,
+              draft.valid(vaultName: vaultName) else { return }
+        saveItem(draft.item, create: false, revision: draft.revision, draftID: draft.id, originalName: draft.originalName)
+    }
     func selectField(_ reference: SecretReference) { if selected != reference { conceal() }; selected = reference }
     func vaultLabel(_ descriptor: VaultDescriptor) -> String {
         guard let name = descriptor.name else { return "Legacy · " + descriptor.id }
@@ -71,76 +395,161 @@ final class AppModel {
 
     func conceal() { revealed = nil; concealTask?.cancel() }
     func clearClipboard() { clipboard.clear() }
-    func deactivate() {
-        isActive = false
-        conceal()
-        // The view hides all metadata immediately. A temporary authentication
-        // dialog may return focus before the command completes.
-        if !busy { lock(clearClipboard: false) }
+    func startMonitoringActivity() {
+        guard lifecycleObservers.isEmpty else { return }
+        observe(NotificationCenter.default, NSApplication.didResignActiveNotification) { $0.deactivate() }
+        observe(NotificationCenter.default, NSApplication.didBecomeActiveNotification) { $0.activate() }
+        observe(NotificationCenter.default, NSApplication.willTerminateNotification) { $0.shutdown() }
+        observe(NotificationCenter.default, .CKAccountChanged) { $0.lock() }
+        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.sessionDidResignActiveNotification) { $0.lock() }
+        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification) { $0.lock() }
+        observe(DistributedNotificationCenter.default(), Notification.Name("com.apple.screenIsLocked")) { $0.lock() }
+        activityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .mouseMoved, .leftMouseDragged, .rightMouseDragged, .scrollWheel]) { [weak self] event in
+            MainActor.assumeIsolated { self?.activity() }
+            return event
+        }
     }
-    func activate() { isActive = true }
+    private func observe(_ center: NotificationCenter, _ name: Notification.Name, action: @escaping @MainActor (AppModel) -> Void) {
+        let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { if let self { action(self) } }
+        }
+        lifecycleObservers.append((center, observer))
+    }
+    func shutdown() {
+        lock(); inactivityTask?.cancel()
+        for (center, observer) in lifecycleObservers { center.removeObserver(observer) }
+        lifecycleObservers.removeAll()
+        if let activityMonitor { NSEvent.removeMonitor(activityMonitor); self.activityMonitor = nil }
+    }
+    func deactivate() { isActive = false; visibilityGeneration += 1; conceal() }
+    func activate() { checkExpiration(); isActive = true; checkRetention() }
+    private func clearSelection() {
+        generation += 1; editorGeneration += 1; itemDraft = nil
+        selectedDeleted = nil; itemToDelete = nil
+        conceal(); catalog = nil; passwordQualities = [:]; references = []; selected = nil; devices = []; requests = []
+        enrollment = nil; revoking = nil; selectedItem = nil; sheet = nil; notice = nil
+        search = ""; deleteConfirmation = false; error = nil
+    }
+    private func clearView() {
+        clearSelection()
+        catalogs = [:]; deletedCatalogs = [:]; authenticated = false
+    }
     func lock(clearClipboard: Bool = true) {
-        generation += 1
-        conceal(); if clearClipboard { self.clearClipboard() }; references = []; selected = nil; devices = []; requests = []
-        enrollment = nil; revoking = nil; selectedItem = nil; authenticated = false; sheet = nil; notice = nil
+        service.lock(); operationTask?.cancel(); lastActivity = nil
+        clearView(); if clearClipboard { self.clearClipboard() }
         status = "Locked"
     }
     func changedContext() { lock(); status = offline ? "Offline mode · unlock a verified snapshot" : "Ready to authenticate" }
+    func changedVault() {
+        checkExpiration()
+        clearSelection()
+        guard service.isAuthenticated else { authenticated = false; status = "Ready to authenticate"; return }
+        let ids = requestedVaultIDs
+        if !ids.isEmpty && ids.allSatisfy({ catalogs[$0] != nil }) {
+            if let cached = catalogs[vault] { try? applyCatalog(cached) }
+            authenticated = true
+            status = offline ? "Read only · verified cached catalogs" : "Unlocked"
+        } else {
+            status = "Opening vault"
+            perform { token in try await self.unlockContents(token, refresh: false) }
+        }
+    }
+    private var requestedVaultIDs: [String] {
+        (allVaults || page == .recentlyDeleted) ? vaults.filter { $0.supported && $0.enrolled }.map(\.id) : (vault.isEmpty ? [] : [vault])
+    }
 
     func perform(_ action: @escaping @MainActor (Int) async throws -> Void) {
+        checkExpiration()
         guard !busy else { return }
         busy = true; error = nil; notice = nil
         let token = generation
-        Task {
-            defer {
-                busy = false
-                if !isActive { lock(clearClipboard: false) }
-            }
+        operationTask = Task {
+            defer { busy = false; checkExpiration() }
+            guard self.current(token) else { return }
             do { try await action(token) }
             catch {
-                if token == generation { if case CLIError.failed(let code) = error, [8, 10, 13, 16, 18].contains(code) { self.lock() }
-                    self.error = (error as? LocalizedError)?.errorDescription ?? "The operation could not be completed." }
+                if token == generation {
+                    if let failure = error as? MopError,
+                       [.authentication, .signing, .invalidDevice, .invalidVault, .vaultUntrusted, .deviceNotEnrolled, .cloudAccount].contains(failure) { self.lock() }
+                    // Framework errors may contain arbitrary diagnostics. Only
+                    // domain errors have user-safe messages.
+                    self.error = (error as? MopError)?.errorDescription ?? "The operation could not be completed."
+                }
             }
         }
     }
-    func current(_ token: Int) -> Bool { token == generation && isActive }
+    func current(_ token: Int) -> Bool { checkExpiration(); return token == generation }
 
-    func discover() {
+    func start() {
+        guard !launchAttempted else { return }
+        launchAttempted = true
+        discover(autoUnlock: true)
+    }
+    func discover(autoUnlock: Bool = false) {
         perform { token in
-            let result = try await self.client.run(["vault", "list", "--json"], offline: self.offline)
-            let rows = try result.decode([VaultDescriptor].self)
+            let result = try await self.service.execute(.discover, vault: nil, offline: self.offline)
+            let rows = result.vaults
             let ids = rows.map(\.id)
             guard self.current(token) else { return }
             self.vaults = rows
+            self.catalogs = self.catalogs.filter { ids.contains($0.key) }
+            self.deletedCatalogs = self.deletedCatalogs.filter { ids.contains($0.key) }
             // Use the repository's account-scoped default, never an arbitrary vault.
             if self.vault.isEmpty {
-                if let result = try? await self.client.run(["vault", "status"]),
-                   let status = try? result.decode([String: String].self),
-                   let id = status["vault"], ids.contains(id), self.current(token) { self.vault = id }
+                if let id = result.defaultVault, ids.contains(id) { self.vault = id }
             } else if !ids.contains(self.vault) { self.vault = ""; self.lock() }
             self.status = ids.isEmpty ? "Create your first vault" : "Choose a vault, then unlock its index"
+            if autoUnlock, rows.contains(where: { $0.supported && $0.enrolled }) {
+                self.allVaults = true
+                try await self.unlockContents(token)
+            }
         }
     }
     func unlock() {
         guard !busy else { return }
-        conceal(); references = []; authenticated = false
-        perform { token in
-            let result = try await self.client.run(["list", "--json"], vault: self.selectedVault, offline: self.offline)
-            let refs = try result.decode([String].self).map { try SecretReference($0) }.sorted()
-            guard self.current(token) else { return }
-            self.references = refs; self.authenticated = true
-            if let name = refs.first?.vault {
-                self.vaults.removeAll { $0.id == self.vault }
-                self.vaults.append(VaultDescriptor(id: self.vault, name: name, format: "mop-vault-v4", enrolled: true))
-            } else if self.vaultName.isEmpty {
-                let discovery = try await self.client.run(["vault", "list", "--json"], offline: self.offline)
-                let rows = try discovery.decode([VaultDescriptor].self)
-                guard self.current(token) else { return }
-                self.vaults = rows
-            }
-            if let item = self.selectedItem, !refs.contains(where: { $0.item == item }) { self.selectedItem = nil }
-            if let selected = self.selected, !refs.contains(selected) { self.selected = nil }
-            self.status = self.offline ? "Read only · verified cache from \(result.offlineDate ?? "unknown time")" : "Index authenticated · values concealed"
+        cancelItemEditing(); catalog = nil; passwordQualities = [:]; references = []; authenticated = false
+        perform { token in try await self.unlockContents(token) }
+    }
+    private func unlockContents(_ token: Int, refresh: Bool = true) async throws {
+        let ids = requestedVaultIDs
+        guard !ids.isEmpty else { status = "No enrolled vaults to unlock. Select a vault to request access."; return }
+        var loaded = catalogs
+        var deleted = deletedCatalogs
+        var dates: [String: Date] = [:]
+        for id in ids where refresh || loaded[id] == nil {
+            let result = try await service.execute(.catalog, vault: id, offline: offline)
+            guard current(token) else { return }
+            loaded[id] = try result.requireCatalog()
+            deleted[id] = result.deletedCatalog
+            dates[id] = result.offlineDate
+        }
+        guard current(token) else { return }
+        catalogs = loaded; deletedCatalogs = deleted; retentionDate = wallNow()
+        if loaded[vault] == nil { vault = ids[0] }
+        if let catalog = loaded[vault] { try applyCatalog(catalog) }
+        authenticated = true
+        for (id, catalog) in loaded {
+            vaults.removeAll { $0.id == id }
+            vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v4", enrolled: true))
+        }
+        if let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
+        if let selected, !references.contains(selected) { self.selected = nil }
+        let date = dates.values.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
+        status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
+    }
+    func loadPasswordQuality() async {
+        passwordQualities = [:]
+        guard authenticated, service.isAuthenticated, let item = selectedTypedItem,
+              item.fields.contains(where: { $0.type == .password }) else { return }
+        let token = generation, id = vault, name = item.name
+        do {
+            let result = try await service.execute(.passwordQuality(item: name), vault: id, offline: offline)
+            guard current(token), !Task.isCancelled, vault == id, selectedItem == name else { return }
+            passwordQualities = result.passwordQuality
+        } catch {
+            // Scores are optional. Authentication/account failures still clear the
+            // session through the service and expiry check; never expose diagnostics.
+            checkExpiration()
         }
     }
     func copyReference() {
@@ -151,39 +560,60 @@ final class AppModel {
     func read(copy: Bool) {
         guard let selected else { return }
         conceal()
+        let visibility = visibilityGeneration
         perform { token in
-            let result = try await self.client.run(["read", "--no-newline", selected.description], vault: self.selectedVault, offline: self.offline)
-            guard self.current(token), self.selected == selected, NSApplication.shared.isActive else { return }
+            let result = try await self.service.execute(.read(selected), vault: self.selectedVault, offline: self.offline)
+            guard self.current(token), self.selected == selected, self.isActive, self.visibilityGeneration == visibility else { return }
+            guard let value = result.value else { throw MopError.invalidVault }
             if copy {
-                self.clipboard.copy(result.output)
-                self.notice = "Value copied. Mop clears its clipboard entry after 30 seconds."
+                self.clipboard.copy(value, concealed: result.valueIsConcealed)
+                self.notice = result.valueIsConcealed
+                    ? "Value copied. Mop clears its clipboard entry after 30 seconds."
+                    : "Value copied."
             } else {
-                self.revealed = result.output
+                self.revealed = value
                 self.concealTask = Task { [weak self = self] in
                     try? await Task.sleep(for: .seconds(30))
                     guard !Task.isCancelled else { return }; self?.conceal()
                 }
             }
-            if self.offline { self.status = "Read only · verified cache from \(result.offlineDate ?? "unknown time")" }
+            if self.offline { self.status = "Read only · verified cache from \(result.offlineDate.map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time")" }
         }
     }
     func write(reference: SecretReference, value: String, replace: Bool) {
         guard !offline else { return }
+        if var item = catalog?.items.first(where: { $0.name == reference.item }) {
+            let path = [reference.section, reference.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
+            if let i = item.fields.firstIndex(where: { $0.path == path }) {
+                guard replace else { error = MopError.duplicate.errorDescription; return }
+                item.fields[i].value = value
+            } else {
+                guard !replace else { error = MopError.notFound.errorDescription; return }
+                item.fields.append(ItemField(path: path, value: value))
+            }
+            saveItem(item, create: false); return
+        }
         let value = SecretBytes(utf8: value)
         perform { token in
-            _ = try await self.client.run(["write", reference.description] + (replace ? ["--replace"] : []), vault: self.selectedVault, input: value)
+            let result = try await self.service.execute(.write(reference, value, replace: replace), vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
-            if !self.references.contains(reference) { self.references.append(reference); self.references.sort() }
+            try self.applyCatalog(result.requireCatalog())
             self.selected = reference; self.selectedItem = reference.item; self.authenticated = true
             self.sheet = nil; self.conceal(); self.notice = "Secret saved to iCloud."
         }
     }
     func delete() {
         guard let selected, !offline else { return }
+        if let item = selectedTypedItem, let field = metadata(selected), item.isTemplateField(field) { return }
+        if var item = selectedTypedItem, item.fields.count > 1 {
+            item.fields.removeAll { selected.relativePath == SecretReference.encode(item.name) + "/" + $0.path }
+            saveItem(item, create: false); return
+        }
         perform { token in
-            _ = try await self.client.run(["delete", selected.description], vault: self.selectedVault)
+            let result = try await self.service.execute(.delete(selected), vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
-            self.references.removeAll { $0 == selected }; self.selected = nil; self.conceal()
+            try self.applyCatalog(result.requireCatalog())
+            self.selected = nil; self.conceal()
             if self.itemFields.isEmpty { self.selectedItem = nil }
             self.notice = "Secret deleted. Historical encrypted copies remain."
         }
@@ -191,69 +621,75 @@ final class AppModel {
     func loadDevices() {
         guard !offline else { return }
         perform { token in
-            let result = try await self.client.run(["device", "list"], vault: self.selectedVault)
-            let devices = try result.decode([MacRecord].self)
+            let result = try await self.service.execute(.devices, vault: self.selectedVault, offline: false)
+            let devices = result.devices
             guard self.current(token) else { return }
             self.devices = devices
-            let pending = try await self.client.run(["device", "requests"], vault: self.selectedVault)
+            self.requests = []
+            self.status = "Trusted Macs loaded · refreshing enrollment requests"
+            let pending = try await self.service.execute(.requests, vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
-            self.requests = try pending.decode([Enrollment].self).filter { request in !devices.contains { $0.fingerprint == request.fingerprint } }
+            self.requests = pending.requests.filter { request in !devices.contains { $0.fingerprint == request.fingerprint } }
             self.status = "Device list authenticated"
         }
     }
-    func management(_ command: [String], input: String? = nil) {
+    func management(_ action: VaultManagement) {
         guard !offline else { return }
         perform { token in
-            let result = try await self.client.run(command, vault: self.selectedVault, input: input.map { SecretBytes(utf8: $0) })
+            let result = try await self.service.execute(.manage(action), vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
-            self.sheet = nil; self.notice = result.text
+            if let catalog = result.catalog { try self.applyCatalog(catalog) }
+            self.sheet = nil; self.notice = result.message
             self.requests = []; self.devices = []
         }
     }
     func sync() {
         guard !offline else { return }
         perform { token in
-            _ = try await self.client.run(["vault", "sync"], vault: self.selectedVault)
+            _ = try await self.service.execute(.sync, vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
             self.status = "Ciphertext synchronized · unlock to verify the offline snapshot"
         }
     }
     func createVault(name: String, deviceName: String, strict: Bool, recovery: URL) {
         guard !offline, !busy else { return }
-        conceal(); references = []; selected = nil; devices = []; requests = []; authenticated = false
+        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; devices = []; requests = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
-            self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v4", enrolled: true))
+            self.allVaults = false; self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v4", enrolled: true))
             self.status = "Creating vault \(id) · retain any recovery file written"
-            let result = try await self.client.run(["vault", "init", name, "--device-name", deviceName, "--recovery-file", recovery.path] + (strict ? ["--strict-biometrics"] : []), vault: id)
+            let result = try await self.service.execute(.create(name: name, deviceName: deviceName, strict: strict, recovery: recovery), vault: id, offline: false)
             guard self.current(token) else { return }
-            self.references = []; self.selected = nil; self.authenticated = true; self.sheet = nil
-            self.notice = result.text; self.status = "Vault created · move the recovery credential offline"
+            try self.applyCatalog(result.requireCatalog())
+            self.selected = nil; self.authenticated = true; self.sheet = nil
+            self.notice = result.message; self.status = "Vault created · move the recovery credential offline"
         }
     }
     func renameVault(to name: String) {
         guard !offline, !vault.isEmpty else { return }
         let id = vault
         perform { token in
-            _ = try await self.client.run(["vault", "rename", id, name], vault: id)
+            let result = try await self.service.execute(.rename(name), vault: id, offline: false)
             guard self.current(token), self.vault == id else { return }
-            self.lock()
+            try self.applyCatalog(result.requireCatalog())
+            self.authenticated = true; self.sheet = nil; self.selected = nil; self.conceal()
             if let index = self.vaults.firstIndex(where: { $0.id == id }) {
                 let old = self.vaults[index]
                 self.vaults[index] = VaultDescriptor(id: id, name: name, format: old.format, enrolled: old.enrolled)
             }
-            self.notice = "Vault renamed. Update existing references; unlock to refresh items."
+            self.notice = "Vault renamed. Update existing references."
         }
     }
     func deleteVault(target: VaultDescriptor, confirmation: String) {
         guard !offline, !busy, vault == target.id, confirmation == (target.name ?? target.id) else { return }
-        conceal(); clearClipboard(); references = []; selected = nil; selectedItem = nil; authenticated = false
+        conceal(); clearClipboard(); catalog = nil; references = []; selected = nil; selectedItem = nil; authenticated = false
         perform { token in
-            _ = try await self.client.run(["vault", "delete", target.id, "--yes"], vault: target.id)
+            _ = try await self.service.execute(.deleteVault, vault: target.id, offline: false)
             guard self.current(token), self.vault == target.id else { return }
             self.lock()
             self.vaults.removeAll { $0.id == target.id }
+            self.catalogs[target.id] = nil
             self.vault = ""
             self.notice = "Vault deleted. Backups and caches on other Macs remain."
             self.status = "Vault deleted"
@@ -271,7 +707,7 @@ final class AppModel {
         guard canExportBackup, !busy else { return }
         let id = vault
         perform { token in
-            _ = try await self.client.run(["vault", "export", "--out-file", url.path], vault: id, offline: self.offline)
+            _ = try await self.service.execute(.export(url), vault: id, offline: self.offline)
             guard self.current(token) else { return }; self.notice = "Encrypted backup exported. Keep your recovery key separately."
         }
     }

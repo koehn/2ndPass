@@ -1,0 +1,72 @@
+import Foundation
+
+public enum FieldType: String, Codable, CaseIterable, Sendable {
+    case text, username, website, email, password, otp, concealed, notes
+    public var concealed: Bool { [.password, .otp, .concealed].contains(self) }
+    public var label: String { self == .otp ? "OTP" : rawValue.capitalized }
+}
+
+public enum ItemType: String, Codable, CaseIterable, Sendable {
+    case login, password, apiCredential, secureNote, database, custom
+    public var label: String {
+        switch self {
+        case .apiCredential: "API credential"
+        case .secureNote: "Secure note"
+        default: rawValue.capitalized
+        }
+    }
+    public var template: [ItemField] {
+        let fields: [(String, FieldType)]
+        switch self {
+        case .login: fields = [("username", .username), ("password", .password), ("website", .website)]
+        case .password: fields = [("password", .password)]
+        case .apiCredential: fields = [("username", .username), ("token", .concealed), ("website", .website)]
+        case .secureNote: fields = [("note", .concealed)]
+        case .database: fields = [("server", .text), ("username", .username), ("password", .password), ("database", .text)]
+        case .custom: fields = [("field", .concealed)]
+        }
+        return (fields + [("notes", .notes)]).map { ItemField(path: $0.0, type: $0.1, value: "", isTemplate: true) }
+    }
+}
+
+/// Values are present only for visible fields when listing. In edits, nil keeps the existing value.
+public struct ItemField: Codable, Equatable, Sendable {
+    public var path: String
+    public var type: FieldType
+    public var value: String?
+    public var passwordQuality: PasswordQuality?
+    public var isTemplate: Bool?
+    public init(path: String, type: FieldType = .concealed, value: String? = nil, isTemplate: Bool? = nil) {
+        self.path = path; self.type = type; self.value = value; self.isTemplate = isTemplate
+    }
+}
+
+public struct VaultItem: Codable, Equatable, Sendable {
+    public var name: String
+    public var type: ItemType
+    public var fields: [ItemField]
+    public var deletion: ItemDeletion?
+    public func isTemplateField(_ field: ItemField) -> Bool {
+        field.isTemplate == true || type.template.contains { $0.path == field.path }
+    }
+    public init(name: String, type: ItemType = .custom, fields: [ItemField]) {
+        self.name = name; self.type = type; self.fields = fields
+    }
+}
+
+public struct ItemCatalog: Codable, Sendable {
+    public var vault: String
+    public var revision: String
+    public var items: [VaultItem]
+    public init(vault: String, revision: String, items: [VaultItem]) { self.vault = vault; self.revision = revision; self.items = items }
+}
+
+public struct ItemEdit: Codable, Sendable {
+    public var revision: String
+    public var item: VaultItem
+    public var create: Bool
+    public var originalName: String?
+    public init(revision: String, item: VaultItem, create: Bool, originalName: String? = nil) {
+        self.revision = revision; self.item = item; self.create = create; self.originalName = originalName
+    }
+}
