@@ -1,0 +1,21 @@
+name: Apple applications
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shared-app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Mac regression suites
+        run: swift test
+      - name: Compile simulator and release device applications
+        run: scripts/mobile.sh build
+      - name: Shared unit and interface tests on iPhone and iPad
+        run: scripts/mobile.sh test

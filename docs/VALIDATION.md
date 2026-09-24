@@ -72,7 +72,7 @@ device's item. Run once with default authentication and again with
 ## Application-bound enclave probe
 
 Build `scripts/package.sh --check` using a **separate** explicit profile and
-bundle ID (default `net.koehn.mop.enclave-check`). This executable uses the same
+bundle ID (default `com.koehn.mop.enclave-check`). This executable uses the same
 LocalDevice implementation as mop.
 
 ```sh
@@ -93,7 +93,7 @@ For cross-application denial, create a disposable device using the signed mop
 app. Run the differently provisioned probe against that metadata and mop's group:
 
 ```sh
-"$probe" foreign /path/to/disposable/mop-state TEAMID.net.koehn.mop
+"$probe" foreign /path/to/disposable/mop-state TEAMID.com.koehn.mop
 ```
 
 The probe explicitly requests the other app's group and requires
@@ -154,3 +154,88 @@ zones disappear. Verify the current Mac's scoped cache/default are removed while
 other vaults and shared device keys still work. A second Mac's offline cache must
 remain until separately removed. Test a lost delete response and retry the same
 UUID; no successful deletion should be reported without verified remote absence.
+
+## QR pairing validation — September 23, 2026
+
+- `swift test`: all 216 tests pass, including 23 new pairing protocol, coordinator,
+  enrollment, cancellation, and UI-model tests.
+- `scripts/mobile.sh build`: simulator test build and unsigned Release iOS device
+  build both succeed.
+- `scripts/mobile.sh test`: all 194 shared tests and six UI tests pass on both the
+  selected iPhone and iPad simulators. Pairing UI tests exercise a synthetic scan
+  while locked, comparison-code presentation, completion, and camera denial.
+- Integration tests cover competing phones, frozen request identity, tampered
+  messages, lost message responses, uncertain enrollment commits, publication
+  conflicts, cancellation before/after publication starts, account changes,
+  missing zones, interrupted trust setup, rotation, and revocation.
+- UI test navigation now handles compact back navigation and restores portrait
+  orientation before saving a draft after its rotation check. New protocol and
+  coordinator test files are included explicitly in the Xcode test target.
+
+Physical camera scanning, real Secure Enclave biometrics, signed two-device
+pairing, and Production CloudKit remain unverified for this feature. A physical
+iPad was detected during this run; the physical iPhone was offline. Simulator
+fixtures do not replace hands-on approval and biometric authentication. No app
+was installed on a physical device, and no production vault was modified.
+
+### Pairing completion and verification-error regressions
+
+- Simulator test and unsigned Release iOS device builds both succeed.
+- All 221 Mac package tests pass.
+- All 199 shared tests and seven UI tests pass on each selected iPhone/iPad
+  simulator, including verification failure after local authentication ends.
+- Mac approval stays pending until the phone sends an authenticated acknowledgement
+  of the exact receipt after saving trust and opening the vault. Missing or invalid
+  acknowledgements cannot produce a successful completion on the Mac.
+- Regression tests reproduce approval without mobile trust, verify that fresh
+  pairing repairs interrupted setup without duplicate enrollment, and confirm
+  that the phone can unlock after subsequently locking.
+- A pairing failure remains visible when the service invalidates authentication;
+  vault contents are cleared. Explicit lock/background cancellation still applies.
+- Physical-device pairing must be retried with both updated applications. These
+  tests do not identify an unobserved hardware error or replace real biometrics.
+
+### Shared automatic vault sessions
+
+- All 224 Swift package tests pass. Regression coverage includes all-or-none
+  opening across connected vaults, exclusion and icons for unconnected vaults,
+  inactivity resets, background session reuse and expiry, and cancellation without
+  repeated authentication prompts.
+- All 202 shared tests and seven UI tests pass on both iPhone and iPad simulators.
+  UI coverage verifies background/foreground session retention and absence of an
+  Unlock button, alongside the existing manual-lock and pairing regressions.
+- Simulator test builds and the unsigned Release iOS device build both succeed.
+- Real-device biometric session reuse has not been exercised for this change.
+  Simulator authentication fixtures remain Debug-only and do not bypass production
+  authentication.
+
+### Trust after app updates and automatic-unlock failures
+
+- All 229 Swift package tests pass. New regression tests move an entire cloud
+  state directory to a different sandbox path and reopen both legacy and stable
+  trust bindings. They reject absent/ambiguous legacy pins, wrong keys, wrong
+  cloud scope, and invalid stable records even when a valid legacy pin remains.
+- iPhone and iPad shared/UI suites pass, with eight UI tests on each. The new UI
+  regression dismisses a trust failure, interacts with Settings, and backgrounds
+  and reactivates the app without another automatic unlock attempt.
+- Model tests cover trust failures across input and Face ID lifecycle events,
+  deliberate refresh retries, and service invalidation before error delivery.
+- A signed physical-device app update and real Face ID were not exercised in this
+  run. Install over the existing app to preserve local trust for migration.
+
+### Account identity and one-time membership conversion
+
+- All 239 Swift package tests pass. Coverage includes signed membership and
+  revisions, tampering, conversion with key rotation, preserved recovery access,
+  competing identity creation, delayed Keychain delivery, account changes,
+  dropped acknowledgements, uncertain conversion reconciliation, and fresh-device
+  access to multiple owned vaults.
+- Both iPhone and iPad simulators pass 217 shared tests and seven UI tests each.
+  UI regressions cover removal of pairing controls and identity/trust failures
+  without repeated automatic authentication.
+- Simulator test builds and the unsigned Release iOS device build succeed.
+  `git diff --check` passes.
+- Signed physical-device Keychain synchronization, provisioning access groups,
+  and actual Face ID/Touch ID behavior were not validated. Follow the acceptance
+  steps in [ACCOUNT-IDENTITY.md](ACCOUNT-IDENTITY.md) before release. Simulator
+  fixtures remain Debug-only and do not bypass production authentication.

@@ -1,0 +1,23 @@
+{
+  "originHash" : "6504dec98d13fd2ad07b3e9e5af0166531b09e9aa34164e9b386676417243f4b",
+  "pins" : [
+    {
+      "identity" : "swift-argument-parser",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-argument-parser.git",
+      "state" : {
+        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+        "version" : "1.8.2"
+      }
+    },
+    {
+      "identity" : "zxcvbn-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/DeVitoC/zxcvbn-swift.git",
+      "state" : {
+        "revision" : "2d0c1137bab12e2c1dc13f167c650256bf60d0b8"
+      }
+    }
+  ],
+  "version" : 3
+}

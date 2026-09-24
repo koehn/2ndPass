@@ -35,19 +35,22 @@ struct CloudManifest: Codable, Sendable {
     let header: VaultHeader
     let sealed: Data
     let records: [String: String]
+    let signature: Data?
+    let signer: Data?
 
     init(document: VaultDocument) throws {
         format = "mop-cloud-manifest-v2"
         header = document.header
         sealed = document.sealed
+        signature = document.signature; signer = document.signer
         records = try document.records.mapValues { VaultCoding.digest(try VaultCoding.encode($0)) }
     }
 
     func document(records values: [String: VaultRecord]) throws -> VaultDocument {
         guard format == "mop-cloud-manifest-v2", Set(records.keys) == Set(values.keys) else { throw MopError.invalidVault }
         // Decode through the v4 validator, including its size limit.
-        struct Parts: Encodable { let header: VaultHeader; let sealed: Data; let records: [String: VaultRecord] }
-        return try VaultDocument.decode(VaultCoding.encode(Parts(header: header, sealed: sealed, records: values)))
+        struct Parts: Encodable { let header: VaultHeader; let sealed: Data; let records: [String: VaultRecord]; let signature: Data?; let signer: Data? }
+        return try VaultDocument.decode(VaultCoding.encode(Parts(header: header, sealed: sealed, records: values, signature: signature, signer: signer)))
     }
 }
 

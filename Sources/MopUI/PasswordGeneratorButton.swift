@@ -33,7 +33,7 @@ private struct PasswordGeneratorView: View {
     @State private var error: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        ScrollView { VStack(alignment: .leading, spacing: 14) {
             Text("Generate password").font(.headline)
             Stepper("Length: \(options.length)", value: $options.length, in: 8...128)
             Toggle("Pronounceable", isOn: $options.pronounceable)
@@ -66,7 +66,7 @@ private struct PasswordGeneratorView: View {
             }
             Text("Use password updates the input. Choose Save to store it.")
                 .font(.caption).foregroundStyle(.secondary)
-        }.padding(20).frame(width: 420)
+        }.padding(20) }.mopSheetWidth(420).frame(idealHeight: 600, maxHeight: 700)
         .onAppear(perform: generate)
         .onChange(of: options) { _, _ in generate() }
         .onDisappear { candidate = "" }

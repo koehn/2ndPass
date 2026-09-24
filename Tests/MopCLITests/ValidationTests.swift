@@ -3,14 +3,17 @@ import MopCore
 @testable import MopCLI
 
 @Suite struct ValidationTests {
-    @Test func wrappedLegacyOptionRetainsSafeDiagnostic() throws {
+    @Test func packagingIdentityCommandRemainsAvailable() throws {
+        let command = try Mop.parseAsRoot(["device", "identity"])
+        #expect(command is Device.Identity)
+    }
+
+    @Test func removedFileOptionIsAnUnknownArgument() throws {
         do {
             _ = try Mop.parseAsRoot(["read", "mop://personal/mycloud/sshd", "--vault-file", "/sensitive-path"])
             Issue.record("Legacy file configuration was accepted")
         } catch {
-            #expect(Mop.knownValidationError(error) == .fileMigration)
-            #expect(Mop.knownValidationError(error)?.errorDescription?.contains("Unset MOP_VAULT_FILE") == true)
-            #expect(Mop.knownValidationError(error)?.errorDescription?.contains("sensitive-path") == false)
+            #expect(Mop.knownValidationError(error) == nil)
         }
     }
 

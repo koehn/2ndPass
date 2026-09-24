@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 import MopCore
-@testable import MopApp
+@testable import MopUI
 
 struct ItemDraftTests {
     private var item: VaultItem {
@@ -11,9 +11,9 @@ struct ItemDraftTests {
             ItemField(path: "notes", type: .notes, value: "details", isTemplate: true)
         ])
     }
-    @Test func templatesIncludeNotesAndLegacyProtectionSurvivesTypeChange() {
-        for type in ItemType.allCases {
-            #expect(type.template.contains { $0.path == "notes" && $0.type == .notes })
+    @Test func templateFieldsAndLegacyProtectionSurviveTypeChange() {
+        for type in ItemType.templateTypes {
+            #expect(type.template.contains { $0.path == "notes" && $0.type == .notes } == (type != .secureNote))
             #expect(type.template.allSatisfy { $0.isTemplate == true })
         }
         let legacy = VaultItem(name: "login", type: .login, fields: [
@@ -24,6 +24,28 @@ struct ItemDraftTests {
         draft.type = .custom
         #expect(draft.item.isTemplateField(draft.item.fields[0]))
         #expect(!draft.item.isTemplateField(draft.item.fields[1]))
+    }
+
+    @Test func otpEditingNeverPrefillsSecretAndRejectsInvalidReplacement() {
+        let item = VaultItem(name: "login", type: .login, fields: [ItemField(path: "otp", type: .otp, value: "JBSWY3DPEHPK3PXP")])
+        var draft = ItemDraft(vault: "uuid", revision: "r1", item: item, mode: .value("otp"))
+        #expect(draft.fields[0].value == nil && draft.item.fields[0].value == nil)
+        #expect(draft.valid(vaultName: "personal"))
+        draft.fields[0].value = "123456"
+        #expect(draft.fields[0].validationError != nil && !draft.valid(vaultName: "personal"))
+        draft.fields[0].value = ""
+        #expect(!draft.valid(vaultName: "personal"))
+        draft.fields[0].value = "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP"
+        #expect(draft.fields[0].validationError == nil && draft.valid(vaultName: "personal"))
+    }
+
+    @Test func concealedProvisioningURLsBecomeOTPFieldsAndValidate() {
+        var field = ItemDraft.Field(ItemField(path: "otp", value: "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP"), existing: false)
+        #expect(field.field.type == .otp && field.validationError == nil)
+        field.value = "otpauth://totp/Test?secret=invalid"
+        #expect(field.field.type == .otp && field.validationError != nil)
+        field.value = "ordinary secret"
+        #expect(field.field.type == .concealed && field.validationError == nil)
     }
 
     @Test func unchangedPasswordsUseStoredRatingAndOnlyEditsAreEstimated() {

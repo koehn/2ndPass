@@ -39,7 +39,13 @@ public final class RoutedSecretStore: AsyncSecretStore {
     }
 
     public func read(_ reference: SecretReference) async throws -> SecretBytes {
-        try await store(resolve(reference)).read(reference)
+        let opened = try await store(resolve(reference))
+        let path = [reference.section, reference.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
+        let type = try opened.catalog().items.first { $0.name == reference.item }?
+            .fields.first { $0.path == path }?.type
+        let stored = try opened.read(reference)
+        guard type == .otp else { return stored }
+        return SecretBytes(utf8: try TimeBasedOTP(String(decoding: stored, as: UTF8.self)).code())
     }
     public func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) async throws {
         try await store(resolve(reference)).write(reference, value: value, replace: replace)

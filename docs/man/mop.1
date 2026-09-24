@@ -34,12 +34,12 @@ Remote revocation cannot be checked. Offline mutations are rejected.
 .El
 .Pp
 Normal commands fetch current cloud state. There is no automatic offline fallback.
-The legacy --vault-file option and MOP_VAULT_FILE variable are rejected with
-guidance. Legacy vault formats are unsupported; no migration is provided.
+Legacy vault formats are unsupported; no migration is provided.
 .Sh SECRET COMMANDS
 .Bl -tag -width indent
 .It Cm read Ar REFERENCE
 Read a UTF-8 secret, followed by a newline unless -n is supplied.
+OTP fields return the generated value for the current time, never the stored seed or provisioning URL.
 .It Cm write Op Fl -replace Ar REFERENCE
 Read a secret from hidden terminal input or UTF-8 stdin. Never provide a secret
 as a command argument. Ordinary writes refuse existing fields; --replace requires one.

@@ -3,8 +3,14 @@ import PackageDescription
 
 let package = Package(
     name: "mop",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
+        .library(name: "MopUI", targets: ["MopUI"]),
+        .library(name: "MopCore", targets: ["MopCore"]),
+        .library(name: "MopAppSupport", targets: ["MopAppSupport"]),
+        .library(name: "MopVault", targets: ["MopVault"]),
+        .library(name: "MopCloudKit", targets: ["MopCloudKit"]),
+        .library(name: "MopKeychain", targets: ["MopKeychain"]),
         .executable(name: "mop", targets: ["MopCLI"]),
         .executable(name: "MopApp", targets: ["MopApp"]),
         .executable(name: "mop-keychain-check", targets: ["MopKeychainCheck"]),
@@ -17,9 +23,10 @@ let package = Package(
     targets: [
         .target(name: "MopCore", dependencies: [.product(name: "zxcvbn", package: "zxcvbn-swift")]),
         .target(name: "MopAppSupport", dependencies: ["MopCore", "MopCloudKit", "MopVault", "MopAuth", "MopKeychain"]),
-        .executableTarget(name: "MopApp", dependencies: ["MopAppSupport", "MopCore"]),
+        .target(name: "MopUI", dependencies: ["MopAppSupport", "MopCore"]),
+        .executableTarget(name: "MopApp", dependencies: ["MopUI"]),
         .testTarget(name: "MopAppSupportTests", dependencies: ["MopAppSupport", "MopCore"]),
-        .testTarget(name: "MopAppTests", dependencies: ["MopApp", "MopAppSupport", "MopCore"]),
+        .testTarget(name: "MopAppTests", dependencies: ["MopUI", "MopAppSupport", "MopCore"]),
         .target(name: "MopAuth", dependencies: ["MopCore"]),
         .target(name: "MopKeychain", dependencies: ["MopCore", "MopAuth"]),
         .target(name: "MopCloudKit", dependencies: ["MopCore", "MopVault", "MopKeychain"]),

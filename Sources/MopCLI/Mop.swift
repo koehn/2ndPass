@@ -9,14 +9,14 @@ struct Mop: AsyncParsableCommand {
         commandName: "mop",
         abstract: "Read and manage an encrypted vault using your Mac's Secure Enclave.",
         version: "0.5.0",
-        subcommands: [Item.self, Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Device.self, Completion.self]
+        subcommands: [Item.self, Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Completion.self, Device.self]
     )
 
     /// ArgumentParser wraps errors thrown by option-group validation. Match only
     /// our fixed diagnostics; never print parser text containing user arguments.
     static func knownValidationError(_ error: Error) -> MopError? {
         let message = message(for: error)
-        return [MopError.fileMigration, .invalidVaultName, .confirmationRequired, .invalidProcess]
+        return [MopError.invalidVaultName, .confirmationRequired, .invalidProcess]
             .first { $0.errorDescription == message }
     }
 

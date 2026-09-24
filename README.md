@@ -18,23 +18,25 @@ For licensing inquiries, contact Koehn Consulting, Inc.
 See the [copyright notice](LICENSE). Build, installation, and operational instructions in this repository are for the copyright holder and separately authorized users; they do not grant permission. Third-party dependencies retain their own licenses.
 
 mop is a macOS secret manager with a native Mac app, a command-line interface, CloudKit synchronization, and
-Secure Enclave-protected access. It supplies credentials to commands and templates
+account identities synchronized through iCloud Keychain. It supplies credentials to commands and templates
 using references such as `mop://personal/service/token`.
 
 **CloudKit implementation: signed two-Mac and production acceptance are still
 required before release.** See [validation](docs/VALIDATION.md).
 
-Requires macOS 15+, a Secure Enclave, a logged-in macOS user, an Apple Account
-with iCloud access, and a provisioned signed application. There is no software-key
-or unsigned-build fallback for secret access.
+Requires macOS 15+ or iOS/iPadOS 18+, an Apple Account with iCloud Passwords &
+Keychain enabled, and a provisioned signed application. See the
+[account identity and membership model](docs/ACCOUNT-IDENTITY.md).
 
 ## Native Mac app
 
-Open the packaged `Mop.app` to browse secrets, copy references, manage trusted
-Macs, create vaults, and export encrypted backups. The app authenticates once per
+Open the packaged `Mop.app` to browse secrets, copy references, view account
+membership, create vaults, and export encrypted backups. The app authenticates once per
 session across enrolled vaults and locks after configurable inactivity (1–60
 minutes, default 5). It calls the native vault libraries using the existing device
-state. On first opening it prompts to unlock enrolled vaults. A collapsible vault
+state. Both apps start locked and automatically authenticate all connected vaults together.
+Interaction resets the timeout; switching apps retains the session until it expires.
+Unconnected vaults have a distinct icon. A collapsible vault
 sidebar and All Vaults view keep items organized; editing supports inline item
 renaming and password-strength indicators. Offline browsing is explicit and read only. See [the Mac app guide](docs/GUI.md).
 
@@ -44,19 +46,20 @@ open dist/Mop.app
 
 ## Item templates and field types
 
-**New item** offers Login, Password, API credential, Secure note, Database, and
-Custom templates. **Edit item** changes the item/field types, adds or removes fields,
+**New item** offers Login, Password, API credential, Secure note, and Database
+templates. **Edit item** changes the item/field types, adds or removes fields,
 and moves fields up or down. Order is saved with the item and synchronized across Macs.
 
 Username, website, email, text, and notes fields are visible after unlocking the
-index. Password, OTP, and concealed fields remain hidden until explicitly read. The CLI
+index. Password and concealed fields remain hidden until explicitly read. The CLI
 authenticates each command; the GUI reuses its unlocked session.
-All values remain encrypted in storage, backups, and iCloud. OTP currently stores
-an OTP seed or `otpauth` URL; it does not generate codes.
+All values remain encrypted in storage, backups, and iCloud. OTP fields display
+the current time-based code. CLI reads, template injection, and environment
+reference substitution return that code rather than the seed or provisioning URL.
 
 Existing fields default to concealed in a Custom item. Upgrade all Macs before
 saving typed items: older clients cannot read the extended encrypted index. Existing
-v4 vaults and backups remain readable by the updated client without migration.
+Existing v4 vaults receive a one-time online conversion to account membership.
 
 `mop item catalog --vault personal` returns JSON with the current revision, item
 and field types, saved order, and visible values (never concealed values).
@@ -70,20 +73,17 @@ are deleted. Stale revisions fail without overwriting another writer. Ordinary
 
 ## Storage and authentication
 
-mop encrypts the index and each secret locally using the `mop-vault-v4`
-format. Each secret has an independent AES-256-GCM key. HPKE wraps the index and
-secret keys separately for every enrolled Mac and for an offline recovery key.
-CloudKit stores individual immutable encrypted records and revision manifests;
-a conditional head update publishes a complete revision. Unchanged secret records
-are reused. Concurrent writers fail explicitly rather than overwrite changes.
+Mop encrypts each vault using `mop-vault-v5`, with independent AES-GCM keys
+wrapped for its account owner and offline recovery credential. The owner's
+synchronized identity signs membership and every revision. CloudKit stores
+immutable ciphertext and publishes changes with conditional, journaled commits.
 
-Every CLI secret command authenticates afresh with Touch ID or the system password.
-`--strict-biometrics` on initial device creation requires the current Touch ID
-set with no password fallback. Changing biometric enrollment then requires
-recovery. The Secure Enclave key and its Keychain item enforce the policy;
-there is no synchronizing private key or app-only authentication gate.
+The app authenticates once per session; CLI secret commands authenticate per
+command. Account private keys synchronize through iCloud Keychain and are not
+Secure Enclave keys. Device-based vaults are authenticated once for conversion,
+then all encryption keys rotate and device recipients are removed.
 
-Each named vault has its own stable UUID, CloudKit zone, enrollment list, recovery
+Each named vault has its own stable UUID, CloudKit zone, signed membership, recovery
 credential, and trust fingerprint. In `mop://personal/service/token`, `personal`
 selects that encrypted vault, `service` is an item, and `token` is a field.
 Vault names are discoverable metadata visible to CloudKit; item/field names and
@@ -104,7 +104,7 @@ Unsigned builds support help, completions, and commands without secret reference
 Operational access requires a signed bundle. Keep the application identifier,
 signing team, and CloudKit container stable across upgrades.
 
-1. Register an explicit macOS App ID (default `net.koehn.mop`). Enable iCloud with
+1. Register an explicit macOS App ID (default `com.koehn.mop`). Enable iCloud with
    CloudKit and the application-specific Keychain access group.
 2. Associate the container `iCloud.<bundle identifier>` with the App ID.
 3. Generate a provisioning profile authorizing that container and the selected
@@ -114,12 +114,22 @@ signing team, and CloudKit container stable across upgrades.
 ```sh
 export MOP_SIGN_IDENTITY='Your Apple signing identity'
 export MOP_PROVISION_PROFILE='/path/to/profile.provisionprofile'
-export MOP_BUNDLE_ID='net.koehn.mop'
+export MOP_BUNDLE_ID='com.koehn.mop'
 export MOP_CLOUD_ENVIRONMENT='Development' # Production for release builds
 scripts/package.sh
 scripts/install.sh dist/Mop.app
-mop device identity
+open /Applications/Mop.app
+mop vault list
 ```
+
+The installer places the app at `/Applications/Mop.app` and links the CLI at
+`/usr/local/bin/mop`. It requests administrator access only when needed for file
+installation. Run the script as your normal user. Manpages and completions go under
+`/usr/local/share`; ensure `/usr/local/bin` is on your PATH. If an older installation
+at `~/.local/bin/mop` takes precedence, remove that old symlink or place
+`/usr/local/bin` earlier in PATH; check with `command -v mop`. Existing vault state
+in `~/.mop` is unchanged. For isolated test installs,
+set both `MOP_INSTALL_ROOT` (CLI/resources prefix) and `MOP_APPLICATIONS_DIR`.
 
 Packaging defaults to `Production` and rejects profiles without the matching
 CloudKit environment/container. It emits only the narrow Keychain and CloudKit
@@ -130,12 +140,12 @@ Developer profiles/environments are distinct from production data.
 ## Create and select a vault
 
 ```sh
-mop vault init personal --recovery-file "$HOME/mop-recovery.key" --device-name 'First Mac'
+mop vault init personal --recovery-file "$HOME/mop-recovery.key"
 mop vault list
 mop vault use VAULT_UUID
 ```
 
-Initialization prints the vault UUID, device fingerprint, and vault fingerprint.
+Initialization prints the vault UUID, account identity, and vault fingerprint.
 Move the recovery file offline and retain the vault fingerprint with it. The
 recovery credential is a full alternative decryption capability: never put it
 in CloudKit or keep it next to a synchronized backup. A failed initialization
@@ -195,49 +205,20 @@ absence before local cleanup and never automatically repeats a delete request.
 Local metadata defaults to `~/.mop`, overridden by `--state-directory` or
 `MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains public
 device metadata, account-scoped ciphertext caches, commit journals, and local
-trust pins. The private enclave key blob lives only in the application's
-nonsynchronizing Data Protection Keychain. Keep both metadata and the Keychain
-item across upgrades. Secret output cannot target the state directory.
+trust pins. Account private keys live in iCloud Keychain. Legacy device keys
+are retained locally only for one-time conversion of remaining v4 vaults. Secret output cannot target the state directory.
 
-## Enroll another Mac
+## Use another Mac, iPhone, or iPad
 
-Install the same provisioned application on both Macs and sign into the same
-Apple Account. On the new Mac:
+Sign into the same Apple Account, enable iCloud Passwords & Keychain, and open Mop.
+Owned vaults appear automatically once the identity reaches the device. There is
+no QR pairing or device enrollment step. If Mop reports that it is waiting for
+its identity, let Keychain synchronize and refresh the vault list.
 
-```sh
-mop vault list
-mop vault use VAULT_UUID
-mop device request --name 'Second Mac'
-```
-
-On an enrolled Mac:
-
-```sh
-mop device requests
-mop device add REQUEST_ID --fingerprint FINGERPRINT_FROM_NEW_MAC
-mop vault fingerprint
-```
-
-Compare the full device fingerprint using an independent trusted channel. The
-request list is untrusted public metadata, not evidence of identity. Then, on the
-new Mac, compare and pin the vault fingerprint from the trusted Mac:
-
-```sh
-mop vault trust --fingerprint VAULT_FINGERPRINT_FROM_TRUSTED_MAC
-```
-
-Requests remain available for auditing/retry; approval does not delete them.
-A pending request never grants access by itself.
-
-```sh
-mop device list
-mop device remove DEVICE_FINGERPRINT
-```
-
-Removal rotates the index key and every secret key. Verify and pin the newly
-printed vault fingerprint on remaining Macs. Old ciphertext, backups, and offline
-caches remain decryptable by their former recipients. Remote removal cannot erase
-secrets already learned. You cannot remove the device executing the command.
+For existing v4 vaults, first open them online in an updated Mop on a previously
+connected device. Conversion rotates all keys and removes device access. Update
+all clients before using the converted vaults. Recovery credentials remain valid;
+old backups and historical revisions retain their old access.
 
 ## Read, write, run, and inject
 
@@ -275,7 +256,25 @@ execution and preserves terminal behavior. Masking cannot hide transformed secre
 files or `/dev/tty` written by children, or deliberate bypasses. See
 [examples](docs/EXAMPLES.md) for more command workflows.
 
-## Offline operation and synchronization
+## Automatic app updates and offline availability
+
+The Mac, iPhone, and iPad apps automatically use the last verified encrypted
+snapshot when disconnected. No offline toggle or separate Sync action is needed.
+Local authentication is still required. Cached data is read-only; saving changes
+requires iCloud. The status shows when cached data is in use.
+
+CloudKit database change notifications trigger refreshes. Returning to the app,
+reconnecting, and periodic checks while active also reconcile updates. Refreshes
+wait until an open editor is finished. Background notifications can download
+ciphertext without prompting; the next authenticated opening verifies it before
+it becomes the offline snapshot. Push delivery and background execution are
+scheduled by the operating system, so updates are not guaranteed to be immediate.
+
+Only connection unavailability permits cached reads. Account, permission, trust,
+revocation, and missing-vault errors remain errors. A device needs an initial
+online authenticated opening before its vault is available offline.
+
+### Command-line offline operation
 
 Online commands fetch the current head before opening the vault. Writes succeed
 only after server confirmation. No mutations are queued offline.
@@ -305,20 +304,19 @@ a committed vault and is never automatically replayed.
 
 ## Migration, backups, history, and recovery
 
-Operational `--vault-file` and `MOP_VAULT_FILE` have been removed. Unset the old
-environment variable and remove any export from your shell startup configuration.
-Retain your device state. References select named vaults; import accepts v4 backups only:
+Operational storage uses named CloudKit vaults.
+Retain your device state for one-time conversion. References select named vaults;
+import accepts current backups and converts authenticated v4 backups:
 
 ```sh
-unset MOP_VAULT_FILE
 mop vault import --file /path/to/existing.mopfile
 mop vault export --out-file /path/to/backup.mopfile
 ```
 
 Import requires the source's established local trust, or `--fingerprint` /
-`--revision` evidence obtained independently. It accepts v4 only, preserves vault
+`--revision` evidence obtained independently. It preserves vault
 identity and recovery relationships, refuses an existing destination head, and
-never deletes or modifies the source file. Export creates a verified encrypted v4
+never deletes or modifies the source file. Export creates a verified encrypted v5
 backup; it does not include the recovery private key. Preserve the printed UUID.
 
 ```sh
@@ -331,13 +329,13 @@ mop vault recover --recovery-file /offline/recovery.key --name 'Replacement Mac'
 History lists only committed ancestry, never abandoned uploads. Restoration keeps
 the current vault name, recipients, and keys. Imported history starts at the imported snapshot;
 file-vault backends and external `.history` directories are no longer supported.
-Encrypted v4 backup import/export remains supported. Immutable cloud revisions and
+Encrypted backup import/export remains supported. Immutable cloud revisions and
 abandoned staged records are retained in this version and count toward quota.
 
-Recovery enrolls the current Mac after local authentication and trust verification.
+Recovery restores vault access for the destination account after local authentication and trust verification.
 For a deleted cloud zone, explicitly import an encrypted export. If no enrolled
 device remains, use `vault import --file BACKUP --recovery-file KEY --fingerprint
-FINGERPRINT` to verify the backup and enroll the new Mac before publication.
+FINGERPRINT` to verify the backup and wrap its keys for the account before publication.
 The source backup remains unchanged.
 Missing zones are never silently recreated by ordinary commands.
 
@@ -345,14 +343,15 @@ Missing zones are never silently recreated by ordinary commands.
 
 CloudKit's encryption supplements mop's encryption; secret confidentiality does
 not depend on Advanced Data Protection being enabled. The service can observe
-record sizes, update timing, and public device metadata. It can delete data or
+record sizes, update timing, and public membership metadata. It can delete data or
 withhold changes. Local key pins and verified generation/digest watermarks reject
-observed rollback and substitution, but a new device needs independent trust
-and cannot infer global freshness from the service alone.
+observed rollback and substitution. New devices establish owner trust through
+the identity delivered by iCloud Keychain, but cannot infer global freshness
+from the service alone.
 
 Requested plaintext and unwrapped symmetric keys enter mop's process memory.
 Compromised authorized code could request other secrets. Recovery remains an
-alternative to the hardware authentication path. There is no guarantee of secure
+alternative to the account identity. There is no guarantee of secure
 erasure from Swift-managed memory or from historical copies.
 
 Diagnostics go to stderr without secret values or arbitrary CloudKit error text.
@@ -372,3 +371,10 @@ mop completion fish
 
 See [CloudKit provisioning](docs/CLOUDKIT.md) and [validation](docs/VALIDATION.md)
 before distributing a production build.
+
+### iPhone and iPad application
+
+The Mac, iPhone, and iPad interfaces share the `MopUI` SwiftUI library. Open
+`Apple/Mop.xcodeproj` to build the mobile application; see [mobile application
+instructions](docs/MOBILE.md) for simulator tests, TestFlight archives, and device
+acceptance. The existing Mac packaging and CLI installation remain supported.

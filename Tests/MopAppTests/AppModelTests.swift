@@ -3,7 +3,7 @@ import Synchronization
 import Testing
 import MopCore
 import MopAppSupport
-@testable import MopApp
+@testable import MopUI
 
 private final class FakeService: VaultService, Sendable {
     struct State {
@@ -35,11 +35,12 @@ private actor Barrier {
         let defaults = UserDefaults(suiteName: "mop-session-test-" + UUID().uuidString)!
         let model = AppModel(service: service, defaults: defaults, now: { clock.time }, automaticTimer: false)
         model.vault = UUID().uuidString
+        model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-vault-v4", enrolled: true)]
         return model
     }
     private func finish(_ model: AppModel) async throws {
         for _ in 0..<500 {
-            if !model.busy { return }
+            if !model.busy && !model.refreshing { return }
             try await Task.sleep(for: .milliseconds(10))
         }
         Issue.record("Operation did not finish")
@@ -56,13 +57,30 @@ private actor Barrier {
             ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "token")
         ])])
     }
+    @Test func fingerprintRemainsInVaultSettings() async throws {
+        let service = FakeService { operation, _, _ in
+            guard case .manage(.fingerprint) = operation else { throw MopError.invalidProcess }
+            var result = VaultResult()
+            result.message = String(repeating: "a", count: 64)
+            return result
+        }
+        service.authenticate()
+        let model = model(service)
+        model.sheet = .vaultSettings
+        model.management(.fingerprint, keepSheet: true)
+        try await finish(model)
+        #expect(model.sheet == .vaultSettings)
+        #expect(model.notice == String(repeating: "a", count: 64))
+        #expect(model.error == nil)
+    }
+
     @Test func vaultMenuTargetsItsRowWithoutStartingAnUnlock() throws {
         let service = FakeService(); service.authenticate()
         let model = model(service)
         let target = UUID().uuidString
         model.vaults = [VaultDescriptor(id: target, name: "personal", format: "mop-vault-v4", enrolled: true)]
         model.allVaults = true
-        model.catalogs[target] = Self.catalog
+        model.catalogs[target] = Self.catalog; model.authenticated = true
         #expect(model.prepareVaultAction(target))
         #expect(model.vault == target && !model.allVaults)
         #expect(model.authenticated && model.catalog?.vault == "personal")
@@ -144,14 +162,12 @@ private actor Barrier {
         model.deactivate(); model.activate(); await barrier.release(); try await finish(model)
         #expect(model.revealed == nil && service.isAuthenticated)
     }
-    @Test func switchingVaultUsesExistingSessionAndOfflineSwitchLocks() async throws {
+    @Test func switchingVaultUsesExistingSession() async throws {
         let service = FakeService { _, _, _ in var r = VaultResult(); r.catalog = Self.catalog; return r }
         service.authenticate()
         let model = model(service)
         model.vault = UUID().uuidString; model.changedVault(); try await finish(model)
         #expect(model.authenticated && service.state.withLock { $0.locks } == 0)
-        model.offline = true; model.changedContext()
-        #expect(!service.isAuthenticated && model.catalog == nil)
     }
     @Test func failedEnrollmentRefreshKeepsDevicesButClearsOldRequests() async throws {
         let service = FakeService { operation, _, _ in
@@ -212,11 +228,11 @@ private actor Barrier {
 }
 
 extension AppModelTests {
-    @Test func exportUsesSelectedUUIDAndExplicitOfflineMode() async throws {
+    @Test func exportUsesSelectedUUIDAndAutomaticAvailability() async throws {
         let id = UUID().uuidString, output = URL(fileURLWithPath: "/tmp/unused-export.mopfile")
         let service = FakeService { operation, vault, offline in
             guard case .export(let url) = operation else { Issue.record("Wrong operation"); return VaultResult() }
-            #expect(vault == id && offline && url == output); return VaultResult()
+            #expect(vault == id && !offline && url == output); return VaultResult()
         }
         let model = model(service)
         model.vault = id; model.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
@@ -450,9 +466,43 @@ extension AppModelTests {
             model.allVaults = all
             for type in FieldType.allCases {
                 model.search = "VALUE-" + type.rawValue + "-NEEDLE"
-                #expect(model.displayedItems.count == (type.concealed ? 0 : 1))
+                #expect(model.searchResults.count == (type.concealed ? 0 : 1))
+                #expect(model.displayedItems.count == 1)
             }
         }
+        #expect(service.state.withLock { $0.operations.isEmpty })
+    }
+
+    @Test func searchMatchesSSHUsernameNameAndValue() throws {
+        let service = FakeService(), model = model(service)
+        let item = VaultItem(name: "server", fields: [ItemField(path: "ssh%20username", type: .username, value: "sshd")])
+        try model.applyCatalog(ItemCatalog(vault: "personal", revision: "1", items: [item]))
+        for all in [false, true] {
+            model.allVaults = all
+            for query in ["ss", "ssh", "sshd", "Ssh Username"] {
+                model.search = query
+                #expect(model.searchResults.map(\.row.item.name) == ["server"])
+            }
+        }
+        #expect(service.state.withLock { $0.operations.isEmpty })
+    }
+
+    @Test func searchResultsIdentifyVisibleMatchAndSelectItsVaultWithoutFilteringList() throws {
+        let service = FakeService(), model = model(service)
+        let first = model.vault, second = UUID().uuidString
+        let one = ItemCatalog(vault: "personal", revision: "1", items: [VaultItem(name: "entry", fields: [ItemField(path: "username", type: .username, value: "alice")])])
+        let two = ItemCatalog(vault: "work", revision: "2", items: [VaultItem(name: "entry", fields: [ItemField(path: "email", type: .email, value: "bob@example.test"), ItemField(path: "password", type: .password, value: "hidden")])])
+        try model.applyCatalog(one); model.catalogs[second] = two; model.allVaults = true
+        model.search = "EXAMPLE.TEST"
+        let result = try #require(model.searchResults.first)
+        #expect(model.searchResults.count == 1 && result.row.id.vault == second)
+        #expect(result.detail == "email: bob@example.test")
+        #expect(model.displayedItems.count == 2)
+        model.selectedRow = result.id
+        #expect(model.selectedItem == "entry" && model.vault == second && model.catalog?.revision == "2")
+        #expect(model.displayedItems.count == 2 && model.catalogs[first] != nil)
+        model.search = "password"
+        #expect(model.searchResults.isEmpty)
         #expect(service.state.withLock { $0.operations.isEmpty })
     }
 
@@ -618,10 +668,376 @@ extension AppModelTests {
         let model = model(service)
         let first = model.vault
         model.catalogs[first] = Self.catalog; model.authenticated = true
+        model.vaults.append(VaultDescriptor(id: target, name: "work", format: "mop-vault-v4", enrolled: true))
         model.chooseVault(target); try await finish(model)
         #expect(model.catalog?.vault == "work" && model.catalogs[first]?.revision == "r1")
         model.chooseVault(first)
         #expect(model.catalog?.vault == "personal")
         #expect(service.state.withLock { $0.operations.count } == 1)
     }
+}
+
+@MainActor private final class TestClipboard: SecretClipboardAccess {
+    var clears = 0
+    func copy(_ value: SecretBytes, concealed: Bool) {}
+    func clear() { clears += 1 }
+}
+@MainActor private final class TestLifecycle: AppLifecycleMonitoring {
+    var receive: (@MainActor (AppLifecycleEvent) -> Void)?
+    func start(_ receive: @escaping @MainActor (AppLifecycleEvent) -> Void) { self.receive = receive }
+    func stop() { receive = nil }
+}
+
+extension AppModelTests {
+    @Test func backgroundPreservesSessionButDeviceLockEndsIt() {
+        let service = FakeService()
+        service.authenticate()
+        let clipboard = TestClipboard(), lifecycle = TestLifecycle()
+        let model = AppModel(service: service, clipboard: clipboard, lifecycle: lifecycle, now: { 1 }, automaticTimer: false)
+        model.authenticated = true
+        model.catalog = Self.catalog
+        model.revealed = "secret"
+        model.startMonitoringActivity()
+        lifecycle.receive?(.inactive)
+        #expect(model.revealed == nil && !model.isActive)
+        #expect(service.isAuthenticated)
+        #expect(clipboard.clears == 0)
+        lifecycle.receive?(.active)
+        #expect(model.isActive && model.authenticated)
+        lifecycle.receive?(.background)
+        #expect(service.isAuthenticated && model.authenticated)
+        #expect(model.catalog != nil && model.itemDraft == nil)
+        #expect(clipboard.clears == 0)
+        lifecycle.receive?(.lock)
+        #expect(!service.isAuthenticated && !model.authenticated && model.catalog == nil)
+        #expect(clipboard.clears == 1)
+        model.shutdown()
+        #expect(lifecycle.receive == nil)
+    }
+}
+
+extension AppModelTests {
+    @Test func lateBackupPickerCannotReauthenticateAfterLockOrChangeVault() throws {
+        let service = FakeService()
+        let model = model(service)
+        model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-vault-v4", enrolled: true)]
+        model.chooseExportBackup()
+        let request = try #require(model.documentRequest)
+        model.lock()
+        model.completeBackupSelection(folder: FileManager.default.temporaryDirectory, request: request)
+        #expect(!model.busy)
+        #expect(service.state.withLock { $0.operations.isEmpty })
+        model.chooseExportBackup()
+        let second = try #require(model.documentRequest)
+        let other = UUID().uuidString
+        model.vaults.append(VaultDescriptor(id: other, name: "other", format: "mop-vault-v4", enrolled: true))
+        #expect(model.prepareVaultAction(other))
+        model.completeBackupSelection(folder: FileManager.default.temporaryDirectory, request: second)
+        #expect(!model.busy)
+        #expect(service.state.withLock { $0.operations.isEmpty })
+    }
+}
+
+extension AppModelTests {
+    @Test func pairingIsAvailableWhileLockedAndEndsOnBackground() {
+        let service = FakeService()
+        let model = model(service)
+        model.beginPairing(host: false)
+        let pairing = model.pairing
+        #expect(pairing != nil)
+        #expect(!model.authenticated)
+        model.deactivate()
+        #expect(model.pairing != nil) // System permission/authentication prompts only conceal.
+        model.activate()
+        model.background()
+        #expect(model.pairing == nil)
+        #expect(pairing?.finished == true)
+    }
+    @Test func offlineAndLockRespectPairingLifecycle() {
+        let model = model(FakeService())
+        model.offline = true
+        model.beginPairing(host: false)
+        #expect(model.pairing == nil)
+        model.offline = false
+        model.beginPairing(host: false)
+        #expect(model.pairing != nil)
+        model.lock()
+        #expect(model.pairing == nil)
+    }
+}
+
+extension AppModelTests {
+    @Test func untrustedConversionOffersAnAppRecoveryPath() async throws {
+        let service = FakeService { operation, _, _ in
+            if case .catalog = operation { throw MopError.vaultUntrusted }
+            return VaultResult()
+        }
+        let model = model(service)
+        model.unlock()
+        try await finish(model)
+        #expect(model.error?.contains("previously connected device") == true)
+        #expect(model.error?.contains("mop vault trust") == false)
+        #expect(!model.authenticated)
+    }
+}
+
+extension AppModelTests {
+    @Test func pairingFailureSurvivesServiceSessionInvalidation() async throws {
+        let barrier = Barrier()
+        let service = FakeService { operation, _, _ in
+            if case .pairing(.start) = operation {
+                await barrier.wait()
+                throw MopError.authentication
+            }
+            return VaultResult()
+        }
+        let model = model(service)
+        service.authenticate()
+        model.checkExpiration()
+        model.authenticated = true
+        model.beginPairing(host: true)
+        for _ in 0..<500 {
+            if await barrier.entered { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let activePairing = try #require(model.pairing)
+        service.lock() // Mirrors NativeVaultService's failure invalidation.
+        model.checkExpiration() // May run before the coordinator receives the error.
+        #expect(model.pairing === activePairing)
+        #expect(!model.authenticated)
+        #expect(model.catalogs.isEmpty)
+        await barrier.release()
+        for _ in 0..<500 {
+            if activePairing.finished { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(activePairing.error == MopError.authentication.errorDescription)
+        model.checkExpiration()
+        #expect(model.pairing === activePairing)
+        model.background()
+        #expect(model.pairing == nil)
+    }
+}
+
+
+extension AppModelTests {
+    @Test func openingSelectedVaultOpensEveryConnectedVaultAtomically() async throws {
+        let first = UUID().uuidString, second = UUID().uuidString, unconnected = UUID().uuidString
+        let attempts = Mutex<[String]>([])
+        let service = FakeService { _, id, _ in
+            attempts.withLock { $0.append(id!) }
+            if id == second { throw MopError.cloudUnavailable }
+            var result = VaultResult(); result.catalog = Self.catalog; return result
+        }
+        service.authenticate()
+        let model = model(service)
+        model.vault = first
+        model.vaults = [first, second, unconnected].map {
+            VaultDescriptor(id: $0, name: $0, format: "mop-vault-v4", enrolled: $0 != unconnected)
+        }
+        model.unlock(); try await finish(model)
+        #expect(attempts.withLock { $0 } == [first, second])
+        #expect(!model.authenticated && !service.isAuthenticated)
+        #expect(model.catalogs.isEmpty && model.catalog == nil && model.references.isEmpty)
+        #expect(model.vaultIcon(model.vaults[2]) == "externaldrive.badge.plus")
+        #expect(model.vaultIcon(model.vaults[0]) == "lock.rectangle")
+    }
+
+    @Test func backgroundReturnReusesSessionUntilInactivityExpires() async throws {
+        let id = UUID().uuidString, clock = Clock()
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
+            } else { result.catalog = Self.catalog }
+            return result
+        }
+        service.authenticate()
+        let model = model(service, clock: clock); model.vault = ""
+        model.start(); try await finish(model)
+        clock.time = 290; model.activity()
+        model.background(); clock.time = 500; model.activate()
+        #expect(model.authenticated && service.isAuthenticated)
+        #expect(service.state.withLock { $0.operations.count } == 2)
+        model.background(); clock.time = 801; model.checkExpiration()
+        #expect(!model.authenticated && model.catalogs.isEmpty)
+        service.authenticate(at: clock.time)
+        model.activate()
+        try await Task.sleep(for: .milliseconds(20)); try await finish(model)
+        #expect(model.authenticated)
+        #expect(service.state.withLock { $0.operations.count } == 3)
+        model.shutdown()
+    }
+
+    @Test func cancelledAutomaticAuthenticationWaitsForInteraction() async throws {
+        let id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            if case .discover = operation {
+                var result = VaultResult()
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
+                return result
+            }
+            throw MopError.authentication
+        }
+        let model = model(service); model.vault = ""
+        model.start(); try await finish(model)
+        model.error = nil
+        model.deactivate(); model.activate(); model.checkExpiration()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(service.state.withLock { $0.operations.count } == 2)
+        model.activity()
+        try await Task.sleep(for: .milliseconds(20)); try await finish(model)
+        #expect(service.state.withLock { $0.operations.count } == 3)
+        model.shutdown()
+    }
+}
+
+extension AppModelTests {
+    @Test func trustFailureDoesNotLoopOnTapsOrFaceIDLifecycle() async throws {
+        let id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            if case .discover = operation {
+                var result = VaultResult()
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
+                return result
+            }
+            throw MopError.vaultUntrusted
+        }
+        let model = model(service); model.vault = ""
+        model.start(); try await finish(model)
+        #expect(model.error != nil)
+        model.error = nil
+        for _ in 0..<3 {
+            model.activity(); model.deactivate(); model.activate()
+            model.background(); model.activate(); model.checkExpiration()
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(service.state.withLock { $0.operations.count } == 2)
+        #expect(!model.authenticated && model.catalogs.isEmpty)
+        // Deliberate refresh can retry after the user repairs the connection.
+        model.discover(); try await finish(model)
+        try await Task.sleep(for: .milliseconds(20)); try await finish(model)
+        #expect(service.state.withLock { $0.operations.count } == 4)
+        model.shutdown()
+    }
+}
+
+
+extension AppModelTests {
+    @Test func serviceInvalidationDuringOpeningPreservesTrustFailure() async throws {
+        let barrier = Barrier()
+        let service = FakeService { _, _, _ in
+            await barrier.wait()
+            throw MopError.vaultUntrusted
+        }
+        let model = model(service)
+        model.unlock(); try await entered(barrier)
+        service.authenticate(); model.checkExpiration()
+        service.lock(); model.checkExpiration()
+        await barrier.release(); try await finish(model)
+        #expect(model.error?.contains("Automatic unlocking is paused") == true)
+        #expect(!model.authenticated && model.catalogs.isEmpty)
+    }
+}
+
+extension AppModelTests {
+    @Test func cloudNotificationRefreshesCatalogAndPreservesVaultSelection() async throws {
+        let id = UUID().uuidString
+        let revision = Mutex("before")
+        let service = FakeService { operation, _, offline in
+            #expect(!offline)
+            var result = VaultResult()
+            switch operation {
+            case .discover:
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
+            case .catalog:
+                result.catalog = ItemCatalog(vault: "personal", revision: revision.withLock { $0 }, items: [])
+            default: break
+            }
+            return result
+        }
+        service.authenticate()
+        let model = model(service); model.vault = id; model.start()
+        try await finish(model)
+        model.allVaults = false
+        #expect(model.catalog?.revision == "before")
+        revision.withLock { $0 = "after" }
+        model.cloudChanged(); try await finish(model)
+        #expect(model.catalog?.revision == "after")
+        #expect(model.vault == id && !model.allVaults)
+        #expect(service.state.withLock { $0.locks } == 0)
+    }
+
+    @Test func notificationsCoalesceWhileEditingAndRefreshAfterEditing() async throws {
+        let id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
+            } else if case .catalog = operation { result.catalog = Self.catalog }
+            return result
+        }
+        service.authenticate()
+        let model = model(service); model.vault = id; model.start()
+        try await finish(model)
+        model.selectedItem = "github"; model.beginItemEditing()
+        #expect(model.itemDraft != nil)
+        let draft = model.itemDraft?.id
+        let count = service.state.withLock { $0.operations.count }
+        model.cloudChanged(); model.cloudChanged()
+        #expect(!model.busy && model.itemDraft?.id == draft)
+        #expect(service.state.withLock { $0.operations.count } == count)
+        model.cancelItemEditing(); model.refreshCloudIfNeeded()
+        try await finish(model)
+        #expect(service.state.withLock { $0.operations.count } == count + 2)
+    }
+    @Test func backgroundRefreshLeavesReadsAvailableAndUpdatesSelectedItem() async throws {
+        let id = UUID().uuidString, barrier = Barrier(), refresh = Mutex(false)
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            switch operation {
+            case .discover:
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
+            case .catalog:
+                if refresh.withLock({ $0 }) { await barrier.wait() }
+                result.catalog = ItemCatalog(vault: "personal", revision: refresh.withLock { $0 } ? "new" : "old", items: Self.catalog.items)
+            case .read: result.value = SecretBytes(utf8: "available")
+            default: break
+            }
+            return result
+        }
+        service.authenticate()
+        let model = model(service); model.vault = id; model.start(); try await finish(model)
+        model.selectedItem = "github"
+        refresh.withLock { $0 = true }; model.cloudChanged(); try await entered(barrier)
+        #expect(model.refreshing && !model.busy)
+        #expect(model.catalog?.revision == "old")
+        let result = try await service.execute(.read(SecretReference("mop://personal/github/password")), vault: id, offline: false)
+        #expect(result.value == "available")
+        await barrier.release(); try await finish(model)
+        #expect(model.catalog?.revision == "new" && model.selectedItem == "github")
+    }
+
+    @Test func draftStartedDuringRefreshIsPreserved() async throws {
+        let id = UUID().uuidString, barrier = Barrier(), refresh = Mutex(false)
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-vault-v4", enrolled: true)]
+            } else if case .catalog = operation {
+                if refresh.withLock({ $0 }) { await barrier.wait() }
+                result.catalog = Self.catalog
+            }
+            return result
+        }
+        service.authenticate()
+        let model = model(service); model.vault = id; model.start(); try await finish(model)
+        model.selectedItem = "github"
+        refresh.withLock { $0 = true }; model.cloudChanged(); try await entered(barrier)
+        model.beginItemEditing(); let draft = model.itemDraft?.id
+        #expect(draft != nil)
+        await barrier.release(); try await finish(model)
+        #expect(model.itemDraft?.id == draft)
+    }
+
 }

@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import Testing
 import MopCore
+import MopKeychain
 import MopVault
 @testable import MopCloudKit
 
@@ -24,6 +25,8 @@ private actor MemoryCloud: CloudTransport {
     var saves: [String] = []
     var fetches: [String] = []
     var loseResponse = false
+    var loseIdentityResponse = false
+    var identityWinner: Data?
     var failHead: MopError?
     var failBlob: MopError?
     var barrier = false
@@ -56,16 +59,24 @@ private actor MemoryCloud: CloudTransport {
         guard let zone = data[vault] else { throw MopError.vaultMissing }
         if kind == .blob, let failBlob { throw failBlob }
         if kind == .head, let failHead { throw failHead }
+        if id == "account-identity-v1", let identityWinner {
+            self.identityWinner = nil
+            data[vault]![id] = CloudObject(data: identityWinner, version: Data("winner".utf8))
+            throw MopError.vaultConflict
+        }
         guard zone[id]?.version == expected else { throw MopError.vaultConflict }
         let object = CloudObject(data: bytes, version: Data(UUID().uuidString.utf8))
         data[vault]![id] = object
         saves.append(id)
+        if id == "account-identity-v1", loseIdentityResponse { loseIdentityResponse = false; throw MopError.cloudUnavailable }
         if kind == .head && loseResponse { loseResponse = false; throw MopError.cloudUnavailable }
         return object
     }
     func requests(vault: UUID) -> [String] { data[vault]?.keys.filter { $0.hasPrefix("q-") } ?? [] }
     func synchronizeHeads() { barrier = true }
     func validateOfflineAccount() throws { if accountError == .cloudAccount { throw MopError.cloudAccount } }
+    func setIdentityLoss() { loseIdentityResponse = true }
+    func raceIdentity(_ bytes: Data) { identityWinner = bytes }
     func setLoss() { loseResponse = true }
     func setAccount(_ value: String) { user = value }
     func setAccountError(_ value: MopError?) { accountError = value }
@@ -807,5 +818,173 @@ private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
         if failSecond { await #expect(throws: MopError.authentication) { try await service.list(vault: nil) } }
         else { _ = try await service.list(vault: nil) }
         #expect(opened == 2 && closed == 1)
+    }
+}
+
+@Test(arguments: [false, true]) func cloudTrustSurvivesSandboxRelocation(legacy: Bool) async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let trustDirectory = f.vault.cache.directory.appendingPathComponent("trust")
+    if legacy {
+        let old = VaultTrust(vault: f.vault.cache.directory.appendingPathComponent("identity"), directory: trustDirectory)
+        try VaultSession.trustSnapshot(f.initial, trust: old, opener: f.device, revision: VaultCoding.digest(f.initial))
+        try FileManager.default.removeItem(at: trustDirectory.appendingPathComponent("cloud.json"))
+    }
+    let relocated = f.directory.appendingPathExtension("new-sandbox")
+    defer { try? FileManager.default.removeItem(at: relocated) }
+    try FileManager.default.moveItem(at: f.directory, to: relocated)
+    let repo = try await CloudRepository.open(transport: f.cloud, state: relocated)
+    let vault = try repo.vault(f.vault.id)
+    let store = try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.device)
+    #expect(try store.catalog().vault == "v")
+    store.close()
+    #expect(FileManager.default.fileExists(atPath: vault.cache.directory.appendingPathComponent("trust/cloud.json").path))
+    // Reopening also uses the migrated stable binding, not the old absolute path.
+    let reopened = try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.device)
+    #expect(try reopened.catalog().vault == "v")
+    reopened.close()
+    let wrongScope = VaultTrust(cloudBinding: "another-account-or-environment", directory: vault.cache.directory.appendingPathComponent("trust"))
+    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: f.initial, trust: wrongScope, opener: f.device) }
+}
+
+private final class MemoryIdentityKeys: IdentityKeyStore {
+    var values: [String: Data] = [:]
+    func read(scope: String, id: UUID) throws -> Data? { values[scope + id.uuidString] }
+    func insert(_ material: Data, scope: String, id: UUID) throws {
+        let key = scope + id.uuidString
+        if let existing = values[key], existing != material { throw MopError.invalidDevice }
+        values[key] = material
+    }
+}
+
+@Test func accountIdentityWaitsForKeychainAndSurvivesNewDeviceAndOffline() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let keys = MemoryIdentityKeys()
+    let first = try await f.repo.accountIdentity(keys: keys, create: true)
+    defer { first.close() }
+    let anchor = try #require(try await f.repo.identityAnchor())
+    #expect(anchor.identity == first.identity)
+    #expect(!(try await f.repo.list()).contains(CloudRepository.identityZone))
+    let secondState = f.directory.appendingPathComponent("second-device")
+    let second = try await CloudRepository.open(transport: f.cloud, state: secondState)
+    let delayedKeys = MemoryIdentityKeys()
+    await #expect(throws: MopError.identityPending) { _ = try await second.accountIdentity(keys: delayedKeys, create: true) }
+    #expect(delayedKeys.values.isEmpty)
+    delayedKeys.values = keys.values
+    let synced = try await second.accountIdentity(keys: delayedKeys, create: true)
+    #expect(synced.identity == first.identity)
+    #expect(keys.values.count == 1)
+    let offline = try await CloudRepository.open(transport: f.cloud, state: secondState, offline: true)
+    #expect(try await offline.accountIdentity(keys: delayedKeys, create: false).identity == first.identity)
+    await f.cloud.delete("account-identity-v1", vault: CloudRepository.identityZone)
+    await #expect(throws: MopError.identityPending) { _ = try await second.accountIdentity(keys: delayedKeys, create: true) }
+    #expect(delayedKeys.values.count == 1)
+}
+
+@Test func accountMigrationCommitAndFreshDeviceTrust() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let owner = try await f.repo.accountIdentity(keys: MemoryIdentityKeys(), create: true)
+    let store = try await f.store()
+    let before = store.snapshot
+    try await store.adoptOwner(owner)
+    #expect(store.snapshot != before)
+    #expect(try await f.vault.revisions().contains(VaultCoding.digest(before)))
+    let second = try await CloudRepository.open(transport: f.cloud, state: f.directory.appendingPathComponent("second"))
+    let discovered = try await second.descriptors(identity: owner.identity)
+    #expect(discovered.count == 1 && discovered[0].enrolled && discovered[0].supported)
+    let vault = try second.vault(f.vault.id)
+    let opened = try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: owner)
+    #expect(try opened.catalog().vault == "v")
+    let count = await f.cloud.saves.count
+    try await opened.adoptOwner(owner)
+    #expect(await f.cloud.saves.count == count)
+    let secondDevice = TestDevice()
+    // Recovery/device slots cannot forge an owner-authorized revision.
+    #expect(throws: MopError.deviceNotEnrolled) { try CloudSecretStore(vault: vault, snapshot: opened.snapshot, opener: secondDevice) }
+}
+
+@Test func cancelledAccountMigrationDoesNotPublishMembership() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let store = try await f.store(), owner = AccountIdentity()
+    let original = store.snapshot
+    await #expect(throws: MopError.authentication) {
+        try await store.adoptOwner(owner, beforePublish: { throw MopError.authentication })
+    }
+    #expect(try await f.vault.sync() == original)
+    #expect(try VaultDocument.decode(await f.vault.sync()).header.membership == nil)
+}
+
+
+@Test func identityConditionalCreationUsesWinnerWithoutReplacingMissingKeys() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let winner = AccountIdentity(), keyID = UUID()
+    let anchor = try CloudIdentityAnchor(keyID: keyID, identity: winner, scope: f.repo.identityScope)
+    await f.cloud.raceIdentity(try VaultCoding.encode(anchor))
+    let keys = MemoryIdentityKeys()
+    await #expect(throws: MopError.identityPending) { _ = try await f.repo.accountIdentity(keys: keys, create: true) }
+    #expect(keys.values.count == 1) // losing candidate is never published/overwritten
+    await #expect(throws: MopError.identityPending) { _ = try await f.repo.accountIdentity(keys: keys, create: true) }
+    #expect(keys.values.count == 1)
+    try winner.withMaterial { try keys.insert($0, scope: f.repo.identityScope, id: keyID) }
+    #expect(try await f.repo.accountIdentity(keys: keys, create: true).identity == winner.identity)
+    #expect(try await f.repo.identityAnchor() == anchor)
+}
+
+@Test func lostIdentityAcknowledgementReconcilesWithoutRepeatingCreation() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    await f.cloud.setIdentityLoss()
+    let keys = MemoryIdentityKeys()
+    let identity = try await f.repo.accountIdentity(keys: keys, create: true)
+    #expect(try await f.repo.identityAnchor()?.identity == identity.identity)
+    #expect(await f.cloud.saves.filter { $0 == "account-identity-v1" }.count == 1)
+    #expect(keys.values.count == 1)
+    await f.cloud.setAccount("another-account")
+    await #expect(throws: MopError.cloudAccount) { _ = try await f.repo.accountIdentity(keys: keys, create: true) }
+    #expect(keys.values.count == 1)
+}
+
+@Test func interruptedOwnerConversionReconcilesCommittedRotation() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let owner = AccountIdentity(), store = try await f.store()
+    await f.cloud.setLoss()
+    await #expect(throws: MopError.cloudUncertain) { try await store.adoptOwner(owner) }
+    let committed = try await f.vault.sync()
+    let reopened = try CloudSecretStore(vault: f.vault, snapshot: committed, opener: owner)
+    #expect(reopened.membership?.owner == owner.identity)
+    #expect(try VaultDocument.decode(committed).header.recipients.allSatisfy { $0.kind != "device" })
+    let recovered = try CloudSecretStore(vault: f.vault, snapshot: committed, opener: f.recovery)
+    #expect(try recovered.catalog().vault == "v")
+}
+
+@Test func commandReadsAndSubstitutionGenerateOTPForSeedsAndURLs() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let store = try await f.store()
+    let secret = "JBSWY3DPEHPK3PXP"
+    let item = VaultItem(name: "login", type: .login, fields: [
+        ItemField(path: "seed", type: .otp, value: secret),
+        ItemField(path: "url", type: .otp, value: "otpauth://totp/Test?secret=\(secret)"),
+        ItemField(path: "token", type: .concealed, value: "ordinary-secret")
+    ])
+    try await store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true))
+    store.close()
+    let rows = try await f.repo.descriptors(publicKey: f.device.publicKey)
+    let otp = try TimeBasedOTP(secret)
+    for offline in [false, true] {
+        let service = AsyncSecretService {
+            RoutedSecretStore(repository: f.repo, rows: rows, selection: nil) { _ in
+                if offline { return try CloudSecretStore(vault: f.vault, snapshot: f.vault.cached().0, opener: f.device, offline: true) }
+                return try await f.store()
+            }
+        }
+        for path in ["seed", "url"] {
+            let start = Date()
+            let value = try await service.read(SecretReference("mop://v/login/\(path)"))
+            let expected = try [SecretBytes(utf8: otp.code(at: start)), SecretBytes(utf8: otp.code())]
+            #expect(expected.contains(value))
+        }
+        let start = Date()
+        let injected = try await service.inject("{{mop://v/login/url}}")
+        let expected = try [SecretBytes(utf8: otp.code(at: start)), SecretBytes(utf8: otp.code())]
+        #expect(expected.contains(injected))
+        #expect(try await service.read(SecretReference("mop://v/login/token")) == "ordinary-secret")
     }
 }

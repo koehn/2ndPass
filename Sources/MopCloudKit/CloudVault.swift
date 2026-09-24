@@ -14,7 +14,9 @@ public final class CloudVault {
 
     public init(id: UUID, cache: CloudCache, transport: any CloudTransport, accountID: String, invalidateBinding: @escaping () throws -> Void = {}) {
         self.id = id; self.cache = cache; self.transport = transport; self.accountID = accountID; self.invalidateBinding = invalidateBinding
-        trust = VaultTrust(vault: cache.directory.appendingPathComponent("identity"), directory: cache.directory.appendingPathComponent("trust"))
+        let binding = [transport.container, transport.environment, accountID, id.uuidString]
+            .map { "\($0.utf8.count):" + $0 }.joined()
+        trust = VaultTrust(cloudBinding: binding, directory: cache.directory.appendingPathComponent("trust"))
     }
 
     private func checkAccount() async throws {
@@ -208,7 +210,7 @@ public final class CloudVault {
         }
     }
 
-    public func commit(expected: Data?, replacement: Data, rotationFingerprint: String? = nil) async throws {
+    public func commit(expected: Data?, replacement: Data, rotationFingerprint: String? = nil, beforePublish: (() throws -> Void)? = nil) async throws {
         try await checkAccount()
         let doc = try VaultDocument.decode(replacement)
         guard doc.header.vaultID == id, try VaultCoding.encode(doc) == replacement else { throw MopError.invalidVault }
@@ -245,6 +247,8 @@ public final class CloudVault {
             }
             try await upload("m-" + digest, bytes: VaultCoding.encode(CloudManifest(document: doc)))
             try await checkAccount()
+            // Pairing can expire or be cancelled while encrypted records are staged.
+            try beforePublish?()
             publishing = true
             let saved = try await transport.save("head", kind: .head, data: VaultCoding.encode(CloudHead(revision: digest, root: root)), vault: id, expected: current?.version)
             try cache.locked {

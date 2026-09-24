@@ -21,7 +21,14 @@ public final class VaultSession: SecretStore {
         let document = try VaultDocument.decode(snapshot)
         guard let slot = document.header.recipients.first(where: { $0.publicKey == opener.publicKey }) else { throw MopError.deviceNotEnrolled }
         let key = try opener.unwrap(slot, vaultID: document.header.vaultID)
-        try trust.verify(document: document, key: key)
+        if let identity = opener as? AccountIdentity, let membership = document.header.membership {
+            guard membership.owner == identity.identity,
+                  membership.vaultFingerprint == VaultTrust.fingerprint(document: document, key: key) else { throw MopError.vaultUntrusted }
+            // The signing identity arrived through the user's Keychain, never
+            // from an untrusted CloudKit header. Authenticate contents before pinning.
+            _ = try document.decryptCatalog(key: key)
+            try trust.pin(document: document, key: key)
+        } else { try trust.verify(document: document, key: key) }
         let catalog = try document.decryptCatalog(key: key)
         let index = catalog.references
         self.items = catalog.items
@@ -68,6 +75,9 @@ public final class VaultSession: SecretStore {
     public func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) throws {
         _ = try requireKey()
         try check(reference)
+        if items.first(where: { $0.name == reference.item })?.fields.first(where: { $0.path == fieldPath(reference) })?.type == .otp {
+            _ = try TimeBasedOTP(String(decoding: value, as: UTF8.self))
+        }
         let exists = index[reference.relativePath] != nil
         if exists && !replace { throw MopError.duplicate }
         if !exists && replace { throw MopError.notFound }
@@ -158,6 +168,15 @@ public final class VaultSession: SecretStore {
             let ref = try SecretReference(vault: name, relativePath: SecretReference.encode(item.name) + "/" + field.path)
             guard ref.item == item.name else { throw MopError.invalidReference }
             let old = existing?.fields.first { $0.path == field.path }
+            if field.type == .otp {
+                if let value = field.value { _ = try TimeBasedOTP(value) }
+                else if old?.type != .otp {
+                    guard old != nil else { throw MopError.invalidOTP }
+                    let reference = try SecretReference(vault: name, relativePath: SecretReference.encode(sourceName) + "/" + field.path)
+                    let stored = try read(reference)
+                    _ = try TimeBasedOTP(String(decoding: stored, as: UTF8.self))
+                }
+            }
             if let value = field.value, old?.value != value || old?.type.concealed != false {
                 if let id = index[ref.relativePath] { records.removeValue(forKey: id) }
                 let id = UUID().uuidString
@@ -252,6 +271,7 @@ public final class VaultSession: SecretStore {
     }
 
     public func enroll(_ request: DeviceRequest, expectedFingerprint: String) throws {
+        guard document.header.membership == nil else { throw MopError.cloudPermission }
         let key = try requireKey()
         try request.validate()
         guard request.fingerprint == expectedFingerprint else { throw MopError.invalidDevice }
@@ -267,7 +287,37 @@ public final class VaultSession: SecretStore {
         try commit(index: index, records: records, header: header)
     }
 
+    public var membership: VaultMembership? { document.header.membership }
+
+    /// One-way conversion of an authenticated personal vault. Rotate all keys,
+    /// replace device slots with the owner, and retain the recovery credential.
+    public func adoptOwner(_ owner: AccountIdentity) throws {
+        if let membership = document.header.membership {
+            if membership.owner == owner.identity { self.opener = owner; return }
+            guard let opener, document.header.recipients.contains(where: { $0.kind == "recovery" && $0.publicKey == opener.publicKey }) else { throw MopError.cloudPermission }
+        }
+        _ = try requireKey()
+        let key = SymmetricKey(size: .bits256), priorOpener = try requireOpener()
+        var header = document.header
+        guard let recovery = header.recipients.first(where: { $0.kind == "recovery" }) else { throw MopError.invalidVault }
+        header.recipients = try [
+            VaultDocument.wrap(key: key, request: owner.request, kind: "member", vaultID: header.vaultID),
+            VaultDocument.wrap(key: key, request: DeviceRequest(name: recovery.name, publicKey: recovery.publicKey), kind: "recovery", vaultID: header.vaultID)
+        ].sorted { $0.fingerprint < $1.fingerprint }
+        var records: [String: VaultRecord] = [:]
+        for (id, record) in document.records {
+            records[id] = try VaultRecord.create(value: record.read(id: id, vaultID: header.vaultID, opener: priorOpener), id: id, header: header)
+        }
+        header.format = "mop-vault-v5"
+        let evidence = VaultDocument(header: header, sealed: Data(), records: [:])
+        header.membership = try VaultMembership(vaultID: header.vaultID, fingerprint: VaultTrust.fingerprint(document: evidence, key: key), owner: owner)
+        self.opener = owner
+        do { try commit(index: index, records: records, header: header, newKey: key) }
+        catch { self.opener = priorOpener; throw error }
+    }
+
     public func revoke(_ fingerprint: String, currentDevice: Data) throws {
+        guard document.header.membership == nil else { throw MopError.cloudPermission }
         _ = try requireKey()
         guard fingerprint != VaultCoding.digest(currentDevice),
               document.header.recipients.contains(where: { $0.kind == "device" && $0.fingerprint == fingerprint }) else { throw MopError.invalidDevice }
@@ -293,7 +343,12 @@ public final class VaultSession: SecretStore {
         next.generation += 1
         next.parent = VaultCoding.digest(snapshot)
         next.recipients.sort { $0.fingerprint < $1.fingerprint }
-        let document = try VaultDocument.seal(header: next, index: index, records: records, key: selectedKey, items: items ?? self.items)
+        if next.membership != nil, let newKey {
+            guard let owner = opener as? AccountIdentity else { throw MopError.cloudPermission }
+            let evidence = VaultDocument(header: next, sealed: Data(), records: [:])
+            next.membership = try VaultMembership(vaultID: next.vaultID, fingerprint: VaultTrust.fingerprint(document: evidence, key: newKey), owner: owner)
+        }
+        let document = try VaultDocument.seal(header: next, index: index, records: records, key: selectedKey, items: items ?? self.items, signer: opener as? any VaultSigningOpener)
         let bytes = try VaultCoding.encode(document)
         self.items = items ?? self.items
         self.document = document
@@ -329,6 +384,18 @@ public final class VaultSession: SecretStore {
         return try VaultCoding.encode(VaultDocument.seal(header: header, index: [:], records: [:], key: key))
     }
 
+    public static func createAccountSnapshot(id: UUID = UUID(), name: String, owner: AccountIdentity, recovery: RecoveryKey) throws -> Data {
+        let key = SymmetricKey(size: .bits256)
+        let recipients = try [
+            VaultDocument.wrap(key: key, request: owner.request, kind: "member", vaultID: id),
+            VaultDocument.wrap(key: key, request: recovery.request, kind: "recovery", vaultID: id)
+        ].sorted { $0.fingerprint < $1.fingerprint }
+        var header = VaultHeader(format: "mop-vault-v5", vaultID: id, name: name, generation: 1, parent: nil, recipients: recipients)
+        let evidence = VaultDocument(header: header, sealed: Data(), records: [:])
+        header.membership = try VaultMembership(vaultID: id, fingerprint: VaultTrust.fingerprint(document: evidence, key: key), owner: owner)
+        return try VaultCoding.encode(VaultDocument.seal(header: header, index: [:], records: [:], key: key, signer: owner))
+    }
+
     /// Bootstrap trust only with independently obtained fingerprint or revision evidence.
     public static func trustSnapshot(_ bytes: Data, trust: VaultTrust, opener: any VaultKeyOpener,
                                      fingerprint: String? = nil, revision: String? = nil) throws {
@@ -347,7 +414,7 @@ public final class VaultSession: SecretStore {
         let selected = try VaultDocument.decode(bytes)
         guard selected.header.vaultID == document.header.vaultID,
               let slot = selected.header.recipients.first(where: { $0.publicKey == opener?.publicKey }),
-              document.header.recipients.contains(where: { $0.publicKey == opener?.publicKey && $0.kind == "device" }) else { throw MopError.deviceNotEnrolled }
+              document.header.recipients.contains(where: { $0.publicKey == opener?.publicKey && ["device", "member"].contains($0.kind) }) else { throw MopError.deviceNotEnrolled }
         let opener = try requireOpener()
         let oldKey = try opener.unwrap(slot, vaultID: document.header.vaultID)
         try trust.verify(document: selected, key: oldKey, historical: true)

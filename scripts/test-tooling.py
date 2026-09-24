@@ -13,19 +13,21 @@ app = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app').resolve
 root = pathlib.Path(__file__).resolve().parent.parent
 with tempfile.TemporaryDirectory(prefix='mop-install-test-') as directory:
     prefix = pathlib.Path(directory) / 'prefix'
-    environment = os.environ | {'MOP_INSTALL_ROOT': str(prefix)}
+    applications = pathlib.Path(directory) / 'Applications'
+    environment = os.environ | {'MOP_INSTALL_ROOT': str(prefix), 'MOP_APPLICATIONS_DIR': str(applications)}
     command = [str(root / 'scripts/install.sh'), str(app)]
     subprocess.run(command, env=environment, check=True, capture_output=True)
     link = prefix / 'bin/mop'
     assert link.is_symlink()
-    assert (prefix / 'lib/mop/Mop.app/Contents/embedded.provisionprofile').is_file()
-    info = plistlib.loads((prefix / 'lib/mop/Mop.app/Contents/Info.plist').read_bytes())
+    assert link.readlink() == applications / 'Mop.app/Contents/MacOS/mop'
+    assert (applications / 'Mop.app/Contents/embedded.provisionprofile').is_file()
+    info = plistlib.loads((applications / 'Mop.app/Contents/Info.plist').read_bytes())
     assert info['CFBundleExecutable'] == 'MopApp'
-    assert (prefix / 'lib/mop/Mop.app/Contents/MacOS/MopApp').is_file()
-    resources_dir = prefix / 'lib/mop/Mop.app/Contents/Resources'
+    assert (applications / 'Mop.app/Contents/MacOS/MopApp').is_file()
+    resources_dir = applications / 'Mop.app/Contents/Resources'
     assert (resources_dir / 'zxcvbn_zxcvbn.bundle').is_dir()
     assert (resources_dir / 'zxcvbn-LICENSE.txt').is_file()
-    direct = prefix / 'lib/mop/Mop.app/Contents/MacOS/mop'
+    direct = applications / 'Mop.app/Contents/MacOS/mop'
     identity = subprocess.check_output([str(direct), 'device', 'identity']).strip()
     assert identity
     assert subprocess.check_output([str(link), 'device', 'identity']).strip() == identity

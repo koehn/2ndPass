@@ -15,17 +15,19 @@ public enum ItemType: String, Codable, CaseIterable, Sendable {
         default: rawValue.capitalized
         }
     }
+    /// Custom remains decodable for existing items, but has no creation template.
+    public static var templateTypes: [ItemType] { allCases.filter { $0 != .custom } }
     public var template: [ItemField] {
         let fields: [(String, FieldType)]
         switch self {
         case .login: fields = [("username", .username), ("password", .password), ("website", .website)]
         case .password: fields = [("password", .password)]
-        case .apiCredential: fields = [("username", .username), ("token", .concealed), ("website", .website)]
+        case .apiCredential: fields = [("token", .concealed), ("endpoint", .website)]
         case .secureNote: fields = [("note", .concealed)]
         case .database: fields = [("server", .text), ("username", .username), ("password", .password), ("database", .text)]
-        case .custom: fields = [("field", .concealed)]
+        case .custom: return []
         }
-        return (fields + [("notes", .notes)]).map { ItemField(path: $0.0, type: $0.1, value: "", isTemplate: true) }
+        return (fields + (self == .secureNote ? [] : [("notes", .notes)])).map { ItemField(path: $0.0, type: $0.1, value: "", isTemplate: true) }
     }
 }
 

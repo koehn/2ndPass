@@ -129,6 +129,7 @@ private final class CountingOpener: VaultKeyOpener {
     }
 }
 
+#if os(macOS)
 @Test func privateFilesStripInheritedACLsAndRejectExistingGrants() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-acl-test-" + UUID().uuidString)
     try SafeFile.privateDirectory(directory)
@@ -153,6 +154,8 @@ private final class CountingOpener: VaultKeyOpener {
     try chmod(["-N", recoveryURL.path])
     #expect(try RecoveryKey(file: recoveryURL).publicKey == recovery.publicKey)
 }
+
+#endif
 
 @Test func readsOnlyRequestedRecordAndMutationsPreserveOtherCiphertexts() throws {
     let (directory, trust, initial, device, _) = try fixture()
@@ -410,7 +413,7 @@ private final class CountingOpener: VaultKeyOpener {
     let item = VaultItem(name: "login", type: .login, fields: [
         ItemField(path: "username", type: .username, value: "VISIBLE_USERNAME"),
         ItemField(path: "password", type: .password, value: "HIDDEN_PASSWORD"),
-        ItemField(path: "otp", type: .otp, value: "HIDDEN_OTP")
+        ItemField(path: "otp", type: .otp, value: "JBSWY3DPEHPK3PXP")
     ])
     try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true))
     #expect(!String(decoding: store.snapshot, as: UTF8.self).contains("VISIBLE_USERNAME"))
@@ -426,7 +429,7 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(try reopened.catalog().items[0].fields.map(\.path) == ["otp", "password", "username"])
     opener.allowRecords = true
     #expect(try reopened.read(SecretReference("mop://v/login/password")) == "HIDDEN_PASSWORD")
-    #expect(try reopened.read(SecretReference("mop://v/login/otp")) == "HIDDEN_OTP")
+    #expect(try reopened.read(SecretReference("mop://v/login/otp")) == "JBSWY3DPEHPK3PXP")
     // CLI replacements and deletions keep visible metadata consistent.
     try reopened.write(SecretReference("mop://v/login/username"), value: "new-user", replace: true)
     #expect(try reopened.catalog().items[0].fields.last?.value == "new-user")
@@ -635,4 +638,121 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(store.snapshot == collision)
     try store.trashItem(name: "login", revision: store.catalog().revision, at: date)
     #expect(try store.recentlyDeleted(at: date).items.count == 2)
+}
+
+@Test func cloudTrustMigrationRequiresAnExistingMatchingLocalPin() throws {
+    let (directory, _, snapshot, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let trustDirectory = directory.appendingPathComponent("local-trust")
+    let stable = VaultTrust(cloudBinding: "test-scope", directory: trustDirectory)
+    let document = try VaultDocument.decode(snapshot)
+    #expect(throws: MopError.vaultUntrusted) { try stable.verify(document: document, key: SymmetricKey(size: .bits256)) }
+    #expect(!FileManager.default.fileExists(atPath: trustDirectory.appendingPathComponent("cloud.json").path))
+    let missing = VaultTrust(cloudBinding: "missing", directory: directory.appendingPathComponent("missing"))
+    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: snapshot, trust: missing, opener: device) }
+    let duplicate = VaultTrust(vault: directory.appendingPathComponent("another-path"), directory: trustDirectory)
+    try VaultSession.trustSnapshot(snapshot, trust: duplicate, opener: device, revision: VaultCoding.digest(snapshot))
+    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: snapshot, trust: stable, opener: device) }
+}
+
+
+@Test func invalidStableCloudPinNeverFallsBackToLegacyPin() throws {
+    let (directory, _, snapshot, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let trustDirectory = directory.appendingPathComponent("local-trust")
+    let stable = VaultTrust(cloudBinding: "test-scope", directory: trustDirectory)
+    let session = try VaultSession(snapshot: snapshot, trust: stable, opener: device)
+    session.close()
+    try SafeFile.write(Data("{}".utf8), to: trustDirectory.appendingPathComponent("cloud.json"), replace: true)
+    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: snapshot, trust: stable, opener: device) }
+}
+
+@Test func ownerMembershipMigrationRotatesKeysAndPreservesRecovery() throws {
+    let (directory, trust, initial, device, recovery) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let session = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    let reference = try SecretReference("mop://v/login/password")
+    try session.write(reference, value: "owner-secret", replace: false)
+    let before = try VaultDocument.decode(session.snapshot)
+    let owner = AccountIdentity(); defer { owner.close() }
+    try session.adoptOwner(owner)
+    let migrated = try VaultDocument.decode(session.snapshot)
+    #expect(migrated.header.format == "mop-vault-v5")
+    #expect(migrated.header.membership?.owner == owner.identity)
+    #expect(migrated.header.recipients.count == 2 && !migrated.header.recipients.contains { $0.kind == "device" })
+    try session.pinCommittedKey()
+    #expect(migrated.records.mapValues(\.sealed) != before.records.mapValues(\.sealed))
+    #expect(try session.read(reference) == "owner-secret")
+    let freshTrust = VaultTrust(cloudBinding: "new-device", directory: directory.appendingPathComponent("new-device"))
+    let secondOwner = try owner.withMaterial { try AccountIdentity(material: $0) }
+    let second = try VaultSession(snapshot: session.snapshot, trust: freshTrust, opener: secondOwner)
+    #expect(try second.read(reference) == "owner-secret")
+    try second.write(reference, value: "updated", replace: true)
+    #expect(try second.read(reference) == "updated")
+    let recovered = try VaultSession(snapshot: second.snapshot, trust: trust, opener: recovery)
+    #expect(try recovered.read(reference) == "updated")
+    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: second.snapshot, trust: trust, opener: device) }
+    #expect(throws: MopError.cloudPermission) { try second.enroll(device.request, expectedFingerprint: device.request.fingerprint) }
+    let otherOwner = AccountIdentity()
+    #expect(throws: MopError.cloudPermission) { try second.adoptOwner(otherOwner) }
+    secondOwner.close()
+    #expect(throws: MopError.authentication) { try second.read(reference) }
+}
+
+@Test func membershipAndRevisionSignaturesRejectSubstitution() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let owner = AccountIdentity(), session = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    try session.adoptOwner(owner)
+    let snapshot = session.snapshot
+    var document = try VaultDocument.decode(snapshot)
+    document.header.name = "tampered"
+    #expect(throws: MopError.invalidVault) { try VaultDocument.decode(VaultCoding.encode(document)) }
+    document = try VaultDocument.decode(snapshot)
+    document.signature = Data(repeating: 0, count: 64)
+    #expect(throws: MopError.invalidVault) { try VaultDocument.decode(VaultCoding.encode(document)) }
+    let membership = try #require(document.header.membership)
+    #expect(throws: MopError.invalidVault) { try membership.validate(vaultID: UUID()) }
+    let impostor = AccountIdentity()
+    let freshTrust = VaultTrust(cloudBinding: "fresh", directory: directory.appendingPathComponent("fresh"))
+    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: snapshot, trust: freshTrust, opener: impostor) }
+}
+
+@Test func invalidOTPReplacementsCannotChangeVault() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    defer { store.close() }
+    var item = VaultItem(name: "otp-login", type: .login, fields: [ItemField(path: "otp", type: .otp, value: "123456")])
+    let initialSnapshot = store.snapshot
+    #expect(throws: MopError.invalidOTP) { try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true)) }
+    #expect(store.snapshot == initialSnapshot)
+    item.fields[0].value = "JBSWY3DPEHPK3PXP"
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true))
+    let ref = try SecretReference("mop://v/otp-login/otp"), saved = store.snapshot
+    #expect(throws: MopError.invalidOTP) { try store.write(ref, value: "invalid", replace: true) }
+    #expect(store.snapshot == saved)
+    let unchanged = try #require(store.catalog().items.first { $0.name == "otp-login" })
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: unchanged, create: false))
+    #expect(try store.read(ref) == "JBSWY3DPEHPK3PXP")
+}
+
+@Test func existingConcealedOTPURLCanBeConvertedWithoutReturningSeed() throws {
+    let (directory, trust, initial, device, _) = try fixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
+    defer { store.close() }
+    try store.write(SecretReference("mop://v/login/otp"), value: "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP", replace: false)
+    var item = try #require(store.catalog().items.first { $0.name == "login" })
+    #expect(item.fields[0].type == .concealed && item.fields[0].value == nil)
+    item.fields[0].type = .otp
+    try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false))
+    let converted = try #require(store.catalog().items.first { $0.name == "login" })
+    #expect(converted.fields[0].type == .otp && converted.fields[0].value == nil)
+    try store.write(SecretReference("mop://v/login/other"), value: "not-an-otp", replace: false)
+    var invalid = try #require(store.catalog().items.first { $0.name == "login" })
+    invalid.fields[1].type = .otp
+    let previous = store.snapshot
+    #expect(throws: MopError.invalidOTP) { try store.saveItem(ItemEdit(revision: store.catalog().revision, item: invalid, create: false)) }
+    #expect(store.snapshot == previous)
 }

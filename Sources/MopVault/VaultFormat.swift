@@ -55,6 +55,7 @@ public struct VaultHeader: Codable, Equatable, Sendable {
     public var generation: UInt64
     public var parent: String?
     public var recipients: [VaultRecipient]
+    public var membership: VaultMembership? = nil
 }
 
 struct VaultIndex: Codable {
@@ -66,6 +67,8 @@ public struct VaultDocument: Codable, Sendable {
     public var header: VaultHeader
     public var sealed: Data
     public var records: [String: VaultRecord] = [:]
+    public var signature: Data? = nil
+    public var signer: Data? = nil
 
     public static func decode(_ bytes: Data) throws -> VaultDocument {
         do {
@@ -74,14 +77,20 @@ public struct VaultDocument: Codable, Sendable {
             if let version = try? JSONDecoder().decode(Version.self, from: bytes), version.header.format == "mop-vault-v3" { throw MopError.legacyVault }
             let document = try JSONDecoder().decode(Self.self, from: bytes)
             try VaultName.validate(document.header.name)
-            guard document.header.format == "mop-vault-v4", document.header.generation > 0,
+            guard ["mop-vault-v4", "mop-vault-v5"].contains(document.header.format), document.header.generation > 0,
                   document.header.recipients.count <= 64,
                   document.header.recipients.filter({ $0.kind == "recovery" }).count == 1,
-                  document.header.recipients.contains(where: { $0.kind == "device" }),
+                  document.header.recipients.contains(where: { $0.kind == (document.header.format == "mop-vault-v5" ? "member" : "device") }),
                   Set(document.header.recipients.map(\.fingerprint)).count == document.header.recipients.count,
                   document.sealed.count >= 28 else { throw MopError.invalidVault }
+            if document.header.format == "mop-vault-v5" {
+                guard let membership = document.header.membership else { throw MopError.invalidVault }
+                try membership.validate(vaultID: document.header.vaultID)
+                guard document.header.recipients.count == 2, document.header.recipients.contains(where: { $0.publicKey == membership.owner.encryptionKey && $0.kind == "member" }) else { throw MopError.invalidVault }
+                try document.verifySignature()
+            } else if document.header.membership != nil || document.signature != nil || document.signer != nil { throw MopError.invalidVault }
             for slot in document.header.recipients {
-                guard ["device", "recovery"].contains(slot.kind), slot.encapsulatedKey.count == 65,
+                guard [document.header.format == "mop-vault-v5" ? "member" : "device", "recovery"].contains(slot.kind), slot.encapsulatedKey.count == 65,
                       slot.wrappedKey.count == 48, slot.purpose == "index" else { throw MopError.invalidVault }
                 _ = try DeviceRequest(name: slot.name, publicKey: slot.publicKey)
             }
@@ -136,14 +145,34 @@ public struct VaultDocument: Codable, Sendable {
         try VaultCoding.encode(AssociatedData(header: header, recordsDigest: VaultCoding.digest(VaultCoding.encode(records))))
     }
 
-    public static func seal(header: VaultHeader, index: [String: String], records: [String: VaultRecord], key: SymmetricKey, items: [VaultItem] = []) throws -> VaultDocument {
+    public static func seal(header: VaultHeader, index: [String: String], records: [String: VaultRecord], key: SymmetricKey, items: [VaultItem] = [], signer: (any VaultSigningOpener)? = nil) throws -> VaultDocument {
         let plaintext = try items.isEmpty ? VaultCoding.encode(index) : VaultCoding.encode(VaultIndex(references: index, items: items))
         let box = try AES.GCM.seal(plaintext, using: key,
                                   authenticating: associatedData(header: header, records: records))
         guard let combined = box.combined else { throw MopError.invalidVault }
-        let document = VaultDocument(header: header, sealed: combined, records: records)
+        var document = VaultDocument(header: header, sealed: combined, records: records)
+        if header.format == "mop-vault-v5" {
+            guard let signer else { throw MopError.cloudPermission }
+            document.signer = signer.signingPublicKey
+            document.signature = try signer.sign(document.signingData())
+        }
         // Apply identical size/structure limits to writes and reads.
         return try decode(VaultCoding.encode(document))
+    }
+
+    private struct SignedRevision: Encodable {
+        let domain: String; let header: VaultHeader; let sealed: Data; let recordsDigest: String
+    }
+    private func signingData() throws -> Data {
+        try VaultCoding.encode(SignedRevision(domain: "mop-vault-revision-v1", header: header, sealed: sealed,
+                                             recordsDigest: VaultCoding.digest(VaultCoding.encode(records))))
+    }
+    private func verifySignature() throws {
+        guard let signer, let signature, signature.count == 64,
+              signer == header.membership?.owner.signingKey || header.recipients.contains(where: { $0.kind == "recovery" && $0.publicKey == signer }),
+              let key = try? P256.Signing.PublicKey(x963Representation: signer),
+              let sig = try? P256.Signing.ECDSASignature(rawRepresentation: signature),
+              key.isValidSignature(sig, for: try signingData()) else { throw MopError.invalidVault }
     }
 
     public func decryptIndex(key: SymmetricKey) throws -> [String: String] {

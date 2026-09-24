@@ -29,7 +29,7 @@ struct PasswordStrengthView: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Estimated password strength: \(score?.label ?? "unavailable")")
-        .help("Estimated on this Mac using zxcvbn. This is not a check for leaked passwords.")
+        .help("Estimated on this device using zxcvbn. This is not a check for leaked passwords.")
         .task(id: Evaluation(password: password, inputs: userInputs)) {
             liveScore = nil
             guard let password else { return }

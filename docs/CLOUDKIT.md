@@ -113,3 +113,26 @@ manifests are reported but not opened. Creation/import/rename check current name
 availability; separate-zone races can still create duplicates and resolution then
 fails explicitly. UUID selection remains available to repair names. No global
 name registry or cross-zone transaction is introduced.
+
+## Automatic application refresh
+
+Native apps register for silent remote notifications and save the private database
+subscription `mop-private-database-v1`. Xcode builds include the platform-specific
+APNs entitlement and mobile `remote-notification` background mode. macOS script
+packages copy the APNs environment from the provisioning profile when present;
+use a profile containing `com.apple.developer.aps-environment` for push delivery.
+Foreground and periodic refresh still work without push registration.
+
+Notifications are hints; authenticated reads always validate the fetched revision.
+Background downloads store ciphertext only. Reconnection and foregrounding also
+refresh, and active sessions reconcile every minute to recover missed pushes.
+Unsaved editors defer automatic refresh. Previously verified snapshots remain
+readable during transport outages, without changing the authentication session.
+
+Signed-device acceptance: open a vault online on both devices, change an item on
+A, and confirm B updates without manual refresh. Repeat while B is backgrounded,
+then foreground it. Disconnect B and relaunch: authenticate and read its cached
+secret, verify mutations require a connection, then reconnect and confirm updates.
+Repeat with an open edit on B (no draft loss) and an account change (no old cache
+fallback). APNs delivery requires signed physical-device testing; unit tests and
+unsigned simulator builds do not establish delivery or background scheduling.

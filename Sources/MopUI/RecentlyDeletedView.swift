@@ -7,10 +7,10 @@ struct RecentlyDeletedList: View {
             HStack { Text("Recently Deleted").font(.headline); Spacer() }.padding()
             if model.authenticated {
                 List(model.deletedRows, selection: $model.selectedDeleted) { row in
-                    VStack(alignment: .leading, spacing: 4) {
+                    NavigationLink(value: row.id) { VStack(alignment: .leading, spacing: 4) {
                         Text(row.item.deletion?.originalName ?? row.item.name).fontWeight(.medium)
                         Text(row.vaultName).font(.caption).foregroundStyle(.secondary)
-                    }.padding(.vertical, 5).tag(row.id)
+                    }.padding(.vertical, 5) }.tag(row.id)
                         .contextMenu {
                             Button("Restore") { model.restoreDeletedItem(row) }.disabled(model.offline || model.busy)
                         }
@@ -19,8 +19,7 @@ struct RecentlyDeletedList: View {
             } else {
                 ContentUnavailableView {
                     Label("Recently Deleted is locked", systemImage: "lock")
-                } description: { Text("Unlock to view deleted items from your enrolled vaults.") }
-                actions: { Button("Unlock") { model.unlock() }.disabled(model.busy) }
+                } description: { Text("Mop authenticates automatically while active to open all connected vaults.") }
             }
         }
     }

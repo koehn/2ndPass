@@ -13,7 +13,7 @@ struct CLIClientTests {
         return url
     }
     @Test func visibleSelectionOverridesLegacyEnvironment() {
-        let result = CLIClient.environment(["MOP_CLOUD_VAULT": "hidden", "MOP_VAULT_FILE": "/old/vault", "MOP_STATE_DIRECTORY": "/state", "PATH": "/bin"])
+        let result = CLIClient.environment(["MOP_CLOUD_VAULT": "hidden", "MOP_STATE_DIRECTORY": "/state", "PATH": "/bin"])
         #expect(result == ["MOP_STATE_DIRECTORY": "/state", "PATH": "/bin"])
     }
     @Test func earlyChildExitDoesNotTerminateWriter() async throws {

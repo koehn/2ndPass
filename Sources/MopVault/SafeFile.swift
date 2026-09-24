@@ -60,6 +60,13 @@ public enum SafeFile {
                 defer { Darwin.close(fd) }
                 try PrivateACL.validate(fd)
             }
+            #if os(iOS)
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+            var excluded = url
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try excluded.setResourceValues(values)
+            #endif
         } catch let error as MopError { throw error }
           catch { throw MopError.inputOutput }
     }
@@ -71,6 +78,10 @@ public enum SafeFile {
         let fd = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw MopError.inputOutput }
         defer { Darwin.close(fd); unlink(temporary.path) }
+        #if os(iOS)
+        // Protect the empty staging inode before any secret bytes are written.
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: temporary.path)
+        #endif
         try PrivateACL.clear(fd)
         try data.withUnsafeBytes { bytes in
             var offset = 0

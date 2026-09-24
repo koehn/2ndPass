@@ -40,7 +40,9 @@ if executable == 'mop':
     def permits(key, requested):
         return any(fnmatch.fnmatchcase(requested, pattern) for pattern in allowed_values(key))
 
-    required = [('com.apple.developer.icloud-container-identifiers', container),
+    kvstore = team + '.' + bundle_id
+    required = [('com.apple.developer.ubiquity-kvstore-identifier', kvstore),
+                ('com.apple.developer.icloud-container-identifiers', container),
                 ('com.apple.developer.icloud-services', 'CloudKit'),
                 ('com.apple.developer.icloud-container-environment', environment)]
     problems = []
@@ -50,11 +52,15 @@ if executable == 'mop':
             problems.append(f'  {key}: requires {requested}; profile permits {permitted}')
     if problems:
         sys.exit('CloudKit provisioning does not authorize this build:\n' + '\n'.join(problems)
-                 + f'\nEnable CloudKit for {bundle_id}, associate {container}, then regenerate/download its profile.'
+                 + f'\nEnable CloudKit and iCloud Key-Value Storage for {bundle_id}, associate {container}, then regenerate/download its profile.'
                  + '\nMOP_CLOUD_ENVIRONMENT selects Development or Production (default Production); the profile must permit it.')
-    output.update({'com.apple.developer.icloud-container-identifiers': [container],
+    output.update({'com.apple.developer.ubiquity-kvstore-identifier': kvstore,
+                   'com.apple.developer.icloud-container-identifiers': [container],
                    'com.apple.developer.icloud-services': ['CloudKit'],
                    'com.apple.developer.icloud-container-environment': environment})
+# Carry the profile's APNs environment into native macOS app signatures.
+if executable == 'mop' and entitlements.get('com.apple.developer.aps-environment'):
+    output['com.apple.developer.aps-environment'] = entitlements['com.apple.developer.aps-environment']
 with open(entitlements_path, 'wb') as f:
     plistlib.dump(output, f)
 with open(info_path, 'wb') as f:

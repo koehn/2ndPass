@@ -1,18 +1,17 @@
-import AppKit
-import CloudKit
 import SwiftUI
 import MopCore
 import MopAppSupport
 
-enum AppPage: String, CaseIterable { case secrets = "Secrets", recentlyDeleted = "Recently Deleted", devices = "Trusted Macs" }
-enum AppSheet: String, Identifiable { case createVault, renameVault, deleteVault, request, trust, approve, selectVault, recover, revoke
+enum AppPage: String, CaseIterable { case secrets = "Secrets", recentlyDeleted = "Recently Deleted" }
+enum AppSheet: String, Identifiable { case createVault, renameVault, deleteVault, vaultSettings, trust, recover
     var id: String { rawValue }
 }
 
 @MainActor @Observable
 final class AppModel {
     let service: any VaultService
-    let clipboard: SecretClipboard
+    let documents: any DocumentAccessing
+    let clipboard: any SecretClipboardAccess
     var isActive = true
     var vaults: [VaultDescriptor] = []
     var vault = ""
@@ -33,22 +32,33 @@ final class AppModel {
     var selected: SecretReference?
     var search = ""
     var devices: [MacRecord] = []
+    var members: [VaultMemberRecord] = []
     var requests: [Enrollment] = []
-    var enrollment: Enrollment?
-    var revoking: MacRecord?
     var offline = false
+    private var cloudRefreshPending = false
+    private var nextCloudRefresh = Date.distantPast
     var authenticated = false
     var revealed: SecretBytes?
     var busy = false
+    var refreshing = false
+    private var foregroundRevision = 0
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
     var error: String?
     var notice: String?
+    struct CopyFeedback {
+        let id = UUID()
+        let reference: SecretReference
+        let message: String
+    }
+    var copyFeedback: CopyFeedback?
     var status = "Select a vault to begin"
+    var pairing: PairingCoordinator?
     var sheet: AppSheet?
     var deleteConfirmation = false
+    var documentRequest: DocumentRequest?
     private var generation = 0
     private var visibilityGeneration = 0
-    @ObservationIgnored private var activityMonitor: Any?
-    @ObservationIgnored private var lifecycleObservers: [(NotificationCenter, NSObjectProtocol)] = []
+    @ObservationIgnored private let lifecycle: any AppLifecycleMonitoring
     private var concealTask: Task<Void, Never>?
 
     @ObservationIgnored private let now: () -> TimeInterval
@@ -56,6 +66,11 @@ final class AppModel {
     @ObservationIgnored private var inactivityTask: Task<Void, Never>?
     @ObservationIgnored private var operationTask: Task<Void, Never>?
     private var lastActivity: TimeInterval?
+    private var automaticUnlockBlocked = false
+    private var automaticUnlockNeedsRepair = false
+    private var wasBackgrounded = false
+    private var needsAccountDiscovery = false
+    @ObservationIgnored private var automaticUnlockTask: Task<Void, Never>?
     var editorGeneration = 0
     var itemDraft: ItemDraft?
     var passwordGeneratorOptions = PasswordOptions() {
@@ -74,12 +89,15 @@ final class AppModel {
         }
     }
 
-    init(service: any VaultService = NativeVaultService(), clipboard: SecretClipboard? = nil,
-         defaults: UserDefaults = .standard,
+    init(service: any VaultService = NativeVaultService(), clipboard: (any SecretClipboardAccess)? = nil,
+         defaults: UserDefaults = .standard, lifecycle: (any AppLifecycleMonitoring)? = nil,
+         documents: any DocumentAccessing = SystemDocumentAccess(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init) {
+        self.lifecycle = lifecycle ?? SystemAppLifecycleMonitor()
         self.wallNow = wallNow; retentionDate = wallNow()
         self.service = service
+        self.documents = documents
         self.clipboard = clipboard ?? SecretClipboard()
         self.defaults = defaults; self.now = now
         let saved = defaults.object(forKey: "autoLockMinutes") as? Int ?? 5
@@ -96,21 +114,62 @@ final class AppModel {
                     guard !Task.isCancelled else { return }
                     self?.checkExpiration()
                     self?.checkRetention()
+                    self?.refreshCloudIfNeeded()
                 }
             }
         }
     }
-    deinit { inactivityTask?.cancel() }
+    deinit { inactivityTask?.cancel(); automaticUnlockTask?.cancel() }
     func checkExpiration() {
         if let started = service.authenticatedAt {
             if lastActivity == nil { lastActivity = started }
-            if now() - (lastActivity ?? started) >= Double(autoLockMinutes * 60) { lock() }
-        } else if lastActivity != nil { lock() }
+            if now() - (lastActivity ?? started) >= Double(autoLockMinutes * 60) {
+                lock(); automaticUnlockBlocked = false
+            }
+        } else if lastActivity != nil {
+            if let activePairing = pairing {
+                // The service may invalidate authentication while the pairing
+                // coordinator is still receiving its error. Clear vault contents,
+                // but retain that sheet so the actual failure remains visible.
+                // Explicit lock/background/account events still cancel pairing.
+                pairing = nil
+                operationTask?.cancel(); lastActivity = nil
+                clearView(); clearClipboard(); status = "Locked"
+                pairing = activePairing
+            } else if busy && !authenticated {
+                // Let an in-flight opening report its failure after the service
+                // invalidates authentication. Invalidating its generation here
+                // would swallow that error and its automatic-retry pause.
+                lastActivity = nil; automaticUnlockBlocked = true; conceal()
+            } else { lock() }
+        }
+        scheduleAutomaticUnlock()
+    }
+    private func scheduleAutomaticUnlock() {
+        if needsAccountDiscovery, isActive, !busy {
+            needsAccountDiscovery = false
+            Task { [weak self] in self?.discover(autoUnlock: true) }
+            return
+        }
+        guard launchAttempted, isActive, !authenticated, !busy, !automaticUnlockBlocked, !automaticUnlockNeedsRepair,
+              error == nil, pairing == nil, sheet == nil, !requestedVaultIDs.isEmpty,
+              automaticUnlockTask == nil else { return }
+        automaticUnlockTask = Task { [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            self.automaticUnlockTask = nil
+            guard !Task.isCancelled, self.isActive, !self.authenticated, !self.busy,
+                  !self.automaticUnlockBlocked, !self.automaticUnlockNeedsRepair, self.error == nil, self.pairing == nil,
+                  self.sheet == nil, !self.requestedVaultIDs.isEmpty else { return }
+            self.unlock()
+        }
     }
     func activity() {
         checkExpiration()
-        guard isActive, service.isAuthenticated else { return }
-        lastActivity = now()
+        guard isActive else { return }
+        if service.isAuthenticated { lastActivity = now() }
+        if !busy, error == nil { automaticUnlockBlocked = false }
+        scheduleAutomaticUnlock()
     }
     var selectedVaultDescriptor: VaultDescriptor? { vaults.first { $0.id == vault } }
     var canExportBackup: Bool { !allVaults && !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
@@ -122,17 +181,26 @@ final class AppModel {
     var displayedItems: [ItemRow] {
         let included = allVaults ? catalogs : catalog.map { [vault: $0] } ?? [:]
         return included.flatMap { id, catalog in
-            catalog.items.compactMap { item -> ItemRow? in
-                let matches = search.isEmpty || item.name.localizedCaseInsensitiveContains(search)
-                    || catalog.vault.localizedCaseInsensitiveContains(search)
-                    || item.fields.contains {
-                        $0.path.localizedCaseInsensitiveContains(search)
-                            || (!$0.type.concealed && $0.value?.localizedCaseInsensitiveContains(search) == true)
-                    }
-                return matches ? ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item) : nil
+            catalog.items.map { item in
+                ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item)
             }
         }.sorted { ($0.item.name, $0.vaultName, $0.id.vault) < ($1.item.name, $1.vaultName, $1.id.vault) }
     }
+    var searchResults: [ItemSearchResult] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+        return displayedItems.compactMap { row in
+            let field = row.item.fields.first { field in
+                guard !field.type.concealed else { return false }
+                let label = field.path.removingPercentEncoding ?? field.path
+                return label.localizedCaseInsensitiveContains(query) || field.value?.localizedCaseInsensitiveContains(query) == true
+            }
+            guard field != nil || row.item.name.localizedCaseInsensitiveContains(query)
+                    || row.vaultName.localizedCaseInsensitiveContains(query) else { return nil }
+            return ItemSearchResult(row: row, field: field)
+        }
+    }
+
     var deletedRows: [ItemRow] {
         deletedCatalogs.flatMap { id, catalog in
             catalog.items.compactMap { item -> ItemRow? in
@@ -149,7 +217,7 @@ final class AppModel {
         guard !busy else { return }
         page = .recentlyDeleted; allVaults = false
         changedVault()
-        if !service.isAuthenticated { unlock() }
+        scheduleAutomaticUnlock()
     }
     func trashItem(_ row: ItemRow) {
         guard !busy, !offline, authenticated, let source = catalogs[row.id.vault],
@@ -213,7 +281,7 @@ final class AppModel {
         guard !busy else { return }
         allVaults = false; page = .secrets; vault = id
         changedVault()
-        if !service.isAuthenticated && !id.isEmpty { unlock() }
+        scheduleAutomaticUnlock()
     }
     /// Target the row's vault without starting an unlock that could race the action.
     func prepareVaultAction(_ id: String) -> Bool {
@@ -222,10 +290,9 @@ final class AppModel {
         if allVaults || vault != id || page != .secrets {
             let cached = service.isAuthenticated ? catalogs[id] : nil
             clearSelection()
-            vault = id; allVaults = false; page = .secrets; authenticated = false
+            vault = id; allVaults = false; page = .secrets
             if let cached {
                 try? applyCatalog(cached)
-                authenticated = true
             }
             status = authenticated ? "Unlocked" : "Ready to authenticate"
         }
@@ -236,15 +303,14 @@ final class AppModel {
         guard !busy else { return }
         allVaults = true; page = .secrets
         changedVault()
-        if !service.isAuthenticated { unlock() }
+        scheduleAutomaticUnlock()
     }
     var sidebarSelection: String {
-        get { page == .recentlyDeleted ? "deleted" : page == .devices ? "devices" : allVaults ? "all" : "vault:" + vault }
+        get { page == .recentlyDeleted ? "deleted" : allVaults ? "all" : "vault:" + vault }
         set {
             guard newValue != sidebarSelection else { return }
             if newValue == "deleted" { chooseRecentlyDeleted() }
             else if newValue == "all" { chooseAllVaults() }
-            else if newValue == "devices" { page = .devices }
             else if newValue.hasPrefix("vault:") { chooseVault(String(newValue.dropFirst(6))) }
         }
     }
@@ -396,50 +462,76 @@ final class AppModel {
     func conceal() { revealed = nil; concealTask?.cancel() }
     func clearClipboard() { clipboard.clear() }
     func startMonitoringActivity() {
-        guard lifecycleObservers.isEmpty else { return }
-        observe(NotificationCenter.default, NSApplication.didResignActiveNotification) { $0.deactivate() }
-        observe(NotificationCenter.default, NSApplication.didBecomeActiveNotification) { $0.activate() }
-        observe(NotificationCenter.default, NSApplication.willTerminateNotification) { $0.shutdown() }
-        observe(NotificationCenter.default, .CKAccountChanged) { $0.lock() }
-        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.sessionDidResignActiveNotification) { $0.lock() }
-        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification) { $0.lock() }
-        observe(DistributedNotificationCenter.default(), Notification.Name("com.apple.screenIsLocked")) { $0.lock() }
-        activityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .mouseMoved, .leftMouseDragged, .rightMouseDragged, .scrollWheel]) { [weak self] event in
-            MainActor.assumeIsolated { self?.activity() }
-            return event
+        lifecycle.start { [weak self] event in
+            guard let self else { return }
+            switch event {
+            case .active: self.activate()
+            case .cloudChanged: self.cloudChanged()
+            case .inactive: self.deactivate()
+            case .background: self.background()
+            case .lock: self.deactivate(); self.lock(); self.wasBackgrounded = true
+            case .accountChanged:
+                self.lock(); self.vaults = []; self.vault = ""
+                self.automaticUnlockBlocked = false
+                self.automaticUnlockNeedsRepair = false
+                self.needsAccountDiscovery = true
+                self.scheduleAutomaticUnlock()
+            case .terminate: self.shutdown()
+            case .activity: self.activity()
+            }
         }
     }
-    private func observe(_ center: NotificationCenter, _ name: Notification.Name, action: @escaping @MainActor (AppModel) -> Void) {
-        let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { if let self { action(self) } }
-        }
-        lifecycleObservers.append((center, observer))
+    func beginPairing(host: Bool) {
+        guard !offline, !busy, pairing == nil else { return }
+        let coordinator = PairingCoordinator(service: service)
+        pairing = coordinator
+        if host { coordinator.start(vault: vault) }
     }
-    func shutdown() {
-        lock(); inactivityTask?.cancel()
-        for (center, observer) in lifecycleObservers { center.removeObserver(observer) }
-        lifecycleObservers.removeAll()
-        if let activityMonitor { NSEvent.removeMonitor(activityMonitor); self.activityMonitor = nil }
+    func dismissPairing() { pairing?.cancel(); pairing = nil }
+    func finishPairing() {
+        guard let progress = pairing?.progress, progress.phase == .complete else { return }
+        let id = progress.vault.uuidString
+        dismissPairing()
+        vault = id; allVaults = false; page = .secrets
+        automaticUnlockBlocked = false; automaticUnlockNeedsRepair = false
+        discover(autoUnlock: true, selectedOnly: true)
     }
-    func deactivate() { isActive = false; visibilityGeneration += 1; conceal() }
-    func activate() { checkExpiration(); isActive = true; checkRetention() }
+    func shutdown() { isActive = false; lock(); inactivityTask?.cancel(); lifecycle.stop() }
+    func background() {
+        deactivate(); wasBackgrounded = true
+        // A temporary app switch preserves the authenticated vault session.
+        // Pairing and pending authentication cannot continue in the background.
+        dismissPairing(); cancelItemEditing()
+        if busy && !authenticated { lock(clearClipboard: false) }
+        checkExpiration()
+    }
+    func deactivate() { isActive = false; visibilityGeneration += 1; conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil }
+    func activate() {
+        checkExpiration(); isActive = true
+        if wasBackgrounded { automaticUnlockBlocked = false; wasBackgrounded = false }
+        if service.isAuthenticated, !busy { lastActivity = now() }
+        scheduleAutomaticUnlock(); checkRetention()
+        if launchAttempted && authenticated { cloudChanged() }
+    }
     private func clearSelection() {
+        pairing?.cancel(); pairing = nil
         generation += 1; editorGeneration += 1; itemDraft = nil
         selectedDeleted = nil; itemToDelete = nil
-        conceal(); catalog = nil; passwordQualities = [:]; references = []; selected = nil; devices = []; requests = []
-        enrollment = nil; revoking = nil; selectedItem = nil; sheet = nil; notice = nil
-        search = ""; deleteConfirmation = false; error = nil
+        conceal(); catalog = nil; passwordQualities = [:]; references = []; selected = nil; devices = []; members = []; requests = []
+        selectedItem = nil; sheet = nil; notice = nil
+        search = ""; deleteConfirmation = false; documentRequest = nil; error = nil
     }
     private func clearView() {
         clearSelection()
         catalogs = [:]; deletedCatalogs = [:]; authenticated = false
     }
     func lock(clearClipboard: Bool = true) {
-        service.lock(); operationTask?.cancel(); lastActivity = nil
+        automaticUnlockBlocked = true
+        automaticUnlockTask?.cancel(); automaticUnlockTask = nil
+        service.lock(); operationTask?.cancel(); refreshTask?.cancel(); lastActivity = nil
         clearView(); if clearClipboard { self.clearClipboard() }
         status = "Locked"
     }
-    func changedContext() { lock(); status = offline ? "Offline mode · unlock a verified snapshot" : "Ready to authenticate" }
     func changedVault() {
         checkExpiration()
         clearSelection()
@@ -450,17 +542,30 @@ final class AppModel {
             authenticated = true
             status = offline ? "Read only · verified cached catalogs" : "Unlocked"
         } else {
-            status = "Opening vault"
+            authenticated = false
+            status = "Opening vaults"
             perform { token in try await self.unlockContents(token, refresh: false) }
         }
     }
     private var requestedVaultIDs: [String] {
-        (allVaults || page == .recentlyDeleted) ? vaults.filter { $0.supported && $0.enrolled }.map(\.id) : (vault.isEmpty ? [] : [vault])
+        vaults.filter { $0.supported && $0.enrolled }.map(\.id)
+    }
+    var hasConnectedVaults: Bool { !requestedVaultIDs.isEmpty }
+    func vaultIcon(_ descriptor: VaultDescriptor) -> String {
+        if !descriptor.supported { return "exclamationmark.triangle" }
+        if !descriptor.enrolled { return "externaldrive.badge.plus" }
+        return authenticated ? "lock.open" : "lock.rectangle"
+    }
+    func vaultConnectionLabel(_ descriptor: VaultDescriptor) -> String {
+        if !descriptor.supported { return "Unsupported vault" }
+        if !descriptor.enrolled { return "Not connected on this device" }
+        return authenticated ? "Unlocked" : "Locked"
     }
 
     func perform(_ action: @escaping @MainActor (Int) async throws -> Void) {
         checkExpiration()
         guard !busy else { return }
+        foregroundRevision += 1
         busy = true; error = nil; notice = nil
         let token = generation
         operationTask = Task {
@@ -469,11 +574,21 @@ final class AppModel {
             do { try await action(token) }
             catch {
                 if token == generation {
+                    self.automaticUnlockBlocked = true
+                    // A trust/account/data failure needs repair. Taps and Face ID
+                    // lifecycle notifications must not repeat the same failure.
+                    if (!self.authenticated && error as? MopError != .authentication) || error as? MopError == .vaultUntrusted {
+                        self.automaticUnlockNeedsRepair = true
+                    }
                     if let failure = error as? MopError,
                        [.authentication, .signing, .invalidDevice, .invalidVault, .vaultUntrusted, .deviceNotEnrolled, .cloudAccount].contains(failure) { self.lock() }
                     // Framework errors may contain arbitrary diagnostics. Only
                     // domain errors have user-safe messages.
-                    self.error = (error as? MopError)?.errorDescription ?? "The operation could not be completed."
+                    if error as? MopError == .vaultUntrusted {
+                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Refresh after iCloud Keychain finishes syncing. For an existing device-based vault, verify its fingerprint on the previously connected device before conversion."
+                    } else {
+                        self.error = (error as? MopError)?.errorDescription ?? "The operation could not be completed."
+                    }
                 }
             }
         }
@@ -485,9 +600,12 @@ final class AppModel {
         launchAttempted = true
         discover(autoUnlock: true)
     }
-    func discover(autoUnlock: Bool = false) {
+    func discover(autoUnlock: Bool = false, selectedOnly: Bool = false) {
+        automaticUnlockNeedsRepair = false
+        if !autoUnlock { automaticUnlockBlocked = false }
         perform { token in
-            let result = try await self.service.execute(.discover, vault: nil, offline: self.offline)
+            let result = try await self.service.execute(.discover, vault: nil, offline: false)
+            self.offline = result.usingCache
             let rows = result.vaults
             let ids = rows.map(\.id)
             guard self.current(token) else { return }
@@ -497,45 +615,65 @@ final class AppModel {
             // Use the repository's account-scoped default, never an arbitrary vault.
             if self.vault.isEmpty {
                 if let id = result.defaultVault, ids.contains(id) { self.vault = id }
-            } else if !ids.contains(self.vault) { self.vault = ""; self.lock() }
-            self.status = ids.isEmpty ? "Create your first vault" : "Choose a vault, then unlock its index"
-            if autoUnlock, rows.contains(where: { $0.supported && $0.enrolled }) {
-                self.allVaults = true
+            } else if !ids.contains(self.vault) {
+                self.vault = ""; self.lock(); self.automaticUnlockBlocked = false
+                return
+            }
+            self.status = ids.isEmpty ? "Create your first vault" : "Vaults available"
+            if self.authenticated && self.requestedVaultIDs.contains(where: { self.catalogs[$0] == nil }) {
+                self.authenticated = false
+            }
+            if autoUnlock, self.isActive, !self.automaticUnlockBlocked,
+               rows.contains(where: { $0.supported && $0.enrolled }) {
+                if !selectedOnly { self.allVaults = true }
                 try await self.unlockContents(token)
             }
         }
     }
     func unlock() {
         guard !busy else { return }
-        cancelItemEditing(); catalog = nil; passwordQualities = [:]; references = []; authenticated = false
+        cancelItemEditing(); conceal(); catalog = nil; catalogs = [:]; deletedCatalogs = [:]
+        passwordQualities = [:]; references = []; authenticated = false
         perform { token in try await self.unlockContents(token) }
     }
     private func unlockContents(_ token: Int, refresh: Bool = true) async throws {
-        let ids = requestedVaultIDs
-        guard !ids.isEmpty else { status = "No enrolled vaults to unlock. Select a vault to request access."; return }
-        var loaded = catalogs
-        var deleted = deletedCatalogs
-        var dates: [String: Date] = [:]
-        for id in ids where refresh || loaded[id] == nil {
-            let result = try await service.execute(.catalog, vault: id, offline: offline)
+        do {
+            let ids = requestedVaultIDs
+            guard !ids.isEmpty else { status = "Connect this device to a vault to get started."; return }
+            var loaded = refresh ? [:] : catalogs.filter { ids.contains($0.key) }
+            var deleted = refresh ? [:] : deletedCatalogs.filter { ids.contains($0.key) }
+            var dates: [String: Date] = [:]
+            for id in ids where refresh || loaded[id] == nil {
+                let result = try await service.execute(.catalog, vault: id, offline: false)
+                guard current(token) else { return }
+                loaded[id] = try result.requireCatalog()
+                deleted[id] = result.deletedCatalog
+                dates[id] = result.offlineDate
+            }
             guard current(token) else { return }
-            loaded[id] = try result.requireCatalog()
-            deleted[id] = result.deletedCatalog
-            dates[id] = result.offlineDate
+            offline = !dates.isEmpty
+            catalogs = loaded; deletedCatalogs = deleted; retentionDate = wallNow()
+            if vault.isEmpty { vault = ids[0] }
+            if let catalog = loaded[vault] { try applyCatalog(catalog) }
+            else { catalog = nil; references = [] }
+            authenticated = true
+            if lastActivity == nil { lastActivity = now() }
+            for (id, catalog) in loaded {
+                vaults.removeAll { $0.id == id }
+                vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v4", enrolled: true))
+            }
+            if let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
+            if let selected, !references.contains(selected) { self.selected = nil }
+            let date = dates.values.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
+            status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
+        } catch {
+            // Publish no partial unlocked state, even for a network failure in a
+            // later vault after earlier vaults have successfully authenticated.
+            service.lock(); lastActivity = nil; authenticated = false
+            catalog = nil; catalogs = [:]; deletedCatalogs = [:]; references = []
+            passwordQualities = [:]; conceal(); clearClipboard()
+            throw error
         }
-        guard current(token) else { return }
-        catalogs = loaded; deletedCatalogs = deleted; retentionDate = wallNow()
-        if loaded[vault] == nil { vault = ids[0] }
-        if let catalog = loaded[vault] { try applyCatalog(catalog) }
-        authenticated = true
-        for (id, catalog) in loaded {
-            vaults.removeAll { $0.id == id }
-            vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v4", enrolled: true))
-        }
-        if let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
-        if let selected, !references.contains(selected) { self.selected = nil }
-        let date = dates.values.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
-        status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
     }
     func loadPasswordQuality() async {
         passwordQualities = [:]
@@ -543,7 +681,7 @@ final class AppModel {
               item.fields.contains(where: { $0.type == .password }) else { return }
         let token = generation, id = vault, name = item.name
         do {
-            let result = try await service.execute(.passwordQuality(item: name), vault: id, offline: offline)
+            let result = try await service.execute(.passwordQuality(item: name), vault: id, offline: false)
             guard current(token), !Task.isCancelled, vault == id, selectedItem == name else { return }
             passwordQualities = result.passwordQuality
         } catch {
@@ -554,22 +692,30 @@ final class AppModel {
     }
     func copyReference() {
         guard let selected else { return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(selected.description, forType: .string)
-        notice = "Reference copied."
+        clipboard.copy(SecretBytes(utf8: selected.description), concealed: false)
+        copyFeedback = CopyFeedback(reference: selected, message: "Reference copied")
     }
+    func currentOTP(_ reference: SecretReference) async throws -> (code: String, expires: Date, period: Int) {
+        let token = generation, visibility = visibilityGeneration, id = vault, item = selectedItem
+        guard isActive, authenticated, service.isAuthenticated else { throw MopError.authentication }
+        let result = try await service.execute(.read(reference), vault: id, offline: false)
+        guard current(token), !Task.isCancelled, isActive, visibilityGeneration == visibility,
+              vault == id, selectedItem == item, let value = result.value else { throw MopError.authentication }
+        guard let expires = result.otpExpiresAt, let period = result.otpPeriod else { throw MopError.invalidOTP }
+        return (String(decoding: value, as: UTF8.self), expires, period)
+    }
+
     func read(copy: Bool) {
         guard let selected else { return }
         conceal()
         let visibility = visibilityGeneration
         perform { token in
-            let result = try await self.service.execute(.read(selected), vault: self.selectedVault, offline: self.offline)
+            let result = try await self.service.execute(.read(selected), vault: self.selectedVault, offline: false)
             guard self.current(token), self.selected == selected, self.isActive, self.visibilityGeneration == visibility else { return }
             guard let value = result.value else { throw MopError.invalidVault }
             if copy {
                 self.clipboard.copy(value, concealed: result.valueIsConcealed)
-                self.notice = result.valueIsConcealed
-                    ? "Value copied. Mop clears its clipboard entry after 30 seconds."
-                    : "Value copied."
+                self.copyFeedback = CopyFeedback(reference: selected, message: "Copied")
             } else {
                 self.revealed = value
                 self.concealTask = Task { [weak self = self] in
@@ -598,7 +744,8 @@ final class AppModel {
             let result = try await self.service.execute(.write(reference, value, replace: replace), vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
-            self.selected = reference; self.selectedItem = reference.item; self.authenticated = true
+            try await self.unlockContents(token, refresh: false)
+            self.selected = reference; self.selectedItem = reference.item
             self.sheet = nil; self.conceal(); self.notice = "Secret saved to iCloud."
         }
     }
@@ -624,36 +771,109 @@ final class AppModel {
             let result = try await self.service.execute(.devices, vault: self.selectedVault, offline: false)
             let devices = result.devices
             guard self.current(token) else { return }
-            self.devices = devices
+            self.devices = devices; self.members = result.members
             self.requests = []
-            self.status = "Trusted Macs loaded · refreshing enrollment requests"
+            if !result.members.isEmpty { self.status = "Account membership verified"; return }
+            self.status = "Trusted Devices loaded · refreshing enrollment requests"
             let pending = try await self.service.execute(.requests, vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
             self.requests = pending.requests.filter { request in !devices.contains { $0.fingerprint == request.fingerprint } }
             self.status = "Device list authenticated"
         }
     }
-    func management(_ action: VaultManagement) {
+    func management(_ action: VaultManagement, keepSheet: Bool = false) {
         guard !offline else { return }
         perform { token in
             let result = try await self.service.execute(.manage(action), vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
             if let catalog = result.catalog { try self.applyCatalog(catalog) }
-            self.sheet = nil; self.notice = result.message
+            if !keepSheet { self.sheet = nil }
+            self.notice = result.message
+            self.automaticUnlockNeedsRepair = false; self.automaticUnlockBlocked = false
             self.requests = []; self.devices = []
         }
     }
-    func sync() {
-        guard !offline else { return }
-        perform { token in
-            _ = try await self.service.execute(.sync, vault: self.selectedVault, offline: false)
-            guard self.current(token) else { return }
-            self.status = "Ciphertext synchronized · unlock to verify the offline snapshot"
+    func cloudChanged() {
+        cloudRefreshPending = true
+        nextCloudRefresh = .distantPast
+        refreshCloudIfNeeded()
+    }
+    func refreshCloudIfNeeded() {
+        guard launchAttempted, isActive, !busy, !refreshing, itemDraft == nil, sheet == nil, pairing == nil,
+              !automaticUnlockNeedsRepair, wallNow() >= nextCloudRefresh else { return }
+        guard cloudRefreshPending || authenticated else { return }
+        cloudRefreshPending = false
+        // Push delivery is best effort. Reconcile periodically as well as on
+        // notifications, foregrounding and network reconnection.
+        nextCloudRefresh = wallNow().addingTimeInterval(60)
+        guard authenticated else { discover(); return }
+        let token = generation, revision = foregroundRevision, editing = editorGeneration
+        let selectedVault = vault, requested = requestedVaultIDs
+        refreshing = true
+        refreshTask = Task {
+            defer { refreshing = false }
+            guard current(token), !Task.isCancelled, isActive else { return }
+            do {
+                let discovery = try await service.execute(.discover, vault: nil, offline: false)
+                guard current(token), !Task.isCancelled else { return }
+                let available = Set(discovery.vaults.map(\.id))
+                guard requested.allSatisfy({ available.contains($0) }) else { lock(); return }
+                var loaded: [String: ItemCatalog] = [:], deleted: [String: ItemCatalog] = [:]
+                var dates: [Date] = []
+                for id in requested {
+                    let result = try await service.execute(.catalog, vault: id, offline: false)
+                    guard current(token), !Task.isCancelled else { return }
+                    loaded[id] = try result.requireCatalog(); deleted[id] = result.deletedCatalog
+                    if let date = result.offlineDate { dates.append(date) }
+                }
+                // A foreground operation or draft may have started while fetching.
+                // Never replace its state with an earlier refresh result.
+                guard isActive, !busy, itemDraft == nil, sheet == nil, pairing == nil,
+                      revision == foregroundRevision, editing == editorGeneration,
+                      vault == selectedVault, requestedVaultIDs == requested else {
+                    cloudRefreshPending = true; nextCloudRefresh = .distantPast; return
+                }
+                if catalog?.revision != loaded[vault]?.revision { conceal() }
+                vaults = discovery.vaults; catalogs = loaded; deletedCatalogs = deleted
+                retentionDate = wallNow(); offline = !dates.isEmpty
+                if let next = loaded[vault] { try applyCatalog(next) }
+                if let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
+                if let selected, !references.contains(selected) { self.selected = nil }
+                let date = dates.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
+                status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
+            } catch {
+                guard token == generation, !Task.isCancelled else { return }
+                if let failure = error as? MopError,
+                   [.authentication, .signing, .invalidDevice, .invalidVault, .vaultUntrusted, .deviceNotEnrolled, .cloudAccount].contains(failure) {
+                    lock()
+                    self.error = failure.errorDescription
+                } else {
+                    cloudRefreshPending = true
+                }
+            }
         }
     }
+    func createPreparedVault(_ intent: PendingVaultCreation) {
+        guard !offline, !busy, intent.exported else { return }
+        clearView()
+        allVaults = false; vault = intent.id.uuidString
+        if !vaults.contains(where: { $0.id == vault }) {
+            vaults.append(VaultDescriptor(id: vault, name: intent.name, format: "mop-vault-v4", enrolled: true))
+        }
+        status = "Creating or reconciling vault " + vault
+        perform { token in
+            let result = try await self.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
+            guard self.current(token) else { return }
+            try self.applyCatalog(result.requireCatalog())
+            try await self.unlockContents(token, refresh: false)
+            self.sheet = nil; self.notice = result.message
+            self.status = "Vault created"
+        }
+    }
+
     func createVault(name: String, deviceName: String, strict: Bool, recovery: URL) {
         guard !offline, !busy else { return }
-        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; devices = []; requests = []; authenticated = false
+        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; devices = []; members = []; requests = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
@@ -662,7 +882,8 @@ final class AppModel {
             let result = try await self.service.execute(.create(name: name, deviceName: deviceName, strict: strict, recovery: recovery), vault: id, offline: false)
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
-            self.selected = nil; self.authenticated = true; self.sheet = nil
+            try await self.unlockContents(token, refresh: false)
+            self.selected = nil; self.sheet = nil
             self.notice = result.message; self.status = "Vault created · move the recovery credential offline"
         }
     }
@@ -673,7 +894,8 @@ final class AppModel {
             let result = try await self.service.execute(.rename(name), vault: id, offline: false)
             guard self.current(token), self.vault == id else { return }
             try self.applyCatalog(result.requireCatalog())
-            self.authenticated = true; self.sheet = nil; self.selected = nil; self.conceal()
+            try await self.unlockContents(token, refresh: false)
+            self.sheet = nil; self.selected = nil; self.conceal()
             if let index = self.vaults.firstIndex(where: { $0.id == id }) {
                 let old = self.vaults[index]
                 self.vaults[index] = VaultDescriptor(id: id, name: name, format: old.format, enrolled: old.enrolled)
@@ -691,23 +913,24 @@ final class AppModel {
             self.vaults.removeAll { $0.id == target.id }
             self.catalogs[target.id] = nil
             self.vault = ""
-            self.notice = "Vault deleted. Backups and caches on other Macs remain."
+            self.notice = "Vault deleted. Backups and caches on other devices remain."
             self.status = "Vault deleted"
         }
     }
 
     func chooseExportBackup() {
         guard canExportBackup, !busy else { return }
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = (vaultName.isEmpty ? "vault" : vaultName) + ".mopfile"
-        panel.title = "Export encrypted backup"
-        if panel.runModal() == .OK, let url = panel.url { exportBackup(to: url) }
+        documentRequest = DocumentRequest(vault: vault, generation: editorGeneration)
+    }
+    func completeBackupSelection(folder: URL, request: DocumentRequest) {
+        guard editorGeneration == request.generation, vault == request.vault else { return }
+        exportBackup(to: folder.appendingPathComponent("mop-backup-" + UUID().uuidString + ".mopfile"))
     }
     func exportBackup(to url: URL) {
         guard canExportBackup, !busy else { return }
         let id = vault
         perform { token in
-            _ = try await self.service.execute(.export(url), vault: id, offline: self.offline)
+            _ = try await self.service.execute(.export(url), vault: id, offline: false)
             guard self.current(token) else { return }; self.notice = "Encrypted backup exported. Keep your recovery key separately."
         }
     }

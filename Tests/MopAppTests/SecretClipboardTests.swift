@@ -1,6 +1,7 @@
+#if os(macOS)
 import AppKit
 import Testing
-@testable import MopApp
+@testable import MopUI
 
 @MainActor struct SecretClipboardTests {
     @Test func valueExpiresWithoutTouchingGeneralPasteboard() async throws {
@@ -61,3 +62,33 @@ extension SecretClipboardTests {
         #expect(board.string(forType: .string) == nil)
     }
 }
+
+#endif
+
+#if os(iOS)
+import UIKit
+import Testing
+@testable import MopUI
+
+@MainActor struct MobileClipboardTests {
+    @Test func secretExpiryAndReplacementOwnership() async throws {
+        let name = UIPasteboard.Name("mop-test-" + UUID().uuidString)
+        let board = try #require(UIPasteboard(name: name, create: true))
+        defer { UIPasteboard.remove(withName: name) }
+        board.string = "warmup"
+        #expect(board.string == "warmup")
+        let clipboard = SecretClipboard(pasteboard: board, lifetime: .seconds(2))
+        clipboard.copy("secret")
+        #expect(board.string == "secret")
+        try await Task.sleep(for: .seconds(3))
+        #expect(board.string == nil)
+        clipboard.copy("secret")
+        board.string = "new-owner"
+        clipboard.clear()
+        #expect(board.string == "new-owner")
+        clipboard.copy("visible", concealed: false)
+        clipboard.clear()
+        #expect(board.string == "visible")
+    }
+}
+#endif

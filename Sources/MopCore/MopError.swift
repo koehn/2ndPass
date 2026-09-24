@@ -2,14 +2,17 @@ import Foundation
 
 /// Deliberately contains no secret values, OS error descriptions, or user input.
 public enum MopError: Error, LocalizedError, Equatable {
+    case conversionRequired
+    case identityPending
     case cloudInvalidRequest
-    case cloudUnavailable, cloudAccount, cloudQuota, cloudThrottled, cloudPermission, cloudUncertain, offlineWrite, fileMigration
+    case cloudUnavailable, cloudAccount, cloudQuota, cloudThrottled, cloudPermission, cloudUncertain, offlineWrite
     case invalidVaultName, ambiguousVault, vaultSelectionMismatch, legacyVault
     case vaultDeleteUncertain, vaultDeleteCleanup, confirmationRequired, operationCancelled
     case invalidOutput
     case outputExists
     case invalidReference
     case invalidEnvironment(line: Int)
+    case invalidOTP
     case invalidTemplate
     case authentication
     case notFound
@@ -33,6 +36,8 @@ public enum MopError: Error, LocalizedError, Equatable {
 
     public var exitCode: Int32 {
         switch self {
+        case .conversionRequired: 31
+        case .identityPending: 30
         case .vaultDeleteUncertain: 27
         case .vaultDeleteCleanup: 28
         case .confirmationRequired, .operationCancelled: 2
@@ -47,8 +52,8 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .cloudThrottled: 20
         case .cloudPermission: 21
         case .cloudUncertain: 22
-        case .offlineWrite, .fileMigration: 2
-        case .invalidOutput, .invalidReference, .invalidEnvironment, .invalidTemplate, .invalidProcess: 2
+        case .offlineWrite: 2
+        case .invalidOTP, .invalidOutput, .invalidReference, .invalidEnvironment, .invalidTemplate, .invalidProcess: 2
         case .authentication: 3
         case .notFound: 4
         case .duplicate, .outputExists: 5
@@ -70,6 +75,9 @@ public enum MopError: Error, LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
+        case .invalidOTP: "Enter a valid Base32 secret or otpauth://totp URL (SHA1, SHA256, or SHA512; 6 or 8 digits)."
+        case .conversionRequired: "This device-based vault requires one-time online conversion on a previously connected device. Converted vaults use account membership and iCloud Keychain."
+        case .identityPending: "Waiting for your Mop identity in iCloud Keychain. Enable iCloud Passwords & Keychain on this device using the same Apple Account, then refresh. No replacement identity was created."
         case .vaultDeleteUncertain: "Vault deletion could not be confirmed. Local data was retained. Retry mop vault delete with the same UUID to reconcile."
         case .vaultDeleteCleanup: "The cloud vault was deleted, but local cleanup failed. Retry mop vault delete with the same UUID to finish cleanup."
         case .confirmationRequired: "Vault deletion requires interactive confirmation or --yes. Authentication is still required with --yes."
@@ -86,7 +94,6 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .cloudPermission: "CloudKit access was denied; verify provisioning and account permissions."
         case .cloudUncertain: "The commit outcome is uncertain. Run mop vault sync online to reconcile before writing again."
         case .offlineWrite: "This command requires online CloudKit access; offline writes are not supported."
-        case .fileMigration: "Legacy file storage is not supported. Unset MOP_VAULT_FILE and remove --vault-file; references now select named CloudKit vaults. Only v4 backups can be imported; legacy formats require an older client."
         case .invalidOutput: "Invalid output options; use --out-file with --force or an octal --file-mode through 0777."
         case .outputExists: "Output file already exists; use --force to replace it."
         case .invalidReference: "Invalid secret reference; use mop://vault/item/[section/]field with percent-encoded components."

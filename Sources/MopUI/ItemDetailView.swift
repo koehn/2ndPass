@@ -4,7 +4,9 @@ import MopCore
 struct ItemDetailView: View {
     @Bindable var model: AppModel
     let itemName: String
+    @Environment(\.dynamicTypeSize) private var textSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage("developerToolsEnabled") private var developerTools = false
     @FocusState private var focusedField: String?
     @State private var dropTarget: String?
     @State private var hoveredField: String?
@@ -23,16 +25,9 @@ struct ItemDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            HStack(spacing: 8) {
-                Image(systemName: "lock.shield").foregroundStyle(.secondary)
-                Text(editingVaultName).foregroundStyle(.secondary)
-                Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
-                Text(creating ? "New item" : itemName).lineLimit(1)
-                Spacer(minLength: 16)
-                if model.itemDraft == nil {
-                    Button("Edit item") { change { model.beginItemEditing() }; focusedField = "item-name" }
-                        .disabled(model.busy || model.offline)
-                } else if editingItem { saveControls }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { breadcrumb; Spacer(minLength: 16); editActions }
+                VStack(alignment: .leading, spacing: 12) { breadcrumb; editActions }
             }
             .font(.callout)
             .accessibilityElement(children: .contain)
@@ -55,12 +50,13 @@ struct ItemDetailView: View {
             } else { Text(itemName).font(.largeTitle).fontWeight(.semibold) }
             if editingItem {
                 Picker("Item type", selection: Binding(get: { model.itemDraft?.type ?? .custom }, set: { model.changeDraftType($0) })) {
-                    ForEach(ItemType.allCases, id: \.self) { Text($0.label).tag($0) }
+                    ForEach(ItemType.templateTypes, id: \.self) { Text($0.label).tag($0) }
+                    if !creating && model.itemDraft?.type == .custom { Text("Custom").tag(ItemType.custom) }
                 }.frame(maxWidth: 280).disabled(model.busy)
                 Text("Drag the handles to reorder fields. Changes are saved together when you choose Save.")
                     .font(.caption).foregroundStyle(.secondary)
             } else { Text(model.selectedTypedItem?.type.label ?? "Custom").foregroundStyle(.secondary) }
-            ForEach(fields) { field in
+            ForEach(fields.filter { edits($0) || $0.type != .notes || $0.value != "" }) { field in
                 fieldRow(field)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -75,17 +71,46 @@ struct ItemDetailView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             if model.offline {
-                Label("Read-only snapshot. Remote revocation cannot be checked.", systemImage: "icloud.slash")
+                Label("Available offline. Changes require an iCloud connection.", systemImage: "icloud.slash")
                     .font(.callout).foregroundStyle(.secondary)
             }
-        }.padding(28).frame(maxWidth: .infinity, alignment: .leading)
+        }.padding(24).frame(maxWidth: 760, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear { if creating { focusedField = "item-name" } }
+        .task(id: model.copyFeedback?.id) {
+            guard let feedback = model.copyFeedback else { return }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            if model.copyFeedback?.id == feedback.id { model.copyFeedback = nil }
+        }
+        .onDisappear { model.copyFeedback = nil }
         .onChange(of: model.itemDraft?.id) { old, new in
             if old != nil && new == nil { focusedField = nil; dropTarget = nil }
         }
         .animation(model.isActive && model.authenticated ? motion : nil, value: model.itemDraft?.id)
         // Security transitions must never animate secret-bearing views out.
         .transaction { if !model.isActive || !model.authenticated { $0.disablesAnimations = true } }
+    }
+
+    private var breadcrumb: some View {
+        HStack(spacing: 8) {
+                Image(systemName: "lock.shield").foregroundStyle(.secondary)
+                Text(editingVaultName).foregroundStyle(.secondary)
+        }.lineLimit(1)
+    }
+    @ViewBuilder private var editActions: some View {
+                if model.itemDraft == nil {
+                    HStack(spacing: 12) {
+                        Button("Edit item") { change { model.beginItemEditing() }; focusedField = "item-name" }
+                            .disabled(model.busy || model.offline)
+                        Menu {
+                            Button("Delete item…", role: .destructive) {
+                                if let item = model.selectedTypedItem {
+                                    model.itemToDelete = ItemRow(id: .init(vault: model.vault, name: item.name), vaultName: model.vaultName, item: item)
+                                }
+                            }.disabled(model.busy || model.offline)
+                        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Item actions") }
+                    }
+                } else if editingItem { saveControls }
     }
 
     private var saveControls: some View {
@@ -98,6 +123,13 @@ struct ItemDetailView: View {
         }.disabled(model.busy)
     }
 
+    private func copyVisibility(_ field: ItemDraft.Field) -> Double {
+        #if os(macOS)
+        hoveredField == field.id || focusedCopy == field.id ? 1 : 0
+        #else
+        1
+        #endif
+    }
     private func isTemplate(_ field: ItemDraft.Field) -> Bool {
         field.isTemplate || (!creating && model.selectedTypedItem?.isTemplateField(field.field) == true)
     }
@@ -109,18 +141,28 @@ struct ItemDetailView: View {
     }
     private func binding<T>(_ field: ItemDraft.Field, _ key: WritableKeyPath<ItemDraft.Field, T>, fallback: T) -> Binding<T> {
         Binding(get: { model.itemDraft?.fields.first { $0.id == field.id }?[keyPath: key] ?? fallback }, set: { value in
+            model.activity()
             guard let index = model.itemDraft?.fields.firstIndex(where: { $0.id == field.id }) else { return }
             model.itemDraft?.fields[index][keyPath: key] = value
         })
     }
     private func valueBinding(_ field: ItemDraft.Field) -> Binding<String> {
         Binding(get: { model.itemDraft?.fields.first { $0.id == field.id }?.value ?? "" }, set: { value in
+            model.activity()
             guard let index = model.itemDraft?.fields.firstIndex(where: { $0.id == field.id }) else { return }
             model.itemDraft?.fields[index].value = value
         })
     }
+    private var fieldLayout: AnyLayout {
+        #if os(iOS)
+        if textSize.isAccessibilitySize {
+            return AnyLayout(VStackLayout(alignment: .leading, spacing: 12))
+        }
+        #endif
+        return AnyLayout(HStackLayout(alignment: .center, spacing: 12))
+    }
     private func fieldRow(_ field: ItemDraft.Field) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        fieldLayout {
             if editingItem { handle(field) }
             VStack(alignment: .leading, spacing: 8) {
                 if !field.existing && !field.isTemplate {
@@ -130,17 +172,26 @@ struct ItemDetailView: View {
                         ForEach(FieldType.allCases, id: \.self) { Text($0.label).tag($0) }
                     }.frame(maxWidth: 280)
                 } else {
-                    Text(field.path.split(separator: "/").map { String($0).removingPercentEncoding ?? String($0) }.joined(separator: " / "))
+                    Text(field.path.split(separator: "/").map { String($0).removingPercentEncoding ?? String($0) }.joined(separator: " / ").capitalized)
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if edits(field) {
                     valueInput(field)
+                    if let error = field.validationError {
+                        Text(error).font(.caption).foregroundStyle(.red)
+                            .accessibilityLabel("\(field.path): \(error)")
+                    }
                     if field.value == nil {
                         Text("Stored value unchanged. Enter a replacement to change it.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     if !editingItem { HStack { Spacer(); saveControls }.font(.callout) }
-                } else if let ref = reference(field) { displayedValue(field, ref: ref) }
+                } else if let ref = reference(field) {
+                    fieldLayout {
+                        displayedValue(field, ref: ref)
+                        fieldActions(field, ref: ref)
+                    }
+                }
                 if field.type == .password {
                     if edits(field) {
                         PasswordGeneratorButton(model: model) { password in
@@ -158,17 +209,7 @@ struct ItemDetailView: View {
                 } label: { Image(systemName: "minus.circle") }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
                     .help("Remove field when saved").accessibilityLabel("Remove \(field.path)")
-            } else if let ref = reference(field), !edits(field) {
-                HStack(spacing: 8) {
-                    Button { model.selectField(ref); model.read(copy: true) } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
-                    }
-                    .buttonStyle(.borderless).foregroundStyle(Color.accentColor)
-                    .focused($focusedCopy, equals: field.id)
-                    .opacity(hoveredField == field.id || focusedCopy == field.id ? 1 : 0)
-                    .help("Copy value").accessibilityLabel("Copy \(field.path) value")
-                    fieldMenu(field, ref: ref)
-                }.disabled(model.itemDraft != nil).padding(.top, 10)
+
             }
         }
         .padding(16)
@@ -180,6 +221,22 @@ struct ItemDetailView: View {
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: hoveredField == field.id)
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(dropTarget == field.id && editingItem ? Color.accentColor : Color.clear, lineWidth: 2))
+        .overlay {
+            let showingFeedback = model.copyFeedback?.reference == reference(field) && model.copyFeedback != nil && !editingItem
+            ZStack {
+                if showingFeedback, let feedback = model.copyFeedback {
+                    Label(feedback.message, systemImage: "checkmark.circle.fill")
+                        .font(.callout.weight(.medium))
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(.regularMaterial, in: Capsule())
+                        .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+                        .accessibilityIdentifier("copy-feedback-" + field.path)
+                        .transition(.opacity)
+                }
+            }
+            .animation(reduceMotion ? nil : (showingFeedback ? .easeOut(duration: 0.12) : .easeInOut(duration: 0.4)), value: showingFeedback)
+            .allowsHitTesting(false)
+        }
         .disabled(model.busy)
         .dropDestination(for: String.self) { values, _ in
             guard editingItem, !model.busy, values.count == 1,
@@ -192,6 +249,33 @@ struct ItemDetailView: View {
             else if dropTarget == field.id { dropTarget = nil }
         }
     }
+    private func fieldActions(_ field: ItemDraft.Field, ref: SecretReference) -> some View {
+        HStack(spacing: 4) {
+            #if os(macOS)
+            if field.type.concealed && field.type != .otp {
+                Button {
+                    if model.selected == ref && model.revealed != nil { model.conceal() }
+                    else { model.selectField(ref); model.read(copy: false) }
+                } label: {
+                    Image(systemName: model.selected == ref && model.revealed != nil ? "eye.slash" : "eye").mopControlTarget()
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel((model.selected == ref && model.revealed != nil ? "Conceal " : "Reveal ") + field.path)
+            }
+            Button { model.selectField(ref); model.read(copy: true) } label: {
+                Label("Copy", systemImage: "doc.on.doc").mopControlTarget()
+            }
+            .buttonStyle(.borderless).labelStyle(.iconOnly).foregroundStyle(Color.accentColor)
+            .focused($focusedCopy, equals: field.id)
+            .opacity(copyVisibility(field))
+            .help("Copy value").accessibilityLabel("Copy \(field.path) value")
+            #endif
+            fieldMenu(field, ref: ref)
+        }
+        .frame(maxWidth: textSize.isAccessibilitySize ? .infinity : nil, alignment: .trailing)
+        .disabled(model.itemDraft != nil)
+    }
+
     private func handle(_ field: ItemDraft.Field) -> some View {
         Image(systemName: "line.3.horizontal")
             .foregroundStyle(.secondary).padding(.vertical, 8).padding(.horizontal, 4)
@@ -228,9 +312,23 @@ struct ItemDetailView: View {
         .accessibilityLabel("\(field.path) value")
     }
     private func displayedValue(_ field: ItemDraft.Field, ref: SecretReference) -> some View {
-        Text((model.selected == ref ? model.revealed : nil).map { String(decoding: $0, as: UTF8.self) } ?? field.value ?? "••••••••••••••••••••")
-            .font(.system(.body, design: .monospaced)).textSelection(.disabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        Group {
+            if field.type == .otp {
+                OTPCodeView(model: model, reference: ref)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text((model.selected == ref ? model.revealed : nil).map { String(decoding: $0, as: UTF8.self) } ?? field.value ?? "••••••••")
+                    .font(.system(.body, design: field.type.concealed ? .monospaced : .default)).textSelection(.disabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectField(ref); model.read(copy: true) }
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Copy value")
+        .accessibilityAction { model.selectField(ref); model.read(copy: true) }
+        .help("Copy value")
+        .disabled(model.itemDraft != nil || !model.isActive || !model.authenticated)
     }
     private func fieldMenu(_ field: ItemDraft.Field, ref: SecretReference) -> some View {
         Menu {
@@ -239,13 +337,19 @@ struct ItemDetailView: View {
                 change { model.beginItemEditing(replacing: field.path) }
                 focusedField = field.id
             }.disabled(model.offline)
-            if model.selected == ref && model.revealed != nil {
+            if field.type != .otp && model.selected == ref && model.revealed != nil {
                 Button("Conceal", systemImage: "eye.slash") { model.conceal() }
-            } else if field.value == nil {
+            } else if field.type != .otp && field.value == nil {
                 Button("Reveal", systemImage: "eye") { model.selectField(ref); model.read(copy: false) }
             }
             Button("Copy value", systemImage: "doc.on.doc") { model.selectField(ref); model.read(copy: true) }
-            Button("Copy reference", systemImage: "link") { model.selectField(ref); model.copyReference() }
+            if field.type == .website, let value = field.value,
+               let url = URL(string: value), ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil {
+                Link("Open website", destination: url)
+            }
+            if developerTools {
+                Button("Copy reference", systemImage: "link") { model.selectField(ref); model.copyReference() }
+            }
             if !isTemplate(field) {
                 Divider()
                 Button("Delete field…", systemImage: "trash", role: .destructive) {
@@ -253,9 +357,70 @@ struct ItemDetailView: View {
                 }.disabled(model.offline)
             }
         } label: {
+            #if os(iOS)
+            Image(systemName: "chevron.down").font(.caption.weight(.semibold))
+                .frame(width: 44, height: 44, alignment: .trailing).contentShape(Rectangle())
+            #else
             Image(systemName: "chevron.down").font(.caption.weight(.semibold)).frame(width: 24, height: 24)
+            #endif
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .mopMenuStyle()
         .help("Field actions").accessibilityLabel("Actions for \(field.path)")
+    }
+}
+
+private struct OTPCodeView: View {
+    let model: AppModel
+    let reference: SecretReference
+    @State private var code: String?
+    @State private var invalid = false
+    @State private var expires: Date?
+    @State private var period = 30
+    private var active: Bool { model.isActive && model.authenticated }
+    private var identity: String { "\(reference.description)|\(model.vault)|\(model.catalog?.revision ?? "")|\(active)" }
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(active ? (invalid ? "Invalid OTP — replace the secret" : code ?? "••••••") : "••••••")
+                .accessibilityIdentifier("otp-code-" + reference.description)
+            if active, code != nil, let expires {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let remaining = max(0, Int(ceil(expires.timeIntervalSince(context.date))))
+                    let tint: Color = remaining <= 5 ? .red : .green
+                    HStack(spacing: 3) {
+                        ZStack {
+                            Circle().stroke(tint.opacity(0.2), lineWidth: 3)
+                            Circle().trim(from: 0, to: min(1, Double(remaining) / Double(period)))
+                                .stroke(tint, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                                .rotationEffect(.degrees(-90))
+                        }.frame(width: 16, height: 16)
+                        Text("\(remaining)").monospacedDigit().frame(minWidth: 16, alignment: .leading)
+                    }
+                    .font(.caption).foregroundStyle(tint)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Code expires in \(remaining) seconds")
+                    .accessibilityIdentifier("otp-countdown-" + reference.description)
+                }
+            }
+        }
+            .font(.system(.body, design: .monospaced)).monospacedDigit()
+            .foregroundStyle(invalid ? Color.red : Color.primary)
+            .textSelection(.disabled)
+            .task(id: identity) {
+                code = nil; expires = nil; invalid = false
+                guard active else { return }
+                while !Task.isCancelled {
+                    do {
+                        let next = try await model.currentOTP(reference)
+                        guard !Task.isCancelled else { return }
+                        code = next.code; expires = next.expires; period = next.period; invalid = false
+                    } catch {
+                        guard !Task.isCancelled else { return }
+                        code = nil; expires = nil; invalid = error as? MopError == .invalidOTP
+                        return
+                    }
+                    do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                }
+            }
+            .onDisappear { code = nil; expires = nil }
     }
 }

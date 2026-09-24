@@ -57,9 +57,6 @@ run(["vault", "trust", "--fingerprint", "invalid"], code=2, output=b"")
 run(["vault", "trust", "--fingerprint", "0" * 64, "--revision", "0" * 64], code=2, output=b"")
 run(["vault", "recover", "--recovery-file", "/unused", "--fingerprint", "invalid"], code=2, output=b"")
 run(["read", "mop://v/i/f", "--vault-file", "/unused"], code=2, output=b"")
-legacy = run(["read", "mop://v/i/f"], env={"MOP_VAULT_FILE": "/sensitive-path-not-for-output"}, code=2, output=b"")
-assert b"Unset MOP_VAULT_FILE" in legacy.stderr
-assert b"sensitive-path-not-for-output" not in legacy.stderr
 confirmation = run(["vault", "delete", "personal"], code=2, output=b"")
 assert b"interactive confirmation or --yes" in confirmation.stderr
 run(["write", "mop://v/i/f", "--offline"], code=2, output=b"")

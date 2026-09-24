@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import Security
 import LocalAuthentication
@@ -89,3 +90,5 @@ public enum SigningIdentity {
         return bundle
     }
 }
+
+#endif

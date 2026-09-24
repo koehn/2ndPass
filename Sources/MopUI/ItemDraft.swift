@@ -17,7 +17,8 @@ struct ItemDraft: Identifiable {
         init(_ field: ItemField, existing: Bool = true) {
             id = existing ? "existing:" + field.path : "new:" + UUID().uuidString
             isTemplate = field.isTemplate == true
-            self.existing = existing; path = field.path; type = field.type; value = field.value
+            self.existing = existing; path = field.path; type = field.type
+            value = existing && field.type == .otp ? nil : field.value
             storedPasswordQuality = existing ? field.passwordQuality : nil
             loadedPassword = existing && field.type == .password ? field.value : nil
         }
@@ -29,8 +30,18 @@ struct ItemDraft: Identifiable {
         var encodedPath: String {
             existing ? path : path.split(separator: "/", omittingEmptySubsequences: false).map { SecretReference.encode(String($0)) }.joined(separator: "/")
         }
+        var effectiveType: FieldType {
+            if type == .concealed, let value,
+               value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("otpauth:") { return .otp }
+            return type
+        }
+        var validationError: String? {
+            guard effectiveType == .otp else { return nil }
+            guard let value else { return existing ? nil : MopError.invalidOTP.errorDescription }
+            return (try? TimeBasedOTP(value)) == nil ? MopError.invalidOTP.errorDescription : nil
+        }
         var field: ItemField {
-            ItemField(path: encodedPath, type: type,
+            ItemField(path: encodedPath, type: effectiveType,
                       value: existing && loadedPassword != nil && value == loadedPassword ? nil : value,
                       isTemplate: isTemplate ? true : nil)
         }
@@ -54,13 +65,13 @@ struct ItemDraft: Identifiable {
             if item.isTemplateField(field) { field.isTemplate = true }
             return Field(field, existing: !isNew)
         }; self.mode = mode
-        if case .value(let path) = mode, let index = fields.firstIndex(where: { $0.path == path }), fields[index].type != .password {
+        if case .value(let path) = mode, let index = fields.firstIndex(where: { $0.path == path }), fields[index].type != .password && fields[index].type != .otp {
             fields[index].value = fields[index].value ?? ""
         }
     }
     var item: VaultItem { VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field)) }
     func valid(vaultName: String) -> Bool {
-        !fields.isEmpty && Set(fields.map(\.encodedPath)).count == fields.count && fields.allSatisfy {
+        !fields.isEmpty && fields.allSatisfy { $0.validationError == nil } && Set(fields.map(\.encodedPath)).count == fields.count && fields.allSatisfy {
             guard let ref = try? SecretReference(vault: vaultName, relativePath: SecretReference.encode(item.name) + "/" + $0.encodedPath) else { return false }
             return ref.item == item.name
         }

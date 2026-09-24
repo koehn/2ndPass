@@ -50,10 +50,10 @@ public final class CloudRepository {
         }
     }
 
-    public func list() async throws -> [UUID] { try await online(); return try await transport.zones() }
+    public func list() async throws -> [UUID] { try await online(); return try await transport.zones().filter { $0 != Self.identityZone } }
 
     /// Header discovery does not authenticate names or enrollment claims.
-    public func descriptors(publicKey: Data? = nil) async throws -> [VaultDescriptor] {
+    public func descriptors(publicKey: Data? = nil, identity: UserIdentity? = nil) async throws -> [VaultDescriptor] {
         let ids: [UUID]
         if offline {
             ids = try FileManager.default.contentsOfDirectory(atPath: scope.directory.path).compactMap(UUID.init(uuidString:))
@@ -79,7 +79,7 @@ public final class CloudRepository {
                 }
                 let metadata = try decodeCloud(Metadata.self, object.data)
                 guard metadata.header.vaultID == id else { throw MopError.invalidVault }
-                guard metadata.format == "mop-cloud-manifest-v2", metadata.header.format == "mop-vault-v4" else {
+                guard metadata.format == "mop-cloud-manifest-v2", ["mop-vault-v4", "mop-vault-v5"].contains(metadata.header.format) else {
                     rows.append(VaultDescriptor(id: id.uuidString, name: nil, format: metadata.header.format == "mop-vault-v4" ? "unsupported-" + metadata.format : metadata.header.format, enrolled: false))
                     continue
                 }
@@ -87,7 +87,7 @@ public final class CloudRepository {
                 try VaultName.validate(header.name)
             }
             rows.append(VaultDescriptor(id: id.uuidString, name: header.name, format: header.format,
-                enrolled: publicKey.map { key in header.recipients.contains { $0.kind == "device" && $0.publicKey == key } } ?? false))
+                enrolled: (publicKey.map { key in header.recipients.contains { $0.kind == "device" && $0.publicKey == key } } ?? false) || (identity != nil && header.membership?.members.contains { $0.identity == identity } == true)))
         }
         return rows.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
     }
@@ -162,7 +162,8 @@ public final class CloudRepository {
     }
 
     public func vault(_ id: UUID) throws -> CloudVault {
-        CloudVault(id: id, cache: try CloudCache(directory: scope.directory.appendingPathComponent(id.uuidString)), transport: transport, accountID: accountID, invalidateBinding: {
+        guard id != Self.identityZone else { throw MopError.invalidVault }
+        return CloudVault(id: id, cache: try CloudCache(directory: scope.directory.appendingPathComponent(id.uuidString)), transport: transport, accountID: accountID, invalidateBinding: {
             try self.accounts.locked {
                 if try self.accounts.read("binding.json", as: String.self) == self.accountID {
                     try self.accounts.remove("binding.json")

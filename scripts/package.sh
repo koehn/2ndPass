@@ -4,11 +4,11 @@ umask 077
 cd "$(dirname "$0")/.."
 product=mop
 bundle_name=Mop
-bundle_id=${MOP_BUNDLE_ID:-net.koehn.mop}
+bundle_id=${MOP_BUNDLE_ID:-com.koehn.mop}
 if [[ ${1:-} == --check && $# == 1 ]]; then
     product=mop-enclave-check
     bundle_name=MopEnclaveCheck
-    bundle_id=${MOP_BUNDLE_ID:-net.koehn.mop.enclave-check}
+    bundle_id=${MOP_BUNDLE_ID:-com.koehn.mop.enclave-check}
 elif [[ $# != 0 ]]; then
     echo 'Usage: scripts/package.sh [--check]' >&2
     exit 2

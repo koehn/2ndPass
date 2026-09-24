@@ -147,7 +147,13 @@ public final class LocalDevice: VaultKeyOpener {
     deinit { context.invalidate() }
 }
 
-public struct RecoveryKey: VaultKeyOpener {
+public struct RecoveryKey: VaultSigningOpener {
+    public var signingPublicKey: Data { publicKey }
+    public func sign(_ data: Data) throws -> Data {
+        var raw = key.rawRepresentation
+        defer { KeyMaterial.wipe(&raw) }
+        return try P256.Signing.PrivateKey(rawRepresentation: raw).signature(for: data).rawRepresentation
+    }
     private let key: P256.KeyAgreement.PrivateKey
     public var publicKey: Data { key.publicKey.x963Representation }
     public var request: DeviceRequest { try! DeviceRequest(name: "Recovery", publicKey: publicKey) }
@@ -186,6 +192,14 @@ public struct RecoveryKey: VaultKeyOpener {
         .map { Array(String($0).utf8) }
 
     public func save(to file: URL) throws {
+        try encode { try SafeFile.write($0, to: file) }
+    }
+
+    public func export(to output: OutputFile) throws {
+        try encode { try output.write($0) }
+    }
+
+    private func encode(_ write: (KeyBuffer) throws -> Void) throws {
         var raw = key.rawRepresentation
         defer { KeyMaterial.wipe(&raw) }
         var encoded = raw.base64EncodedData()
@@ -202,7 +216,7 @@ public struct RecoveryKey: VaultKeyOpener {
             }
             destination[output.count - 1] = 0x0A
         }
-        try SafeFile.write(output, to: file)
+        try write(output)
     }
 
     public func unwrap(_ recipient: VaultRecipient, vaultID: UUID) throws -> SymmetricKey {

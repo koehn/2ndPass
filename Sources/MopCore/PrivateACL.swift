@@ -3,9 +3,17 @@ import Darwin
 /// POSIX mode bits do not describe access granted by a macOS extended ACL.
 public enum PrivateACL {
     public static func clear(_ fd: Int32) throws {
+        #if os(iOS)
+        // The device sandbox denies ACL mutation (acl_set_fd returns EPERM).
+        // Inspect the newly created file instead: reject inherited allow grants
+        // rather than ignoring an error or writing secrets with broader access.
+        // Callers still enforce POSIX permissions and private-storage protection.
+        try validate(fd)
+        #else
         guard let acl = acl_init(0) else { throw MopError.inputOutput }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
         guard acl_set_fd(fd, acl) == 0 else { throw MopError.inputOutput }
+        #endif
     }
 
     public static func validate(_ fd: Int32) throws {

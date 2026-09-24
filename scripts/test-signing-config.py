@@ -16,6 +16,7 @@ base = {'ExpirationDate': datetime.datetime.now() + datetime.timedelta(days=1),
                          'keychain-access-groups': ['TEAM.*'], 'get-task-allow': True,
                          'com.apple.developer.icloud-container-identifiers': ['iCloud.net.test.mop'],
                          'com.apple.developer.icloud-services': ['CloudKit'],
+                         'com.apple.developer.ubiquity-kvstore-identifier': 'TEAM.net.test.mop',
                          'com.apple.developer.icloud-container-environment': 'Production'}}
 with tempfile.TemporaryDirectory() as tmp:
     root = Path(tmp)
@@ -31,6 +32,7 @@ with tempfile.TemporaryDirectory() as tmp:
                    'keychain-access-groups': ['TEAM.net.test.mop'],
                    'com.apple.developer.icloud-container-identifiers': ['iCloud.net.test.mop'],
                    'com.apple.developer.icloud-services': ['CloudKit'],
+                         'com.apple.developer.ubiquity-kvstore-identifier': 'TEAM.net.test.mop',
                    'com.apple.developer.icloud-container-environment': 'Production'}
     assert plistlib.loads((root / 'info').read_bytes())['CFBundleExecutable'] == 'mop'
     for field, value in [('com.apple.application-identifier', 'TEAM.*'),
@@ -39,6 +41,7 @@ with tempfile.TemporaryDirectory() as tmp:
                          ('keychain-access-groups', ['TEAM.net.other.app']),
                          ('com.apple.developer.icloud-container-identifiers', ['iCloud.other']),
                          ('com.apple.developer.icloud-services', []),
+                         ('com.apple.developer.ubiquity-kvstore-identifier', 'TEAM.other'),
                          ('com.apple.developer.icloud-container-environment', 'Development')]:
         bad = copy.deepcopy(base)
         bad['Entitlements'][field] = value
@@ -47,12 +50,14 @@ with tempfile.TemporaryDirectory() as tmp:
     multiple = copy.deepcopy(base)
     multiple['Entitlements']['com.apple.developer.icloud-container-environment'] = ['Development', 'Production']
     multiple['Entitlements']['com.apple.developer.icloud-services'] = '*'
+    multiple['Entitlements']['com.apple.developer.ubiquity-kvstore-identifier'] = 'TEAM.*'
     multiple['Entitlements']['com.apple.developer.icloud-container-identifiers'] = ['iCloud.net.test.*']
     for environment in ('Development', 'Production'):
         assert generate(multiple, environment).returncode == 0
         narrowed = plistlib.loads((root / 'entitlements').read_bytes())
         assert narrowed['com.apple.developer.icloud-container-environment'] == environment
         assert narrowed['com.apple.developer.icloud-services'] == ['CloudKit']
+        assert narrowed['com.apple.developer.ubiquity-kvstore-identifier'] == 'TEAM.net.test.mop'
         assert narrowed['com.apple.developer.icloud-container-identifiers'] == ['iCloud.net.test.mop']
     multiple['Entitlements']['com.apple.developer.icloud-container-environment'] = ['Development']
     result = generate(multiple)

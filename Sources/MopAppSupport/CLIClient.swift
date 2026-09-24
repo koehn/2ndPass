@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import Darwin
 import MopCore
@@ -53,7 +54,6 @@ public struct CLIClient: Sendable {
     public static func environment(_ inherited: [String: String]) -> [String: String] {
         var result = inherited
         result.removeValue(forKey: "MOP_CLOUD_VAULT")
-        result.removeValue(forKey: "MOP_VAULT_FILE")
         return result
     }
 
@@ -101,3 +101,5 @@ public struct CLIClient: Sendable {
             return try buffers.withLock { CLIResult(output: try $0.out.get(), diagnostic: try $0.err.get()) }
     }
 }
+
+#endif

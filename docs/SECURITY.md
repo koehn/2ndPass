@@ -1,5 +1,12 @@
 # Security and key management
 
+The current v5 security model is specified in [Account identities and membership](ACCOUNT-IDENTITY.md).
+Account keys intentionally synchronize through iCloud Keychain, local app authentication
+gates their use, and signed membership replaces device enrollment. The v4 encryption,
+Enclave, and enrollment descriptions below are historical context for one-time
+conversion only; they do not describe ongoing v5 access. File safety, clipboard,
+commit-journal, and rollback requirements continue to apply.
+
 This guide describes the current CloudKit-backed CLI and native Mac app. See
 [validation](VALIDATION.md) for executed tests and outstanding hardware/multi-Mac
 acceptance, and the [security audit](security-audit/2026-09-23.md) for the reviewed
@@ -28,8 +35,7 @@ decryption capability; it does not require the original Mac, enclave, or biometr
 
 ## Storage and account binding
 
-Operational storage is CloudKit. `--vault-file` and `MOP_VAULT_FILE` are rejected;
-use explicit `vault import --file` for v4 backups. Older formats are rejected;
+Operational storage is CloudKit; use explicit `vault import --file` for v4 backups. Older formats are rejected;
 there is no migration, and existing remote data is not modified.
 The first reference component selects the actual encrypted vault by name.
 `--vault NAME-OR-UUID` constrains reference commands; saved defaults apply only
@@ -218,7 +224,9 @@ sequenceDiagram
 ```
 
 Offline mode also checks the local account binding and any locally observable
-sign-out. It never falls back from a failed online read, and cannot detect remote
+sign-out. The CLI requires explicit offline selection. Native apps automatically
+fall back only for connection unavailability, never for account, permission,
+revocation, missing-vault or verification errors. Cached reads cannot detect remote
 revocation that happened after the cached revision. File-output validation occurs
 before authentication; a failed read emits no secret output.
 
@@ -567,11 +575,14 @@ strings are masked on stdout/stderr, including across chunks; transformed output
 files, `/dev/tty`, or deliberately malicious children can bypass masking. No shell
 is implicitly invoked, and reference expansion does not recursively expand secrets.
 
-The native app uses a serialized in-process service and typed operations. It retains
-an authenticated device context and vault stores scoped to the account and UUID.
-Each online sensitive operation refreshes the snapshot before use, including
-checking current recipients; revisions still use conditional cloud commits. Failed
-mutations discard stores, and subsequent refresh reconciles uncertain publication.
+The native app serializes cloud operations and mutations through an in-process
+service. It retains an authenticated context and vault stores scoped to the account
+and UUID. Reads use separate, lock-protected copies of authenticated snapshots,
+without waiting for cloud refreshes or exposing uncommitted mutations. Background
+refreshes and writes check current recipients and trust; remote revocation therefore
+takes effect when reconciliation detects it, rather than on each read. Lock and
+expiry invalidate reads immediately. Revisions still use conditional cloud commits.
+Failed mutations discard stores, and subsequent refresh reconciles uncertain publication.
 
 Concealed-field copies use a device-local pasteboard entry, a cooperative confidential-content
 marker, and a 30-second expiry. Revealed text cannot be copied through native text
@@ -579,12 +590,12 @@ selection; use Copy value. Clearing checks the pasteboard change count to avoid
 erasing another application's newer content. Clipboard readers can still capture
 an intentionally copied value; cooperative markers are not access controls.
 Non-concealed field copies remain device-local but have no confidential marker,
-expiry, or clear-on-lock ownership. Classification comes from the refreshed native
+expiry, or clear-on-lock ownership. Classification comes from the authenticated snapshot’s native
 read result; missing field metadata defaults to concealed. Replacing a secret copy
 with a visible value cancels its pending expiry.
 
-App deactivation leaves metadata, editor drafts, and sheets visible; there is no
-privacy cover. It conceals explicitly revealed values and closes generator popovers,
+On macOS, app deactivation leaves metadata, editor drafts, and sheets visible;
+iOS covers the window. It conceals explicitly revealed values and closes generator popovers,
 but does not end authorization. Only input inside Mop resets
 the inactivity timer; background work and authentication dialogs do not. Timeout,
 manual lock, sleep, screen/session lock, termination, account changes, and mode
@@ -683,3 +694,52 @@ before invalidating its shared authorization, including after partial failure.
 Empty or entirely skipped listings do not prompt. Each vault still synchronizes and
 passes its own enrollment and trust checks; authorization is not retained between
 separate CLI invocations.
+
+## Mobile application boundaries
+
+The iOS/iPadOS application uses the same vault service and cryptographic formats
+as the Mac. iOS enforces the provisioned Keychain access group; a noninteractive
+probe fails closed without that entitlement. CloudKit access is provisioned for
+the existing container. Desktop SecCode and hardened-runtime checks are unchanged.
+
+Private mobile files use complete Data Protection and are excluded from backup.
+Files-provider imports are bounded and privately staged before recovery parsing.
+Exports use coordinated, exclusive writes and reject unsupported providers rather
+than bypassing output protections. Pending creation stores the original UUID,
+recovery key, account binding, and encrypted initial snapshot for reconciliation.
+A missing head after submission never causes automatic vault recreation.
+
+Mobile inactivity covers the window; background entry discards drafts and cancels
+pairing, while retaining ordinary vault authorization until the inactivity timeout.
+Both apps start locked and automatically open all connected vaults together while
+active. Failure opening any connected vault clears all catalogs and authorization.
+Unconnected vaults are never implicitly enrolled or trusted. Explicitly copied secrets retain their original 30-second iOS
+pasteboard expiration during ordinary app switching. Timers are checked again on
+foreground entry. Clipboard ownership checks preserve newer content from other
+apps. UI automation fixtures are compiled only in Debug simulator builds and
+cannot be used as evidence of Secure Enclave or distribution-signing behavior.
+
+### Cloud trust across app updates
+
+Cloud trust records use a stable binding to the CloudKit container, environment,
+account, and vault UUID, independent of the app sandbox's absolute path. File
+vaults retain their existing path-based binding. When a cloud vault has one legacy
+path-named pin in its dedicated local trust directory, Mop verifies that pin against
+the decrypted vault key before migrating it to the stable binding. Missing,
+ambiguous, malformed, wrong-key, or wrong-scope records fail closed; downloaded
+ciphertext alone never establishes trust. Once a stable record exists it takes
+precedence over legacy files, including when validation fails.
+
+A trust failure pauses automatic unlocking across input events and foreground
+transitions. Verified pairing or explicit trust repair re-enables it; refreshing
+the vault list deliberately retries. Ordinary authentication cancellation still
+allows another attempt on the next interaction.
+
+Native OTP reads return a current RFC 6238 code rather than the stored seed or
+provisioning URL. The app offers no seed reveal action and never preloads OTP
+secrets into edit drafts. Replacement validation runs in both the editor and the
+vault save/write paths. Untouched concealed records remain unchanged. Parsed OTP
+keys are cached only within the authenticated snapshot reader and discarded on
+snapshot replacement or lock; ticking the UI does not repeatedly unwrap records.
+Generation is checked against the authenticated session, and inactive views hide
+codes. Tests cover RFC 6238 Appendix B for SHA1, SHA256, and SHA512.
