@@ -58,7 +58,7 @@ import MopCore
 
 @Test func borrowedKeyWrappingAndIncrementalTrustRemainCompatible() throws {
     let privateKey = P256.KeyAgreement.PrivateKey()
-    let request = try DeviceRequest(name: "Test", publicKey: privateKey.publicKey.x963Representation)
+    let request = try RecipientKey(name: "Test", publicKey: privateKey.publicKey.x963Representation)
     let vaultID = UUID()
     let raw = Data(0..<32)
     let key = SymmetricKey(data: raw)

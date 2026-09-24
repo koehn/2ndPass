@@ -31,9 +31,7 @@ final class AppModel {
     var references: [SecretReference] = []
     var selected: SecretReference?
     var search = ""
-    var devices: [MacRecord] = []
     var members: [VaultMemberRecord] = []
-    var requests: [Enrollment] = []
     var offline = false
     private var cloudRefreshPending = false
     private var nextCloudRefresh = Date.distantPast
@@ -52,7 +50,6 @@ final class AppModel {
     }
     var copyFeedback: CopyFeedback?
     var status = "Select a vault to begin"
-    var pairing: PairingCoordinator?
     var sheet: AppSheet?
     var deleteConfirmation = false
     var documentRequest: DocumentRequest?
@@ -127,16 +124,7 @@ final class AppModel {
                 lock(); automaticUnlockBlocked = false
             }
         } else if lastActivity != nil {
-            if let activePairing = pairing {
-                // The service may invalidate authentication while the pairing
-                // coordinator is still receiving its error. Clear vault contents,
-                // but retain that sheet so the actual failure remains visible.
-                // Explicit lock/background/account events still cancel pairing.
-                pairing = nil
-                operationTask?.cancel(); lastActivity = nil
-                clearView(); clearClipboard(); status = "Locked"
-                pairing = activePairing
-            } else if busy && !authenticated {
+            if busy && !authenticated {
                 // Let an in-flight opening report its failure after the service
                 // invalidates authentication. Invalidating its generation here
                 // would swallow that error and its automatic-retry pause.
@@ -152,14 +140,14 @@ final class AppModel {
             return
         }
         guard launchAttempted, isActive, !authenticated, !busy, !automaticUnlockBlocked, !automaticUnlockNeedsRepair,
-              error == nil, pairing == nil, sheet == nil, !requestedVaultIDs.isEmpty,
+              error == nil, sheet == nil, !requestedVaultIDs.isEmpty,
               automaticUnlockTask == nil else { return }
         automaticUnlockTask = Task { [weak self] in
             await Task.yield()
             guard let self else { return }
             self.automaticUnlockTask = nil
             guard !Task.isCancelled, self.isActive, !self.authenticated, !self.busy,
-                  !self.automaticUnlockBlocked, !self.automaticUnlockNeedsRepair, self.error == nil, self.pairing == nil,
+                  !self.automaticUnlockBlocked, !self.automaticUnlockNeedsRepair, self.error == nil,
                   self.sheet == nil, !self.requestedVaultIDs.isEmpty else { return }
             self.unlock()
         }
@@ -481,27 +469,12 @@ final class AppModel {
             }
         }
     }
-    func beginPairing(host: Bool) {
-        guard !offline, !busy, pairing == nil else { return }
-        let coordinator = PairingCoordinator(service: service)
-        pairing = coordinator
-        if host { coordinator.start(vault: vault) }
-    }
-    func dismissPairing() { pairing?.cancel(); pairing = nil }
-    func finishPairing() {
-        guard let progress = pairing?.progress, progress.phase == .complete else { return }
-        let id = progress.vault.uuidString
-        dismissPairing()
-        vault = id; allVaults = false; page = .secrets
-        automaticUnlockBlocked = false; automaticUnlockNeedsRepair = false
-        discover(autoUnlock: true, selectedOnly: true)
-    }
     func shutdown() { isActive = false; lock(); inactivityTask?.cancel(); lifecycle.stop() }
     func background() {
         deactivate(); wasBackgrounded = true
         // A temporary app switch preserves the authenticated vault session.
-        // Pairing and pending authentication cannot continue in the background.
-        dismissPairing(); cancelItemEditing()
+        // Pending authentication cannot continue in the background.
+        cancelItemEditing()
         if busy && !authenticated { lock(clearClipboard: false) }
         checkExpiration()
     }
@@ -514,10 +487,9 @@ final class AppModel {
         if launchAttempted && authenticated { cloudChanged() }
     }
     private func clearSelection() {
-        pairing?.cancel(); pairing = nil
         generation += 1; editorGeneration += 1; itemDraft = nil
         selectedDeleted = nil; itemToDelete = nil
-        conceal(); catalog = nil; passwordQualities = [:]; references = []; selected = nil; devices = []; members = []; requests = []
+        conceal(); catalog = nil; passwordQualities = [:]; references = []; selected = nil; members = []
         selectedItem = nil; sheet = nil; notice = nil
         search = ""; deleteConfirmation = false; documentRequest = nil; error = nil
     }
@@ -558,7 +530,7 @@ final class AppModel {
     }
     func vaultConnectionLabel(_ descriptor: VaultDescriptor) -> String {
         if !descriptor.supported { return "Unsupported vault" }
-        if !descriptor.enrolled { return "Not connected on this device" }
+        if !descriptor.enrolled { return "Not owned by this account" }
         return authenticated ? "Unlocked" : "Locked"
     }
 
@@ -581,11 +553,11 @@ final class AppModel {
                         self.automaticUnlockNeedsRepair = true
                     }
                     if let failure = error as? MopError,
-                       [.authentication, .signing, .invalidDevice, .invalidVault, .vaultUntrusted, .deviceNotEnrolled, .cloudAccount].contains(failure) { self.lock() }
+                       [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(failure) { self.lock() }
                     // Framework errors may contain arbitrary diagnostics. Only
                     // domain errors have user-safe messages.
                     if error as? MopError == .vaultUntrusted {
-                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Refresh after iCloud Keychain finishes syncing. For an existing device-based vault, verify its fingerprint on the previously connected device before conversion."
+                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Refresh after iCloud Keychain finishes syncing. For a v5 vault, verify independent fingerprint evidence or use recovery. Older vault formats are unsupported."
                     } else {
                         self.error = (error as? MopError)?.errorDescription ?? "The operation could not be completed."
                     }
@@ -660,7 +632,7 @@ final class AppModel {
             if lastActivity == nil { lastActivity = now() }
             for (id, catalog) in loaded {
                 vaults.removeAll { $0.id == id }
-                vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v4", enrolled: true))
+                vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v5", enrolled: true))
             }
             if let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
             if let selected, !references.contains(selected) { self.selected = nil }
@@ -765,20 +737,13 @@ final class AppModel {
             self.notice = "Secret deleted. Historical encrypted copies remain."
         }
     }
-    func loadDevices() {
+    func loadMembers() {
         guard !offline else { return }
         perform { token in
-            let result = try await self.service.execute(.devices, vault: self.selectedVault, offline: false)
-            let devices = result.devices
+            let result = try await self.service.execute(.members, vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
-            self.devices = devices; self.members = result.members
-            self.requests = []
-            if !result.members.isEmpty { self.status = "Account membership verified"; return }
-            self.status = "Trusted Devices loaded · refreshing enrollment requests"
-            let pending = try await self.service.execute(.requests, vault: self.selectedVault, offline: false)
-            guard self.current(token) else { return }
-            self.requests = pending.requests.filter { request in !devices.contains { $0.fingerprint == request.fingerprint } }
-            self.status = "Device list authenticated"
+            self.members = result.members
+            self.status = "Account membership verified"
         }
     }
     func management(_ action: VaultManagement, keepSheet: Bool = false) {
@@ -790,7 +755,6 @@ final class AppModel {
             if !keepSheet { self.sheet = nil }
             self.notice = result.message
             self.automaticUnlockNeedsRepair = false; self.automaticUnlockBlocked = false
-            self.requests = []; self.devices = []
         }
     }
     func cloudChanged() {
@@ -799,7 +763,7 @@ final class AppModel {
         refreshCloudIfNeeded()
     }
     func refreshCloudIfNeeded() {
-        guard launchAttempted, isActive, !busy, !refreshing, itemDraft == nil, sheet == nil, pairing == nil,
+        guard launchAttempted, isActive, !busy, !refreshing, itemDraft == nil, sheet == nil,
               !automaticUnlockNeedsRepair, wallNow() >= nextCloudRefresh else { return }
         guard cloudRefreshPending || authenticated else { return }
         cloudRefreshPending = false
@@ -828,7 +792,7 @@ final class AppModel {
                 }
                 // A foreground operation or draft may have started while fetching.
                 // Never replace its state with an earlier refresh result.
-                guard isActive, !busy, itemDraft == nil, sheet == nil, pairing == nil,
+                guard isActive, !busy, itemDraft == nil, sheet == nil,
                       revision == foregroundRevision, editing == editorGeneration,
                       vault == selectedVault, requestedVaultIDs == requested else {
                     cloudRefreshPending = true; nextCloudRefresh = .distantPast; return
@@ -844,7 +808,7 @@ final class AppModel {
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
                 if let failure = error as? MopError,
-                   [.authentication, .signing, .invalidDevice, .invalidVault, .vaultUntrusted, .deviceNotEnrolled, .cloudAccount].contains(failure) {
+                   [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(failure) {
                     lock()
                     self.error = failure.errorDescription
                 } else {
@@ -858,7 +822,7 @@ final class AppModel {
         clearView()
         allVaults = false; vault = intent.id.uuidString
         if !vaults.contains(where: { $0.id == vault }) {
-            vaults.append(VaultDescriptor(id: vault, name: intent.name, format: "mop-vault-v4", enrolled: true))
+            vaults.append(VaultDescriptor(id: vault, name: intent.name, format: "mop-vault-v5", enrolled: true))
         }
         status = "Creating or reconciling vault " + vault
         perform { token in
@@ -871,15 +835,15 @@ final class AppModel {
         }
     }
 
-    func createVault(name: String, deviceName: String, strict: Bool, recovery: URL) {
+    func createVault(name: String, strict: Bool, recovery: URL) {
         guard !offline, !busy else { return }
-        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; devices = []; members = []; requests = []; authenticated = false
+        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; members = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
-            self.allVaults = false; self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v4", enrolled: true))
+            self.allVaults = false; self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v5", enrolled: true))
             self.status = "Creating vault \(id) · retain any recovery file written"
-            let result = try await self.service.execute(.create(name: name, deviceName: deviceName, strict: strict, recovery: recovery), vault: id, offline: false)
+            let result = try await self.service.execute(.create(name: name, strict: strict, recovery: recovery), vault: id, offline: false)
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
             try await self.unlockContents(token, refresh: false)

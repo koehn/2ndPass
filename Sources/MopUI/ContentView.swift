@@ -88,9 +88,9 @@ struct ContentView: View {
                     }.padding()
                     if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
                         ContentUnavailableView {
-                            Label("Device not connected", systemImage: model.vaultIcon(descriptor))
+                            Label("Account access unavailable", systemImage: model.vaultIcon(descriptor))
                         } description: {
-                            Text("Enable iCloud Passwords & Keychain using the same Apple Account, then refresh. Existing device-based vaults must first be converted on a previously connected device.")
+                            Text("Enable iCloud Passwords & Keychain using the owning Apple Account, then refresh. Older vault formats are unsupported.")
                         }
                     } else if model.authenticated {
                         ItemSearchView(model: model, selected: { showDetail() }).padding(.horizontal).padding(.bottom, 8).zIndex(1)

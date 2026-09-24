@@ -62,7 +62,7 @@ public final class RoutedSecretStore: AsyncSecretStore {
         } else {
             included = rows.filter { $0.supported && $0.enrolled }
             for row in rows where !row.supported || !row.enrolled {
-                diagnostic("Skipping vault \(row.id): \(row.supported ? "not enrolled" : "unsupported legacy format; use an older client").")
+                diagnostic("Skipping vault \(row.id): \(row.supported ? "not owned by this account" : "unsupported legacy format; use an older client").")
             }
             for row in included { _ = try repository.resolve(row.name!, in: rows, nameOnly: true) }
         }

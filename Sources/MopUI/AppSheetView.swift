@@ -7,7 +7,6 @@ struct AppSheetView: View {
     @Bindable var model: AppModel
     let kind: AppSheet
     @State private var vaultName = "personal"
-    @State private var name = DeviceLabel.name
     @State private var fingerprint = ""
     @State private var strict = false
     @State private var confirmed = false
@@ -37,11 +36,11 @@ struct AppSheetView: View {
     private var canSubmit: Bool {
         switch kind {
         case .vaultSettings: true
-        case .createVault: (try? VaultName.validate(vaultName)) != nil && !name.isEmpty && pending?.exported == true && confirmed
+        case .createVault: (try? VaultName.validate(vaultName)) != nil && pending?.exported == true && confirmed
         case .renameVault: (try? VaultName.validate(vaultName)) != nil
         case .deleteVault: deletionTarget != nil && !model.offline && deletionConfirmation == (deletionTarget?.name ?? deletionTarget?.id)
         case .trust: validFingerprint
-        case .recover: validFingerprint && recoveryURL != nil && !name.isEmpty
+        case .recover: validFingerprint && recoveryURL != nil
         }
     }
     var body: some View {
@@ -56,11 +55,11 @@ struct AppSheetView: View {
                 Text("Your Mop identity synchronizes through iCloud Keychain. Mop authenticates locally before opening it.").font(.caption).foregroundStyle(.secondary)
                 Button(pending?.exported == true ? "Export another recovery key copy…" : "Export recovery key…") {
                     do {
-                        pending = try PendingVaultCreation.prepare(name: vaultName, deviceName: name, strict: strict, state: AppStorageLocation.defaultState)
+                        pending = try PendingVaultCreation.prepare(name: vaultName, strict: strict, state: AppStorageLocation.defaultState)
                         fileRequestGeneration = model.editorGeneration
                         choosingRecoveryFolder = true
                     } catch { localError = safeMessage(error) }
-                }.disabled((try? VaultName.validate(vaultName)) == nil || name.isEmpty)
+                }.disabled((try? VaultName.validate(vaultName)) == nil)
                 if let pending {
                     Text("Vault UUID: " + pending.id.uuidString).font(.caption).textSelection(.enabled)
                     Text(pending.exported ? "Recovery credential exported. Continue to create or reconcile this vault." : "Choose a folder outside Mop to save the recovery credential.").font(.caption)
@@ -141,7 +140,7 @@ struct AppSheetView: View {
             if kind == .createVault {
                 do {
                     pending = try PendingVaultCreation.load(state: AppStorageLocation.defaultState)
-                    if let pending { vaultName = pending.name; name = pending.deviceName; strict = pending.strict }
+                    if let pending { vaultName = pending.name; strict = pending.strict }
                 } catch { localError = safeMessage(error) }
             }
             if kind == .renameVault { vaultName = model.vaultName }
@@ -168,7 +167,7 @@ struct AppSheetView: View {
         case .trust:
             model.management(.trust(fingerprint: fingerprint))
         case .recover:
-            if let recoveryURL { model.management(.recover(file: recoveryURL, name: name, fingerprint: fingerprint)) }
+            if let recoveryURL { model.management(.recover(file: recoveryURL, fingerprint: fingerprint)) }
         case .vaultSettings: break
         }
     }
@@ -181,7 +180,7 @@ struct AppSheetView: View {
             Text("Account access").font(.headline)
             Text("Connected vaults are available on devices using your Apple Account and iCloud Keychain.")
                 .foregroundStyle(.secondary)
-            Button("Verify account membership") { model.loadDevices() }.disabled(model.offline)
+            Button("Verify account membership") { model.loadMembers() }.disabled(model.offline)
             if !model.members.isEmpty {
                 Label("Your Apple Account · Owner", systemImage: "person.crop.circle.badge.checkmark")
             }

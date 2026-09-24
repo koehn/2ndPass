@@ -2,13 +2,13 @@
 
 **Current access model:** [account identities and membership](ACCOUNT-IDENTITY.md).
 New devices use iCloud Keychain; QR pairing and device enrollment are removed.
-Existing v4 vaults convert once online, rotating keys and removing device access.
+Only v5 vaults and backups are accepted. Older formats and device credentials are unsupported; no conversion is performed.
 Vault administration lives in Vault Settings; normal browsing focuses on items.
 
 `MopApp` is a SwiftUI companion to the CLI. The signed `Mop.app` opens the native
 window; `Contents/MacOS/mop` remains the CLI used by the installer and shell.
 Both executables use the same signing identity, application-specific Keychain
-group, CloudKit container, and existing local device state. Version 0.5 requires fresh named vaults; legacy cloud data remains untouched.
+group, CloudKit container, and synchronized account identity. Only v5 vaults are supported; legacy cloud data remains untouched.
 
 ## Build and open
 
@@ -31,11 +31,11 @@ its `Contents/MacOS/mop` helper. It requests administrator access if needed.
 
 ## Workflows
 
-- Opening the app discovers your vaults and prompts once to unlock enrolled vaults.
+- Opening the app discovers your vaults and prompts once to unlock owned vaults.
   Cancelling leaves the app locked without repeatedly prompting. The sidebar has
   **All Items** and a collapsible **Vaults** list. All Items combines items while
   showing their vault names; same-named items remain separate. Select a specific
-  vault before creating items or managing that vault. Unsupported and unenrolled
+  vault before creating items or managing that vault. Unsupported and unowned
   vaults stay in the sidebar for explicit management rather than being opened.
 - Find named vaults, select by name, or create a new vault. UUIDs remain visible in details and can be entered explicitly. New vault
   creation saves the recovery credential first and displays the vault and device
@@ -88,7 +88,7 @@ together when active, using one device context. There is no Unlock button. Any
 vault-open failure clears the entire session; unconnected vaults are excluded and
 use a distinct add-device icon. Switching vaults does not prompt again. Cancelling
 authentication pauses retries until the next interaction. Authenticated reads use the last verified in-memory snapshot without waiting for
-CloudKit. Background catalog refreshes and online writes check account, enrollment,
+CloudKit. Background catalog refreshes and online writes check account, membership,
 trust, and revision conflicts. Connection unavailability automatically selects verified cached data and displays its age. Account, permission and verification failures never fall back.
 
 **Mop → Settings…** configures 1–60 whole minutes of GUI inactivity, default 5.
@@ -107,11 +107,11 @@ native operation also reconciles through its snapshot refresh. Context failures
 require fresh authentication; interact with Mop after dismissing the error to retry. Secrets are not saved to preferences or logs.
 
 The GUI honors `MOP_STATE_DIRECTORY` and constrains native operations to the selected UUID.
-`MOP_CLOUD_VAULT` no longer selects a vault. The CLI can import encrypted v4 backups; legacy file vaults
+`MOP_CLOUD_VAULT` no longer selects a vault. The CLI can import encrypted v5 backups; legacy file vaults
 are no longer supported and have no migration path.
 CloudKit access requires the same signed-device validation described in
 [VALIDATION.md](VALIDATION.md). Automated GUI tests use injected services, clocks, authentication, and in-memory
-cloud transports; they do not replace Touch ID, signed two-Mac enrollment, or
+cloud transports; they do not replace Touch ID, signed multi-device account access, or
 production acceptance tests.
 
 File import and historical revision restoration remain CLI workflows in this
@@ -196,18 +196,19 @@ backups require an older client.
 Package with the existing signing identity and provisioning profile, then verify:
 
 1. Set inactivity to 10 minutes. Unlock with Touch ID (and test password fallback
-   separately on a non-strict device). Read, edit, and switch between enrolled
+   separately on a non-strict device). Read, edit, and switch between owned
    vaults without another prompt. Keep interacting for more than five minutes and
    confirm subsequent reads still work without prompting.
 2. Switch apps and return before expiry: values are concealed and the session is
    retained. Leave Mop idle through the deadline: returning requires authentication.
 3. Lock manually during authentication, a read, and a submitted write. No late
    result restores data. A submitted write may require Refresh to reconcile.
-4. Test Mac screen lock, sleep, account changes, and disconnecting and reconnecting;
-   each ends authorization. Unlocking then prompts again. Verify strict biometric
-   policy continues to reject password fallback.
+4. Test Mac screen lock, sleep, and account changes; each ends authorization.
+   Unlocking then prompts again. Disconnection/reconnection may retain a valid
+   session and use verified cached reads. Verify local strict biometric policy
+   continues to reject password fallback.
 
-These checks require the signed application and interactive Secure Enclave hardware;
+These checks require the signed application and real biometric hardware;
 a passing software suite alone does not establish them.
 
 ## Password quality
@@ -266,7 +267,7 @@ item and vault names, non-concealed field labels, and non-hidden field values
 other concealed values are excluded, and searching never reads secret records.
 
 New item uses the same inline editor as Edit item. From All Vaults, its Vault picker
-chooses among unlocked, enrolled vaults and remembers your selection locally for
+chooses among unlocked, owned vaults and remembers your selection locally for
 next time. An unavailable remembered vault is ignored. Creating from a single vault
 uses that vault without changing the All Vaults preference. Cancel and Lock discard
 the draft; Save keeps the All Vaults view and selects the newly created item.
@@ -276,7 +277,7 @@ the draft; Save keeps the All Vaults view and selects the newly created item.
 Right-click an item in the item list and choose **Delete…**, then confirm. The whole
 item moves to **Recently Deleted** in the sidebar and disappears from normal vault
 lists, search, and All Vaults. This is a separate GUI area, not a new cloud vault:
-each item keeps its source vault's encryption, enrolled Macs, and recovery key.
+each item keeps its source vault's encryption, account membership, and recovery key.
 
 Select a deleted item and choose **Restore item**, or right-click it and choose
 **Restore**, within 30 days. Restoration goes to its original vault and preserves
@@ -301,7 +302,7 @@ published to readers. Push notifications, foregrounding, reconnection, and a
 60-second fallback trigger background reconciliation while active. Verified updates
 replace the displayed catalog and item without disabling controls; updates defer
 when editing or a foreground operation intervenes. Changed revisions conceal any
-revealed value. Remote revocation is detected on reconciliation, not on every read.
+revealed value. Remote ownership changes is detected on reconciliation, not on every read.
 Lock and authentication expiry immediately invalidate snapshot access.
 
 ## iPhone and iPad

@@ -66,7 +66,9 @@ public final class CloudCache: @unchecked Sendable {
         for name in ["snapshot.json", "downloaded.json"] {
             guard let snapshot = try read(name, as: CachedSnapshot.self) else { continue }
             guard VaultCoding.digest(snapshot.document) == snapshot.revision else { throw MopError.invalidVault }
-            let document = try VaultDocument.decode(snapshot.document)
+            let document: VaultDocument
+            do { document = try VaultDocument.decode(snapshot.document) }
+            catch MopError.legacyVault { continue } // Old ciphertext is never reused or converted.
             for record in document.records.values {
                 let bytes = try VaultCoding.encode(record)
                 result[VaultCoding.digest(bytes)] = bytes

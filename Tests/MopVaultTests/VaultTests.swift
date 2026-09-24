@@ -5,12 +5,14 @@ import MopCore
 @testable import MopVault
 
 // Software keys are used only in this test target. Production has no fallback.
-private struct TestDevice: VaultKeyOpener {
-    let key = P256.KeyAgreement.PrivateKey()
-    var publicKey: Data { key.publicKey.x963Representation }
-    var request: DeviceRequest { try! DeviceRequest(name: "Test Mac", publicKey: publicKey) }
+private struct TestDevice: VaultSigningOpener {
+    let identity = AccountIdentity()
+    var publicKey: Data { identity.publicKey }
+    var signingPublicKey: Data { identity.signingPublicKey }
+    var request: RecipientKey { identity.request }
+    func sign(_ data: Data) throws -> Data { try identity.sign(data) }
     func unwrap(_ recipient: VaultRecipient, vaultID: UUID) throws -> SymmetricKey {
-        try VaultDocument.unwrap(recipient, vaultID: vaultID, privateKey: key)
+        try identity.unwrap(recipient, vaultID: vaultID)
     }
 }
 
@@ -20,18 +22,20 @@ private func fixture() throws -> (URL, VaultTrust, Data, TestDevice, RecoveryKey
     let trust = VaultTrust(vault: directory.appendingPathComponent("identity"), directory: directory.appendingPathComponent("local-trust"))
     let device = TestDevice()
     let recovery = RecoveryKey()
-    let snapshot = try VaultSession.createSnapshot(name: "v", device: device.request, recovery: recovery)
+    let snapshot = try VaultSession.createAccountSnapshot(name: "v", owner: device.identity, recovery: recovery)
     // These bytes were generated here, independently of any untrusted transport.
     try VaultSession.trustSnapshot(snapshot, trust: trust, opener: device, revision: VaultCoding.digest(snapshot))
     return (directory, trust, snapshot, device, recovery)
 }
 
-private final class CountingOpener: VaultKeyOpener {
+private final class CountingOpener: VaultSigningOpener {
     let device: TestDevice
     var purposes: [String] = []
     var allowRecords = true
     init(_ device: TestDevice) { self.device = device }
     var publicKey: Data { device.publicKey }
+    var signingPublicKey: Data { device.signingPublicKey }
+    func sign(_ data: Data) throws -> Data { try device.sign(data) }
     func unwrap(_ recipient: VaultRecipient, vaultID: UUID) throws -> SymmetricKey {
         purposes.append(recipient.purpose)
         if recipient.purpose != "index", !allowRecords { throw MopError.authentication }
@@ -122,10 +126,10 @@ private final class CountingOpener: VaultKeyOpener {
     let (directory, trust, initial, device, _) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
     var document = try VaultDocument.decode(initial)
-    #expect(document.header.format == "mop-vault-v4")
-    for format in ["mop-vault-v1", "mop-vault-v2"] {
+    #expect(document.header.format == "mop-vault-v5")
+    for format in ["mop-vault-v1", "mop-vault-v2", "mop-vault-v3", "mop-vault-v4"] {
         document.header.format = format
-        #expect(throws: MopError.invalidVault) { try VaultSession(snapshot: VaultCoding.encode(document), trust: trust, opener: device) }
+        #expect(throws: MopError.legacyVault) { try VaultSession(snapshot: VaultCoding.encode(document), trust: trust, opener: device) }
     }
 }
 
@@ -212,34 +216,6 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(throws: (any Error).self) { try record.read(id: ids[1], vaultID: original.header.vaultID, opener: device) }
 }
 
-@Test func enrollmentRewrapsWithoutChangingValuesAndRevocationRotatesEveryRecord() throws {
-    let (directory, trust, initial, device, _) = try fixture()
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let spy = CountingOpener(device)
-    let store = try VaultSession(snapshot: initial, trust: trust, opener: spy)
-    defer { store.close() }
-    for name in ["a", "b"] { try store.write(SecretReference("mop://v/i/" + name), value: SecretBytes(utf8: name), replace: false) }
-    let before = try VaultDocument.decode(store.snapshot)
-    let other = TestDevice()
-    try store.enroll(other.request, expectedFingerprint: other.request.fingerprint)
-    let enrolled = try VaultDocument.decode(store.snapshot)
-    #expect(spy.purposes.filter { $0.hasPrefix("record:") }.count == 2)
-    for (id, record) in before.records {
-        #expect(enrolled.records[id]!.sealed == record.sealed)
-        #expect(enrolled.records[id]!.recipients.count == 3)
-    }
-    try store.revoke(other.request.fingerprint, currentDevice: device.publicKey)
-    let revoked = try VaultDocument.decode(store.snapshot)
-    for (id, record) in enrolled.records {
-        let rotated = revoked.records[id]!
-        #expect(rotated.sealed != record.sealed)
-        #expect(rotated.recipients.count == 2)
-        let oldKey = try record.key(id: id, vaultID: before.header.vaultID, opener: other)
-        let newKey = try rotated.key(id: id, vaultID: before.header.vaultID, opener: device)
-        #expect(oldKey != newKey)
-    }
-}
-
 @Test func renamePreservesIdentityRecordsAndHistoricalRestoreKeepsName() throws {
     let (directory, trust, initial, device, recovery) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -279,49 +255,6 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(throws: MopError.legacyVault) { try VaultDocument.decode(JSONSerialization.data(withJSONObject: legacy)) }
 }
 
-@Test func deviceEnrollmentRevocationAndRecovery() throws {
-    let (directory, trust, initial, first, recovery) = try fixture()
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let second = TestDevice()
-    let ref = try SecretReference("mop://v/i/f")
-    let a = try VaultSession(snapshot: initial, trust: trust, opener: first)
-    defer { a.close() }
-    try a.write(ref, value: "shared", replace: false)
-    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: a.snapshot, trust: trust, opener: second) }
-    #expect(throws: MopError.invalidDevice) { try a.enroll(second.request, expectedFingerprint: "wrong") }
-    try a.enroll(second.request, expectedFingerprint: second.request.fingerprint)
-    let b = try VaultSession(snapshot: a.snapshot, trust: trust, opener: second)
-    defer { b.close() }
-    #expect(try b.read(ref) == "shared")
-    let beforeRevoke = a.snapshot
-    try a.revoke(second.request.fingerprint, currentDevice: first.publicKey)
-    try a.pinCommittedKey() // In production this happens only after CloudKit commits.
-    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: a.snapshot, trust: trust, opener: second) }
-    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: beforeRevoke, trust: trust, opener: second) }
-    let old = try VaultDocument.decode(beforeRevoke)
-    let oldKey = try second.unwrap(old.header.recipients.first { $0.publicKey == second.publicKey }!, vaultID: old.header.vaultID)
-    let id = try old.decryptIndex(key: oldKey)[ref.relativePath]!
-    #expect(try old.records[id]!.read(id: id, vaultID: old.header.vaultID, opener: second) == "shared")
-    let recovered = try VaultSession(snapshot: a.snapshot, trust: trust, opener: recovery)
-    defer { recovered.close() }
-    #expect(try recovered.read(ref) == "shared")
-    try recovered.enroll(second.request, expectedFingerprint: second.request.fingerprint)
-    let recoveryFile = directory.appendingPathComponent("offline.key")
-    try recovery.save(to: recoveryFile)
-    #expect(try RecoveryKey(file: recoveryFile).publicKey == recovery.publicKey)
-}
-
-@Test func enrollmentInOneVaultDoesNotGrantAccessToAnother() throws {
-    let (directory, trust, initial, device, _) = try fixture()
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let other = TestDevice()
-    let second = try VaultSession.createSnapshot(name: "other", device: other.request, recovery: RecoveryKey())
-    let otherTrust = VaultTrust(vault: directory.appendingPathComponent("other"), directory: directory.appendingPathComponent("other-trust"))
-    try VaultSession.trustSnapshot(second, trust: otherTrust, opener: other, revision: VaultCoding.digest(second))
-    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: second, trust: otherTrust, opener: device) }
-    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: initial, trust: trust, opener: other) }
-}
-
 @Test func rejectsForgedSnapshotsAndHistoryDespiteValidEncryption() throws {
     let (directory, trust, original, device, _) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -331,74 +264,22 @@ private final class CountingOpener: VaultKeyOpener {
     var header = document.header
     header.generation += 1; header.parent = VaultCoding.digest(original)
     header.recipients = try header.recipients.map {
-        try VaultDocument.wrap(key: attackerKey, request: DeviceRequest(name: $0.name, publicKey: $0.publicKey), kind: $0.kind, vaultID: header.vaultID)
+        try VaultDocument.wrap(key: attackerKey, request: RecipientKey(name: $0.name, publicKey: $0.publicKey), kind: $0.kind, vaultID: header.vaultID)
     }
-    header.recipients.append(try VaultDocument.wrap(key: attackerKey, request: attacker.request, kind: "device", vaultID: header.vaultID))
-    let forged = try VaultCoding.encode(VaultDocument.seal(header: header, index: [:], records: [:], key: attackerKey))
-    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: forged, trust: trust, opener: device) }
-    #expect(throws: MopError.vaultUntrusted) {
-        try VaultSession.trustSnapshot(forged, trust: trust, opener: device, revision: VaultCoding.digest(original))
+    #expect(throws: MopError.invalidVault) {
+        try VaultDocument.seal(header: header, index: [:], records: [:], key: attackerKey, signer: attacker)
     }
     let store = try VaultSession(snapshot: original, trust: trust, opener: device)
     defer { store.close() }
-    #expect(throws: MopError.vaultUntrusted) {
-        try VaultSession.trustSnapshot(forged, trust: trust, opener: device, fingerprint: store.fingerprint())
-    }
-    #expect(throws: MopError.vaultUntrusted) { try store.restore(forged) }
-    #expect(store.snapshot == original)
     try store.write(SecretReference("mop://v/i/new"), value: "protected-future-secret", replace: false)
-    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: store.snapshot, trust: trust, opener: attacker) }
-}
+    #expect(throws: MopError.notVaultMember) { try VaultSession(snapshot: store.snapshot, trust: trust, opener: attacker) }
 
-@Test func separateDeviceTrustAndRotationRequireIndependentEvidence() throws {
-    let (directory, trust, initial, first, recovery) = try fixture()
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let second = TestDevice(), removed = TestDevice()
-    let store = try VaultSession(snapshot: initial, trust: trust, opener: first)
-    defer { store.close() }
-    try store.enroll(second.request, expectedFingerprint: second.request.fingerprint)
-    try store.enroll(removed.request, expectedFingerprint: removed.request.fingerprint)
-    let otherTrust = VaultTrust(vault: directory.appendingPathComponent("identity"), directory: directory.appendingPathComponent("other-trust"))
-    let oldFingerprint = try store.fingerprint()
-    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: store.snapshot, trust: otherTrust, opener: second) }
-    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: store.snapshot, trust: otherTrust, opener: recovery) }
-    #expect(throws: MopError.vaultUntrusted) {
-        try VaultSession.trustSnapshot(store.snapshot, trust: otherTrust, opener: second, fingerprint: String(repeating: "0", count: 64))
-    }
-    try VaultSession.trustSnapshot(store.snapshot, trust: otherTrust, opener: second, fingerprint: oldFingerprint)
-    let ref = try SecretReference("mop://v/i/f")
-    try store.write(ref, value: "before rotation", replace: false)
-    let oldSnapshot = store.snapshot
-    try store.revoke(removed.request.fingerprint, currentDevice: first.publicKey)
-    let rotated = store.snapshot
-    // Creating the candidate snapshot must not advance durable trust.
-    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: rotated, trust: trust, opener: first) }
-    try store.pinCommittedKey()
-    #expect(try store.fingerprint() != oldFingerprint)
-    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: rotated, trust: otherTrust, opener: second) }
-    try VaultSession.trustSnapshot(rotated, trust: otherTrust, opener: second, fingerprint: store.fingerprint())
-    let trusted = try VaultSession(snapshot: rotated, trust: otherTrust, opener: second)
-    defer { trusted.close() }
-    #expect(try trusted.read(ref) == "before rotation")
-    #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: oldSnapshot, trust: trust, opener: first) }
-    try store.restore(oldSnapshot)
-    #expect(try store.read(ref) == "before rotation")
-    #expect(try !store.recipients().contains { $0.fingerprint == removed.request.fingerprint })
-    // An encrypted backup authenticates through independent revision evidence.
-    let backup = directory.appendingPathComponent("backup.mopfile")
-    try SafeFile.write(store.snapshot, to: backup)
-    let backupTrust = VaultTrust(vault: backup, directory: directory.appendingPathComponent("backup-trust"))
-    let bytes = try SafeFile.read(backup)
-    try VaultSession.trustSnapshot(bytes, trust: backupTrust, opener: recovery, revision: VaultCoding.digest(store.snapshot))
-    let recovered = try VaultSession(snapshot: bytes, trust: backupTrust, opener: recovery)
-    defer { recovered.close() }
-    #expect(try recovered.read(ref) == "before rotation")
 }
 
 @Test func changingVaultIdentityOrLosingPinsNeverEstablishesTrust() throws {
     let (directory, trust, original, device, recovery) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let other = try VaultSession.createSnapshot(name: "v", device: device.request, recovery: recovery)
+    let other = try VaultSession.createAccountSnapshot(name: "v", owner: device.identity, recovery: recovery)
     #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: other, trust: trust, opener: device) }
     try FileManager.default.removeItem(at: directory.appendingPathComponent("local-trust"))
     #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: original, trust: trust, opener: device) }
@@ -473,7 +354,7 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(try store.read(ref) == "keep-me")
 }
 
-@Test func itemMetadataSurvivesRenameRestoreEnrollmentAndRotation() throws {
+@Test func itemMetadataSurvivesRenameAndRestore() throws {
     let (directory, trust, initial, device, _) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
@@ -483,9 +364,6 @@ private final class CountingOpener: VaultKeyOpener {
     item.type = .login; item.fields[0].type = .username
     try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false))
     let saved = store.snapshot
-    let other = TestDevice()
-    try store.enroll(other.request, expectedFingerprint: other.request.fingerprint)
-    try store.revoke(other.request.fingerprint, currentDevice: device.publicKey)
     try store.pinCommittedKey()
     #expect(try store.catalog().items[0].fields[0].value == "alice")
     try store.rename("renamed")
@@ -667,43 +545,10 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(throws: MopError.vaultUntrusted) { try VaultSession(snapshot: snapshot, trust: stable, opener: device) }
 }
 
-@Test func ownerMembershipMigrationRotatesKeysAndPreservesRecovery() throws {
-    let (directory, trust, initial, device, recovery) = try fixture()
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let session = try VaultSession(snapshot: initial, trust: trust, opener: device)
-    let reference = try SecretReference("mop://v/login/password")
-    try session.write(reference, value: "owner-secret", replace: false)
-    let before = try VaultDocument.decode(session.snapshot)
-    let owner = AccountIdentity(); defer { owner.close() }
-    try session.adoptOwner(owner)
-    let migrated = try VaultDocument.decode(session.snapshot)
-    #expect(migrated.header.format == "mop-vault-v5")
-    #expect(migrated.header.membership?.owner == owner.identity)
-    #expect(migrated.header.recipients.count == 2 && !migrated.header.recipients.contains { $0.kind == "device" })
-    try session.pinCommittedKey()
-    #expect(migrated.records.mapValues(\.sealed) != before.records.mapValues(\.sealed))
-    #expect(try session.read(reference) == "owner-secret")
-    let freshTrust = VaultTrust(cloudBinding: "new-device", directory: directory.appendingPathComponent("new-device"))
-    let secondOwner = try owner.withMaterial { try AccountIdentity(material: $0) }
-    let second = try VaultSession(snapshot: session.snapshot, trust: freshTrust, opener: secondOwner)
-    #expect(try second.read(reference) == "owner-secret")
-    try second.write(reference, value: "updated", replace: true)
-    #expect(try second.read(reference) == "updated")
-    let recovered = try VaultSession(snapshot: second.snapshot, trust: trust, opener: recovery)
-    #expect(try recovered.read(reference) == "updated")
-    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: second.snapshot, trust: trust, opener: device) }
-    #expect(throws: MopError.cloudPermission) { try second.enroll(device.request, expectedFingerprint: device.request.fingerprint) }
-    let otherOwner = AccountIdentity()
-    #expect(throws: MopError.cloudPermission) { try second.adoptOwner(otherOwner) }
-    secondOwner.close()
-    #expect(throws: MopError.authentication) { try second.read(reference) }
-}
-
 @Test func membershipAndRevisionSignaturesRejectSubstitution() throws {
     let (directory, trust, initial, device, _) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let owner = AccountIdentity(), session = try VaultSession(snapshot: initial, trust: trust, opener: device)
-    try session.adoptOwner(owner)
+    let session = try VaultSession(snapshot: initial, trust: trust, opener: device)
     let snapshot = session.snapshot
     var document = try VaultDocument.decode(snapshot)
     document.header.name = "tampered"
@@ -715,7 +560,7 @@ private final class CountingOpener: VaultKeyOpener {
     #expect(throws: MopError.invalidVault) { try membership.validate(vaultID: UUID()) }
     let impostor = AccountIdentity()
     let freshTrust = VaultTrust(cloudBinding: "fresh", directory: directory.appendingPathComponent("fresh"))
-    #expect(throws: MopError.deviceNotEnrolled) { try VaultSession(snapshot: snapshot, trust: freshTrust, opener: impostor) }
+    #expect(throws: MopError.notVaultMember) { try VaultSession(snapshot: snapshot, trust: freshTrust, opener: impostor) }
 }
 
 @Test func invalidOTPReplacementsCannotChangeVault() throws {

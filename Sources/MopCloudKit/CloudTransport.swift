@@ -2,7 +2,7 @@ import Foundation
 import MopCore
 import MopVault
 
-public enum CloudKind: String, Sendable { case blob = "MopBlob", head = "MopHead", request = "MopRequest" }
+public enum CloudKind: String, Sendable { case blob = "MopBlob", head = "MopHead" }
 
 public struct CloudObject: Sendable {
     public let data: Data
@@ -22,7 +22,6 @@ public protocol CloudTransport: Sendable {
     func deleteZone(_ vault: UUID) async throws
     func fetch(_ id: String, vault: UUID) async throws -> CloudObject?
     func save(_ id: String, kind: CloudKind, data: Data, vault: UUID, expected: Data?) async throws -> CloudObject
-    func requests(vault: UUID) async throws -> [String]
 }
 
 struct CloudHead: Codable, Sendable {
@@ -48,7 +47,7 @@ struct CloudManifest: Codable, Sendable {
 
     func document(records values: [String: VaultRecord]) throws -> VaultDocument {
         guard format == "mop-cloud-manifest-v2", Set(records.keys) == Set(values.keys) else { throw MopError.invalidVault }
-        // Decode through the v4 validator, including its size limit.
+        // Decode through the v5 validator, including its size limit.
         struct Parts: Encodable { let header: VaultHeader; let sealed: Data; let records: [String: VaultRecord]; let signature: Data?; let signer: Data? }
         return try VaultDocument.decode(VaultCoding.encode(Parts(header: header, sealed: sealed, records: values, signature: signature, signer: signer)))
     }

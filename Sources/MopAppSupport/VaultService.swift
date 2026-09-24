@@ -7,37 +7,20 @@ import MopVault
 import MopKeychain
 import MopCloudKit
 
-public struct MacRecord: Sendable, Identifiable {
-    public let name: String
-    public let fingerprint: String
-    public var id: String { fingerprint }
-    public init(name: String, fingerprint: String) { self.name = name; self.fingerprint = fingerprint }
-}
 public struct VaultMemberRecord: Sendable, Identifiable {
     public let id: String
     public let role: String
 }
-public struct Enrollment: Sendable, Identifiable {
-    public let request: String
-    public let name: String
-    public let fingerprint: String
-    public var id: String { request }
-    public init(request: String, name: String, fingerprint: String) {
-        self.request = request; self.name = name; self.fingerprint = fingerprint
-    }
-}
 public enum VaultManagement: Sendable {
-    case fingerprint, request(name: String, strict: Bool), trust(fingerprint: String)
-    case recover(file: URL, name: String, fingerprint: String)
-    case approve(request: String, fingerprint: String), revoke(fingerprint: String)
+    case fingerprint, trust(fingerprint: String)
+    case recover(file: URL, fingerprint: String)
 }
 public enum VaultOperation: Sendable {
-    case pairing(PairingOperation)
     case discover, catalog, passwordQuality(item: String), read(SecretReference), save(ItemEdit)
     case write(SecretReference, SecretBytes, replace: Bool), delete(SecretReference)
     case recentlyDeleted, trashItem(name: String, revision: String), restoreItem(id: UUID, revision: String)
-    case devices, requests, manage(VaultManagement), sync
-    case create(name: String, deviceName: String, strict: Bool, recovery: URL)
+    case members, manage(VaultManagement), sync
+    case create(name: String, strict: Bool, recovery: URL)
     case createPrepared
     case rename(String), deleteVault, export(URL)
 }
@@ -50,7 +33,6 @@ extension VaultOperation {
     }
 }
 public struct VaultResult: Sendable {
-    public var pairing: PairingProgress?
     public var vaults: [VaultDescriptor] = []
     public var defaultVault: String?
     public var catalog: ItemCatalog?
@@ -60,8 +42,6 @@ public struct VaultResult: Sendable {
     public var otpExpiresAt: Date?
     public var otpPeriod: Int?
     public var passwordQuality: [String: PasswordQuality] = [:]
-    public var devices: [MacRecord] = []
-    public var requests: [Enrollment] = []
     public var members: [VaultMemberRecord] = []
     public var message = ""
     public var usingCache = false
@@ -151,13 +131,6 @@ private actor OperationGate {
     }
 }
 
-public protocol SessionDevice: VaultKeyOpener {
-    var request: DeviceRequest { get }
-    var strictBiometrics: Bool { get }
-    func close()
-}
-extension LocalDevice: SessionDevice {}
-
 /// Native GUI boundary. Worker objects are confined to a single operation permit;
 /// they are never accessed by the main actor or concurrently by other operations.
 public final class NativeVaultService: VaultService, @unchecked Sendable {
@@ -170,42 +143,24 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 documents: any DocumentAccessing = SystemDocumentAccess()) {
         let state = state ?? configuration.stateDirectory
         worker = Worker(state: state.standardizedFileURL, documents: documents, identityKeys: SynchronizedIdentityStore(), accountAuthentication: { strict, register in
-            let policyFile = state.appendingPathComponent("account-authentication.json")
-            let hasPolicy = FileManager.default.fileExists(atPath: policyFile.path)
-            let saved = hasPolicy
-                ? try JSONDecoder().decode(Bool.self, from: SafeFile.read(policyFile, privateFile: true, limit: 1024)) : false
-            let context = try Authentication.authorize(strictBiometrics: hasPolicy ? saved : (strict ?? false), reason: "unlock your Mop vaults", contextCreated: { context in
+            let context = try AccountAuthenticationPolicy.authorize(state: state, strict: strict ?? false, reason: "unlock your Mop vaults", contextCreated: { context in
                 let invalidator = ContextInvalidator(context)
                 try register { invalidator.invalidate() }
             })
             let invalidator = ContextInvalidator(context)
-            do {
-                if !hasPolicy {
-                    try SafeFile.privateDirectory(state)
-                    try SafeFile.write(JSONEncoder().encode(strict ?? false), to: policyFile)
-                }
-            } catch { context.invalidate(); throw error }
             return { invalidator.invalidate() }
         }, transport: {
             let config = try configuration.cloudConfiguration()
             return AppleCloudTransport(container: config.container, environment: config.environment)
-        }, device: { state, create, name, strict, register in
-            try LocalDevice.open(directory: state, create: create, name: name, strictBiometrics: strict, authorize: { strict in
-                try Authentication.authorize(strictBiometrics: strict, reason: "unlock your Mop vaults", contextCreated: { context in
-                    let invalidator = ContextInvalidator(context)
-                    try register { invalidator.invalidate() }
-                })
-            })
         })
     }
 
-    // Internal injection keeps test keys and transports out of the public app API.
-    init(state: URL, identityKeys: (any IdentityKeyStore)? = nil, transport: @escaping () throws -> any CloudTransport,
-         device: @escaping DeviceFactory) {
-        worker = Worker(state: state, identityKeys: identityKeys, transport: transport, device: device)
+    // Internal injection keeps test keys/transports and authentication out of the public app API.
+    init(state: URL, identityKeys: any IdentityKeyStore, transport: @escaping () throws -> any CloudTransport,
+         authenticate: @escaping AccountAuthenticationFactory) {
+        worker = Worker(state: state, identityKeys: identityKeys, accountAuthentication: authenticate, transport: transport)
     }
     typealias AccountAuthenticationFactory = (Bool?, (@escaping @Sendable () -> Void) throws -> Void) throws -> (@Sendable () -> Void)
-    typealias DeviceFactory = (URL, Bool, String, Bool?, (@escaping @Sendable () -> Void) throws -> Void) throws -> any SessionDevice
 
     public func lock() {
         control.lock()
@@ -224,7 +179,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 if let result = try worker.published.read(operation, selection: vault, offline: offline, control: control, token: token) { return result }
             } catch {
                 if let failure = error as? MopError,
-                   [.authentication, .signing, .invalidDevice, .invalidVault, .vaultUntrusted, .deviceNotEnrolled, .cloudAccount].contains(failure),
+                   [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(failure),
                    control.generation == token { lock() }
                 throw error
             }
@@ -233,11 +188,9 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             guard control.generation == token else {
                 await gate.leave(); throw MopError.authentication
             }
-            var beganExecution = false
             do {
                 try control.check(token)
                 if worker.generation != token { worker.reset(); worker.generation = token }
-                beganExecution = true
                 let result: VaultResult
                 let cached = offline || (operation.allowsCachedRead && !NetworkAvailability.shared.isOnline)
                 do {
@@ -255,14 +208,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 return result
             } catch {
                 if let error = error as? MopError,
-                   [.authentication, .signing, .invalidDevice, .invalidVault, .vaultUntrusted, .deviceNotEnrolled, .cloudAccount].contains(error) {
+                   [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(error) {
                     if control.generation == token { control.lock() }
-                }
-                if beganExecution, case .pairing(let action) = operation {
-                    switch action {
-                    case .start, .join: worker.pairing = nil
-                    default: if Task.isCancelled { worker.pairing = nil }
-                    }
                 }
                 // A failed operation cannot leave a partially mutated store reusable.
                 worker.closeStores()
@@ -287,61 +234,39 @@ private final class Worker {
     let state: URL
     let documents: any DocumentAccessing
     let transportFactory: () throws -> any CloudTransport
-    let deviceFactory: NativeVaultService.DeviceFactory
     var generation = -1
-    var device: (any SessionDevice)?
     var repository: CloudRepository?
-    let identityKeys: (any IdentityKeyStore)?
+    let identityKeys: any IdentityKeyStore
     var accountIdentity: AccountIdentity?
-    let accountAuthentication: NativeVaultService.AccountAuthenticationFactory?
+    let accountAuthentication: NativeVaultService.AccountAuthenticationFactory
     var accountAuthenticationClose: (@Sendable () -> Void)?
     var stores: [UUID: CloudSecretStore] = [:]
     var snapshotDates: [UUID: Date] = [:]
     let published = PublishedSnapshots()
-    var pairing: ActivePairing?
-    init(state: URL, documents: any DocumentAccessing = SystemDocumentAccess(), identityKeys: (any IdentityKeyStore)? = nil, accountAuthentication: NativeVaultService.AccountAuthenticationFactory? = nil, transport: @escaping () throws -> any CloudTransport, device: @escaping NativeVaultService.DeviceFactory) {
+    init(state: URL, documents: any DocumentAccessing = SystemDocumentAccess(), identityKeys: any IdentityKeyStore, accountAuthentication: @escaping NativeVaultService.AccountAuthenticationFactory, transport: @escaping () throws -> any CloudTransport) {
         self.documents = documents; self.identityKeys = identityKeys; self.accountAuthentication = accountAuthentication
-        self.state = state; transportFactory = transport; deviceFactory = device
+        self.state = state; transportFactory = transport
     }
     func closeStores() { published.clear(); stores.values.forEach { $0.close() }; stores.removeAll(); snapshotDates.removeAll() }
-    func reset() { accountAuthenticationClose?(); accountAuthenticationClose = nil; pairing = nil; closeStores(); accountIdentity?.close(); accountIdentity = nil; device?.close(); device = nil; repository = nil }
+    func reset() { accountAuthenticationClose?(); accountAuthenticationClose = nil; closeStores(); accountIdentity?.close(); accountIdentity = nil; repository = nil }
     deinit { reset() }
 
     func publishSnapshots(control: SessionControl, token: Int) throws {
         try control.check(token)
         try published.update(stores: stores, dates: snapshotDates, offline: repository?.offline == true,
-                             opener: accountIdentity.map { $0 as any VaultKeyOpener } ?? device.map { $0 as any VaultKeyOpener }, generation: token)
+                             opener: accountIdentity.map { $0 as any VaultKeyOpener }, generation: token)
     }
 
-    func authorize(_ control: SessionControl, _ token: Int, create: Bool = false, name: String = "Mac", strict: Bool? = nil) throws -> any SessionDevice {
+    func userIdentity(_ repo: CloudRepository, control: SessionControl, token: Int, strict: Bool? = nil) async throws -> AccountIdentity {
         try control.check(token)
-        if let device {
-            // Explicit strict requests must still be checked against the saved ACL.
-            if strict == true, !device.strictBiometrics { throw MopError.invalidDevice }
-            return device
+        if let accountIdentity, strict != true { return accountIdentity }
+        if !control.authenticated || strict == true {
+            let close = try accountAuthentication(strict) { try control.register($0, token: token) }
+            do { try control.check(token); try control.authorized(token) } catch { close(); throw error }
+            accountAuthenticationClose?()
+            accountAuthenticationClose = close
         }
-        let opened = try deviceFactory(state, create, name, strict) { try control.register($0, token: token) }
-        do { try control.check(token); try control.authorized(token) }
-        catch { opened.close(); throw error }
-        device = opened
-        return opened
-    }
-    func userIdentity(_ repo: CloudRepository, control: SessionControl, token: Int, strict: Bool? = nil) async throws -> AccountIdentity? {
-        guard let identityKeys else { return nil }
         if let accountIdentity { return accountIdentity }
-        if !control.authenticated {
-            if let accountAuthentication {
-                let close = try accountAuthentication(strict) { try control.register($0, token: token) }
-                do { try control.check(token); try control.authorized(token) } catch { close(); throw error }
-                accountAuthenticationClose = close
-            } else { _ = try authorize(control, token, create: true) }
-        }
-        if let device, accountAuthentication != nil {
-            let policy = state.appendingPathComponent("account-authentication.json")
-            if !FileManager.default.fileExists(atPath: policy.path) {
-                try SafeFile.write(JSONEncoder().encode(device.strictBiometrics), to: policy)
-            }
-        }
         let identity = try await repo.accountIdentity(keys: identityKeys, create: !repo.offline) { try control.check(token) }
         do { try control.check(token) } catch { identity.close(); throw error }
         accountIdentity = identity
@@ -364,22 +289,13 @@ private final class Worker {
         if offline { (bytes, date) = try vault.cached() }
         else { bytes = try await vault.sync(); date = nil }
         try control.check(token)
-        let doc = try VaultDocument.decode(bytes)
-        if identityKeys != nil, offline, doc.header.membership == nil { throw MopError.conversionRequired }
+        _ = try VaultDocument.decode(bytes)
         guard let repository else { throw MopError.cloudAccount }
-        let legacy: (any SessionDevice)? = doc.header.membership == nil ? try authorize(control, token) : nil
-        let owner = try await userIdentity(repository, control: control, token: token)
-        let opener: any VaultKeyOpener
-        if let owner, doc.header.membership != nil { opener = owner }
-        else if let legacy { opener = legacy }
-        else { throw MopError.identityPending }
+        let opener = try await userIdentity(repository, control: control, token: token)
         snapshotDates[vault.id] = date ?? Date()
         if let existing = stores[vault.id], existing.snapshot == bytes { return (existing, date) }
         stores.removeValue(forKey: vault.id)?.close()
         let opened = try CloudSecretStore(vault: vault, snapshot: bytes, opener: opener, offline: offline)
-        if let owner, !offline, opened.membership == nil {
-            try await opened.adoptOwner(owner, beforePublish: { try control.check(token) })
-        }
         try control.check(token)
         stores[vault.id] = opened
         return (opened, date)
@@ -409,10 +325,6 @@ private final class Worker {
     }
 
     func execute(_ operation: VaultOperation, selection: String?, offline: Bool, control: SessionControl, token: Int) async throws -> VaultResult {
-        if case .pairing(.cancel(let id)) = operation {
-            if pairing?.invitation.session == id { pairing = nil }
-            return VaultResult()
-        }
         if case .passwordQuality = operation {
             guard control.authenticated else { throw MopError.authentication }
         }
@@ -435,17 +347,11 @@ private final class Worker {
         let repo = try await repo(offline: offline, control: control, token: token)
         var result = VaultResult()
         result.usingCache = offline
-        if case .pairing(let action) = operation {
-            guard identityKeys == nil else { throw MopError.cloudPermission }
-            guard !offline else { throw MopError.offlineWrite }
-            result.pairing = try await performPairing(action, selection: selection, repo: repo, control: control, token: token)
-            return result
-        }
         switch operation {
         case .discover:
-            let anchor = identityKeys != nil ? try await repo.identityAnchor() : nil
-            result.vaults = try await repo.descriptors(publicKey: LocalDevice.savedPublicKey(directory: state), identity: anchor?.identity)
-            if identityKeys != nil, anchor == nil, result.vaults.contains(where: { $0.format == "mop-vault-v5" }) { throw MopError.identityPending }
+            let anchor = try await repo.identityAnchor()
+            result.vaults = try await repo.descriptors(identity: anchor?.identity)
+            if anchor == nil, result.vaults.contains(where: { $0.format == "mop-vault-v5" }) { throw MopError.identityPending }
             result.defaultVault = try? repo.selected(nil).id.uuidString
             return result
         default: break
@@ -460,20 +366,18 @@ private final class Worker {
         case .sync:
             guard !offline else { throw MopError.offlineWrite }
             _ = try await vault.sync(); return result
-        case .create(let name, let deviceName, let strict, let recoveryURL):
+        case .create(let name, let strict, let recoveryURL):
             guard !offline else { throw MopError.offlineWrite }
             try VaultName.validate(name)
             try await repo.ensureAvailable(name)
             try control.check(token)
             _ = try OutputFile(url: recoveryURL, force: false, mode: 0o600, protectedFiles: [], protectedDirectories: [state])
             let owner = try await userIdentity(repo, control: control, token: token, strict: strict)
-            let device: any VaultKeyOpener = try (owner as (any VaultKeyOpener)?) ?? authorize(control, token, create: true, name: deviceName, strict: strict ? true : nil)
+            let device: any VaultKeyOpener = owner
             let recovery = RecoveryKey()
             try control.check(token)
             try recovery.save(to: recoveryURL)
-            let bytes: Data
-            if let owner { bytes = try VaultSession.createAccountSnapshot(id: vault.id, name: name, owner: owner, recovery: recovery) }
-            else { bytes = try VaultSession.createSnapshot(id: vault.id, name: name, device: DeviceRequest(name: deviceName, publicKey: device.publicKey), recovery: recovery) }
+            let bytes = try VaultSession.createAccountSnapshot(id: vault.id, name: name, owner: owner, recovery: recovery)
             let doc = try VaultDocument.decode(bytes)
             guard let slot = doc.header.recipients.first(where: { $0.publicKey == device.publicKey }) else { throw MopError.invalidVault }
             let fingerprint = try VaultTrust.fingerprint(document: doc, key: device.unwrap(slot, vaultID: vault.id))
@@ -481,9 +385,6 @@ private final class Worker {
             let created = try await repo.create(bytes, fingerprint: fingerprint)
             try control.check(token)
             let store = try CloudSecretStore(vault: created, snapshot: bytes, opener: device)
-            if let owner = try await userIdentity(repo, control: control, token: token) {
-                try await store.adoptOwner(owner, beforePublish: { try control.check(token) })
-            }
             stores[vault.id] = store
             result.catalog = try store.catalog()
             result.message = "Vault created. Move the recovery credential offline.\nAccess key fingerprint: \(VaultCoding.digest(device.publicKey))\nVault fingerprint: \(fingerprint)"
@@ -493,13 +394,11 @@ private final class Worker {
                   intent.id == vault.id, intent.exported else { throw MopError.invalidRecovery }
             guard intent.account == nil || intent.account == repo.accountID else { throw MopError.cloudAccount }
             let owner = try await userIdentity(repo, control: control, token: token, strict: intent.strict)
-            let device: any VaultKeyOpener = try (owner as (any VaultKeyOpener)?) ?? authorize(control, token, create: true, name: intent.deviceName, strict: intent.strict ? true : nil)
+            let device: any VaultKeyOpener = owner
             if intent.snapshot == nil {
                 try await repo.ensureAvailable(intent.name)
                 let recovery = try RecoveryKey(file: PendingVaultCreation.recoveryURL(state: state))
-                let bytes: Data
-                if let owner { bytes = try VaultSession.createAccountSnapshot(id: vault.id, name: intent.name, owner: owner, recovery: recovery) }
-                else { bytes = try VaultSession.createSnapshot(id: vault.id, name: intent.name, device: DeviceRequest(name: intent.deviceName, publicKey: device.publicKey), recovery: recovery) }
+                let bytes = try VaultSession.createAccountSnapshot(id: vault.id, name: intent.name, owner: owner, recovery: recovery)
                 let doc = try VaultDocument.decode(bytes)
                 guard let slot = doc.header.recipients.first(where: { $0.publicKey == device.publicKey }) else { throw MopError.invalidVault }
                 intent.fingerprint = try VaultTrust.fingerprint(document: doc, key: device.unwrap(slot, vaultID: vault.id))
@@ -526,9 +425,6 @@ private final class Worker {
             }
             try control.check(token)
             let store = try CloudSecretStore(vault: vault, snapshot: bytes, opener: device)
-            if let owner = try await userIdentity(repo, control: control, token: token) {
-                try await store.adoptOwner(owner, beforePublish: { try control.check(token) })
-            }
             stores[vault.id] = store
             result.catalog = try store.catalog()
             result.message = "Vault created. Keep the exported recovery credential offline.\nAccess key fingerprint: \(VaultCoding.digest(device.publicKey))\nVault fingerprint: \(fingerprint)"
@@ -536,9 +432,9 @@ private final class Worker {
             return result
         case .deleteVault:
             guard !offline else { throw MopError.offlineWrite }
-            // Legacy vault deletion also works on Macs without an enrolled device.
+            // Deletion does not require decrypting the vault, including unsupported formats.
             if !control.authenticated {
-                let context = try Authentication.authorize(reason: "delete this Mop vault and all its cloud history", contextCreated: { context in
+                let context = try AccountAuthenticationPolicy.authorize(state: state, reason: "delete this Mop vault and all its cloud history", contextCreated: { context in
                     let invalidator = ContextInvalidator(context)
                     try control.register({ invalidator.invalidate() }, token: token)
                 })
@@ -548,43 +444,28 @@ private final class Worker {
             } else { try await repo.delete(vault.id) }
             stores.removeValue(forKey: vault.id)?.close()
             return result
-        case .requests:
-            guard !offline else { throw MopError.offlineWrite }
-            for id in try await repo.transport.requests(vault: vault.id) {
-                try control.check(token)
-                let request = try await repo.request(id, vault: vault)
-                result.requests.append(Enrollment(request: id, name: request.name, fingerprint: request.fingerprint))
-            }
-            return result
         case .manage(let action):
             guard !offline else { throw MopError.offlineWrite }
             switch action {
-            case .request(let name, let strict):
-                let device = try authorize(control, token, create: true, name: name, strict: strict ? true : nil)
-                let id = try await repo.request(device.request, vault: vault)
-                result.message = "Request: \(id)\nCompare on the authorizing Mac: \(device.request.fingerprint)"
-                return result
             case .trust(let fingerprint):
                 guard VaultTrust.validFingerprint(fingerprint) else { throw MopError.invalidProcess }
                 let bytes = try await vault.sync()
-                let device = try authorize(control, token)
+                let device = try await userIdentity(repo, control: control, token: token)
                 try vault.establishTrust(bytes, opener: device, fingerprint: fingerprint, revision: nil)
                 stores.removeValue(forKey: vault.id)?.close()
                 result.message = "Vault key trusted for this account and vault."
                 return result
-            case .recover(let file, let name, let fingerprint):
+            case .recover(let file, let fingerprint):
                 guard VaultTrust.validFingerprint(fingerprint) else { throw MopError.invalidProcess }
                 let bytes = try await vault.sync()
                 try control.check(token)
+                let owner = try await userIdentity(repo, control: control, token: token)
                 let recovery = try RecoveryKey(file: file)
-                let device = identityKeys == nil ? try authorize(control, token, create: true, name: name) : nil
                 try vault.establishTrust(bytes, opener: recovery, fingerprint: fingerprint, revision: nil)
                 let store = try CloudSecretStore(vault: vault, snapshot: bytes, opener: recovery)
                 defer { store.close() }
                 try control.check(token)
-                if let owner = try await userIdentity(repo, control: control, token: token) {
-                    try await store.adoptOwner(owner, beforePublish: { try control.check(token) })
-                } else if let device { try await store.enroll(device.request, fingerprint: device.request.fingerprint) }
+                try await store.adoptOwner(owner, beforePublish: { try control.check(token) })
                 stores.removeValue(forKey: vault.id)?.close()
                 result.message = "Vault access recovered. Return the recovery credential offline."
                 return result
@@ -621,10 +502,8 @@ private final class Worker {
         case .write(let reference, let value, let replace):
             try await store.write(reference, value: value, replace: replace); result.catalog = try store.catalog()
         case .delete(let reference): try await store.delete(reference); result.catalog = try store.catalog()
-        case .devices:
+        case .members:
             result.members = store.membership?.members.map { VaultMemberRecord(id: $0.identity.id, role: $0.role.rawValue) } ?? []
-            result.devices = try store.recipients().filter { $0.publicKey != store.membership?.owner.encryptionKey }
-                .map { MacRecord(name: $0.name, fingerprint: $0.fingerprint) }
         case .rename(let name):
             try await repo.ensureAvailable(name, excluding: vault.id)
             try control.check(token)
@@ -639,155 +518,12 @@ private final class Worker {
         case .manage(let action):
             switch action {
             case .fingerprint: result.message = try store.fingerprint()
-            case .approve(let id, let fingerprint):
-                let request = try await repo.request(id, vault: vault)
-                try control.check(token)
-                guard request.fingerprint == fingerprint else { throw MopError.invalidDevice }
-                try await store.enroll(request, fingerprint: fingerprint)
-                result.message = "Device enrolled. Independently verify this vault fingerprint on the new device:\n\(try store.fingerprint())"
-            case .revoke(let fingerprint):
-                guard let device else { throw MopError.authentication }
-                try await store.revoke(fingerprint, currentDevice: device.publicKey)
-                result.message = "Device removed; historical copies remain decryptable. Independently verify the new fingerprint on remaining Macs:\n\(try store.fingerprint())"
             default: throw MopError.invalidProcess
             }
             result.catalog = try store.catalog()
         default: throw MopError.invalidProcess
         }
         return result
-    }
-}
-
-// Confined to NativeVaultService's operation gate, including across network awaits.
-private final class ActivePairing {
-    let invitation: PairingInvitation
-    let host: Bool
-    let originalFingerprint: String?
-    var request: PairingRequest?
-    var receiptBytes: Data?
-    var acknowledgementBytes: Data?
-    var awaitingTrust = false
-    var submitted = false
-    init(_ invitation: PairingInvitation, host: Bool, fingerprint: String? = nil, request: PairingRequest? = nil) {
-        self.invitation = invitation; self.host = host; originalFingerprint = fingerprint; self.request = request
-    }
-    func progress(complete: Bool = false) throws -> PairingProgress {
-        let phase: PairingProgress.Phase = complete ? .complete : (host ? (awaitingTrust ? .awaitingTrust : (request == nil ? .displaying : .comparing)) : .waiting)
-        return try PairingProgress(session: invitation.session, vault: invitation.vault,
-            expires: Date(timeIntervalSince1970: Double(invitation.expires)), phase: phase,
-            qr: phase == .displaying ? invitation.qr() : nil,
-            code: request.map { try invitation.confirmation($0) }, deviceName: request?.device.name)
-    }
-}
-
-private extension Worker {
-    func performPairing(_ action: PairingOperation, selection: String?, repo: CloudRepository,
-                        control: SessionControl, token: Int) async throws -> PairingProgress {
-        switch action {
-        case .start:
-            guard let selection, let id = UUID(uuidString: selection) else { throw MopError.vaultMissing }
-            let vault = try repo.vault(id)
-            let (store, _) = try await store(vault, offline: false, control: control, token: token)
-            try control.check(token)
-            let active = ActivePairing(PairingInvitation(vault: id, container: repo.transport.container, environment: repo.transport.environment),
-                                       host: true, fingerprint: try store.fingerprint())
-            pairing = active
-            return try active.progress()
-        case .join(let qr, let name, let strict):
-            let invitation = try PairingInvitation.parse(qr)
-            guard invitation.container == repo.transport.container, invitation.environment == repo.transport.environment else { throw PairingError.invalid }
-            // Check account access and the live zone before creating a device identity.
-            guard try await repo.pairingMessage(invitation, direction: .request) == nil else { throw PairingError.occupied }
-            let hasIdentity = try LocalDevice.savedPublicKey(directory: state) != nil || device != nil
-            let device = try authorize(control, token, create: true, name: name, strict: hasIdentity ? nil : (strict ? true : nil))
-            let request = PairingRequest(device: device.request)
-            let active = ActivePairing(invitation, host: false, request: request)
-            pairing = active
-            try control.check(token)
-            try await repo.publishPairing(invitation.seal(request, direction: .request), invitation: invitation, direction: .request)
-            try control.check(token)
-            return try active.progress()
-        case .cancel: throw PairingError.cancelled
-        case .poll(let id), .approve(let id):
-            guard let active = pairing, active.invitation.session == id else { throw PairingError.cancelled }
-            let invitation = active.invitation
-            try invitation.validate(); try control.check(token)
-            let vault = try repo.vault(invitation.vault)
-            if case .approve = action {
-                guard active.host, let request = active.request else { throw PairingError.invalid }
-                // sync() reconciles any previous uncertain write before this decision.
-                let (store, _) = try await store(vault, offline: false, control: control, token: token)
-                guard try store.fingerprint() == active.originalFingerprint else { throw MopError.vaultUntrusted }
-                let recipients = try store.recipients()
-                if !recipients.contains(where: { $0.publicKey == request.device.publicKey }) {
-                    guard !active.submitted else { throw MopError.vaultConflict }
-                    try invitation.validate(); try control.check(token)
-                    active.submitted = true
-                    try await store.enroll(request.device, fingerprint: request.device.fingerprint, beforePublish: {
-                        try invitation.validate(); try control.check(token)
-                    })
-                }
-                try invitation.validate(); try control.check(token)
-                if active.receiptBytes == nil {
-                    let receipt = try PairingReceipt(request: request, vaultFingerprint: store.fingerprint(), revision: VaultCoding.digest(store.snapshot))
-                    active.receiptBytes = try invitation.seal(receipt, direction: .response)
-                }
-                try await repo.publishPairing(active.receiptBytes!, invitation: invitation, direction: .response)
-                try control.check(token)
-                active.awaitingTrust = true
-                return try active.progress()
-            }
-            if active.host {
-                if active.awaitingTrust {
-                    if let bytes = try await repo.pairingMessage(invitation, direction: .acknowledgement) {
-                        guard let receiptBytes = active.receiptBytes else { throw PairingError.invalid }
-                        let receipt = try invitation.open(PairingReceipt.self, bytes: receiptBytes, direction: .response)
-                        let acknowledgement = try invitation.open(PairingAcknowledgement.self, bytes: bytes, direction: .acknowledgement)
-                        try acknowledgement.validate(receipt: receipt)
-                        try control.check(token)
-                        let result = try active.progress(complete: true)
-                        pairing = nil
-                        return result
-                    }
-                    return try active.progress()
-                }
-                if active.request == nil, let bytes = try await repo.pairingMessage(invitation, direction: .request) {
-                    let request = try invitation.open(PairingRequest.self, bytes: bytes, direction: .request)
-                    try request.validate(); try control.check(token)
-                    active.request = request
-                }
-            } else {
-                guard let request = active.request else { throw PairingError.invalid }
-                if let bytes = try await repo.pairingMessage(invitation, direction: .response) {
-                    let receipt = try invitation.open(PairingReceipt.self, bytes: bytes, direction: .response)
-                    try receipt.validate(request: request)
-                    let snapshot = try await vault.sync()
-                    let ancestry = try await vault.revisions()
-                    guard ancestry.first == VaultCoding.digest(snapshot), ancestry.contains(receipt.revision) else { throw MopError.vaultConflict }
-                    let opener = try authorize(control, token)
-                    guard opener.publicKey == request.device.publicKey else { throw PairingError.invalid }
-                    let doc = try VaultDocument.decode(snapshot)
-                    guard doc.header.recipients.contains(where: { $0.kind == "device" && $0.publicKey == opener.publicKey }) else { throw MopError.deviceNotEnrolled }
-                    try invitation.validate(); try control.check(token)
-                    try vault.establishTrust(snapshot, opener: opener, fingerprint: receipt.vaultFingerprint, revision: nil)
-                    let opened = try CloudSecretStore(vault: vault, snapshot: snapshot, opener: opener)
-                    stores.removeValue(forKey: vault.id)?.close(); stores[vault.id] = opened
-                    _ = try opened.catalog()
-                    // Completion on the Mac must mean that this phone has verified
-                    // and persisted trust, not merely that its public key was enrolled.
-                    if active.acknowledgementBytes == nil {
-                        active.acknowledgementBytes = try invitation.seal(PairingAcknowledgement(receipt: receipt), direction: .acknowledgement)
-                    }
-                    try control.check(token)
-                    try await repo.publishPairing(active.acknowledgementBytes!, invitation: invitation, direction: .acknowledgement)
-                    try control.check(token)
-                    let result = try active.progress(complete: true)
-                    pairing = nil
-                    return result
-                }
-            }
-            return try active.progress()
-        }
     }
 }
 

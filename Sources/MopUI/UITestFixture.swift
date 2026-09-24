@@ -62,7 +62,7 @@ final class UITestVaultService: VaultService, Sendable {
                 state.catalog.items.append(item)
                 state.catalog.revision = UUID().uuidString
             case .passwordQuality: return result
-            case .devices, .requests: return result
+            case .members: return result
             case .recentlyDeleted: break
             default: throw MopError.invalidProcess
             }
@@ -71,16 +71,5 @@ final class UITestVaultService: VaultService, Sendable {
             return result
         }
     }
-}
-/// Synthetic camera input is available only to explicitly opted-in simulator UI tests.
-@MainActor func pairingScannerFixture(scanned: (String) -> Void) -> String? {
-    guard ProcessInfo.processInfo.environment["MOP_UI_TESTING"] == "1",
-          let mode = ProcessInfo.processInfo.environment["MOP_UI_PAIRING_SCAN"] else { return nil }
-    if mode == "valid" || mode == "verification-fails" {
-        let invitation = PairingInvitation(vault: UUID(uuidString: UITestVaultService.vaultID)!, container: "iCloud.test", environment: "Development")
-        if let qr = try? invitation.qr() { scanned(qr) }
-        return "Simulated QR scan"
-    }
-    return "Camera access is unavailable. Enable Camera for Mop in Settings, or use manual enrollment."
 }
 #endif

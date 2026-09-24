@@ -32,9 +32,9 @@ Keychain enabled, and a provisioned signed application. See the
 
 Open the packaged `Mop.app` to browse secrets, copy references, view account
 membership, create vaults, and export encrypted backups. The app authenticates once per
-session across enrolled vaults and locks after configurable inactivity (1–60
-minutes, default 5). It calls the native vault libraries using the existing device
-state. Both apps start locked and automatically authenticate all connected vaults together.
+session across owned vaults and locks after configurable inactivity (1–60
+minutes, default 5). It calls the native vault libraries using the synchronized account
+identity. Both apps start locked and automatically authenticate all connected vaults together.
 Interaction resets the timeout; switching apps retains the session until it expires.
 Unconnected vaults have a distinct icon. A collapsible vault
 sidebar and All Vaults view keep items organized; editing supports inline item
@@ -57,9 +57,8 @@ All values remain encrypted in storage, backups, and iCloud. OTP fields display
 the current time-based code. CLI reads, template injection, and environment
 reference substitution return that code rather than the seed or provisioning URL.
 
-Existing fields default to concealed in a Custom item. Upgrade all Macs before
-saving typed items: older clients cannot read the extended encrypted index. Existing
-Existing v4 vaults receive a one-time online conversion to account membership.
+Existing untyped fields default to concealed in a Custom item. Only v5 vaults and
+backups are supported. Older formats are rejected; no conversion is provided.
 
 `mop item catalog --vault personal` returns JSON with the current revision, item
 and field types, saved order, and visible values (never concealed values).
@@ -80,8 +79,7 @@ immutable ciphertext and publishes changes with conditional, journaled commits.
 
 The app authenticates once per session; CLI secret commands authenticate per
 command. Account private keys synchronize through iCloud Keychain and are not
-Secure Enclave keys. Device-based vaults are authenticated once for conversion,
-then all encryption keys rotate and device recipients are removed.
+Secure Enclave keys. Legacy device credentials are not used. Account access replaces enrollment and pairing.
 
 Each named vault has its own stable UUID, CloudKit zone, signed membership, recovery
 credential, and trust fingerprint. In `mop://personal/service/token`, `personal`
@@ -152,15 +150,17 @@ in CloudKit or keep it next to a synchronized backup. A failed initialization
 retains any recovery file already written.
 
 References select their vault by name, independent of any saved default.
-`mop list` lists all enrolled named vaults with one authentication per command;
+`mop list` lists all owned named vaults with one authentication per command;
 `mop list --vault personal` selects one.
 Use `--vault NAME-OR-UUID` to constrain a reference command or select a management
 command's vault. `vault use` saves an account-scoped default for management only.
 A missing or ambiguous name is an error, never a fallback to another vault.
 `--cloud-vault` has been removed; `MOP_CLOUD_VAULT` no longer selects a vault.
-A new Mac can discover names with `vault list`, then use a name or UUID to enroll.
+A new device discovers owned vaults after its account identity arrives through iCloud Keychain.
 `vault list --json` returns descriptors with `id`, `name`, `format`, and `enrolled`.
-Discovery names/enrollment claims are unverified until authentication.
+The retained JSON field `enrolled` means that the account identity is a member;
+it does not describe per-device enrollment.
+Discovery names/membership claims are unverified until authentication.
 
 ```sh
 mop vault rename personal private
@@ -173,9 +173,10 @@ names from verified snapshots and may retain an old name until reconnecting.
 Concurrent creation/rename on separate Macs can produce duplicate names; select
 by UUID to rename one. Name availability checks do not provide a global lock.
 
-Version 0.5 uses new vault/manifest formats and has **no migration** from previous
-versions. Create fresh named vaults. Existing cloud data is left untouched; use
-an older client to access it. Older clients cannot open the new format.
+Only v5 vaults and backups are accepted. Existing v5 vaults remain supported,
+including ones converted by an older release. Pre-v5 vaults, credentials, and
+history have no supported conversion/access path. Existing cloud data is left
+untouched; use an older compatible client separately if you need that data.
 
 ### Delete a vault
 
@@ -187,9 +188,9 @@ mop vault delete VAULT_UUID --yes  # skip typing; authentication still required
 
 Deletion permanently removes the entire cloud zone, including history and staged
 records. It also clears that vault's local cache/trust and its saved default, if
-selected. Shared device identity and Keychain keys are preserved. Exported backups
+selected. The shared account identity and Keychain keys are preserved. Exported backups
 and caches on other Macs remain. Offline deletion is refused. Legacy deletion by
-UUID does not require decrypting the old format or enrolling in that vault.
+UUID does not require decrypting the old format or being a member of that vault.
 
 The GUI offers **Export backup…** and **Delete vault…** under **Vault actions**.
 The delete dialog requires typing the name (UUID for legacy vaults) and offers
@@ -203,10 +204,11 @@ remote deletion succeeded but local cleanup needs retrying. Mop checks remote
 absence before local cleanup and never automatically repeats a delete request.
 
 Local metadata defaults to `~/.mop`, overridden by `--state-directory` or
-`MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains public
-device metadata, account-scoped ciphertext caches, commit journals, and local
-trust pins. Account private keys live in iCloud Keychain. Legacy device keys
-are retained locally only for one-time conversion of remaining v4 vaults. Secret output cannot target the state directory.
+`MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains account-scoped
+ciphertext caches, commit journals, local authentication policy, and trust pins.
+Account private keys live in iCloud Keychain. Old device metadata is ignored;
+removing legacy support does not delete existing files or Keychain items.
+Secret output cannot target the state directory.
 
 ## Use another Mac, iPhone, or iPad
 
@@ -215,10 +217,9 @@ Owned vaults appear automatically once the identity reaches the device. There is
 no QR pairing or device enrollment step. If Mop reports that it is waiting for
 its identity, let Keychain synchronize and refresh the vault list.
 
-For existing v4 vaults, first open them online in an updated Mop on a previously
-connected device. Conversion rotates all keys and removes device access. Update
-all clients before using the converted vaults. Recovery credentials remain valid;
-old backups and historical revisions retain their old access.
+Old device credentials and v4 vaults cannot be opened by this version. There is no
+per-device revocation: all devices holding the account identity have the owner's
+access. See [account identities](docs/ACCOUNT-IDENTITY.md).
 
 ## Read, write, run, and inject
 
@@ -271,7 +272,7 @@ it becomes the offline snapshot. Push delivery and background execution are
 scheduled by the operating system, so updates are not guaranteed to be immediate.
 
 Only connection unavailability permits cached reads. Account, permission, trust,
-revocation, and missing-vault errors remain errors. A device needs an initial
+ownership, and missing-vault errors remain errors. A device needs an initial
 online authenticated opening before its vault is available offline.
 
 ### Command-line offline operation
@@ -291,7 +292,7 @@ Only `read`, `list`, `item catalog`, `run`, `inject`, and encrypted `export` acc
 They use the last authenticated cache, require local authentication, and print its
 fetch time to stderr. There is no implicit fallback after network errors. A sync
 without authentication downloads ciphertext but does not promote it to the
-verified offline snapshot. Offline use cannot detect remote revocation or an
+verified offline snapshot. Offline use cannot detect remote ownership changes or an
 account change not yet observed locally. An observed sign-out invalidates the
 account binding; caches and defaults are isolated by account, container, environment,
 and vault UUID.
@@ -302,19 +303,19 @@ reconcile its recorded revision against committed ancestry before another write.
 A live local writer holds a process lock. Interrupted staging is never exposed as
 a committed vault and is never automatically replayed.
 
-## Migration, backups, history, and recovery
+## Backups, v5 history, and recovery
 
 Operational storage uses named CloudKit vaults.
-Retain your device state for one-time conversion. References select named vaults;
-import accepts current backups and converts authenticated v4 backups:
+References select named vaults. Import accepts only v5 backups:
 
 ```sh
 mop vault import --file /path/to/existing.mopfile
 mop vault export --out-file /path/to/backup.mopfile
 ```
 
-Import requires the source's established local trust, or `--fingerprint` /
-`--revision` evidence obtained independently. It preserves vault
+An owned backup can be verified using the synchronized identity. Recovery-key
+imports require established local trust or `--fingerprint` / `--revision` evidence
+obtained independently. It preserves vault
 identity and recovery relationships, refuses an existing destination head, and
 never deletes or modifies the source file. Export creates a verified encrypted v5
 backup; it does not include the recovery private key. Preserve the printed UUID.
@@ -322,19 +323,20 @@ backup; it does not include the recovery private key. Preserve the printed UUID.
 ```sh
 mop vault conflicts
 mop vault resolve --revision COMMITTED_REVISION_HASH
-mop vault recover --recovery-file /offline/recovery.key --name 'Replacement Mac' \
+mop vault recover --recovery-file /offline/recovery.key \
   --fingerprint INDEPENDENT_VAULT_FINGERPRINT
 ```
 
-History lists only committed ancestry, never abandoned uploads. Restoration keeps
+History lists only committed v5 ancestry, never abandoned uploads, and stops at
+the first v4 ancestor. Pre-v5 history cannot be restored. Restoration requires a
+v5 revision decryptable by the current owner and keeps
 the current vault name, recipients, and keys. Imported history starts at the imported snapshot;
 file-vault backends and external `.history` directories are no longer supported.
 Encrypted backup import/export remains supported. Immutable cloud revisions and
 abandoned staged records are retained in this version and count toward quota.
 
 Recovery restores vault access for the destination account after local authentication and trust verification.
-For a deleted cloud zone, explicitly import an encrypted export. If no enrolled
-device remains, use `vault import --file BACKUP --recovery-file KEY --fingerprint
+For a deleted cloud zone, explicitly import an encrypted export. If the backup belongs to another account, use `vault import --file BACKUP --recovery-file KEY --fingerprint
 FINGERPRINT` to verify the backup and wrap its keys for the account before publication.
 The source backup remains unchanged.
 Missing zones are never silently recreated by ordinary commands.
@@ -357,8 +359,8 @@ erasure from Swift-managed memory or from historical copies.
 Diagnostics go to stderr without secret values or arbitrary CloudKit error text.
 Exit codes: 2 invalid arguments/offline mutation/legacy file options; 3 authentication;
 4 missing secret; 5 duplicate/output exists; 6 Keychain; 7 I/O; 8 signing;
-9 missing vault/default; 10 invalid vault; 11 conflict; 12 unavailable enclave;
-13 unenrolled device; 14 invalid device/recovery; 15 unsafe file;
+9 missing vault/default; 10 invalid vault; 11 conflict; 12 reserved;
+13 identity not a vault member; 14 invalid identity/recovery; 15 unsafe file;
 16 untrusted vault/rollback; 17 cloud unavailable; 18 cloud account;
 19 quota; 20 throttling; 21 cloud permission; 22 uncertain commit;
 126 launch failure; 127 executable missing. Child status is otherwise propagated.

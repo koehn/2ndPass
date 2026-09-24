@@ -7,7 +7,7 @@ Install mop using either method in the [README](../README.md#install) and make
 sure `mop` is on your `PATH`. Start with an initialized vault and the relevant
 third-party CLI installed. Each
 `mop write` below prompts for a value; paste the actual credential at that prompt.
-On subsequent updates, add `--replace`. The selected `.mopfile` must contain the referenced fields.
+On subsequent updates, add `--replace`. The named CloudKit vault must contain the referenced fields.
 Run these commands from a logged-in Mac; secret access requires Touch ID or your
 system password.
 
@@ -222,7 +222,7 @@ If the output file exists, mop refuses to replace it unless you explicitly add
 the key is still handled by SSH. This workflow stores UTF-8 key text and does not
 provide an SSH agent, generate keys, or convert their formats.
 
-For enrollment, recovery, rotation, and trust errors, see
+For account access, recovery, and trust errors, see
 [Security and key management](SECURITY.md).
 
 ## Adapt an existing op workflow

@@ -13,12 +13,13 @@ In CloudKit Console's **development** environment create these record types:
 | Record type | Field | Type | Record IDs |
 |---|---|---|---|
 | MopHead | payload | Asset | `head` |
-| MopBlob | payload | Asset | `s-<ciphertext SHA256>` or `m-<revision SHA256>` |
-| MopRequest | payload | Asset | `q-<device public-key fingerprint>` |
+| MopBlob | payload | Asset | `s-<ciphertext SHA256>`, `m-<revision SHA256>`, or `account-identity-v1` |
 
-Enable the `recordName` queryable index for MopRequest (the request list uses a
-zone-scoped all-records query). Do not add indexes on payloads. All writes use a
-custom `mop-<UUID>` zone; no public database permissions or share records are used.
+No query indexes are required: v5 fetches records by ID. Vault data uses custom
+`mop-<UUID>` zones. The reserved identity zone
+`mop-7C6F7075-7365-4273-8964-656E74697479` contains the public identity anchor and is
+excluded from vault discovery. No public database or CloudKit shares are used.
+The obsolete MopRequest type may remain on the server but is never read or written.
 Use CloudKit Console to deploy the tested schema to production before release.
 Schema deployment is an administrative action, not an application startup task.
 The implementation must never use `CKSyncEngine` or silently recreate deleted
@@ -27,7 +28,7 @@ zones during normal reads/writes.
 The `payload` asset already contains mop ciphertext, or public metadata for
 requests. A manifest contains the existing authenticated header and encrypted
 index plus a map from secret record UUID to ciphertext hash. Reconstructing the
-canonical v4 document authenticates the complete record table. A manifest's ID is
+canonical signed v5 document authenticates the complete record table. A manifest's ID is
 the hash of that complete document, not the hash of the manifest bytes.
 
 Only the small head record is mutable. Its save uses the fetched record's system
@@ -37,44 +38,40 @@ uploads are retained but are not reachable through committed history.
 
 ## Signed acceptance procedure (required before release)
 
-Use disposable data in a development container and two Macs signed into the same
-Apple Account. Use the same signing identity/App ID on both Macs, and isolated
-`MOP_STATE_DIRECTORY` locations. Keep all recovery material offline after testing;
-record the test vault UUIDs for deliberate cleanup in CloudKit Console.
+Use a dedicated test Apple Account and disposable v5 data in Development. Sign
+Mac/iPhone/iPad builds with matching access groups, container, and environment.
+Isolated local state directories do not isolate the synchronized account identity.
+Keep recovery credentials and independently recorded fingerprints separate.
 
-1. On A run `vault init personal`, write at least two secrets, export a v4 backup, and verify
-   the values. Inspect CloudKit Console: it must contain no plaintext secret value
-   or secret reference. Note the authenticated vault fingerprint independently.
-2. On B list/use the UUID, publish `device request`. On A approve it after comparing
-   B's displayed fingerprint. On B use `vault trust` with A's fingerprint and read.
-3. Edit one secret on A. On B sync/read and confirm unchanged encrypted secret
-   records are reused. Check that both caches have the same canonical revision.
-4. Start concurrent writes from both Macs. A stale head save must return code 11;
-   verify the winning value, then retry the losing command. Never accept silent
-   last-writer-wins replacement.
-5. Authenticate a read on B, disconnect the network, and verify an explicit
-   `read --offline`. Ordinary online reads must fail rather than use the cache;
-   `write --offline` must fail before accepting secret input. Reconnect.
-6. Remove B on A. Confirm the head changes only after all rotated records exist.
-   B's online read fails; A still reads. Previously cached offline data remains
-   accessible to B by design. Re-enrollment requires explicit approval/recovery.
-7. Re-pin the new fingerprint on another remaining Mac. Restore an older revision
-   and confirm the removed device is not reinstated. Exercise recovery into fresh
-   local state with the offline key and independent fingerprint.
-8. Interrupt a process during staging and just after head submission. `vault sync`
-   must report committed/not-committed without replaying mutations; repeat after
-   key rotation. Test quota/throttling handling and a deleted test zone.
-9. Sign out/change accounts and verify isolation. No previous default/cache may
-   silently become the other account's vault. Explicit offline reads cannot prove
-   an unobserved account change or remote revocation.
-10. Repeat authentication checks with default password fallback and strict
-    biometric mode. Run the separately provisioned enclave probe's no-prompt
-    denial and foreign-access-group checks from VALIDATION.md.
+1. On A run `mop vault init personal --recovery-file /offline/personal.key`,
+   write two secrets, export a v5 backup, and verify values. Inspect CloudKit:
+   no plaintext values, item paths, account private keys, or recovery keys.
+2. Enable iCloud Passwords & Keychain on B. Wait for identity delivery, then
+   discover and read the owned vault with local authentication. There is no
+   enrollment/approval step. Missing synchronized keys must cause a waiting error.
+3. Edit on A and refresh/read on B. Unchanged encrypted records are reused.
+   Concurrent writes must yield a single conditional-head winner and a conflict
+   for a stale writer, without silent overwrites.
+4. Verify explicit CLI `--offline` reads and refusal of offline writes. Native
+   apps may automatically fall back only on connectivity failures. Reconnect and
+   verify refresh without losing a draft or exposing an uncommitted write.
+5. Restore a committed v5 revision. Confirm current name, membership, and keys
+   remain authoritative. Pre-v5 history is excluded and cannot be restored.
+6. Interrupt staging and head submission. Sync must reconcile uncertain outcomes
+   without replaying a mutation. Repeat during recovery to a new owner with a
+   usable identity, verifying rotation and independent trust evidence.
+7. Change/sign out of accounts and test Development/Production separation.
+   Observe missing-anchor and delayed-key failures, rather than identity reset.
+   Test deleted zones, throttling/quota failures, and backup import into an absent
+   head. Ordinary commands must not recreate a missing zone.
+8. Perform the physical authentication, signing, lifecycle, clipboard, recovery,
+   and accessibility checks in [VALIDATION.md](VALIDATION.md). Device revocation
+   is not a v5 capability; do not claim it was tested.
 
-After development acceptance, promote the schema and package Production. Use a
-new disposable production vault for initialize/write/read/export on a signed
-build. Record build identity, macOS versions, environment, UUIDs, and test results.
-**Do not publish a release until these checks pass.**
+After Development acceptance, promote the schema and use a new disposable
+Production vault for signed initialize/write/read/export/recovery checks. Record
+build/signing identity, OS versions, environment, test UUIDs, and outcomes.
+Do not publish until the required acceptance passes.
 
 ## Failure and recovery behavior
 
@@ -90,23 +87,26 @@ cached contents. A locally generated pending fingerprint permits finishing our
 own interrupted initialization/key rotation, never trusting a fingerprint fetched
 from CloudKit.
 
-Exports are encrypted v4 documents and can be imported only into an absent head.
+Exports are encrypted v5 documents and can be imported only into an absent head.
 An import is an explicit creation operation; it may recreate a previously deleted
 zone after verification. Import does not bring along older external history files.
 There is no automatic history/staging garbage collector yet. Delete disposable
 zones in CloudKit Console after acceptance and remove only their isolated local
-state/Keychain items. Never delete a live device's key as test cleanup.
+fixtures. Never delete the synchronized account identity as vault-test cleanup;
+that deletion propagates to other devices.
 
-## Named vaults (0.5)
+## Named v5 vaults
 
-New manifests use `mop-cloud-manifest-v2`, containing `mop-vault-v4` headers
+New manifests use `mop-cloud-manifest-v2`, containing `mop-vault-v5` headers
 with a required name. The encrypted index maps relative `item/[section/]field`
 paths to record IDs. UUID-based zones and record encryption remain unchanged;
 the existing v3 cryptographic domain strings are retained because their key-wrap
 and value-encryption protocols are unchanged. Header names are included in index
 associated data, so changing an unauthenticated discovery name cannot authorize
 access. Rename publishes a normal revision without uploading new secret blobs.
-Restoring history retains the current name and authorization.
+Restoring supported v5 history retains the current name and authorization.
+Traversal stops at a v4 ancestor without downloading its secret records. Older
+backups and vault heads are rejected, with no conversion or automatic deletion.
 
 Discovery reads committed heads/manifests without decrypting secrets. Legacy
 manifests are reported but not opened. Creation/import/rename check current name

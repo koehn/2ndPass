@@ -19,7 +19,7 @@ public final class VaultSession: SecretStore {
     public init(snapshot: Data, trust: VaultTrust, opener: any VaultKeyOpener,
                 onClose: @escaping () -> Void = {}) throws {
         let document = try VaultDocument.decode(snapshot)
-        guard let slot = document.header.recipients.first(where: { $0.publicKey == opener.publicKey }) else { throw MopError.deviceNotEnrolled }
+        guard let slot = document.header.recipients.first(where: { $0.publicKey == opener.publicKey }) else { throw MopError.notVaultMember }
         let key = try opener.unwrap(slot, vaultID: document.header.vaultID)
         if let identity = opener as? AccountIdentity, let membership = document.header.membership {
             guard membership.owner == identity.identity,
@@ -265,44 +265,21 @@ public final class VaultSession: SecretStore {
         return true
     }
 
-    public func recipients() throws -> [DeviceRequest] {
-        _ = try requireKey()
-        return try document.header.recipients.filter { $0.kind == "device" }.map { try DeviceRequest(name: $0.name, publicKey: $0.publicKey) }
-    }
-
-    public func enroll(_ request: DeviceRequest, expectedFingerprint: String) throws {
-        guard document.header.membership == nil else { throw MopError.cloudPermission }
-        let key = try requireKey()
-        try request.validate()
-        guard request.fingerprint == expectedFingerprint else { throw MopError.invalidDevice }
-        guard !document.header.recipients.contains(where: { $0.fingerprint == request.fingerprint }) else { throw MopError.duplicate }
-        guard document.header.recipients.count < 64 else { throw MopError.invalidVault }
-        var header = document.header
-        header.recipients.append(try VaultDocument.wrap(key: key, request: request, kind: "device", vaultID: header.vaultID))
-        let opener = try requireOpener()
-        var records = document.records
-        for (id, record) in records {
-            records[id] = try record.enrolling(request, id: id, vaultID: header.vaultID, opener: opener)
-        }
-        try commit(index: index, records: records, header: header)
-    }
-
     public var membership: VaultMembership? { document.header.membership }
 
-    /// One-way conversion of an authenticated personal vault. Rotate all keys,
-    /// replace device slots with the owner, and retain the recovery credential.
+    /// Recovery may transfer a v5 vault to a new account, rotating every key.
     public func adoptOwner(_ owner: AccountIdentity) throws {
-        if let membership = document.header.membership {
-            if membership.owner == owner.identity { self.opener = owner; return }
-            guard let opener, document.header.recipients.contains(where: { $0.kind == "recovery" && $0.publicKey == opener.publicKey }) else { throw MopError.cloudPermission }
-        }
+        _ = try requireKey()
+        guard let membership = document.header.membership else { throw MopError.invalidVault }
+        if membership.owner == owner.identity { self.opener = owner; return }
+        guard let opener, document.header.recipients.contains(where: { $0.kind == "recovery" && $0.publicKey == opener.publicKey }) else { throw MopError.cloudPermission }
         _ = try requireKey()
         let key = SymmetricKey(size: .bits256), priorOpener = try requireOpener()
         var header = document.header
         guard let recovery = header.recipients.first(where: { $0.kind == "recovery" }) else { throw MopError.invalidVault }
         header.recipients = try [
             VaultDocument.wrap(key: key, request: owner.request, kind: "member", vaultID: header.vaultID),
-            VaultDocument.wrap(key: key, request: DeviceRequest(name: recovery.name, publicKey: recovery.publicKey), kind: "recovery", vaultID: header.vaultID)
+            VaultDocument.wrap(key: key, request: RecipientKey(name: recovery.name, publicKey: recovery.publicKey), kind: "recovery", vaultID: header.vaultID)
         ].sorted { $0.fingerprint < $1.fingerprint }
         var records: [String: VaultRecord] = [:]
         for (id, record) in document.records {
@@ -314,26 +291,6 @@ public final class VaultSession: SecretStore {
         self.opener = owner
         do { try commit(index: index, records: records, header: header, newKey: key) }
         catch { self.opener = priorOpener; throw error }
-    }
-
-    public func revoke(_ fingerprint: String, currentDevice: Data) throws {
-        guard document.header.membership == nil else { throw MopError.cloudPermission }
-        _ = try requireKey()
-        guard fingerprint != VaultCoding.digest(currentDevice),
-              document.header.recipients.contains(where: { $0.kind == "device" && $0.fingerprint == fingerprint }) else { throw MopError.invalidDevice }
-        var header = document.header
-        let newKey = SymmetricKey(size: .bits256)
-        header.recipients = try header.recipients.filter { $0.fingerprint != fingerprint }.map {
-            try VaultDocument.wrap(key: newKey, request: DeviceRequest(name: $0.name, publicKey: $0.publicKey), kind: $0.kind, vaultID: header.vaultID)
-        }
-        // Rotate every value key: deleting recipient slots alone leaves old keys useful.
-        var records: [String: VaultRecord] = [:]
-        let opener = try requireOpener()
-        for (id, record) in document.records {
-            let value = try record.read(id: id, vaultID: header.vaultID, opener: opener)
-            records[id] = try VaultRecord.create(value: value, id: id, header: header)
-        }
-        try commit(index: index, records: records, header: header, newKey: newKey)
     }
 
     private func commit(index: [String: String], records: [String: VaultRecord], header: VaultHeader? = nil, newKey: SymmetricKey? = nil, items: [VaultItem]? = nil) throws {
@@ -374,16 +331,6 @@ public final class VaultSession: SecretStore {
         try trust.pin(document: document, key: requireKey())
     }
 
-    public static func createSnapshot(id: UUID = UUID(), name: String, device: DeviceRequest, recovery: RecoveryKey) throws -> Data {
-        let key = SymmetricKey(size: .bits256)
-        let recipients = try [
-            VaultDocument.wrap(key: key, request: device, kind: "device", vaultID: id),
-            VaultDocument.wrap(key: key, request: recovery.request, kind: "recovery", vaultID: id)
-        ].sorted { $0.fingerprint < $1.fingerprint }
-        let header = VaultHeader(format: "mop-vault-v4", vaultID: id, name: name, generation: 1, parent: nil, recipients: recipients)
-        return try VaultCoding.encode(VaultDocument.seal(header: header, index: [:], records: [:], key: key))
-    }
-
     public static func createAccountSnapshot(id: UUID = UUID(), name: String, owner: AccountIdentity, recovery: RecoveryKey) throws -> Data {
         let key = SymmetricKey(size: .bits256)
         let recipients = try [
@@ -403,7 +350,7 @@ public final class VaultSession: SecretStore {
               VaultTrust.validFingerprint(fingerprint ?? revision ?? "") else { throw MopError.vaultUntrusted }
         if let revision { guard VaultCoding.digest(bytes) == revision else { throw MopError.vaultUntrusted } }
         let doc = try VaultDocument.decode(bytes)
-        guard let slot = doc.header.recipients.first(where: { $0.publicKey == opener.publicKey }) else { throw MopError.deviceNotEnrolled }
+        guard let slot = doc.header.recipients.first(where: { $0.publicKey == opener.publicKey }) else { throw MopError.notVaultMember }
         let key = try opener.unwrap(slot, vaultID: doc.header.vaultID)
         if let fingerprint { guard VaultTrust.fingerprint(document: doc, key: key) == fingerprint else { throw MopError.vaultUntrusted } }
         _ = try doc.decryptIndex(key: key)
@@ -414,7 +361,7 @@ public final class VaultSession: SecretStore {
         let selected = try VaultDocument.decode(bytes)
         guard selected.header.vaultID == document.header.vaultID,
               let slot = selected.header.recipients.first(where: { $0.publicKey == opener?.publicKey }),
-              document.header.recipients.contains(where: { $0.publicKey == opener?.publicKey && ["device", "member"].contains($0.kind) }) else { throw MopError.deviceNotEnrolled }
+              document.header.recipients.contains(where: { $0.publicKey == opener?.publicKey && $0.kind == "member" }) else { throw MopError.notVaultMember }
         let opener = try requireOpener()
         let oldKey = try opener.unwrap(slot, vaultID: document.header.vaultID)
         try trust.verify(document: selected, key: oldKey, historical: true)

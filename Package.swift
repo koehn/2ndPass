@@ -14,7 +14,6 @@ let package = Package(
         .executable(name: "mop", targets: ["MopCLI"]),
         .executable(name: "MopApp", targets: ["MopApp"]),
         .executable(name: "mop-keychain-check", targets: ["MopKeychainCheck"]),
-        .executable(name: "mop-enclave-check", targets: ["MopEnclaveCheck"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.8.2"),
@@ -36,7 +35,6 @@ let package = Package(
             .product(name: "ArgumentParser", package: "swift-argument-parser"),
         ]),
         .executableTarget(name: "MopKeychainCheck", dependencies: ["MopCore", "MopKeychain", "MopAuth"]),
-        .executableTarget(name: "MopEnclaveCheck", dependencies: ["MopCore", "MopAuth", "MopVault", "MopKeychain"]),
         .testTarget(name: "MopCLITests", dependencies: ["MopCLI", "MopCore", "MopVault"]),
         .testTarget(name: "MopCoreTests", dependencies: ["MopCore"]),
         .testTarget(name: "MopKeychainTests", dependencies: ["MopKeychain", "MopCore"]),

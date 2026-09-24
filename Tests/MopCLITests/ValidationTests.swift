@@ -26,3 +26,13 @@ import MopCore
         }
     }
 }
+
+@Test(arguments: [
+    ["device", "request"], ["device", "requests"], ["device", "list"],
+    ["device", "add", "request", "--fingerprint", String(repeating: "a", count: 64)],
+    ["device", "remove", String(repeating: "a", count: 64)],
+    ["vault", "init", "personal", "--recovery-file", "/tmp/unused", "--device-name", "old-device"],
+    ["vault", "recover", "--recovery-file", "/tmp/unused", "--name", "old-device"]
+]) func removedDeviceCommandsAndOptionsAreRejected(arguments: [String]) {
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(arguments) }
+}

@@ -5,7 +5,7 @@ import MopCore
 import MopVault
 
 /// Foreground operations with per-operation request/resource deadlines. No secrets
-/// are passed here: payloads are ciphertext or public enrollment metadata.
+/// are passed here: payloads are ciphertext or public identity metadata.
 public final class AppleCloudTransport: CloudTransport, @unchecked Sendable {
     public let container: String
     public let environment: String
@@ -184,41 +184,6 @@ public final class AppleCloudTransport: CloudTransport, @unchecked Sendable {
         let coder = NSKeyedArchiver(requiringSecureCoding: true)
         saved.encodeSystemFields(with: coder); coder.finishEncoding()
         return CloudObject(data: data, version: coder.encodedData)
-    }
-
-    public func requests(vault: UUID) async throws -> [String] {
-        var cursor: CKQueryOperation.Cursor?
-        var ids: [String] = []
-        repeat {
-            let page: ([String], CKQueryOperation.Cursor?) = try await withCheckedThrowingContinuation { continuation in
-                let rows = Mutex<[String]>([])
-                let failure = Mutex<MopError?>(nil)
-                let op = cursor.map { CKQueryOperation(cursor: $0) } ?? CKQueryOperation(query: CKQuery(recordType: CloudKind.request.rawValue, predicate: NSPredicate(value: true)))
-                configure(op); op.zoneID = zone(vault); op.desiredKeys = []; op.resultsLimit = 100
-                op.recordMatchedBlock = { id, result in
-                    switch result { case .success: rows.withLock { $0.append(id.recordName) }
-                    case .failure(let error): failure.withLock { $0 = Self.mapQuery(error) } }
-                }
-                op.queryResultBlock = { result in
-                    if let error = failure.withLock({ $0 }) { continuation.resume(throwing: error); return }
-                    switch result { case .success(let cursor): continuation.resume(returning: (rows.withLock { $0 }, cursor))
-                    case .failure(let error): continuation.resume(throwing: Self.mapQuery(error)) }
-                }
-                database.add(op)
-            }
-            ids += page.0; cursor = page.1
-            guard ids.count <= 10_000 else { throw MopError.invalidVault }
-        } while cursor != nil
-        return ids.sorted()
-    }
-
-    // A query has no individual record target: unknownItem here means the
-    // queried record type is unavailable, rather than an absent request.
-    static func mapQuery(_ error: Error) -> MopError {
-        if let cloudError = error as? CKError, cloudError.code == .unknownItem {
-            return .cloudInvalidRequest
-        }
-        return map(error)
     }
 
     static func map(_ error: Error) -> MopError {

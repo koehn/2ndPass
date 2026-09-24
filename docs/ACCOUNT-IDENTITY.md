@@ -48,7 +48,7 @@ one owner. Adding members, changing roles, CloudKit shared databases, cross-acco
 invitations, and an owner-authority transition protocol are not implemented. They
 must not be approximated by inserting unsigned recipients or trusting cloud-only
 public keys. Apple Account membership grants all that account's devices access;
-there is no independent per-device revocation after conversion.
+there is no independent per-device revocation in v5.
 
 Fresh devices authenticate a v5 vault against their Keychain-delivered identity,
 verify its signed key fingerprint and encrypted contents, then save local trust.
@@ -56,23 +56,18 @@ The existing watermark and committed ancestry checks remain in force. Previously
 unseen devices cannot detect every server replay of valid historical state; this
 is not a global freshness or server-availability guarantee.
 
-## One-time conversion
+## Supported formats and history
 
-Opening a v4 vault online on a previously connected device first authenticates
-its existing device key, local trust, and contents. Mop then creates owner
-membership, rotates the index key and every value key, and removes all device
-recipient slots. It preserves the vault UUID, items, metadata, history, and recovery
-credential. The converted revision and new trust fingerprint become current only
-after the conditional commit is confirmed. Uncertain results require journal
-reconciliation before another attempt. Cancellation before publication leaves the
-old head intact. Ordinary offline access to v4 requires conversion first.
+Only v5 vaults and backups are accepted. Legacy device credentials are never
+opened, and there is no pairing, enrollment, device revocation, or conversion
+path. Older cloud objects and local files are left untouched; an older compatible
+client is needed to access them separately.
 
-The old local device credential is retained only so that other unconverted vaults
-can be authenticated for conversion. It cannot decrypt a converted revision.
-Historical revisions and exported old backups remain decryptable with their old
-credentials. Older applications cannot open v5 vaults; update all devices. QR
-pairing, camera permission, and device-enrollment UI/CLI commands have been removed
-from the normal application flow.
+Existing v5 vaults created by an earlier conversion remain supported. History
+listing stops before the first v4 ancestor, and pre-v5 revisions cannot be
+restored. Restore accepts only committed v5 revisions decryptable by the current
+owner. Historical objects are not automatically deleted. Import begins a new
+history root at the verified v5 snapshot.
 
 ## Recovery and backups
 
@@ -91,14 +86,14 @@ Cross-account sharing and collaborative account recovery require further design.
 ## Validation and physical acceptance
 
 Unit/integration tests use software test keys and fake CloudKit/Keychain storage.
-They exercise signed membership, tampering, key rotation, recovery, concurrent
+They exercise signed membership, old-format rejection, recovery key rotation, concurrent
 identity selection, delayed Keychain delivery, dropped acknowledgements, account
 changes, cancellation, and a new device opening multiple owned vaults. Simulator
 UI fixtures remain Debug-only; production authentication is not bypassed.
 
 Before release, test signed Mac and iPhone/iPad builds with matching Keychain access
-groups: convert an existing vault, create a new one, wait for Keychain sync, open
-both on a fresh device without pairing, edit from each device, lock/relaunch,
+groups: create multiple v5 vaults, wait for Keychain sync, open
+them on a fresh device, edit from each device, lock/relaunch,
 disable/re-enable Keychain sync, and verify backup recovery. Also test different
 Apple Accounts and Development/Production isolation. Simulator tests cannot prove
 real iCloud Keychain delivery or Face ID/Touch ID behavior.

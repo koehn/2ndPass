@@ -7,7 +7,6 @@ import MopVault
 public struct PendingVaultCreation: Codable, Sendable {
     public let id: UUID
     public let name: String
-    public let deviceName: String
     public let strict: Bool
     public var exported = false
     public var account: String?
@@ -24,17 +23,16 @@ public struct PendingVaultCreation: Codable, Sendable {
         return try JSONDecoder().decode(Self.self, from: SafeFile.read(url, privateFile: true))
     }
 
-    public static func prepare(name: String, deviceName: String, strict: Bool, state: URL) throws -> Self {
+    public static func prepare(name: String, strict: Bool, state: URL) throws -> Self {
         try VaultName.validate(name)
-        guard !deviceName.isEmpty else { throw MopError.invalidDevice }
         try SafeFile.privateDirectory(state)
         try SafeFile.privateDirectory(directory(state: state))
         let intent: Self
         if let existing = try load(state: state) {
-            guard existing.name == name, existing.deviceName == deviceName, existing.strict == strict else { throw MopError.duplicate }
+            guard existing.name == name, existing.strict == strict else { throw MopError.duplicate }
             intent = existing
         } else {
-            intent = Self(id: UUID(), name: name, deviceName: deviceName, strict: strict)
+            intent = Self(id: UUID(), name: name, strict: strict)
             try intent.save(state: state)
         }
         let key = recoveryURL(state: state)

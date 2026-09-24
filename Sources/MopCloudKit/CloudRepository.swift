@@ -52,8 +52,8 @@ public final class CloudRepository {
 
     public func list() async throws -> [UUID] { try await online(); return try await transport.zones().filter { $0 != Self.identityZone } }
 
-    /// Header discovery does not authenticate names or enrollment claims.
-    public func descriptors(publicKey: Data? = nil, identity: UserIdentity? = nil) async throws -> [VaultDescriptor] {
+    /// Header discovery does not authenticate names or membership claims.
+    public func descriptors(identity: UserIdentity? = nil) async throws -> [VaultDescriptor] {
         let ids: [UUID]
         if offline {
             ids = try FileManager.default.contentsOfDirectory(atPath: scope.directory.path).compactMap(UUID.init(uuidString:))
@@ -79,15 +79,15 @@ public final class CloudRepository {
                 }
                 let metadata = try decodeCloud(Metadata.self, object.data)
                 guard metadata.header.vaultID == id else { throw MopError.invalidVault }
-                guard metadata.format == "mop-cloud-manifest-v2", ["mop-vault-v4", "mop-vault-v5"].contains(metadata.header.format) else {
-                    rows.append(VaultDescriptor(id: id.uuidString, name: nil, format: metadata.header.format == "mop-vault-v4" ? "unsupported-" + metadata.format : metadata.header.format, enrolled: false))
+                guard metadata.format == "mop-cloud-manifest-v2", metadata.header.format == "mop-vault-v5" else {
+                    rows.append(VaultDescriptor(id: id.uuidString, name: nil, format: metadata.header.format == "mop-vault-v5" ? "unsupported-" + metadata.format : metadata.header.format, enrolled: false))
                     continue
                 }
                 header = try decodeCloud(CloudManifest.self, object.data).header
                 try VaultName.validate(header.name)
             }
             rows.append(VaultDescriptor(id: id.uuidString, name: header.name, format: header.format,
-                enrolled: (publicKey.map { key in header.recipients.contains { $0.kind == "device" && $0.publicKey == key } } ?? false) || (identity != nil && header.membership?.members.contains { $0.identity == identity } == true)))
+                enrolled: (identity != nil && header.membership?.members.contains { $0.identity == identity } == true)))
         }
         return rows.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
     }
@@ -196,27 +196,5 @@ public final class CloudRepository {
         return vault
     }
 
-    public func request(_ request: DeviceRequest, vault: CloudVault) async throws -> String {
-        try await online()
-        _ = try await vault.head() // Never recreate a removed zone.
-        try request.validate()
-        let id = "q-" + request.fingerprint
-        let bytes = try VaultCoding.encode(request)
-        if let existing = try await transport.fetch(id, vault: vault.id) {
-            let prior = try decodeCloud(DeviceRequest.self, existing.data)
-            try prior.validate()
-            guard prior.publicKey == request.publicKey else { throw MopError.invalidDevice }
-        } else { _ = try await transport.save(id, kind: .request, data: bytes, vault: vault.id, expected: nil) }
-        return id
-    }
 
-    public func request(_ id: String, vault: CloudVault) async throws -> DeviceRequest {
-        try await online()
-        guard id.hasPrefix("q-"), VaultTrust.validFingerprint(String(id.dropFirst(2))),
-              let object = try await transport.fetch(id, vault: vault.id), object.data.count <= 4096 else { throw MopError.invalidDevice }
-        let request = try decodeCloud(DeviceRequest.self, object.data)
-        try request.validate()
-        guard "q-" + request.fingerprint == id else { throw MopError.invalidDevice }
-        return request
-    }
 }

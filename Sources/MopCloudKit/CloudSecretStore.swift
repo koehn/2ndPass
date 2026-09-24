@@ -40,7 +40,6 @@ public final class CloudSecretStore: AsyncSecretStore {
         try await mutate(rotation: true, beforePublish: beforePublish) { try session.adoptOwner(owner) }
     }
     public func fingerprint() throws -> String { try session.fingerprint() }
-    public func recipients() throws -> [DeviceRequest] { try session.recipients() }
 
     private func mutate(rotation: Bool = false, beforePublish: (() throws -> Void)? = nil, _ body: () throws -> Void) async throws {
         guard !offline else { throw MopError.offlineWrite }
@@ -57,12 +56,6 @@ public final class CloudSecretStore: AsyncSecretStore {
     }
     public func delete(_ reference: SecretReference) async throws { try await mutate { try session.delete(reference) } }
     public func rename(_ name: String) async throws { try await mutate { try session.rename(name) } }
-    public func enroll(_ request: DeviceRequest, fingerprint: String, beforePublish: (() throws -> Void)? = nil) async throws {
-        try await mutate(beforePublish: beforePublish) { try session.enroll(request, expectedFingerprint: fingerprint) }
-    }
-    public func revoke(_ fingerprint: String, currentDevice: Data) async throws {
-        try await mutate(rotation: true) { try session.revoke(fingerprint, currentDevice: currentDevice) }
-    }
     public func restore(_ revision: String) async throws {
         guard !offline else { throw MopError.offlineWrite }
         guard try await vault.revisions().contains(revision) else { throw MopError.invalidVault }

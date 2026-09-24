@@ -58,7 +58,7 @@ pending intent. Mop does not automatically abandon an uncertain creation.
 
 Private mobile state uses complete Data Protection and is excluded from device
 backup. Account access requires the synchronized identity; copying app storage alone does
-not transfer a Secure Enclave identity.
+not transfer the account private keys.
 
 ## Mobile sessions
 
@@ -84,9 +84,8 @@ invalidate authorization. Submitted writes may still complete and need refresh.
 
 The project uses team `VE3U9KBEW4`, bundle identifier `com.koehn.mop`, and the existing
 `iCloud.com.koehn.mop` container. Debug uses Development CloudKit; Release uses
-Production. Keep the mobile App ID associated with that same container. Each
-platform has its own local device key; sharing a bundle identifier does not share
-Secure Enclave keys between devices.
+Production. Keep the mobile App ID associated with that same container. The account identity synchronizes through iCloud Keychain. Verify matching
+provisioned access groups; sharing a CloudKit container alone is insufficient.
 
 Before creating a distribution archive, configure the Apple account in Xcode and
 install the appropriate iOS provisioning profiles and Apple Distribution identity.
@@ -128,7 +127,7 @@ SwiftPM.
 The host has Apple Development signing identities but no Apple Distribution identity,
 and no physical iPhone or iPad is connected.
 No distribution-signed archive, TestFlight upload, or Production CloudKit acceptance
-has been completed. Real-device biometrics, passcode policy, Secure Enclave enrollment,
+has been completed. Real-device biometrics, passcode policy, account identity synchronization,
 suspension, file-provider behavior, and VoiceOver/keyboard acceptance remain required.
 
 Automated tests do not replace these checks with a Mac, iPhone, and iPad on a test
@@ -136,10 +135,10 @@ account:
 
 - Face ID, Touch ID on supported hardware, passcode fallback, strict biometrics,
   cancellation, changed biometric enrollment, and pending authentication at lock.
-- Enrollment and approval in both directions, independent fingerprints, recovery,
-  revocation/key rotation, concurrent edits, and account changes.
+- Account identity delivery across devices, independent recovery evidence, v5
+  backup recovery, ownership-change key rotation, concurrent edits, and account changes.
 - Verified offline reads, automatic fallback on disconnection and refresh on reconnection, Recently Deleted,
-  and confirmation that revocation cannot erase previously obtained offline data.
+  and confirmation that remote changes cannot erase previously obtained offline data.
 - App-switcher privacy, device lock, protected-data loss, suspension, clipboard
   expiry while suspended, and no late result reopening a locked interface.
 - Files providers, collisions, cancelled import/export, termination during creation,
@@ -157,14 +156,14 @@ metadata access for private or explicitly selected files, following Apple’s
 
 Mop identities synchronize through iCloud Keychain. New devices discover all
 account-owned vaults without QR pairing. See [account identities](ACCOUNT-IDENTITY.md)
-for one-time conversion, waiting states, recovery, and physical acceptance.
+for waiting states, recovery, and physical acceptance.
 
 Authenticated item reads use the current verified in-memory snapshot and do not
 wait for iCloud. While the app is active, push notifications, foregrounding,
 reconnection, and a periodic fallback reconcile changes without disabling item
 controls. Verified updates refresh the viewed vault and item; editing defers UI
 replacement. A changed revision conceals any revealed value. Lock or expiry clears
-snapshot access, and reconciliation detects remote revocation.
+snapshot access, and reconciliation detects remote ownership changes.
 
 The Developer setting (which enables Copy Reference) synchronizes using iCloud
 key-value storage across the same Apple Account. App signatures must include

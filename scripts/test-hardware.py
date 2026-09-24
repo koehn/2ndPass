@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Opt-in live Secure Enclave checks. Requires interactive authentication approvals.
+"""Opt-in live v5 account-identity checks. Requires interactive authentication approvals.
 Creates a disposable CloudKit vault; retains local state and recovery files.
-The disposable Keychain item remains; see docs/VALIDATION.md for cleanup. Never reads a user's existing vault.
+Uses or creates the test Apple Account's shared identity; never delete it as vault cleanup.
+See docs/VALIDATION.md. Never reads an existing vault.
 """
 import hashlib
 import os
@@ -15,7 +16,7 @@ mop = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app/Contents/MacO
 if os.environ.get('MOP_LIVE_CLOUD_TEST') != '1':
     raise SystemExit('Set MOP_LIVE_CLOUD_TEST=1 to create a disposable vault in the signed build CloudKit environment.')
 # Retain recovery material and state until the operator deletes the remote test zone.
-directory = tempfile.mkdtemp(prefix='mop-cloud-hardware-050-')
+directory = tempfile.mkdtemp(prefix='mop-cloud-hardware-v5-')
 root = Path(directory)
 vault_id = str(uuid.uuid4())
 environment = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
@@ -41,8 +42,7 @@ def command(label, args, data=b'', extra=None, code=0):
         raise SystemExit(f'{label} failed with code {result.returncode}; expected {code}')
     return result
 
-command('Initialize disposable vault', ['vault', 'init', vault_name, '--recovery-file', str(root / 'recovery.key'),
-                                       '--device-name', 'Disposable mop v4 test'] + (['--strict-biometrics'] if os.environ.get('MOP_TEST_STRICT_BIOMETRICS') == '1' else []))
+command('Initialize disposable vault', ['vault', 'init', vault_name, '--recovery-file', str(root / 'recovery.key')] + (['--strict-biometrics'] if os.environ.get('MOP_TEST_STRICT_BIOMETRICS') == '1' else []))
 command('Write sectioned multiline field', ['write', ref_a], first)
 command('Write second field', ['write', ref_b], second)
 # Hash assertions verify delivery without placing secret values in argv.

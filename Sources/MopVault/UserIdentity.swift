@@ -15,7 +15,7 @@ public struct UserIdentity: Codable, Equatable, Sendable {
     public func validate() throws {
         guard encryptionKey.count == 65, signingKey.count == 65,
               (try? P256.KeyAgreement.PublicKey(x963Representation: encryptionKey)) != nil,
-              (try? P256.Signing.PublicKey(x963Representation: signingKey)) != nil else { throw MopError.invalidDevice }
+              (try? P256.Signing.PublicKey(x963Representation: signingKey)) != nil else { throw MopError.invalidIdentity }
     }
     public func verifies(_ signature: Data, data: Data) -> Bool {
         guard let key = try? P256.Signing.PublicKey(x963Representation: signingKey),
@@ -37,14 +37,14 @@ public final class AccountIdentity: VaultSigningOpener {
     public let identity: UserIdentity
     public var publicKey: Data { identity.encryptionKey }
     public var signingPublicKey: Data { identity.signingKey }
-    public var request: DeviceRequest { try! DeviceRequest(name: "Mop account", publicKey: publicKey) }
+    public var request: RecipientKey { try! RecipientKey(name: "Mop account", publicKey: publicKey) }
     public init() {
         let encryption = P256.KeyAgreement.PrivateKey(), signing = P256.Signing.PrivateKey()
         self.encryption = encryption; self.signing = signing
         identity = try! UserIdentity(encryptionKey: encryption.publicKey.x963Representation, signingKey: signing.publicKey.x963Representation)
     }
     public init(material: Data) throws {
-        guard material.count == 64 else { throw MopError.invalidDevice }
+        guard material.count == 64 else { throw MopError.invalidIdentity }
         let encryption = try P256.KeyAgreement.PrivateKey(rawRepresentation: material.prefix(32))
         let signing = try P256.Signing.PrivateKey(rawRepresentation: material.suffix(32))
         self.encryption = encryption; self.signing = signing
@@ -58,7 +58,7 @@ public final class AccountIdentity: VaultSigningOpener {
     }
     public func unwrap(_ recipient: VaultRecipient, vaultID: UUID) throws -> SymmetricKey {
         guard let encryption else { throw MopError.authentication }
-        guard recipient.publicKey == publicKey else { throw MopError.deviceNotEnrolled }
+        guard recipient.publicKey == publicKey else { throw MopError.notVaultMember }
         return try VaultDocument.unwrap(recipient, vaultID: vaultID, privateKey: encryption)
     }
     public func sign(_ data: Data) throws -> Data {

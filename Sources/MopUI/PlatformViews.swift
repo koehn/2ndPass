@@ -70,16 +70,6 @@ private struct MobileToolbarModifier: ViewModifier {
 }
 #endif
 
-@MainActor enum DeviceLabel {
-    static var name: String {
-        #if os(macOS)
-        Host.current().localizedName ?? "Mac"
-        #else
-        UIDevice.current.model
-        #endif
-    }
-}
-
 struct MopRootView: View {
     @Bindable var model: AppModel
     var body: some View {

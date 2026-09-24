@@ -16,24 +16,24 @@ public enum VaultCoding {
     }
 }
 
-public struct DeviceRequest: Codable, Equatable, Sendable {
+public struct RecipientKey: Codable, Equatable, Sendable {
     public let format: String
     public let name: String
     public let publicKey: Data
     public var fingerprint: String { VaultCoding.digest(publicKey) }
 
     public init(name: String, publicKey: Data) throws {
-        self.format = "mop-device-request-v1"
+        self.format = "mop-recipient-key-v1"
         self.name = name
         self.publicKey = publicKey
         try validate()
     }
 
     public func validate() throws {
-        guard format == "mop-device-request-v1", !name.isEmpty, name.utf8.count <= 128,
+        guard format == "mop-recipient-key-v1", !name.isEmpty, name.utf8.count <= 128,
               !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
               publicKey.count == 65, (try? P256.KeyAgreement.PublicKey(x963Representation: publicKey)) != nil else {
-            throw MopError.invalidDevice
+            throw MopError.invalidIdentity
         }
     }
 }
@@ -74,25 +74,23 @@ public struct VaultDocument: Codable, Sendable {
         do {
             guard bytes.count <= VaultCoding.maximumFileSize else { throw MopError.invalidVault }
             struct Version: Decodable { struct Header: Decodable { let format: String }; let header: Header }
-            if let version = try? JSONDecoder().decode(Version.self, from: bytes), version.header.format == "mop-vault-v3" { throw MopError.legacyVault }
+            if let version = try? JSONDecoder().decode(Version.self, from: bytes), ["mop-vault-v1", "mop-vault-v2", "mop-vault-v3", "mop-vault-v4"].contains(version.header.format) { throw MopError.legacyVault }
             let document = try JSONDecoder().decode(Self.self, from: bytes)
             try VaultName.validate(document.header.name)
-            guard ["mop-vault-v4", "mop-vault-v5"].contains(document.header.format), document.header.generation > 0,
-                  document.header.recipients.count <= 64,
+            guard document.header.format == "mop-vault-v5", document.header.generation > 0,
+                  document.header.recipients.count == 2,
                   document.header.recipients.filter({ $0.kind == "recovery" }).count == 1,
-                  document.header.recipients.contains(where: { $0.kind == (document.header.format == "mop-vault-v5" ? "member" : "device") }),
+                  document.header.recipients.contains(where: { $0.kind == "member" }),
                   Set(document.header.recipients.map(\.fingerprint)).count == document.header.recipients.count,
                   document.sealed.count >= 28 else { throw MopError.invalidVault }
-            if document.header.format == "mop-vault-v5" {
-                guard let membership = document.header.membership else { throw MopError.invalidVault }
-                try membership.validate(vaultID: document.header.vaultID)
-                guard document.header.recipients.count == 2, document.header.recipients.contains(where: { $0.publicKey == membership.owner.encryptionKey && $0.kind == "member" }) else { throw MopError.invalidVault }
-                try document.verifySignature()
-            } else if document.header.membership != nil || document.signature != nil || document.signer != nil { throw MopError.invalidVault }
+            guard let membership = document.header.membership else { throw MopError.invalidVault }
+            try membership.validate(vaultID: document.header.vaultID)
+            guard document.header.recipients.contains(where: { $0.publicKey == membership.owner.encryptionKey && $0.kind == "member" }) else { throw MopError.invalidVault }
+            try document.verifySignature()
             for slot in document.header.recipients {
-                guard [document.header.format == "mop-vault-v5" ? "member" : "device", "recovery"].contains(slot.kind), slot.encapsulatedKey.count == 65,
+                guard ["member", "recovery"].contains(slot.kind), slot.encapsulatedKey.count == 65,
                       slot.wrappedKey.count == 48, slot.purpose == "index" else { throw MopError.invalidVault }
-                _ = try DeviceRequest(name: slot.name, publicKey: slot.publicKey)
+                _ = try RecipientKey(name: slot.name, publicKey: slot.publicKey)
             }
             for (id, record) in document.records {
                 guard UUID(uuidString: id)?.uuidString == id, record.sealed.count >= 28,
@@ -111,7 +109,7 @@ public struct VaultDocument: Codable, Sendable {
           catch { throw MopError.invalidVault }
     }
 
-    public static func wrap(key: SymmetricKey, request: DeviceRequest, kind: String, vaultID: UUID, purpose: String = "index") throws -> VaultRecipient {
+    public static func wrap(key: SymmetricKey, request: RecipientKey, kind: String, vaultID: UUID, purpose: String = "index") throws -> VaultRecipient {
         try request.validate()
         let publicKey = try P256.KeyAgreement.PublicKey(x963Representation: request.publicKey)
         var sender = try HPKE.Sender(recipientKey: publicKey, ciphersuite: .P256_SHA256_AES_GCM_256,
@@ -222,7 +220,7 @@ public struct VaultRecord: Codable, Equatable, Sendable {
         _ = try value.validatedUTF8()
         let key = SymmetricKey(size: .bits256)
         let recipients = try header.recipients.map {
-            try VaultDocument.wrap(key: key, request: DeviceRequest(name: $0.name, publicKey: $0.publicKey),
+            try VaultDocument.wrap(key: key, request: RecipientKey(name: $0.name, publicKey: $0.publicKey),
                                    kind: $0.kind, vaultID: header.vaultID, purpose: "record:" + id)
         }
         let box = try value.withUnsafeBytes { try AES.GCM.seal($0, using: key, authenticating: context(vaultID: header.vaultID, id: id)) }
@@ -246,11 +244,5 @@ public struct VaultRecord: Codable, Equatable, Sendable {
         } catch { throw MopError.invalidVault }
     }
 
-    public func enrolling(_ request: DeviceRequest, id: String, vaultID: UUID, opener: any VaultKeyOpener) throws -> VaultRecord {
-        var record = self
-        let key = try key(id: id, vaultID: vaultID, opener: opener)
-        record.recipients.append(try VaultDocument.wrap(key: key, request: request, kind: "device", vaultID: vaultID, purpose: "record:" + id))
-        record.recipients.sort { $0.fingerprint < $1.fingerprint }
-        return record
-    }
+
 }

@@ -25,17 +25,17 @@ public struct SynchronizedIdentityStore: IdentityKeyStore {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         try KeychainStore.check(status)
-        guard let data = result as? Data, data.count == 64 else { throw MopError.invalidDevice }
+        guard let data = result as? Data, data.count == 64 else { throw MopError.invalidIdentity }
         return data
     }
     public func insert(_ material: Data, scope: String, id: UUID) throws {
-        guard material.count == 64 else { throw MopError.invalidDevice }
+        guard material.count == 64 else { throw MopError.invalidIdentity }
         var query = Self.query(scope: scope, id: id, group: try SigningIdentity.accessGroup())
         query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
         query[kSecValueData as String] = material
         let status = SecItemAdd(query as CFDictionary, nil)
         if status == errSecDuplicateItem {
-            guard try read(scope: scope, id: id) == material else { throw MopError.invalidDevice }
+            guard try read(scope: scope, id: id) == material else { throw MopError.invalidIdentity }
             return
         }
         try KeychainStore.check(status)

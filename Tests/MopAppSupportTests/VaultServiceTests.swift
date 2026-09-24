@@ -8,23 +8,6 @@ import MopVault
 import MopCloudKit
 @testable import MopAppSupport
 
-private final class TestDevice: SessionDevice, @unchecked Sendable {
-    let key: P256.KeyAgreement.PrivateKey
-    let closed = Mutex(false)
-    let strictBiometrics = false
-    let observedUnwrap: @Sendable (String) -> Void
-    init(key: P256.KeyAgreement.PrivateKey, observedUnwrap: @escaping @Sendable (String) -> Void = { _ in }) {
-        self.key = key; self.observedUnwrap = observedUnwrap
-    }
-    var publicKey: Data { key.publicKey.x963Representation }
-    var request: DeviceRequest { try! DeviceRequest(name: "Test Mac", publicKey: publicKey) }
-    func unwrap(_ recipient: VaultRecipient, vaultID: UUID) throws -> SymmetricKey {
-        guard !closed.withLock({ $0 }) else { throw MopError.authentication }
-        observedUnwrap(recipient.purpose)
-        return try VaultDocument.unwrap(recipient, vaultID: vaultID, privateKey: key)
-    }
-    func close() { closed.withLock { $0 = true } }
-}
 private actor TestCloud: CloudTransport {
     nonisolated let container = "iCloud.test.session"
     nonisolated let environment = "Development"
@@ -33,7 +16,6 @@ private actor TestCloud: CloudTransport {
     func fail(with error: MopError?) { failure = error }
     var data: [UUID: [String: CloudObject]] = [:]
     var loseResponse = false
-    var losePairingResponse = false
     var rejectHead = false
     var holdManifest = false
     var holdHead = false
@@ -57,7 +39,6 @@ private actor TestCloud: CloudTransport {
         guard data[vault]?[id]?.version == expected else { throw MopError.vaultConflict }
         let object = CloudObject(data: bytes, version: Data(UUID().uuidString.utf8))
         data[vault, default: [:]][id] = object
-        if id.hasPrefix("p-") && losePairingResponse { losePairingResponse = false; throw MopError.cloudUnavailable }
         if kind == .head && loseResponse { loseResponse = false; throw MopError.cloudUnavailable }
         return object
     }
@@ -68,11 +49,8 @@ private actor TestCloud: CloudTransport {
     func releaseHead() { waiting?.resume(); waiting = nil }
     var isWaiting: Bool { waiting != nil }
     func loseNextResponse() { loseResponse = true }
-    func loseNextPairingResponse() { losePairingResponse = true }
     func rejectNextHead() { rejectHead = true }
-    func replacePairing(_ invitation: PairingInvitation, bytes: Data, direction: PairingInvitation.Direction) {
-        data[invitation.vault]?["p-\(invitation.session.uuidString)-\(direction.rawValue)"] = CloudObject(data: bytes, version: Data("tampered".utf8))
-    }
+
 }
 private final class Counter: Sendable {
     let value = Mutex(0)
@@ -80,22 +58,22 @@ private final class Counter: Sendable {
 private struct Fixture {
     let directory: URL
     let cloud: TestCloud
-    let key: P256.KeyAgreement.PrivateKey
+    let key: AccountIdentity
+    let keys: TestIdentityKeys
     let vaults: [CloudVault]
     let service: NativeVaultService
     let authentications: Counter
-    let indexUnwraps: Counter
-    let recordUnwraps: Counter
     func cleanup() { service.lock(); try? FileManager.default.removeItem(at: directory) }
 }
 private func fixture() async throws -> Fixture {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-native-session-" + UUID().uuidString)
-    let cloud = TestCloud(), key = P256.KeyAgreement.PrivateKey()
-    let device = TestDevice(key: key)
+    let cloud = TestCloud(), keys = TestIdentityKeys()
     let repo = try await CloudRepository.open(transport: cloud, state: directory)
+    let key = try await repo.accountIdentity(keys: keys, create: true)
+    let device = key
     var vaults: [CloudVault] = []
     for name in ["personal", "work"] {
-        let bytes = try VaultSession.createSnapshot(name: name, device: device.request, recovery: RecoveryKey())
+        let bytes = try VaultSession.createAccountSnapshot(name: name, owner: device, recovery: RecoveryKey())
         let document = try VaultDocument.decode(bytes)
         let slot = try #require(document.header.recipients.first { $0.publicKey == device.publicKey })
         let fingerprint = try VaultTrust.fingerprint(document: document, key: device.unwrap(slot, vaultID: document.header.vaultID))
@@ -104,18 +82,13 @@ private func fixture() async throws -> Fixture {
         try await store.write(SecretReference(vault: name, item: "item", field: "token"), value: "value", replace: false)
         store.close(); vaults.append(vault)
     }
-    let count = Counter(), indexUnwraps = Counter(), recordUnwraps = Counter()
-    let service = NativeVaultService(state: directory, transport: { cloud }, device: { _, _, _, _, register in
+    let count = Counter()
+    let service = NativeVaultService(state: directory, identityKeys: keys, transport: { cloud }, authenticate: { _, _ in
         count.value.withLock { $0 += 1 }
-        let device = TestDevice(key: key) { purpose in
-            if purpose == "index" { indexUnwraps.value.withLock { $0 += 1 } }
-            else if purpose.hasPrefix("record:") { recordUnwraps.value.withLock { $0 += 1 } }
-        }
-        // The only concurrent operation on the fake device is its mutex-backed close flag.
-        try register { device.close() }
-        return device
+        return {}
     })
-    return Fixture(directory: directory, cloud: cloud, key: key, vaults: vaults, service: service, authentications: count, indexUnwraps: indexUnwraps, recordUnwraps: recordUnwraps)
+    return Fixture(directory: directory, cloud: cloud, key: key, keys: keys, vaults: vaults, service: service, authentications: count)
+
 }
 private func operation(_ f: Fixture, _ op: VaultOperation, index: Int = 0, offline: Bool = false) async throws -> VaultResult {
     try await f.service.execute(op, vault: f.vaults[index].id.uuidString, offline: offline)
@@ -152,7 +125,7 @@ private func operation(_ f: Fixture, _ op: VaultOperation, index: Int = 0, offli
     let f = try await fixture(); defer { f.cleanup() }
     _ = try await operation(f, .catalog)
     let ref = try SecretReference("mop://personal/item/token")
-    let remote = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: TestDevice(key: f.key))
+    let remote = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: f.key)
     defer { remote.close() }
     try await remote.write(ref, value: "remote", replace: true)
     #expect(try await operation(f, .read(ref)).value == "value")
@@ -237,9 +210,7 @@ private func operation(_ f: Fixture, _ op: VaultOperation, index: Int = 0, offli
     let urlResult = try await operation(f, .read(SecretReference("mop://personal/otp-login/otp-url")))
     let urlExpected = try [SecretBytes(utf8: otp.code(at: urlStart)), SecretBytes(utf8: otp.code())]
     #expect(urlExpected.contains { $0 == urlResult.value })
-    let unwraps = f.recordUnwraps.value.withLock { $0 }
     _ = try await operation(f, .read(ref))
-    #expect(f.recordUnwraps.value.withLock { $0 } == unwraps)
     let replacement = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
     _ = try await operation(f, .write(ref, SecretBytes(utf8: replacement), replace: true))
     let nextStart = Date(), next = try await operation(f, .read(ref))
@@ -256,7 +227,7 @@ private func operation(_ f: Fixture, _ op: VaultOperation, index: Int = 0, offli
     let f = try await fixture(); defer { f.cleanup() }
     let catalog = try await operation(f, .catalog).requireCatalog()
     let ref = try SecretReference("mop://personal/item/token")
-    let remote = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: TestDevice(key: f.key))
+    let remote = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: f.key)
     defer { remote.close() }
     try await remote.write(ref, value: "remote", replace: true)
     let edit = ItemEdit(revision: catalog.revision, item: catalog.items[0], create: false)
@@ -269,21 +240,6 @@ private func operation(_ f: Fixture, _ op: VaultOperation, index: Int = 0, offli
     _ = try await operation(f, .catalog)
     await f.cloud.changeAccount()
     await #expect(throws: MopError.cloudAccount) { _ = try await operation(f, .catalog) }
-    #expect(!f.service.isAuthenticated)
-}
-@Test func onlineRefreshRejectsRemoteRevocation() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let current = TestDevice(key: f.key), other = TestDevice(key: P256.KeyAgreement.PrivateKey())
-    let store = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: current)
-    try await store.enroll(other.request, fingerprint: other.request.fingerprint)
-    store.close()
-    let revoker = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: other)
-    defer { revoker.close() }
-    try await revoker.revoke(current.request.fingerprint, currentDevice: other.publicKey)
-    await #expect(throws: MopError.deviceNotEnrolled) {
-        _ = try await operation(f, .catalog)
-    }
     #expect(!f.service.isAuthenticated)
 }
 @Test func cacheTransitionPreservesSessionAndRejectsOfflineWrites() async throws {
@@ -333,13 +289,12 @@ private final class AuthenticationBarrier: Sendable {
 @Test func lockCancelsPendingAuthenticationWithoutInstallingItsDevice() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let barrier = AuthenticationBarrier()
-    let cloud = f.cloud, key = f.key
-    let service = NativeVaultService(state: f.directory, transport: { cloud }, device: { _, _, _, _, register in
-        let device = TestDevice(key: key)
-        try register { barrier.invalidated.withLock { $0 = true }; device.close() }
+    let cloud = f.cloud
+    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { cloud }, authenticate: { _, register in
+        try register { barrier.invalidated.withLock { $0 = true } }
         barrier.entered.withLock { $0 = true }
         guard barrier.release.wait(timeout: .now() + 5) == .success else { throw MopError.authentication }
-        return device
+        return {}
     })
     let id = f.vaults[0].id.uuidString
     let pending = Task { try await service.execute(.catalog, vault: id, offline: false) }
@@ -364,54 +319,6 @@ private final class AuthenticationBarrier: Sendable {
     await #expect(throws: (any Error).self) { _ = try await operation(f, .export(output)) }
     #expect(try Data(contentsOf: output) == exported)
     await #expect(throws: (any Error).self) { _ = try await operation(f, .export(f.directory.appendingPathComponent("backup"))) }
-}
-
-@Test func nativeCreationEnrollmentTrustAndDeletionUseSharedSession() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let id = UUID().uuidString
-    let recovery = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
-    defer { try? FileManager.default.removeItem(at: recovery) }
-    let created = try await f.service.execute(.create(name: "new", deviceName: "Mac", strict: false, recovery: recovery), vault: id, offline: false)
-    #expect(try created.requireCatalog().vault == "new")
-    #expect(FileManager.default.fileExists(atPath: recovery.path))
-    let otherKey = P256.KeyAgreement.PrivateKey(), cloud = f.cloud
-    let otherDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-other-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: otherDirectory) }
-    let other = NativeVaultService(state: otherDirectory, transport: { cloud }, device: { _, _, _, _, register in
-        let device = TestDevice(key: otherKey); try register { device.close() }; return device
-    })
-    defer { other.lock() }
-    _ = try await other.execute(.manage(.request(name: "Other", strict: false)), vault: id, offline: false)
-    let requests = try await f.service.execute(.requests, vault: id, offline: false).requests
-    let request = try #require(requests.first)
-    let approved = try await f.service.execute(.manage(.approve(request: request.id, fingerprint: request.fingerprint)), vault: id, offline: false)
-    #expect(approved.catalog != nil)
-    let fingerprint = try await f.service.execute(.manage(.fingerprint), vault: id, offline: false).message
-    _ = try await other.execute(.manage(.trust(fingerprint: fingerprint)), vault: id, offline: false)
-    #expect(try await other.execute(.catalog, vault: id, offline: false).requireCatalog().vault == "new")
-    #expect(f.authentications.value.withLock { $0 } == 1)
-    _ = try await f.service.execute(.deleteVault, vault: id, offline: false)
-    #expect(!(await cloud.zones()).contains(UUID(uuidString: id)!))
-    _ = try await operation(f, .catalog)
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-
-@Test func recoveryEnrollsNewDeviceWithoutChangingOtherSessions() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let id = UUID().uuidString
-    let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
-    defer { try? FileManager.default.removeItem(at: file) }
-    _ = try await f.service.execute(.create(name: "recoverable", deviceName: "Mac", strict: false, recovery: file), vault: id, offline: false)
-    let fingerprint = try await f.service.execute(.manage(.fingerprint), vault: id, offline: false).message
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-recovery-test-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let cloud = f.cloud, key = P256.KeyAgreement.PrivateKey()
-    let recovered = NativeVaultService(state: directory, transport: { cloud }, device: { _, _, _, _, register in
-        let device = TestDevice(key: key); try register { device.close() }; return device
-    })
-    defer { recovered.lock() }
-    _ = try await recovered.execute(.manage(.recover(file: file, name: "Recovered", fingerprint: fingerprint)), vault: id, offline: false)
-    #expect(try await recovered.execute(.catalog, vault: id, offline: false).requireCatalog().vault == "recoverable")
 }
 
 @Test func concurrentMutationsHoldPermitAcrossCloudSuspensions() async throws {
@@ -489,7 +396,7 @@ private final class AuthenticationBarrier: Sendable {
 @Test func onlineCatalogPurgesExpiredTrashFromCloudSnapshot() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let vault = f.vaults[0]
-    let remote = try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: TestDevice(key: f.key))
+    let remote = try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.key)
     defer { remote.close() }
     try await remote.trashItem(name: "item", revision: remote.catalog().revision,
                                at: Date().addingTimeInterval(-ItemDeletion.retention - 10))
@@ -509,28 +416,23 @@ private final class AuthenticationBarrier: Sendable {
     #expect(try await !operation(f, .read(ref)).valueIsConcealed)
 }
 
-@Test func unchangedUnlockedVaultsNeverReopenIndexWhenReadingValuesOrSwitching() async throws {
+@Test func unchangedUnlockedVaultsReuseAuthenticationWhenReadingAndSwitching() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     _ = try await operation(f, .catalog)
     _ = try await operation(f, .catalog, index: 1)
-    let indexCount = f.indexUnwraps.value.withLock { $0 }
-    let recordCount = f.recordUnwraps.value.withLock { $0 }
-    #expect(indexCount >= 2 && recordCount == 0)
     for _ in 0..<3 {
         for (index, name) in ["personal", "work"].enumerated() {
             _ = try await operation(f, .catalog, index: index)
             #expect(try await operation(f, .read(SecretReference("mop://" + name + "/item/token")), index: index).value == "value")
         }
     }
-    #expect(f.indexUnwraps.value.withLock { $0 } == indexCount)
-    #expect(f.recordUnwraps.value.withLock { $0 } == recordCount + 6)
     #expect(f.authentications.value.withLock { $0 } == 1)
 }
 
 @Test func preparedCreationRequiresExportAndRetainsIdentity() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "prepared", deviceName: "Phone", strict: false, state: f.directory)
-    let reloaded = try PendingVaultCreation.prepare(name: "prepared", deviceName: "Phone", strict: false, state: f.directory)
+    var intent = try PendingVaultCreation.prepare(name: "prepared", strict: false, state: f.directory)
+    let reloaded = try PendingVaultCreation.prepare(name: "prepared", strict: false, state: f.directory)
     #expect(intent.id == reloaded.id)
     let key = try RecoveryKey(file: PendingVaultCreation.recoveryURL(state: f.directory)).publicKey
     await #expect(throws: MopError.invalidRecovery) {
@@ -551,7 +453,7 @@ private final class AuthenticationBarrier: Sendable {
 
 @Test func preparedCreationReconcilesLostResponseWithoutNewKeyOrVault() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "interrupted", deviceName: "Tablet", strict: false, state: f.directory)
+    var intent = try PendingVaultCreation.prepare(name: "interrupted", strict: false, state: f.directory)
     let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
     defer { try? FileManager.default.removeItem(at: output) }
     try intent.export(to: output, state: f.directory)
@@ -572,7 +474,7 @@ private final class AuthenticationBarrier: Sendable {
 
 @Test func submittedCreationCannotResurrectDeletedVault() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "removed", deviceName: "Phone", strict: false, state: f.directory)
+    var intent = try PendingVaultCreation.prepare(name: "removed", strict: false, state: f.directory)
     let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
     defer { try? FileManager.default.removeItem(at: output) }
     try intent.export(to: output, state: f.directory)
@@ -604,265 +506,13 @@ private final class AuthenticationBarrier: Sendable {
     #expect(throws: MopError.invalidVault) { try DocumentAccess.importRecovery(large, state: directory.appendingPathComponent("state")) }
 }
 
-private func phoneService(_ f: Fixture, key: P256.KeyAgreement.PrivateKey = P256.KeyAgreement.PrivateKey()) -> NativeVaultService {
-    NativeVaultService(state: f.directory.appendingPathComponent("phone-" + UUID().uuidString), transport: { f.cloud }, device: { _, _, _, _, register in
-        let device = TestDevice(key: key)
-        try register { device.close() }
-        return device
-    })
-}
-private func pairingStep(_ service: NativeVaultService, _ operation: PairingOperation, vault: String? = nil) async throws -> PairingProgress {
-    try #require(await service.execute(.pairing(operation), vault: vault, offline: false).pairing)
-}
-private func pairSetup(_ f: Fixture, phone: NativeVaultService) async throws -> PairingProgress {
-    let start = try await pairingStep(f.service, .start, vault: f.vaults[0].id.uuidString)
-    let join = try await pairingStep(phone, .join(qr: #require(start.qr), name: "Phone", strict: false))
-    let compare = try await pairingStep(f.service, .poll(start.session))
-    #expect(compare.phase == .comparing)
-    #expect(compare.qr == nil)
-    #expect(compare.code == join.code)
-    return compare
-}
-
-struct NativePairingTests {
-    @Test func enrollmentAndTrust() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        #expect(try await pairingStep(f.service, .approve(compare.session)).phase == .awaitingTrust)
-        #expect(try await pairingStep(phone, .poll(compare.session)).phase == .complete)
-        let result = try await phone.execute(.read(SecretReference(vault: "personal", item: "item", field: "token")), vault: compare.vault.uuidString, offline: false)
-        #expect(result.value == "value")
-        #expect(await f.cloud.requests(vault: compare.vault).isEmpty)
-        #expect(try await pairingStep(f.service, .poll(compare.session)).phase == .complete)
-        // Consumed sessions cannot publish another approval.
-        await #expect(throws: PairingError.self) { try await pairingStep(f.service, .approve(compare.session)) }
-    }
-    @Test func competingPhonesAndCancel() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let first = phoneService(f), second = phoneService(f)
-        defer { first.lock(); second.lock() }
-        let start = try await pairingStep(f.service, .start, vault: f.vaults[0].id.uuidString)
-        let qr = try #require(start.qr)
-        _ = try await pairingStep(first, .join(qr: qr, name: "One", strict: false))
-        await #expect(throws: PairingError.self) { try await pairingStep(second, .join(qr: qr, name: "Two", strict: false)) }
-        _ = try await f.service.execute(.pairing(.cancel(start.session)), vault: nil, offline: false)
-        await #expect(throws: PairingError.self) { try await pairingStep(f.service, .approve(start.session)) }
-        let devices = try await f.service.execute(.devices, vault: start.vault.uuidString, offline: false)
-        #expect(devices.devices.count == 1)
-    }
-    @Test func uncertainCommitReconcilesWithoutDuplicate() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        await f.cloud.loseNextResponse()
-        await #expect(throws: MopError.self) { try await pairingStep(f.service, .approve(compare.session)) }
-        #expect(try await pairingStep(phone, .poll(compare.session)).phase == .waiting)
-        #expect(try await pairingStep(f.service, .approve(compare.session)).phase == .awaitingTrust)
-        #expect(try await pairingStep(phone, .poll(compare.session)).phase == .complete)
-        let devices = try await f.service.execute(.devices, vault: compare.vault.uuidString, offline: false)
-        #expect(devices.devices.count == 2)
-    }
-    @Test func freshPairingAfterCommittedInterruption() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let first = try await pairSetup(f, phone: phone)
-        _ = try await pairingStep(f.service, .approve(first.session))
-        _ = try await phone.execute(.pairing(.cancel(first.session)), vault: nil, offline: false)
-        let second = try await pairSetup(f, phone: phone)
-        _ = try await pairingStep(f.service, .approve(second.session))
-        #expect(try await pairingStep(phone, .poll(second.session)).phase == .complete)
-        let devices = try await f.service.execute(.devices, vault: second.vault.uuidString, offline: false)
-        #expect(devices.devices.count == 2)
-    }
-    @Test func lockWhileEnrollmentIsSubmitted() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        await f.cloud.pauseHead()
-        let service = f.service
-        let approval = Task { try await pairingStep(service, .approve(compare.session)) }
-        for _ in 0..<500 {
-            if await f.cloud.isWaiting { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        #expect(await f.cloud.isWaiting)
-        f.service.lock()
-        await f.cloud.releaseHead()
-        await #expect(throws: (any Error).self) { try await approval.value }
-        #expect(try await pairingStep(phone, .poll(compare.session)).phase == .waiting)
-        // An uncertain submitted enrollment is finished by a fresh explicit pairing.
-        let retry = try await pairSetup(f, phone: phone)
-        _ = try await pairingStep(f.service, .approve(retry.session))
-        #expect(try await pairingStep(phone, .poll(retry.session)).phase == .complete)
-    }
-    @Test func accountChangeAndMissingZone() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let start = try await pairingStep(f.service, .start, vault: f.vaults[0].id.uuidString)
-        await f.cloud.changeAccount()
-        await #expect(throws: MopError.cloudAccount) { try await pairingStep(f.service, .poll(start.session)) }
-        let other = try await fixture(); defer { other.cleanup() }
-        let invitation = try await pairingStep(other.service, .start, vault: other.vaults[0].id.uuidString)
-        await other.cloud.deleteZone(invitation.vault)
-        let phone = phoneService(other); defer { phone.lock() }
-        await #expect(throws: MopError.vaultMissing) { try await pairingStep(phone, .join(qr: #require(invitation.qr), name: "Phone", strict: false)) }
-        #expect(await other.cloud.zones().contains(invitation.vault) == false)
-    }
-    @Test func revocationBeforePhoneFinishes() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let key = P256.KeyAgreement.PrivateKey()
-        let phone = phoneService(f, key: key); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        _ = try await pairingStep(f.service, .approve(compare.session))
-        let fingerprint = VaultCoding.digest(key.publicKey.x963Representation)
-        _ = try await f.service.execute(.manage(.revoke(fingerprint: fingerprint)), vault: compare.vault.uuidString, offline: false)
-        await #expect(throws: MopError.deviceNotEnrolled) { try await pairingStep(phone, .poll(compare.session)) }
-    }
-}
-
-extension NativePairingTests {
-    @Test func droppedPairingResponsesAreReconciled() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        await f.cloud.loseNextPairingResponse()
-        let compare = try await pairSetup(f, phone: phone)
-        await f.cloud.loseNextPairingResponse()
-        _ = try await pairingStep(f.service, .approve(compare.session))
-        #expect(try await pairingStep(phone, .poll(compare.session)).phase == .complete)
-    }
-    @Test func conflictDoesNotRepeatMutation() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        await f.cloud.rejectNextHead()
-        await #expect(throws: MopError.self) { try await pairingStep(f.service, .approve(compare.session)) }
-        await #expect(throws: MopError.vaultConflict) { try await pairingStep(f.service, .approve(compare.session)) }
-        let devices = try await f.service.execute(.devices, vault: compare.vault.uuidString, offline: false)
-        #expect(devices.devices.count == 1)
-        let retry = try await pairSetup(f, phone: phone)
-        _ = try await pairingStep(f.service, .approve(retry.session))
-        #expect(try await pairingStep(phone, .poll(retry.session)).phase == .complete)
-    }
-    @Test func substitutedRequestCannotChangeApproval() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let key = P256.KeyAgreement.PrivateKey()
-        let phone = phoneService(f, key: key); defer { phone.lock() }
-        let start = try await pairingStep(f.service, .start, vault: f.vaults[0].id.uuidString)
-        let qr = try #require(start.qr), invitation = try PairingInvitation.parse(qr)
-        _ = try await pairingStep(phone, .join(qr: qr, name: "Phone", strict: false))
-        let compare = try await pairingStep(f.service, .poll(start.session))
-        let other = PairingRequest(device: try DeviceRequest(name: "Other", publicKey: P256.KeyAgreement.PrivateKey().publicKey.x963Representation))
-        await f.cloud.replacePairing(invitation, bytes: try invitation.seal(other, direction: .request), direction: .request)
-        let unchanged = try await pairingStep(f.service, .poll(start.session))
-        #expect(unchanged.code == compare.code)
-        _ = try await pairingStep(f.service, .approve(start.session))
-        #expect(try await pairingStep(phone, .poll(start.session)).phase == .complete)
-        let devices = try await f.service.execute(.devices, vault: start.vault.uuidString, offline: false)
-        #expect(devices.devices.contains { $0.fingerprint == VaultCoding.digest(key.publicKey.x963Representation) })
-        #expect(!devices.devices.contains { $0.fingerprint == other.device.fingerprint })
-    }
-    @Test func malformedCloudRequestAndReceiptAreRejected() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let start = try await pairingStep(f.service, .start, vault: f.vaults[0].id.uuidString)
-        let invitation = try PairingInvitation.parse(#require(start.qr))
-        await f.cloud.replacePairing(invitation, bytes: Data(count: 8193), direction: .request)
-        await #expect(throws: PairingError.self) { try await pairingStep(f.service, .poll(start.session)) }
-        let phone = phoneService(f); defer { phone.lock() }
-        let next = try await pairingStep(f.service, .start, vault: start.vault.uuidString)
-        let qr = try #require(next.qr), nextInvitation = try PairingInvitation.parse(qr)
-        _ = try await pairingStep(phone, .join(qr: qr, name: "Phone", strict: false))
-        await f.cloud.replacePairing(nextInvitation, bytes: Data("not authenticated".utf8), direction: .response)
-        await #expect(throws: PairingError.self) { try await pairingStep(phone, .poll(next.session)) }
-    }
-}
-
-extension NativePairingTests {
-    @Test func cancellationWhileStagingPreventsEnrollment() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        await f.cloud.pauseManifest()
-        let service = f.service
-        let approval = Task { try await pairingStep(service, .approve(compare.session)) }
-        for _ in 0..<500 {
-            if await f.cloud.isWaiting { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        #expect(await f.cloud.isWaiting)
-        approval.cancel()
-        await f.cloud.releaseHead()
-        await #expect(throws: (any Error).self) { try await approval.value }
-        let devices = try await f.service.execute(.devices, vault: compare.vault.uuidString, offline: false)
-        #expect(devices.devices.count == 1)
-        #expect(try await pairingStep(phone, .poll(compare.session)).phase == .waiting)
-    }
-    @Test func rotationInvalidatesPendingApproval() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let extra = try DeviceRequest(name: "Other Mac", publicKey: P256.KeyAgreement.PrivateKey().publicKey.x963Representation)
-        let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
-        let requestID = try await repo.request(extra, vault: f.vaults[0])
-        _ = try await f.service.execute(.manage(.approve(request: requestID, fingerprint: extra.fingerprint)), vault: f.vaults[0].id.uuidString, offline: false)
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        _ = try await f.service.execute(.manage(.revoke(fingerprint: extra.fingerprint)), vault: compare.vault.uuidString, offline: false)
-        await #expect(throws: MopError.vaultUntrusted) { try await pairingStep(f.service, .approve(compare.session)) }
-    }
-}
-
-extension NativePairingTests {
-    @Test func hostDoesNotReportCompletionUntilPhoneTrustsVault() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        #expect(try await pairingStep(f.service, .approve(compare.session)).phase == .awaitingTrust)
-        #expect(try await pairingStep(f.service, .poll(compare.session)).phase == .awaitingTrust)
-        // Reproduces leaving the phone's pairing screen after the Mac approved.
-        _ = try await phone.execute(.pairing(.cancel(compare.session)), vault: nil, offline: false)
-        await #expect(throws: MopError.vaultUntrusted) {
-            try await phone.execute(.catalog, vault: compare.vault.uuidString, offline: false)
-        }
-        #expect(try await pairingStep(f.service, .poll(compare.session)).phase == .awaitingTrust)
-        let retry = try await pairSetup(f, phone: phone)
-        _ = try await pairingStep(f.service, .approve(retry.session))
-        #expect(try await pairingStep(phone, .poll(retry.session)).phase == .complete)
-        #expect(try await pairingStep(f.service, .poll(retry.session)).phase == .complete)
-        phone.lock()
-        let reopened = try await phone.execute(.catalog, vault: retry.vault.uuidString, offline: false)
-        #expect(try reopened.requireCatalog().vault == "personal")
-    }
-    @Test func lostAcknowledgementResponseStillCompletes() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let compare = try await pairSetup(f, phone: phone)
-        _ = try await pairingStep(f.service, .approve(compare.session))
-        await f.cloud.loseNextPairingResponse()
-        #expect(try await pairingStep(phone, .poll(compare.session)).phase == .complete)
-        #expect(try await pairingStep(f.service, .poll(compare.session)).phase == .complete)
-    }
-    @Test func invalidAcknowledgementCannotCompleteHost() async throws {
-        let f = try await fixture(); defer { f.cleanup() }
-        let phone = phoneService(f); defer { phone.lock() }
-        let start = try await pairingStep(f.service, .start, vault: f.vaults[0].id.uuidString)
-        let qr = try #require(start.qr), invitation = try PairingInvitation.parse(qr)
-        _ = try await pairingStep(phone, .join(qr: qr, name: "Phone", strict: false))
-        _ = try await pairingStep(f.service, .poll(start.session))
-        _ = try await pairingStep(f.service, .approve(start.session))
-        let differentRequest = PairingRequest(device: try DeviceRequest(name: "Other", publicKey: P256.KeyAgreement.PrivateKey().publicKey.x963Representation))
-        let wrongReceipt = try PairingReceipt(request: differentRequest, vaultFingerprint: String(repeating: "a", count: 64), revision: String(repeating: "b", count: 64))
-        let wrongAck = try PairingAcknowledgement(receipt: wrongReceipt)
-        await f.cloud.replacePairing(invitation, bytes: try invitation.seal(wrongAck, direction: .acknowledgement), direction: .acknowledgement)
-        await #expect(throws: PairingError.self) { try await pairingStep(f.service, .poll(start.session)) }
-    }
-}
-
-
 private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     let values = Mutex<[String: Data]>([:])
     func read(scope: String, id: UUID) throws -> Data? { values.withLock { $0[scope + id.uuidString] } }
     func insert(_ material: Data, scope: String, id: UUID) throws {
         try values.withLock {
             let key = scope + id.uuidString
-            guard $0[key] == nil || $0[key] == material else { throw MopError.invalidDevice }
+            guard $0[key] == nil || $0[key] == material else { throw MopError.invalidIdentity }
             $0[key] = material
         }
     }
@@ -870,16 +520,13 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
 
 @Test func synchronizedIdentityOpensAllVaultsOnUnenrolledDevice() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    let keys = TestIdentityKeys()
-    let existing = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, device: { _, _, _, _, register in
-        let device = TestDevice(key: f.key); try register { device.close() }; return device
-    })
+    let keys = f.keys
+    let existing = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _, _ in {} })
     defer { existing.lock() }
     for vault in f.vaults { _ = try await existing.execute(.catalog, vault: vault.id.uuidString) }
-    let count = Counter(), newKey = P256.KeyAgreement.PrivateKey()
-    let fresh = NativeVaultService(state: f.directory.appendingPathComponent("new-device"), identityKeys: keys, transport: { f.cloud }, device: { _, _, _, _, register in
-        count.value.withLock { $0 += 1 }
-        let device = TestDevice(key: newKey); try register { device.close() }; return device
+    let count = Counter()
+    let fresh = NativeVaultService(state: f.directory.appendingPathComponent("new-device"), identityKeys: keys, transport: { f.cloud }, authenticate: { _, _ in
+        count.value.withLock { $0 += 1 }; return {}
     })
     defer { fresh.lock() }
     let discovered = try await fresh.execute(.discover, vault: nil)
@@ -888,16 +535,14 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
         let catalog = try await fresh.execute(.catalog, vault: vault.id.uuidString).requireCatalog()
         let read = try await fresh.execute(.read(SecretReference(vault: catalog.vault, item: "item", field: "token")), vault: vault.id.uuidString)
         #expect(read.value == "value")
-        let members = try await fresh.execute(.devices, vault: vault.id.uuidString)
+        let members = try await fresh.execute(.members, vault: vault.id.uuidString)
         #expect(members.members.count == 1 && members.members[0].role == "owner")
     }
     #expect(count.value.withLock { $0 } == 1)
     fresh.lock()
     _ = try await fresh.execute(.catalog, vault: f.vaults[0].id.uuidString)
     #expect(count.value.withLock { $0 } == 2)
-    let waiting = NativeVaultService(state: f.directory.appendingPathComponent("waiting-device"), identityKeys: TestIdentityKeys(), transport: { f.cloud }, device: { _, _, _, _, register in
-        let device = TestDevice(key: P256.KeyAgreement.PrivateKey()); try register { device.close() }; return device
-    })
+    let waiting = NativeVaultService(state: f.directory.appendingPathComponent("waiting-device"), identityKeys: TestIdentityKeys(), transport: { f.cloud }, authenticate: { _, _ in {} })
     defer { waiting.lock() }
     await #expect(throws: MopError.identityPending) { try await waiting.execute(.catalog, vault: f.vaults[0].id.uuidString) }
 }
@@ -905,15 +550,13 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
 
 @Test func newAccountVaultHasOnlyOwnerAndRecoveryFromItsFirstRevision() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    let keys = TestIdentityKeys()
-    let service = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, device: { _, _, _, _, register in
-        let device = TestDevice(key: f.key); try register { device.close() }; return device
-    })
+    let keys = f.keys
+    let service = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _, _ in {} })
     defer { service.lock() }
     let recoveryFile = f.directory.appendingPathExtension("account-recovery.key")
     defer { try? FileManager.default.removeItem(at: recoveryFile) }
     let id = UUID()
-    _ = try await service.execute(.create(name: "account-vault", deviceName: "Unused", strict: false, recovery: recoveryFile), vault: id.uuidString)
+    _ = try await service.execute(.create(name: "account-vault", strict: false, recovery: recoveryFile), vault: id.uuidString)
     let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
     let vault = try repo.vault(id)
     #expect(try await vault.revisions().count == 1)
@@ -960,4 +603,14 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     let result = try await operation(f, .catalog)
     #expect(result.usingCache && result.catalog != nil)
     #expect(f.service.isAuthenticated)
+}
+
+@Test func nativeAccountAccessIgnoresLegacyDeviceMetadata() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    // Invalid legacy metadata would have failed the former LocalDevice path.
+    try SafeFile.write(Data("not a legacy credential".utf8), to: f.directory.appendingPathComponent("device.json"))
+    let discovered = try await f.service.execute(.discover, vault: nil)
+    #expect(discovered.vaults.count == 2 && discovered.vaults.allSatisfy(\.enrolled))
+    #expect(try await operation(f, .read(SecretReference("mop://personal/item/token"))).value == "value")
+    #expect(try SafeFile.read(f.directory.appendingPathComponent("device.json")) == Data("not a legacy credential".utf8))
 }

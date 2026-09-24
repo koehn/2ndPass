@@ -1,3 +1,5 @@
+> Historical design plan, retained for context. It is not the current implementation or acceptance runbook. See [MOBILE.md](MOBILE.md), [ACCOUNT-IDENTITY.md](ACCOUNT-IDENTITY.md), and [VALIDATION.md](VALIDATION.md) for v5-only behavior.
+
 # iOS and iPadOS application plan
 
 Status: implementation reference. Shared application sources and build support are

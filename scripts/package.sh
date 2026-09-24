@@ -5,14 +5,7 @@ cd "$(dirname "$0")/.."
 product=mop
 bundle_name=Mop
 bundle_id=${MOP_BUNDLE_ID:-com.koehn.mop}
-if [[ ${1:-} == --check && $# == 1 ]]; then
-    product=mop-enclave-check
-    bundle_name=MopEnclaveCheck
-    bundle_id=${MOP_BUNDLE_ID:-com.koehn.mop.enclave-check}
-elif [[ $# != 0 ]]; then
-    echo 'Usage: scripts/package.sh [--check]' >&2
-    exit 2
-fi
+if [[ $# != 0 ]]; then echo "Usage: scripts/package.sh" >&2; exit 2; fi
 : "${MOP_SIGN_IDENTITY:?Set MOP_SIGN_IDENTITY to your Apple signing identity (not ad-hoc).}"
 : "${MOP_PROVISION_PROFILE:?Set MOP_PROVISION_PROFILE to an explicit macOS provisioning profile for this bundle ID.}"
 if [[ "$MOP_SIGN_IDENTITY" == - ]]; then

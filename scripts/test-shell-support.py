@@ -50,7 +50,8 @@ assert 'trust' in bash_candidates(['mop', 'vault', 'tr'])
 assert 'rename' in bash_candidates(['mop', 'vault', 'ren'])
 assert 'delete' in bash_candidates(['mop', 'vault', 'del'])
 assert '--yes' in bash_candidates(['mop', 'vault', 'delete', '--y'])
-assert '--device-name' in bash_candidates(['mop', 'vault', 'init', '--device'])
+assert '--strict-biometrics' in bash_candidates(['mop', 'vault', 'init', '--strict'])
+assert '--device-name' not in bash_candidates(['mop', 'vault', 'init', '--device'])
 assert '--no-masking' in bash_candidates(['mop', 'run', '--no'])
 assert set(bash_candidates(['mop', 'completion', ''])) == {'bash', 'zsh', 'fish'}
 with tempfile.TemporaryDirectory(prefix='mop-completion-test-') as directory:

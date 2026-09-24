@@ -9,7 +9,7 @@
 > non-secret CLI behavior only, not the new installation/security model.
 
 mop requires macOS 15 or later and Xcode 16 or later to build. To access secrets,
-you also need Secure Enclave hardware and an interactive login session.
+you also need iCloud Passwords & Keychain and an interactive login session.
 
 ## Install
 
@@ -43,7 +43,7 @@ brew upgrade koehn/mop/mop
 ```
 
 Keep your `~/.mop` directory when upgrading. It contains your default vault,
-device key record, and trusted vault fingerprints. If you share a vault between
+authentication policy, caches, and trusted vault fingerprints. If you share a vault between
 Macs, check the [upgrade notes](../README.md#file-boundaries-and-upgrades) before
 using a new file format.
 
@@ -65,7 +65,8 @@ brew untap koehn/mop
 ```
 
 Uninstalling removes the program and its documentation. Your vaults, recovery
-files, and local device records remain in place.
+files, and local application state remain in place. The synchronized account
+identity remains in iCloud Keychain.
 
 ## Development builds
 

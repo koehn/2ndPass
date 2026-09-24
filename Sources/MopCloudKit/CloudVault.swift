@@ -49,6 +49,7 @@ public final class CloudVault {
 
     public func revision(_ digest: String) async throws -> Data {
         let manifest = try await manifest(digest)
+        guard manifest.header.format == "mop-vault-v5" else { throw MopError.legacyVault }
         let reusable = try cache.locked { try cache.recordBlobs() }
         var records: [String: VaultRecord] = [:]
         var total = 0
@@ -80,9 +81,14 @@ public final class CloudVault {
         var cursor = head.revision
         while true {
             guard seen.insert(cursor).inserted, seen.count <= 100_000 else { throw MopError.invalidVault }
+            let metadata = try await manifest(cursor)
+            if metadata.header.format == "mop-vault-v4" {
+                guard !result.isEmpty else { throw MopError.legacyVault }
+                return result
+            }
+            let value = try VaultDocument.decode(await revision(cursor))
             result.append(cursor)
             if cursor == head.root { return result }
-            let value = try VaultDocument.decode(await revision(cursor))
             guard let parent = value.header.parent, VaultTrust.validFingerprint(parent) else { throw MopError.invalidVault }
             cursor = parent
         }
@@ -247,7 +253,7 @@ public final class CloudVault {
             }
             try await upload("m-" + digest, bytes: VaultCoding.encode(CloudManifest(document: doc)))
             try await checkAccount()
-            // Pairing can expire or be cancelled while encrypted records are staged.
+            // Authorization can end while encrypted records are staged.
             try beforePublish?()
             publishing = true
             let saved = try await transport.save("head", kind: .head, data: VaultCoding.encode(CloudHead(revision: digest, root: root)), vault: id, expected: current?.version)

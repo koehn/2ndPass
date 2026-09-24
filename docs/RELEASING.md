@@ -78,7 +78,7 @@ python3 scripts/test-homebrew-release.py
 ```
 
 CI uses a local source archive in a temporary formula. It cannot verify Secure
-Enclave access or interactive authentication; those need hardware testing.
+Keychain synchronization or interactive authentication; those need hardware testing.
 
 ## Homebrew core
 
@@ -101,21 +101,15 @@ See the [formula cookbook](https://docs.brew.sh/Formula-Cookbook),
 [formula requirements](https://docs.brew.sh/Acceptable-Formulae), and
 [package acceptance policy](https://docs.brew.sh/Package-Acceptance-Policy).
 
-## 0.5.0 breaking format change
+## v5-only compatibility
 
-Named vaults replace the separate cloud-vault/namespace model. The reference's
-first component now selects the encrypted vault; the GUI groups fields by item.
-Fresh v4 vaults and v2 manifests are required. No migration or automatic deletion
-is provided; preserve old vaults and use an older client to read them.
+Only signed v5 vaults/backups and synchronized account identities are supported.
+There is no device enrollment, pairing, per-device revocation, conversion, or
+pre-v5 history restoration. Existing v5 vaults remain readable. Old cloud data and
+local credentials are not automatically deleted. Reject old backups explicitly.
 
-The legacy file-vault backend and filesystem history/conflict APIs are removed.
-CloudKit uses an in-memory `VaultSession`; encrypted v4 backup import/export,
-recovery files, and verified offline caches remain supported. Obsolete file-vault
-options are rejected with a diagnostic.
-
-Vault names are discoverable metadata. Renames keep UUIDs, keys, enrollment, and
-records but invalidate old references; no aliases are retained. `mop list` spans
-enrolled vaults, `run`/`inject` support multiple vaults, and `--vault` replaces
-`--cloud-vault`. `MOP_CLOUD_VAULT` no longer selects a vault. Initialization now
-requires a positional vault name and uses `--device-name` for the Mac's name.
-Complete the named-vault two-Mac checks in VALIDATION.md before publishing.
+Keep bundle ID, Keychain group, CloudKit container, and environment consistent
+across Mac/mobile builds and updates. Run the complete current acceptance matrix
+in [VALIDATION.md](VALIDATION.md), including physical Keychain delivery and
+Production smoke tests. Historical audit results do not establish current release
+readiness. Do not publish before those checks pass.
