@@ -205,7 +205,7 @@ absence before local cleanup and never automatically repeats a delete request.
 
 Local metadata defaults to `~/.mop`, overridden by `--state-directory` or
 `MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains account-scoped
-ciphertext caches, commit journals, local authentication policy, and trust pins.
+ciphertext caches, commit journals, and trust pins.
 Account private keys live in iCloud Keychain. Old device metadata is ignored;
 removing legacy support does not delete existing files or Keychain items.
 Secret output cannot target the state directory.

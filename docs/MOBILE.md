@@ -133,7 +133,7 @@ suspension, file-provider behavior, and VoiceOver/keyboard acceptance remain req
 Automated tests do not replace these checks with a Mac, iPhone, and iPad on a test
 account:
 
-- Face ID, Touch ID on supported hardware, passcode fallback, strict biometrics,
+- Face ID, Touch ID on supported hardware, passcode fallback,
   cancellation, changed biometric enrollment, and pending authentication at lock.
 - Account identity delivery across devices, independent recovery evidence, v5
   backup recovery, ownership-change key rotation, concurrent edits, and account changes.

@@ -36,3 +36,11 @@ import MopCore
 ]) func removedDeviceCommandsAndOptionsAreRejected(arguments: [String]) {
     #expect(throws: (any Error).self) { try Mop.parseAsRoot(arguments) }
 }
+
+@Test(arguments: [
+    ["vault", "init", "personal", "--recovery-file", "/tmp/unused", "--strict-biometrics"],
+    ["vault", "import", "--file", "/tmp/unused", "--strict-biometrics"],
+    ["vault", "recover", "--recovery-file", "/tmp/unused", "--strict-biometrics"]
+]) func removedStrictBiometricsOptionIsRejected(arguments: [String]) {
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(arguments) }
+}

@@ -22,7 +22,7 @@ scripts/mobile.sh test
 
 Swift tests cover encryption/signatures, account membership, trust, recovery,
 conditional publication, lost responses, offline caches, rollback, account changes,
-local policy, item edits, OTPs, output files, processes, and session cancellation.
+item edits, OTPs, output files, processes, and session cancellation.
 Regression tests reject v1–v4 documents and stop history at the v4 boundary without
 fetching old secret records. Layout tests stub signing; they are not entitlement
 tests. Simulator UI tests use explicit Debug-only fixtures. Run supported iPhone
@@ -71,9 +71,8 @@ does not create an isolated Keychain identity. Retain the printed vault UUID and
 recovery file until deliberate cleanup. Delete only the test vault and its local
 fixtures; never delete the shared synchronized identity as cleanup.
 
-Run the script once with ordinary authentication, then with
-`MOP_TEST_STRICT_BIOMETRICS=1` in fresh local state. Observe that subsequent reads
-remain biometric-only. No device enrollment or separate enclave probe is used.
+Run the script with ordinary system authentication. No device enrollment or
+separate enclave probe is used.
 
 ## Required physical acceptance
 
@@ -87,10 +86,8 @@ groups and CloudKit environments, on a dedicated test account.
    lock/relaunch, and install an update over existing apps. Missing keys must
    produce a waiting error without replacing the public anchor or private keys.
 3. Test default Face ID/Touch ID/password or passcode fallback, cancellation,
-   lockout, unavailable biometrics, and lock during a pending prompt. Test local
-   strict policy separately: no password fallback, persistence across commands
-   and relaunch, and no weakening through default create/import/recover. Strict
-   policy is not a biometric-enrollment-bound key ACL.
+   lockout, unavailable biometrics, and lock during a pending prompt. Authentication
+   uses the system device-owner policy; no biometric-only mode is offered.
 4. Verify interface/app-switcher concealment, inactivity expiry, protected-data
    loss, clipboard expiration during suspension, and no late visible result after
    lock. Verify shared sessions across owned vaults and fast reads during refresh.

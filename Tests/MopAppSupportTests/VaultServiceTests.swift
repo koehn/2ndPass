@@ -83,7 +83,7 @@ private func fixture() async throws -> Fixture {
         store.close(); vaults.append(vault)
     }
     let count = Counter()
-    let service = NativeVaultService(state: directory, identityKeys: keys, transport: { cloud }, authenticate: { _, _ in
+    let service = NativeVaultService(state: directory, identityKeys: keys, transport: { cloud }, authenticate: { _ in
         count.value.withLock { $0 += 1 }
         return {}
     })
@@ -290,7 +290,7 @@ private final class AuthenticationBarrier: Sendable {
     let f = try await fixture(); defer { f.cleanup() }
     let barrier = AuthenticationBarrier()
     let cloud = f.cloud
-    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { cloud }, authenticate: { _, register in
+    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { cloud }, authenticate: { register in
         try register { barrier.invalidated.withLock { $0 = true } }
         barrier.entered.withLock { $0 = true }
         guard barrier.release.wait(timeout: .now() + 5) == .success else { throw MopError.authentication }
@@ -431,8 +431,8 @@ private final class AuthenticationBarrier: Sendable {
 
 @Test func preparedCreationRequiresExportAndRetainsIdentity() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "prepared", strict: false, state: f.directory)
-    let reloaded = try PendingVaultCreation.prepare(name: "prepared", strict: false, state: f.directory)
+    var intent = try PendingVaultCreation.prepare(name: "prepared", state: f.directory)
+    let reloaded = try PendingVaultCreation.prepare(name: "prepared", state: f.directory)
     #expect(intent.id == reloaded.id)
     let key = try RecoveryKey(file: PendingVaultCreation.recoveryURL(state: f.directory)).publicKey
     await #expect(throws: MopError.invalidRecovery) {
@@ -453,7 +453,7 @@ private final class AuthenticationBarrier: Sendable {
 
 @Test func preparedCreationReconcilesLostResponseWithoutNewKeyOrVault() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "interrupted", strict: false, state: f.directory)
+    var intent = try PendingVaultCreation.prepare(name: "interrupted", state: f.directory)
     let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
     defer { try? FileManager.default.removeItem(at: output) }
     try intent.export(to: output, state: f.directory)
@@ -474,7 +474,7 @@ private final class AuthenticationBarrier: Sendable {
 
 @Test func submittedCreationCannotResurrectDeletedVault() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "removed", strict: false, state: f.directory)
+    var intent = try PendingVaultCreation.prepare(name: "removed", state: f.directory)
     let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
     defer { try? FileManager.default.removeItem(at: output) }
     try intent.export(to: output, state: f.directory)
@@ -521,11 +521,11 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
 @Test func synchronizedIdentityOpensAllVaultsOnUnenrolledDevice() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let keys = f.keys
-    let existing = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _, _ in {} })
+    let existing = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _ in {} })
     defer { existing.lock() }
     for vault in f.vaults { _ = try await existing.execute(.catalog, vault: vault.id.uuidString) }
     let count = Counter()
-    let fresh = NativeVaultService(state: f.directory.appendingPathComponent("new-device"), identityKeys: keys, transport: { f.cloud }, authenticate: { _, _ in
+    let fresh = NativeVaultService(state: f.directory.appendingPathComponent("new-device"), identityKeys: keys, transport: { f.cloud }, authenticate: { _ in
         count.value.withLock { $0 += 1 }; return {}
     })
     defer { fresh.lock() }
@@ -542,7 +542,7 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     fresh.lock()
     _ = try await fresh.execute(.catalog, vault: f.vaults[0].id.uuidString)
     #expect(count.value.withLock { $0 } == 2)
-    let waiting = NativeVaultService(state: f.directory.appendingPathComponent("waiting-device"), identityKeys: TestIdentityKeys(), transport: { f.cloud }, authenticate: { _, _ in {} })
+    let waiting = NativeVaultService(state: f.directory.appendingPathComponent("waiting-device"), identityKeys: TestIdentityKeys(), transport: { f.cloud }, authenticate: { _ in {} })
     defer { waiting.lock() }
     await #expect(throws: MopError.identityPending) { try await waiting.execute(.catalog, vault: f.vaults[0].id.uuidString) }
 }
@@ -551,12 +551,12 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
 @Test func newAccountVaultHasOnlyOwnerAndRecoveryFromItsFirstRevision() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let keys = f.keys
-    let service = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _, _ in {} })
+    let service = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _ in {} })
     defer { service.lock() }
     let recoveryFile = f.directory.appendingPathExtension("account-recovery.key")
     defer { try? FileManager.default.removeItem(at: recoveryFile) }
     let id = UUID()
-    _ = try await service.execute(.create(name: "account-vault", strict: false, recovery: recoveryFile), vault: id.uuidString)
+    _ = try await service.execute(.create(name: "account-vault", recovery: recoveryFile), vault: id.uuidString)
     let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
     let vault = try repo.vault(id)
     #expect(try await vault.revisions().count == 1)

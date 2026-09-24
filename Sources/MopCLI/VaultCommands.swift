@@ -83,7 +83,6 @@ struct Vault: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         @Argument var name: String
         @Option(completion: .file()) var recoveryFile: String
-        @Flag var strictBiometrics = false
         func run() async throws {
             try storage.requireOnline()
             try VaultName.validate(name)
@@ -92,7 +91,7 @@ struct Vault: AsyncParsableCommand {
             try await repo.ensureAvailable(name)
             let recoveryURL = URL(fileURLWithPath: recoveryFile).standardizedFileURL
             _ = try OutputFile(url: recoveryURL, force: false, mode: 0o600, protectedFiles: [], protectedDirectories: [storage.stateURL])
-            let context = try AccountAuthenticationPolicy.authorize(state: storage.stateURL, strict: strictBiometrics)
+            let context = try Authentication.authorize()
             defer { context.invalidate() }
             let owner = try await repo.accountIdentity(keys: SynchronizedIdentityStore(), create: true)
             defer { owner.close() }
@@ -156,7 +155,7 @@ struct Vault: AsyncParsableCommand {
             if let selection = storage.selection,
                try await repo.deletionTarget(selection).id != target.id { throw MopError.vaultSelectionMismatch }
             try IO.requireDeletionConfirmation(target, yes: yes)
-            let authorization = try AccountAuthenticationPolicy.authorize(state: storage.stateURL, reason: "delete this mop vault and all its cloud history")
+            let authorization = try Authentication.authorize(reason: "delete this mop vault and all its cloud history")
             defer { authorization.invalidate() }
             try await repo.delete(UUID(uuidString: target.id)!)
             try IO.output("Vault deleted: \(target.id). Local vault data removed; backups and other Macs' caches remain.\n")
@@ -199,7 +198,6 @@ struct Vault: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         @Option(completion: .file()) var file: String
         @Option(completion: .file()) var recoveryFile: String?
-        @Flag var strictBiometrics = false
         @Option var fingerprint: String?
         @Option var revision: String?
         func validate() throws { try validateEvidence(fingerprint, revision) }
@@ -211,7 +209,7 @@ struct Vault: AsyncParsableCommand {
             let doc = try VaultDocument.decode(bytes)
             if let selection = storage.selection { guard UUID(uuidString: selection) == doc.header.vaultID || selection == doc.header.name else { throw MopError.vaultSelectionMismatch } }
             try await repo.ensureAvailable(doc.header.name)
-            let context = try AccountAuthenticationPolicy.authorize(state: storage.stateURL, strict: strictBiometrics)
+            let context = try Authentication.authorize()
             defer { context.invalidate() }
             let owner = try await repo.accountIdentity(keys: SynchronizedIdentityStore(), create: true)
             defer { owner.close() }
@@ -270,7 +268,6 @@ struct Vault: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Recover v5 access using an offline recovery credential and independent trust evidence.")
         @OptionGroup var storage: VaultOptions
         @Option(completion: .file()) var recoveryFile: String
-        @Flag var strictBiometrics = false
         @Option var fingerprint: String?
         @Option var revision: String?
         func validate() throws { try validateEvidence(fingerprint, revision) }
@@ -279,7 +276,7 @@ struct Vault: AsyncParsableCommand {
             let (repo, vault) = try await storage.selected()
             let bytes = try await vault.sync()
             let recovery = try RecoveryKey(file: URL(fileURLWithPath: recoveryFile))
-            let context = try AccountAuthenticationPolicy.authorize(state: storage.stateURL, strict: strictBiometrics)
+            let context = try Authentication.authorize()
             defer { context.invalidate() }
             let owner = try await repo.accountIdentity(keys: SynchronizedIdentityStore(), create: true)
             defer { owner.close() }

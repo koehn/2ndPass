@@ -16,7 +16,7 @@ final class CommandAccountAuthorization {
     func opener(repo: CloudRepository, offline: Bool) async throws -> AccountIdentity {
         guard !closed else { throw MopError.authentication }
         if let identity { return identity }
-        context = try AccountAuthenticationPolicy.authorize(state: state)
+        context = try Authentication.authorize()
         let opened = try await repo.accountIdentity(keys: SynchronizedIdentityStore(), create: !offline)
         identity = opened
         return opened

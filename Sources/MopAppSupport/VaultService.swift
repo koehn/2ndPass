@@ -20,7 +20,7 @@ public enum VaultOperation: Sendable {
     case write(SecretReference, SecretBytes, replace: Bool), delete(SecretReference)
     case recentlyDeleted, trashItem(name: String, revision: String), restoreItem(id: UUID, revision: String)
     case members, manage(VaultManagement), sync
-    case create(name: String, strict: Bool, recovery: URL)
+    case create(name: String, recovery: URL)
     case createPrepared
     case rename(String), deleteVault, export(URL)
 }
@@ -142,8 +142,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     public init(state: URL? = nil, configuration: any VaultPlatformConfiguration = DefaultVaultPlatformConfiguration(),
                 documents: any DocumentAccessing = SystemDocumentAccess()) {
         let state = state ?? configuration.stateDirectory
-        worker = Worker(state: state.standardizedFileURL, documents: documents, identityKeys: SynchronizedIdentityStore(), accountAuthentication: { strict, register in
-            let context = try AccountAuthenticationPolicy.authorize(state: state, strict: strict ?? false, reason: "unlock your Mop vaults", contextCreated: { context in
+        worker = Worker(state: state.standardizedFileURL, documents: documents, identityKeys: SynchronizedIdentityStore(), accountAuthentication: { register in
+            let context = try Authentication.authorize(reason: "unlock your Mop vaults", contextCreated: { context in
                 let invalidator = ContextInvalidator(context)
                 try register { invalidator.invalidate() }
             })
@@ -160,7 +160,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
          authenticate: @escaping AccountAuthenticationFactory) {
         worker = Worker(state: state, identityKeys: identityKeys, accountAuthentication: authenticate, transport: transport)
     }
-    typealias AccountAuthenticationFactory = (Bool?, (@escaping @Sendable () -> Void) throws -> Void) throws -> (@Sendable () -> Void)
+    typealias AccountAuthenticationFactory = ((@escaping @Sendable () -> Void) throws -> Void) throws -> (@Sendable () -> Void)
 
     public func lock() {
         control.lock()
@@ -257,11 +257,11 @@ private final class Worker {
                              opener: accountIdentity.map { $0 as any VaultKeyOpener }, generation: token)
     }
 
-    func userIdentity(_ repo: CloudRepository, control: SessionControl, token: Int, strict: Bool? = nil) async throws -> AccountIdentity {
+    func userIdentity(_ repo: CloudRepository, control: SessionControl, token: Int) async throws -> AccountIdentity {
         try control.check(token)
-        if let accountIdentity, strict != true { return accountIdentity }
-        if !control.authenticated || strict == true {
-            let close = try accountAuthentication(strict) { try control.register($0, token: token) }
+        if let accountIdentity { return accountIdentity }
+        if !control.authenticated {
+            let close = try accountAuthentication { try control.register($0, token: token) }
             do { try control.check(token); try control.authorized(token) } catch { close(); throw error }
             accountAuthenticationClose?()
             accountAuthenticationClose = close
@@ -366,13 +366,13 @@ private final class Worker {
         case .sync:
             guard !offline else { throw MopError.offlineWrite }
             _ = try await vault.sync(); return result
-        case .create(let name, let strict, let recoveryURL):
+        case .create(let name, let recoveryURL):
             guard !offline else { throw MopError.offlineWrite }
             try VaultName.validate(name)
             try await repo.ensureAvailable(name)
             try control.check(token)
             _ = try OutputFile(url: recoveryURL, force: false, mode: 0o600, protectedFiles: [], protectedDirectories: [state])
-            let owner = try await userIdentity(repo, control: control, token: token, strict: strict)
+            let owner = try await userIdentity(repo, control: control, token: token)
             let device: any VaultKeyOpener = owner
             let recovery = RecoveryKey()
             try control.check(token)
@@ -393,7 +393,7 @@ private final class Worker {
             guard !offline, var intent = try PendingVaultCreation.load(state: state),
                   intent.id == vault.id, intent.exported else { throw MopError.invalidRecovery }
             guard intent.account == nil || intent.account == repo.accountID else { throw MopError.cloudAccount }
-            let owner = try await userIdentity(repo, control: control, token: token, strict: intent.strict)
+            let owner = try await userIdentity(repo, control: control, token: token)
             let device: any VaultKeyOpener = owner
             if intent.snapshot == nil {
                 try await repo.ensureAvailable(intent.name)
@@ -434,7 +434,7 @@ private final class Worker {
             guard !offline else { throw MopError.offlineWrite }
             // Deletion does not require decrypting the vault, including unsupported formats.
             if !control.authenticated {
-                let context = try AccountAuthenticationPolicy.authorize(state: state, reason: "delete this Mop vault and all its cloud history", contextCreated: { context in
+                let context = try Authentication.authorize(reason: "delete this Mop vault and all its cloud history", contextCreated: { context in
                     let invalidator = ContextInvalidator(context)
                     try control.register({ invalidator.invalidate() }, token: token)
                 })

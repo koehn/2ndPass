@@ -835,7 +835,7 @@ final class AppModel {
         }
     }
 
-    func createVault(name: String, strict: Bool, recovery: URL) {
+    func createVault(name: String, recovery: URL) {
         guard !offline, !busy else { return }
         conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; members = []; authenticated = false
         let id = UUID().uuidString
@@ -843,7 +843,7 @@ final class AppModel {
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
             self.allVaults = false; self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v5", enrolled: true))
             self.status = "Creating vault \(id) · retain any recovery file written"
-            let result = try await self.service.execute(.create(name: name, strict: strict, recovery: recovery), vault: id, offline: false)
+            let result = try await self.service.execute(.create(name: name, recovery: recovery), vault: id, offline: false)
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
             try await self.unlockContents(token, refresh: false)

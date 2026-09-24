@@ -13,9 +13,8 @@
 stores independently encrypted secrets in a private CloudKit database.
 Each named vault has a stable UUID and a custom record zone.
 Every command accessing secrets authenticates afresh with Touch ID or the
-system password. Strict local biometric policy has no password fallback and is
-persisted per state directory. It is application policy, not a biometric-enrollment
-Keychain ACL. Software encryption/signing keys synchronize through iCloud Keychain.
+system password. Authentication is application policy, not a per-use Keychain
+ACL. Software encryption/signing keys synchronize through iCloud Keychain.
 CloudKit receives ciphertext, discoverable vault names, and signed public membership.
 .Pp
 Requires macOS 15 or later, an available user session, iCloud Passwords & Keychain,
@@ -70,7 +69,7 @@ Output is atomic after all references resolve, defaults to mode 0600, and cannot
 target the local state directory. Existing files require --force.
 .Sh VAULT COMMANDS
 .Bl -tag -width indent
-.It Cm vault init Ar NAME Fl -recovery-file Ar PATH Op Fl -strict-biometrics
+.It Cm vault init Ar NAME Fl -recovery-file Ar PATH
 Create a CloudKit vault and an exclusive offline recovery file. Prints the UUID
 and fingerprints. Retain any recovery file after an interrupted initialization.
 .It Cm vault list Op Fl -json
@@ -111,7 +110,7 @@ Restore a committed v5 revision decryptable by the current owner under current
 name, keys, and membership. Pre-v5 history is unsupported.
 .It Cm vault recover Fl -recovery-file Ar PATH
 Recover v5 access for a usable account identity with offline recovery and local
-authentication. Accepts --strict-biometrics and independent --fingerprint/--revision
+authentication. Accepts independent --fingerprint/--revision
 evidence. A missing synchronized identity is not implicitly reset.
 .El
 .Sh SIGNING DIAGNOSTIC
@@ -128,8 +127,6 @@ Missing zones are not silently recreated. Old revisions and abandoned staging
 records are retained and consume iCloud quota.
 .Sh FILES
 .Bl -tag -width indent
-.It Pa ~/.mop/account-authentication.json
-Local biometric-only policy. Does not contain keys or synchronize between devices.
 .It Pa ~/.mop/cloud/
 Account/container/environment/vault-scoped ciphertext cache, journals, and trust.
 .El

@@ -48,12 +48,11 @@ conceals the UI but may retain the session until that deadline. Pending native
 operations have generation/cancellation checks to prevent late results reopening
 a locked interface; a submitted cloud mutation may still complete.
 
-`--strict-biometrics` selects biometric-only local authentication and persists in
-`account-authentication.json` for that state directory. Subsequent commands honor
-it, and default setup does not weaken it. This is application policy, not
-`biometryCurrentSet` or another per-use Keychain ACL. Changing enrolled biometrics
-does not invalidate the synchronized account keys. Each installation has its own
-local policy; it does not synchronize with the identity.
+Authentication uses the system device-owner policy, allowing biometrics or the
+system password/passcode. There is no biometric-only option or saved local
+authentication policy. Older `account-authentication.json` files are ignored.
+This authentication is enforced by the application, not a per-use Keychain ACL.
+Changing enrolled biometrics does not invalidate the synchronized account keys.
 
 There is one owner per vault. Every device receiving the account identity can
 access its owned vaults. Independent per-device revocation, collaborative roles,

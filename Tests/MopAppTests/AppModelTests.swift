@@ -173,7 +173,7 @@ private actor Barrier {
         let service = FakeService { _, _, _ in throw MopError.cloudUncertain }
         let model = model(service)
         let old = model.vault
-        model.createVault(name: "personal", strict: false, recovery: URL(fileURLWithPath: "/tmp/unused.key"))
+        model.createVault(name: "personal", recovery: URL(fileURLWithPath: "/tmp/unused.key"))
         try await finish(model)
         #expect(model.vault != old && model.vaults.contains { $0.id == model.vault })
         #expect(model.catalog == nil && model.error == MopError.cloudUncertain.errorDescription)

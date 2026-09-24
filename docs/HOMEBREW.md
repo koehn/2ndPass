@@ -43,7 +43,7 @@ brew upgrade koehn/mop/mop
 ```
 
 Keep your `~/.mop` directory when upgrading. It contains your default vault,
-authentication policy, caches, and trusted vault fingerprints. If you share a vault between
+caches and trusted vault fingerprints. If you share a vault between
 Macs, check the [upgrade notes](../README.md#file-boundaries-and-upgrades) before
 using a new file format.
 

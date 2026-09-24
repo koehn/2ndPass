@@ -21,7 +21,7 @@ env = os.environ | {'MOP_CLOUD_VAULT': '00000000-0000-0000-0000-000000000000',
 for shell, path in scripts.items():
     generated = subprocess.check_output([str(binary), 'completion', shell], env=env)
     assert generated == path.read_bytes()
-    assert b'rename' in generated and b'fingerprint' in generated and b'no-masking' in generated and b'strict-biometrics' in generated
+    assert b'rename' in generated and b'fingerprint' in generated and b'no-masking' in generated and b'strict-biometrics' not in generated
     executable = shutil.which(shell)
     if executable:
         subprocess.run([executable, '-n', str(path)], check=True, env=env)
@@ -50,7 +50,7 @@ assert 'trust' in bash_candidates(['mop', 'vault', 'tr'])
 assert 'rename' in bash_candidates(['mop', 'vault', 'ren'])
 assert 'delete' in bash_candidates(['mop', 'vault', 'del'])
 assert '--yes' in bash_candidates(['mop', 'vault', 'delete', '--y'])
-assert '--strict-biometrics' in bash_candidates(['mop', 'vault', 'init', '--strict'])
+assert '--strict-biometrics' not in bash_candidates(['mop', 'vault', 'init', '--strict'])
 assert '--device-name' not in bash_candidates(['mop', 'vault', 'init', '--device'])
 assert '--no-masking' in bash_candidates(['mop', 'run', '--no'])
 assert set(bash_candidates(['mop', 'completion', ''])) == {'bash', 'zsh', 'fish'}

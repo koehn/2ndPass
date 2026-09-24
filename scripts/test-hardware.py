@@ -42,7 +42,7 @@ def command(label, args, data=b'', extra=None, code=0):
         raise SystemExit(f'{label} failed with code {result.returncode}; expected {code}')
     return result
 
-command('Initialize disposable vault', ['vault', 'init', vault_name, '--recovery-file', str(root / 'recovery.key')] + (['--strict-biometrics'] if os.environ.get('MOP_TEST_STRICT_BIOMETRICS') == '1' else []))
+command('Initialize disposable vault', ['vault', 'init', vault_name, '--recovery-file', str(root / 'recovery.key')])
 command('Write sectioned multiline field', ['write', ref_a], first)
 command('Write second field', ['write', ref_b], second)
 # Hash assertions verify delivery without placing secret values in argv.

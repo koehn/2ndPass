@@ -195,8 +195,7 @@ backups require an older client.
 
 Package with the existing signing identity and provisioning profile, then verify:
 
-1. Set inactivity to 10 minutes. Unlock with Touch ID (and test password fallback
-   separately on a non-strict device). Read, edit, and switch between owned
+1. Set inactivity to 10 minutes. Unlock with Touch ID and test password fallback. Read, edit, and switch between owned
    vaults without another prompt. Keep interacting for more than five minutes and
    confirm subsequent reads still work without prompting.
 2. Switch apps and return before expiry: values are concealed and the session is
@@ -205,8 +204,7 @@ Package with the existing signing identity and provisioning profile, then verify
    result restores data. A submitted write may require Refresh to reconcile.
 4. Test Mac screen lock, sleep, and account changes; each ends authorization.
    Unlocking then prompts again. Disconnection/reconnection may retain a valid
-   session and use verified cached reads. Verify local strict biometric policy
-   continues to reject password fallback.
+   session and use verified cached reads.
 
 These checks require the signed application and real biometric hardware;
 a passing software suite alone does not establish them.

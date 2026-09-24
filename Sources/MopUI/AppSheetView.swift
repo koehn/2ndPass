@@ -8,7 +8,6 @@ struct AppSheetView: View {
     let kind: AppSheet
     @State private var vaultName = "personal"
     @State private var fingerprint = ""
-    @State private var strict = false
     @State private var confirmed = false
     @State private var recoveryURL: URL?
     @State private var choosingRecoveryFolder = false
@@ -55,7 +54,7 @@ struct AppSheetView: View {
                 Text("Your Mop identity synchronizes through iCloud Keychain. Mop authenticates locally before opening it.").font(.caption).foregroundStyle(.secondary)
                 Button(pending?.exported == true ? "Export another recovery key copy…" : "Export recovery key…") {
                     do {
-                        pending = try PendingVaultCreation.prepare(name: vaultName, strict: strict, state: AppStorageLocation.defaultState)
+                        pending = try PendingVaultCreation.prepare(name: vaultName, state: AppStorageLocation.defaultState)
                         fileRequestGeneration = model.editorGeneration
                         choosingRecoveryFolder = true
                     } catch { localError = safeMessage(error) }
@@ -140,7 +139,7 @@ struct AppSheetView: View {
             if kind == .createVault {
                 do {
                     pending = try PendingVaultCreation.load(state: AppStorageLocation.defaultState)
-                    if let pending { vaultName = pending.name; strict = pending.strict }
+                    if let pending { vaultName = pending.name }
                 } catch { localError = safeMessage(error) }
             }
             if kind == .renameVault { vaultName = model.vaultName }
