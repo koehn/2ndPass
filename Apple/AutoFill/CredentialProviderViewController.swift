@@ -9,7 +9,7 @@ import MopCore
     private var service: NativeVaultService?
     private var task: Task<Void, Never>?
     private var accountObserver: AccountObservation?
-    private var pendingIdentity: ASPasswordCredentialIdentity?
+    private var pendingIdentity: AutoFillIdentity?
     private let model = CredentialListModel()
 
     override func loadView() {
@@ -52,19 +52,26 @@ import MopCore
     }
 
     override func prepareCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier]) {
+        prepareList(for: serviceIdentifiers, kind: .password)
+    }
+    override func prepareOneTimeCodeCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier]) {
+        prepareList(for: serviceIdentifiers, kind: .oneTimeCode)
+    }
+    private func prepareList(for serviceIdentifiers: [ASCredentialServiceIdentifier], kind: AutoFillKind?) {
         stop()
         pendingIdentity = nil
+        model.kind = kind
         model.showsPicker = true
         model.textInsertion = false
         updatePreferredContentSize()
         model.loading = true
         model.message = nil
         task = Task {
-            let identities: [ASPasswordCredentialIdentity]
+            let identities: [AutoFillIdentity]
             do {
                 let directory = try AutoFillStorage.directory()
                 let entries = try await Task.detached { try AutoFillIndex(directory: directory).load() }.value
-                identities = entries.map(\.identity)
+                identities = entries.filter { kind == nil || $0.kind == kind }
             } catch {
                 guard !Task.isCancelled else { return }
                 Logger(subsystem: "com.koehn.mop", category: "AutoFill").error("Unable to read the shared credential index.")
@@ -76,9 +83,9 @@ import MopCore
             guard !Task.isCancelled else { return }
             let hosts = Set(serviceIdentifiers.compactMap { AutoFillEntry.website($0.identifier) })
             model.entries = identities.sorted {
-                let left = hosts.contains($0.serviceIdentifier.identifier), right = hosts.contains($1.serviceIdentifier.identifier)
+                let left = hosts.contains($0.website), right = hosts.contains($1.website)
                 if left != right { return left }
-                return ($0.serviceIdentifier.identifier, $0.user) < ($1.serviceIdentifier.identifier, $1.user)
+                return ($0.website, $0.username) < ($1.website, $1.username)
             }
             model.loading = false
         }
@@ -90,25 +97,26 @@ import MopCore
     }
     #if os(iOS)
     override func prepareInterfaceForUserChoosingTextToInsert() {
-        prepareCredentialList(for: [])
+        prepareList(for: [], kind: nil)
         model.textInsertion = true
     }
     #endif
     override func provideCredentialWithoutUserInteraction(for credentialRequest: any ASCredentialRequest) {
-        guard let identity = credentialRequest.credentialIdentity as? ASPasswordCredentialIdentity else { cancel(); return }
-        provideCredentialWithoutUserInteraction(for: identity)
+        guard let identity = AutoFillIdentity(identity: credentialRequest.credentialIdentity) else { identityNotFound(); return }
+        provide(identity)
     }
     override func provideCredentialWithoutUserInteraction(for credentialIdentity: ASPasswordCredentialIdentity) {
+        guard let identity = AutoFillIdentity(identity: credentialIdentity) else { identityNotFound(); return }
+        provide(identity)
+    }
+    private func provide(_ identity: AutoFillIdentity) {
         stop()
         pendingIdentity = nil
         observeAccountChanges()
-        guard let identifier = credentialIdentity.recordIdentifier else {
-            extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.credentialIdentityNotFound.rawValue))
-            return
-        }
+        let identifier = identity.recordIdentifier
         task = Task {
             do {
-                try await AutoFillAccess.completeSystemRequest(recordIdentifier: identifier, context: extensionContext)
+                try await AutoFillAccess.completeSystemRequest(recordIdentifier: identifier, kind: identity.kind, context: extensionContext)
             } catch {
                 guard !Task.isCancelled else { return }
                 let code: ASExtensionError.Code
@@ -122,10 +130,14 @@ import MopCore
         }
     }
     override func prepareInterfaceToProvideCredential(for credentialRequest: any ASCredentialRequest) {
-        guard let identity = credentialRequest.credentialIdentity as? ASPasswordCredentialIdentity else { cancel(); return }
-        prepareInterfaceToProvideCredential(for: identity)
+        guard let identity = AutoFillIdentity(identity: credentialRequest.credentialIdentity) else { identityNotFound(); return }
+        prepare(identity)
     }
     override func prepareInterfaceToProvideCredential(for credentialIdentity: ASPasswordCredentialIdentity) {
+        guard let identity = AutoFillIdentity(identity: credentialIdentity) else { identityNotFound(); return }
+        prepare(identity)
+    }
+    private func prepare(_ identity: AutoFillIdentity) {
         stop()
         pendingIdentity = nil
         model.showsPicker = false
@@ -134,8 +146,8 @@ import MopCore
         updatePreferredContentSize()
         model.message = nil
         model.loading = true
-        if isViewLoaded, view.window != nil { fill(credentialIdentity) }
-        else { pendingIdentity = credentialIdentity }
+        if isViewLoaded, view.window != nil { fill(identity) }
+        else { pendingIdentity = identity }
     }
     #if os(macOS)
     override func viewDidAppear() {
@@ -164,8 +176,8 @@ import MopCore
         #endif
     }
 
-    private func fill(_ identity: ASPasswordCredentialIdentity, field: CredentialField? = nil) {
-        guard let identifier = identity.recordIdentifier else { cancel(); return }
+    private func fill(_ identity: AutoFillIdentity, field: CredentialField? = nil) {
+        let identifier = identity.recordIdentifier
         stop()
         model.message = nil
         model.loading = true
@@ -173,6 +185,19 @@ import MopCore
             do {
                 let service = NativeVaultService(state: try AutoFillStorage.directory())
                 self.service = service
+                if identity.kind == .oneTimeCode {
+                    let credential = try await AutoFillAccess.oneTimeCode(recordIdentifier: identifier, service: service)
+                    try Task.checkCancellation()
+                    service.lock(); self.service = nil
+                    #if os(iOS)
+                    if field == .code {
+                        extensionContext.completeRequest(withTextToInsert: credential.code, completionHandler: nil)
+                        return
+                    }
+                    #endif
+                    extensionContext.completeOneTimeCodeRequest(using: credential, completionHandler: nil)
+                    return
+                }
                 let credential = try await AutoFillAccess.credential(recordIdentifier: identifier, service: service)
                 try Task.checkCancellation()
                 service.lock(); self.service = nil
@@ -210,57 +235,66 @@ import MopCore
         model.loading = false
         if wasLoading { model.message = "The request was interrupted. Select an account to try again." }
     }
+    private func identityNotFound() {
+        stop()
+        extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.credentialIdentityNotFound.rawValue))
+    }
     private func cancel() {
         stop()
         extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userCanceled.rawValue))
     }
 }
 
-private enum CredentialField { case username, password }
+private enum CredentialField { case username, password, code }
 
 @MainActor @Observable private final class CredentialListModel {
     // Start without a picker so a selected-credential request cannot flash the list
     // while AuthenticationServices is loading the view.
     var showsPicker = false
     var textInsertion = false
-    var entries: [ASPasswordCredentialIdentity] = []
+    var kind: AutoFillKind? = .password
+    var entries: [AutoFillIdentity] = []
     var loading = true
     var message: String?
 }
 
 private struct CredentialListView: View {
     @Bindable var model: CredentialListModel
-    let select: (ASPasswordCredentialIdentity, CredentialField?) -> Void
+    let select: (AutoFillIdentity, CredentialField?) -> Void
     let cancel: () -> Void
     @State private var search = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack { Text("Mop AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel) }
-            if model.loading { ProgressView(model.showsPicker ? "Please wait…" : "Unlocking to fill your login…") }
+            if model.loading { ProgressView(model.showsPicker ? "Please wait…" : "Unlocking to fill…") }
             if let message = model.message { Text(message).font(.callout) }
             if model.showsPicker {
-                if model.textInsertion { Text("Choose the username or password to insert into the selected field.").font(.callout) }
+                if model.textInsertion { Text("Choose the username, password or code to insert into the selected field.").font(.callout) }
                 if !model.loading && model.entries.isEmpty && model.message == nil {
-                    Text("No logins are available in this AutoFill list. Open and unlock Mop to refresh it, then try again.")
+                    Text(model.kind == .oneTimeCode ? "No codes are available. Open and unlock Mop to refresh AutoFill, then try again." : "No logins are available in this AutoFill list. Open and unlock Mop to refresh it, then try again.")
                 }
                 TextField("Search websites or usernames", text: $search)
                     .textFieldStyle(.roundedBorder)
                 List {
-                    ForEach(model.entries.filter { search.isEmpty || $0.user.localizedCaseInsensitiveContains(search) || $0.serviceIdentifier.identifier.localizedCaseInsensitiveContains(search) }, id: \.recordIdentifier) { entry in
+                    ForEach(model.entries.filter { search.isEmpty || $0.username.localizedCaseInsensitiveContains(search) || $0.website.localizedCaseInsensitiveContains(search) }, id: \.recordIdentifier) { entry in
                         if model.textInsertion {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text(entry.serviceIdentifier.identifier).font(.headline)
-                                Text(entry.user).font(.subheadline)
+                                Text(entry.website).font(.headline)
+                                Text(entry.username).font(.subheadline)
                                 HStack {
-                                    Button("Username") { select(entry, .username) }
-                                    Button("Password") { select(entry, .password) }
+                                    if entry.kind == .oneTimeCode {
+                                        Button("Code") { select(entry, .code) }
+                                    } else {
+                                        Button("Username") { select(entry, .username) }
+                                        Button("Password") { select(entry, .password) }
+                                    }
                                 }.buttonStyle(.bordered).disabled(model.loading)
                             }
                         } else {
                             Button { select(entry, nil) } label: {
                                 VStack(alignment: .leading) {
-                                    Text(entry.serviceIdentifier.identifier).font(.headline)
-                                    Text(entry.user).font(.subheadline)
+                                    Text(entry.website).font(.headline)
+                                    Text(entry.username).font(.subheadline)
                                 }.frame(maxWidth: .infinity, alignment: .leading)
                             }.buttonStyle(.plain).disabled(model.loading)
                         }

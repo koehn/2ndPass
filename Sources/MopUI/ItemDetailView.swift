@@ -58,12 +58,15 @@ struct ItemDetailView: View {
                     .font(.caption).foregroundStyle(.secondary)
             } else { Text(model.selectedTypedItem?.type.label ?? "Custom").foregroundStyle(.secondary) }
             if let item = model.itemDraft?.item ?? model.selectedTypedItem, item.type == .login {
-                if let reason = AutoFillEntry.exclusionReason(for: item) {
-                    Label("AutoFill unavailable: " + reason, systemImage: "info.circle")
-                        .font(.callout).foregroundStyle(.secondary)
-                } else {
-                    Label("Fields ready for AutoFill", systemImage: "checkmark.circle")
-                        .font(.caption).foregroundStyle(.secondary)
+                ForEach(AutoFillKind.allCases, id: \.self) { kind in
+                    let label = kind == .password ? "Password AutoFill" : "Code AutoFill"
+                    if let reason = AutoFillEntry.exclusionReason(for: item, kind: kind) {
+                        Label(label + " unavailable: " + reason, systemImage: "info.circle")
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        Label(label + " fields ready", systemImage: "checkmark.circle")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
             ForEach(fields.filter { edits($0) || $0.type != .notes || $0.value != "" }) { field in

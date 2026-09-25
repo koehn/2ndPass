@@ -1,14 +1,17 @@
-# Password AutoFill
+# Password and TOTP AutoFill
 
 Mop includes a native credential provider extension for iOS/iPadOS 18+ and macOS
 15+. Enable Mop in the system AutoFill/password-provider settings, then open and
 unlock Mop. Each authenticated catalog refresh publishes login websites,
-usernames and opaque credential identifiers to Mop's Apple credential identity
-store. Mop also writes the same three metadata fields to a shared local index;
+usernames and opaque password/code credential identifiers to Mop's Apple credential identity
+store. Mop also writes the same metadata fields plus credential kind to a shared local index;
 the extension reads that index for its searchable picker without unlocking. It
 does not depend on Apple returning its stored suggestions to the extension.
-Only Login items with a usable typed username/email, password and valid HTTP(S)
-website are indexed. The standard `username` and `password` fields take priority
+Only undeleted Login items with a usable typed username/email and valid HTTP(S)
+website are indexed. Password suggestions require a primary typed Password field.
+Code suggestions require a primary typed OTP field, but do not require a password.
+The `otp` field takes priority; otherwise exactly one OTP field is required.
+Ambiguous OTP layouts are excluded from code suggestions without affecting passwords. The standard `username` and `password` fields take priority
 over extra fields. Username takes priority over a contact email; email is used
 when no nonempty Username field exists. Without standard field names, multiple
 distinct usernames or passwords need an explicit primary field. The item view
@@ -19,7 +22,7 @@ available to Mop and its extension without a vault-unlock prompt.
 
 System suggestions use `provideCredentialWithoutUserInteraction`: the extension
 opens the encrypted snapshot through shared Mop libraries, verifies the selected
-identifier against its catalog, and hands the password directly to
+identifier against its catalog, and generates the current TOTP code or reads the password and hands it directly to
 AuthenticationServices without displaying a Mop window. AutoFill owns user
 authentication according to the device's settings on this path. No Touch ID
 token is exported to Mop, and no second LocalAuthentication challenge is issued.
@@ -35,9 +38,13 @@ failure, cancellation or dismissal. App and CLI authentication are unchanged.
 
 On iOS, the text-field menu's AutoFill → Passwords action uses the separate text
 insertion API. Mop advertises `ProvidesTextToInsert` and presents its searchable
-login list with Username and Password buttons. Choosing either authenticates,
+login list with Username, Password and Code actions as applicable. Choosing either authenticates,
 revalidates the credential, and inserts only that value into the focused field.
-Passwords are never shown in the list or copied to the clipboard.
+Passwords and codes are never shown in the list or copied to the clipboard.
+The code picker lists only eligible code accounts; search and website prioritization
+work like the password picker. Codes are generated after authentication at fill time,
+using the saved algorithm, digit count and period. Invalid seeds or expired results
+fail without inserting anything; Mop does not wait for the next TOTP period.
 
 ## Storage and refresh
 
@@ -57,12 +64,14 @@ revoked vaults remove their cached snapshots and suggestions. Account-change
 notifications invalidate the offline binding and clear suggestions.
 
 Websites and usernames are deliberately available to the system without unlocking
-Mop. Passwords remain encrypted on disk; the non-UI suggestion path decrypts only
+Mop. Passwords and OTP seeds remain encrypted on disk; the non-UI suggestion path decrypts only
 for delivery to system AutoFill, which controls authentication before filling.
 Apple manages the metadata
 store, excludes it from device backups and clears it when the provider is disabled.
-This version provides existing passwords only; passkeys, OTP AutoFill and saving
-or generating credentials through AutoFill are not implemented.
+This version provides existing passwords and TOTP codes. Passkeys and saving or
+generating new credentials through AutoFill are not implemented.
+Existing password index rows upgrade automatically on refresh; password identifiers
+remain stable and codes use a separate identifier namespace. No vault migration is needed.
 
 ## Provisioning and building
 
@@ -88,13 +97,16 @@ Keychain sharing or biometric presentation. Before release, use signed builds on
 an iPhone/iPad and Mac to check:
 
 - Enable provider, unlock Mop, and see website/username suggestions in Safari.
+- Verify TOTP suggestions in a code field, including a login without a password.
+- Open the code picker and verify only code accounts appear, with working search.
+- Fill codes before and after a TOTP rollover and compare with Mop’s current code.
 - Browse/search the extension while Mop is locked or terminated, without a prompt.
 - Select a suggestion, authenticate with the system and fill the correct account
   without a Mop window or additional prompt. Choose “Mop…” and verify the picker
   opens and requires authentication before filling.
 - Cancel system authentication and confirm no fields are filled; then retry.
 - On iOS, long-press a text field and choose AutoFill → Passwords. Verify Mop
-  appears, its list can be searched, and Username/Password inserts only the
+  appears, its list can be searched, and Username/Password/Code inserts only the
   chosen value after authentication. Cancelling must leave the field unchanged.
 - Cancel authentication and retry; dismiss the extension during authentication.
 - Fill offline, update a password/username, rename/trash/delete items and vaults,

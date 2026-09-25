@@ -31,7 +31,7 @@
 			<key>ASCredentialProviderExtensionCapabilities</key>
 			<dict>
 				<key>ProvidesOneTimeCodes</key>
-				<false/>
+				<true/>
 				<key>ProvidesPasskeys</key>
 				<false/>
 				<key>ProvidesPasswords</key>

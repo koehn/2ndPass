@@ -44,10 +44,10 @@ renaming and password-strength indicators. Offline browsing is explicit and read
 open dist/Mop.app
 ```
 
-## Password AutoFill
+## Password and TOTP AutoFill
 
 Mop includes an iOS/macOS AutoFill extension. Enable Mop in system AutoFill settings,
-then open and unlock the app to publish website/username suggestions. System AutoFill
+then open and unlock the app to publish password and TOTP website/username suggestions. System AutoFill
 handles authentication for suggested credentials; choosing “Mop…” opens its picker
 with Mop authentication. Both read a shared encrypted snapshot and work offline.
 See [AutoFill setup and provisioning](docs/AUTOFILL.md).

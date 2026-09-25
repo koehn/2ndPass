@@ -7,24 +7,32 @@ import MopVault
 import MopCloudKit
 import MopKeychain
 
-/// Only websites, usernames and opaque locators leave the encrypted catalog.
+public enum AutoFillKind: String, Codable, Sendable, CaseIterable {
+    case password, oneTimeCode
+    var prefix: String { self == .password ? "mop-autofill-v1" : "mop-autofill-otp-v1" }
+}
+
+/// Only websites, usernames, credential kinds and opaque locators leave the encrypted catalog.
 public struct AutoFillEntry: Equatable, Sendable {
     public let website: String
     public let username: String
     public let recordIdentifier: String
     public let reference: SecretReference
+    public let kind: AutoFillKind
 
     public static func entries(catalog: ItemCatalog, vaultID: String) -> [Self] {
         guard let id = UUID(uuidString: vaultID) else { return [] }
         return catalog.items.filter { $0.type == .login && $0.deletion == nil }.flatMap { item -> [Self] in
-            guard exclusionReason(for: item) == nil,
-                  let username = usernameField(in: item)?.value,
-                  let password = passwordField(in: item),
-                  let reference = try? SecretReference(vault: catalog.vault, relativePath: SecretReference.encode(item.name) + "/" + password.path) else { return [] }
-            return Set(item.fields.filter { $0.type == .website }.compactMap { website($0.value ?? "") }).sorted().map { website in
-                let parts = [item.name, password.path, username, website]
-                let digest = SHA256.hash(data: Data(parts.map { "\($0.utf8.count):\($0)" }.joined().utf8)).map { String(format: "%02x", $0) }.joined()
-                return Self(website: website, username: username, recordIdentifier: "mop-autofill-v1:\(id.uuidString):\(digest)", reference: reference)
+            AutoFillKind.allCases.flatMap { kind -> [Self] in
+                guard exclusionReason(for: item, kind: kind) == nil,
+                      let username = usernameField(in: item)?.value,
+                      let field = kind == .password ? passwordField(in: item) : otpField(in: item),
+                      let reference = try? SecretReference(vault: catalog.vault, relativePath: SecretReference.encode(item.name) + "/" + field.path) else { return [] }
+                return Set(item.fields.filter { $0.type == .website }.compactMap { website($0.value ?? "") }).sorted().map { website in
+                    let parts = [item.name, field.path, username, website]
+                    let digest = SHA256.hash(data: Data(parts.map { "\($0.utf8.count):\($0)" }.joined().utf8)).map { String(format: "%02x", $0) }.joined()
+                    return Self(website: website, username: username, recordIdentifier: "\(kind.prefix):\(id.uuidString):\(digest)", reference: reference, kind: kind)
+                }
             }
         }
     }
@@ -44,15 +52,23 @@ public struct AutoFillEntry: Equatable, Sendable {
         if let primary = passwords.first(where: { $0.path == "password" }) { return primary }
         return passwords.count == 1 ? passwords.first : nil
     }
+    private static func otpField(in item: VaultItem) -> ItemField? {
+        let fields = item.fields.filter { $0.type == .otp }
+        if let primary = fields.first(where: { $0.path == "otp" }) { return primary }
+        return fields.count == 1 ? fields.first : nil
+    }
     /// Nil means the field layout is eligible, not that system publication succeeded.
-    public static func exclusionReason(for item: VaultItem) -> String? {
+    public static func exclusionReason(for item: VaultItem, kind: AutoFillKind = .password) -> String? {
         guard item.type == .login else { return "Set the item type to Login." }
         guard item.deletion == nil else { return "Restore this deleted login first." }
         guard usernameField(in: item) != nil else {
             return "Set a nonempty field’s type to Username (or Email). If there are multiple usernames, name the primary Username field ‘username’."
         }
-        guard passwordField(in: item) != nil else {
+        if kind == .password && passwordField(in: item) == nil {
             return "Set the password field’s type to Password. If there are multiple passwords, name the primary Password field ‘password’."
+        }
+        if kind == .oneTimeCode && otpField(in: item) == nil {
+            return "Set a field’s type to OTP. If there are multiple OTP fields, name the primary field ‘otp’."
         }
         guard item.fields.contains(where: { $0.type == .website && website($0.value ?? "") != nil }) else {
             return "Set a field’s type to Website and enter a valid HTTP(S) URL or domain."
@@ -71,13 +87,11 @@ public struct AutoFillEntry: Equatable, Sendable {
     }
     public static func vaultID(_ identifier: String) -> String? {
         let parts = identifier.split(separator: ":", omittingEmptySubsequences: false)
-        guard parts.count == 3, parts[0] == "mop-autofill-v1", let id = UUID(uuidString: String(parts[1])),
+        guard parts.count == 3, AutoFillKind.allCases.contains(where: { $0.prefix == parts[0] }), let id = UUID(uuidString: String(parts[1])),
               VaultTrust.validFingerprint(String(parts[2])) else { return nil }
         return id.uuidString
     }
-    public var identity: ASPasswordCredentialIdentity {
-        ASPasswordCredentialIdentity(serviceIdentifier: ASCredentialServiceIdentifier(identifier: website, type: .domain), user: username, recordIdentifier: recordIdentifier)
-    }
+    public var identity: any ASCredentialIdentity { AutoFillIdentity(entry: self).identity }
 }
 
 /// This projection deliberately cannot encode a secret, item title or reference.
@@ -85,11 +99,33 @@ public struct AutoFillIdentity: Codable, Equatable, Sendable {
     public let website: String
     public let username: String
     public let recordIdentifier: String
+    public let kind: AutoFillKind
     public init(entry: AutoFillEntry) {
-        website = entry.website; username = entry.username; recordIdentifier = entry.recordIdentifier
+        website = entry.website; username = entry.username; recordIdentifier = entry.recordIdentifier; kind = entry.kind
     }
-    public var identity: ASPasswordCredentialIdentity {
-        ASPasswordCredentialIdentity(serviceIdentifier: ASCredentialServiceIdentifier(identifier: website, type: .domain), user: username, recordIdentifier: recordIdentifier)
+    public init?(identity: any ASCredentialIdentity) {
+        guard let identifier = identity.recordIdentifier else { return nil }
+        recordIdentifier = identifier
+        if let password = identity as? ASPasswordCredentialIdentity {
+            website = password.serviceIdentifier.identifier; username = password.user; kind = .password
+        } else if let code = identity as? ASOneTimeCodeCredentialIdentity {
+            website = code.serviceIdentifier.identifier; username = code.label; kind = .oneTimeCode
+        } else { return nil }
+    }
+    private enum CodingKeys: String, CodingKey { case website, username, recordIdentifier, kind }
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        website = try values.decode(String.self, forKey: .website)
+        username = try values.decode(String.self, forKey: .username)
+        recordIdentifier = try values.decode(String.self, forKey: .recordIdentifier)
+        kind = try values.decodeIfPresent(AutoFillKind.self, forKey: .kind) ?? .password
+    }
+    public var identity: any ASCredentialIdentity {
+        let service = ASCredentialServiceIdentifier(identifier: website, type: .domain)
+        switch kind {
+        case .password: return ASPasswordCredentialIdentity(serviceIdentifier: service, user: username, recordIdentifier: recordIdentifier)
+        case .oneTimeCode: return ASOneTimeCodeCredentialIdentity(serviceIdentifier: service, label: username, recordIdentifier: recordIdentifier)
+        }
     }
 }
 
@@ -102,7 +138,7 @@ public struct AutoFillIndex: Sendable {
     private func read() throws -> [AutoFillIdentity] {
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
         let entries = try JSONDecoder().decode([AutoFillIdentity].self, from: SafeFile.read(file, privateFile: true))
-        guard entries.allSatisfy({ AutoFillEntry.vaultID($0.recordIdentifier) != nil && AutoFillEntry.website($0.website) == $0.website }),
+        guard entries.allSatisfy({ AutoFillEntry.vaultID($0.recordIdentifier) != nil && $0.recordIdentifier.hasPrefix($0.kind.prefix + ":") && AutoFillEntry.website($0.website) == $0.website }),
               Set(entries.map(\.recordIdentifier)).count == entries.count else { throw MopError.invalidVault }
         return entries
     }
@@ -189,10 +225,10 @@ actor AutoFillPublisher {
 
 public enum AutoFillAccess {
     /// Only for provideCredentialWithoutUserInteraction. AutoFill owns user
-    /// authentication on this path; the returned password goes directly to the
+    /// authentication on this path; the returned credential goes directly to the
     /// system, never to a caller or a reusable unlocked app session. The picker
     /// must continue using a normally authenticated NativeVaultService.
-    @MainActor public static func completeSystemRequest(recordIdentifier: String,
+    @MainActor public static func completeSystemRequest(recordIdentifier: String, kind: AutoFillKind = .password,
                                                        context: ASCredentialProviderExtensionContext) async throws {
         let extensionInfo = Bundle.main.object(forInfoDictionaryKey: "NSExtension") as? [String: Any]
         guard extensionInfo?["NSExtensionPointIdentifier"] as? String == "com.apple.authentication-services-credential-provider-ui"
@@ -207,9 +243,31 @@ public enum AutoFillAccess {
                 // request. Do not run a second LocalAuthentication challenge.
                 return {}
             })
-        let credential = try await systemCredential(recordIdentifier: recordIdentifier, service: service)
-        try Task.checkCancellation()
-        context.completeRequest(withSelectedCredential: credential, completionHandler: nil)
+        switch kind {
+        case .password:
+            let credential = try await systemCredential(recordIdentifier: recordIdentifier, service: service)
+            try Task.checkCancellation()
+            context.completeRequest(withSelectedCredential: credential, completionHandler: nil)
+        case .oneTimeCode:
+            let credential = try await systemOneTimeCode(recordIdentifier: recordIdentifier, service: service)
+            try Task.checkCancellation()
+            context.completeOneTimeCodeRequest(using: credential, completionHandler: nil)
+        }
+    }
+
+    static func systemOneTimeCode(recordIdentifier: String, service: any VaultService) async throws -> ASOneTimeCodeCredential {
+        defer { service.lock() }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await oneTimeCode(recordIdentifier: recordIdentifier, service: service)
+        } onCancel: { service.lock() }
+    }
+
+    public static func oneTimeCode(recordIdentifier: String, service: any VaultService) async throws -> ASOneTimeCodeCredential {
+        let (_, secret) = try await resolve(recordIdentifier: recordIdentifier, kind: .oneTimeCode, service: service)
+        guard let bytes = secret.value, let expiry = secret.otpExpiresAt, expiry > Date(),
+              let period = secret.otpPeriod, period > 0 else { throw MopError.invalidOTP }
+        return ASOneTimeCodeCredential(code: String(decoding: bytes, as: UTF8.self))
     }
 
     static func systemCredential(recordIdentifier: String, service: any VaultService) async throws -> ASPasswordCredential {
@@ -225,13 +283,19 @@ public enum AutoFillAccess {
     /// Re-resolve the locator from the authenticated catalog. Never trust the
     /// username or reference supplied by the system's potentially stale index.
     public static func credential(recordIdentifier: String, service: any VaultService) async throws -> ASPasswordCredential {
-        guard let id = AutoFillEntry.vaultID(recordIdentifier) else { throw MopError.notFound }
-        let result = try await service.execute(.catalog, vault: id, offline: true)
-        let catalog = try result.requireCatalog()
-        guard let entry = AutoFillEntry.entries(catalog: catalog, vaultID: id).first(where: { $0.recordIdentifier == recordIdentifier }) else { throw MopError.notFound }
-        let secret = try await service.execute(.read(entry.reference), vault: id, offline: true)
-        try Task.checkCancellation()
+        let (entry, secret) = try await resolve(recordIdentifier: recordIdentifier, kind: .password, service: service)
         guard let bytes = secret.value else { throw MopError.notFound }
         return ASPasswordCredential(user: entry.username, password: String(decoding: bytes, as: UTF8.self))
+    }
+
+    private static func resolve(recordIdentifier: String, kind: AutoFillKind, service: any VaultService) async throws -> (AutoFillEntry, VaultResult) {
+        try Task.checkCancellation()
+        guard recordIdentifier.hasPrefix(kind.prefix + ":"), let id = AutoFillEntry.vaultID(recordIdentifier) else { throw MopError.notFound }
+        let result = try await service.execute(.catalog, vault: id, offline: true)
+        let catalog = try result.requireCatalog()
+        guard let entry = AutoFillEntry.entries(catalog: catalog, vaultID: id).first(where: { $0.recordIdentifier == recordIdentifier && $0.kind == kind }) else { throw MopError.notFound }
+        let secret = try await service.execute(.read(entry.reference), vault: id, offline: true)
+        try Task.checkCancellation()
+        return (entry, secret)
     }
 }

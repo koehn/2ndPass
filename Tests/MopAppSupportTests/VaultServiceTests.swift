@@ -727,3 +727,61 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     }
     #expect(!service.isAuthenticated)
 }
+
+@Test func autoFillCodeExportFillsOfflineAndLocks() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let id = f.vaults[0].id.uuidString
+    let catalog = try await operation(f, .catalog).requireCatalog()
+    let seed = "JBSWY3DPEHPK3PXP"
+    var item = VaultItem(name: "Code", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "alice"),
+        ItemField(path: "otp", type: .otp, value: seed),
+        ItemField(path: "website", type: .website, value: "example.com")])
+    let saved = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true))).requireCatalog()
+    let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
+    let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
+    let exported = f.directory.appendingPathComponent("code-extension")
+    try repo.exportAutoFillSnapshot(f.vaults[0].id, expected: f.vaults[0].cached().0, to: exported)
+    await f.cloud.fail(with: .cloudUnavailable)
+    let count = Counter()
+    let service = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
+        count.value.withLock { $0 += 1 }; return {}
+    })
+    let before = Date()
+    let credential = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
+    let after = Date()
+    let otp = try TimeBasedOTP(seed)
+    let expectedCodes = try [otp.code(at: before), otp.code(at: after)]
+    #expect(expectedCodes.contains(credential.code))
+    #expect(credential.code != seed)
+    #expect(count.value.withLock { $0 } == 1)
+    #expect(!service.isAuthenticated)
+    await #expect(throws: MopError.notFound) {
+        _ = try await AutoFillAccess.systemCredential(recordIdentifier: entry.recordIdentifier, service: service)
+    }
+    #expect(!service.isAuthenticated)
+    let denied = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })
+    await #expect(throws: MopError.authentication) {
+        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: denied)
+    }
+    #expect(!denied.isAuthenticated)
+    let stale = String(entry.recordIdentifier.dropLast()) + (entry.recordIdentifier.last == "0" ? "1" : "0")
+    await #expect(throws: MopError.notFound) {
+        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: stale, service: service)
+    }
+    #expect(!service.isAuthenticated)
+    try repo.removeAutoFillSnapshot(id, in: exported)
+    await #expect(throws: MopError.vaultMissing) {
+        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
+    }
+    #expect(!service.isAuthenticated)
+
+    // Current catalog changes invalidate the old code locator.
+    await f.cloud.fail(with: nil)
+    item.fields[0].value = "bob"
+    _ = try await operation(f, .save(ItemEdit(revision: saved.revision, item: item, create: false)))
+    await #expect(throws: MopError.notFound) {
+        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: f.service)
+    }
+    #expect(!f.service.isAuthenticated)
+}
