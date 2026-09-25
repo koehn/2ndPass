@@ -76,4 +76,31 @@ with tempfile.TemporaryDirectory() as tmp:
     expired = copy.deepcopy(base)
     expired['ExpirationDate'] = datetime.datetime.now() - datetime.timedelta(days=1)
     assert generate(expired).returncode != 0
+    # AutoFill requires both capabilities; the extension retains the app's group.
+    autofill = copy.deepcopy(base)
+    autofill['Entitlements'].update({
+        'com.apple.application-identifier': 'TEAM.net.test.mop.AutoFill',
+        'keychain-access-groups': ['TEAM.net.test.mop'],
+        'com.apple.developer.authentication-services.autofill-credential-provider': True,
+        'com.apple.security.application-groups': ['group.net.test.mop']})
+    def extension(profile):
+        (root / 'profile').write_bytes(plistlib.dumps(profile))
+        return subprocess.run([sys.executable, str(script), str(root / 'profile'),
+                               'net.test.mop.AutoFill', 'MopAutoFill', str(root / 'info'), str(root / 'entitlements')],
+                              capture_output=True, env={**os.environ, "MOP_CLOUD_ENVIRONMENT": "Production"})
+    wrong_app = extension(base)
+    assert wrong_app.returncode != 0
+    assert b'TEAM.net.test.mop' in wrong_app.stderr
+    assert b'net.test.mop.AutoFill' in wrong_app.stderr
+    assert b'MOP_AUTOFILL_PROVISION_PROFILE' in wrong_app.stderr
+    result = extension(autofill)
+    assert result.returncode == 0, result.stderr
+    extension_ent = plistlib.loads((root / 'entitlements').read_bytes())
+    assert extension_ent['keychain-access-groups'] == ['TEAM.net.test.mop']
+    assert extension_ent['com.apple.developer.icloud-container-identifiers'] == ['iCloud.net.test.mop']
+    assert extension_ent['com.apple.security.app-sandbox'] is True
+    for key in ['com.apple.security.application-groups', 'com.apple.developer.authentication-services.autofill-credential-provider']:
+        bad = copy.deepcopy(autofill)
+        del bad['Entitlements'][key]
+        assert extension(bad).returncode != 0
 print('PASS: explicit identity, narrow access group, no debug entitlements, and profile rejection checks.')

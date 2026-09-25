@@ -44,12 +44,40 @@ iOS simulator test builds and the unsigned iOS Release build passed. On iOS 27.0
 iPhone 18 Pro and iPad Pro 13-inch (M5) each passed 204 shared tests and
 `testLegacyPairingIsAbsent`. The full iPhone UI suite did not pass: detail-field,
 OTP-display, and settings/interruption tests failed. All four failing test cases
-also failed when run against an isolated checkout of `ccca4d8`; they remain open
-UI validation issues. The full iPad UI suite was not run.
+also failed when run against an isolated checkout of `ccca4d8`. These failures
+were resolved in the follow-up below. The full iPad UI suite was not run at that
+earlier snapshot.
 
 These checks used fixtures. Signed physical-device authentication, actual iCloud
 Keychain delivery, and live Development/Production CloudKit acceptance were not
 performed as part of this change.
+
+### UI-test follow-up (2026-09-24, based on `a67ecfd`)
+
+The four original failures queried copy controls as static text. Tests now locate
+the username button and identify OTP elements independently of their accessibility
+element type, while retaining code-format, layout, replacement-validation, and
+interruption assertions. The lock assertion also checks the actual copy control.
+
+Full iPad testing exposed additional automation assumptions: sidebar overlays
+consume taps meant for underlying content, the vault section can remain collapsed,
+and batched simulator keyboard input can omit characters. Tests explicitly handle
+the sidebar, synchronize title/OTP key events, and check the complete item name
+before and after both rotations. No production app code changed.
+
+On iOS 27.0, iPad Pro 13-inch (M5) passed all 201 shared tests and 14 UI tests;
+the final OTP-entry helper also passed a focused iPad rerun. iPhone 18 Pro passed
+all 201 shared tests and 13 UI tests in the final full run. Its rotation test was
+interrupted by a `testmanagerd` crash and passed in an isolated rerun. Thus every
+UI case has passing evidence on both platforms, but the final iPhone full-run
+result itself is failed due to the test-runner crash. A separate attempt also
+failed to launch after the simulator service exited; it supplied no product result.
+
+The installed `/Applications/Mop.app` passed deep, strict code-signature verification
+with an Apple Development identity, the expected Mop Keychain access group, and
+Development CloudKit entitlements. This verifies a signed Mac installation, not
+completion of hardware acceptance or Production distribution testing. Installed
+iPhone/iPad artifacts were not inspected during this follow-up.
 
 ## Signed Mac packaging checks
 
@@ -78,6 +106,16 @@ separate enclave probe is used.
 
 Use signed Mac, iPhone, and iPad builds with matching provisioned Keychain access
 groups and CloudKit environments, on a dedicated test account.
+
+Installing and running Mop through Xcode on a physical iPhone or iPad counts as
+testing a signed, provisioned build. A Mac bundle signed with an Apple Development
+identity also counts. Development signing is sufficient for the hardware checks
+below; distribution signing is a separate release check. This project's Xcode
+Debug configuration targets Development CloudKit, while Release targets Production.
+Verify the installed artifact's entitlements when recording results. Installing
+successfully establishes deployment; record which authentication, synchronization,
+recovery, and failure scenarios you actually exercised. Everyday use provides
+evidence for those paths, not automatic completion of the entire matrix.
 
 1. Create a fresh v5 vault on A, write multiple typed fields and an OTP, export a
    backup, and independently retain its fingerprint. Wait for iCloud Keychain

@@ -18,7 +18,7 @@ public enum AppStorageLocation {
     public static var defaultState: URL {
         #if os(macOS)
         URL(fileURLWithPath: ProcessInfo.processInfo.environment["MOP_STATE_DIRECTORY"]
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".mop").path, isDirectory: true)
+            ?? URL.applicationSupportDirectory.appendingPathComponent("Mop", isDirectory: true).path, isDirectory: true)
         #else
         URL.applicationSupportDirectory.appendingPathComponent("Mop", isDirectory: true)
         #endif

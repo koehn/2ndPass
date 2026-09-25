@@ -18,12 +18,16 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<true/>
+	<key>MopAppGroup</key>
+	<string>group.$(MOP_HOST_BUNDLE_ID)</string>
 	<key>MopCloudContainer</key>
 	<string>iCloud.com.koehn.mop</string>
 	<key>MopCloudEnvironment</key>
 	<string>$(MOP_CLOUD_ENVIRONMENT)</string>
 	<key>MopKeychainAccessGroup</key>
 	<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>MopPublishesAutoFill</key>
+	<true/>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Authenticate to unlock your Mop vaults and access secrets.</string>
 	<key>UIApplicationSceneManifest</key>
@@ -32,7 +36,9 @@
 		<false/>
 	</dict>
 	<key>UIBackgroundModes</key>
-	<array><string>remote-notification</string></array>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

@@ -197,4 +197,57 @@ public final class CloudRepository {
     }
 
 
+    /// Export only authenticated ciphertext and the public account anchor. The
+    /// extension has its own cache; app/CLI storage and journals stay untouched.
+    public func exportAutoFillSnapshot(_ id: UUID, expected: Data, to state: URL) throws {
+        let source = try vault(id)
+        let snapshot: CachedSnapshot = try source.cache.locked {
+            guard try source.cache.read("deleted.json", as: Bool.self) != true else { throw MopError.vaultMissing }
+            guard let value = try source.cache.read("snapshot.json", as: CachedSnapshot.self) else { throw MopError.vaultMissing }
+            guard value.document == expected, value.revision == VaultCoding.digest(expected),
+                  let verified = try source.cache.read("verified.json", as: Watermark.self),
+                  verified.revision == value.revision else { throw MopError.vaultConflict }
+            return value
+        }
+        guard let anchor = try scope.locked({ try scope.read("account-identity.json", as: CloudIdentityAnchor.self) }) else { throw MopError.identityPending }
+        try anchor.validate(scope: identityScope)
+        let config = VaultCoding.digest(Data((transport.container + ":" + transport.environment).utf8))
+        let accounts = try CloudCache(directory: state.appendingPathComponent("cloud").appendingPathComponent(config))
+        let targetScope = try CloudCache(directory: accounts.directory.appendingPathComponent(VaultCoding.digest(Data(accountID.utf8))))
+        let target = try CloudCache(directory: targetScope.directory.appendingPathComponent(id.uuidString))
+        try target.locked {
+            let generation = try VaultDocument.decode(snapshot.document).header.generation
+            if let old = try target.read("verified.json", as: Watermark.self) {
+                guard generation > old.generation || (generation == old.generation && snapshot.revision == old.revision) else { throw MopError.vaultConflict }
+            }
+            try target.write(snapshot, "snapshot.json")
+            try target.write(Watermark(generation: generation, revision: snapshot.revision), "verified.json")
+            try target.remove("deleted.json")
+        }
+        try targetScope.locked { try targetScope.write(anchor, "account-identity.json") }
+        try accounts.locked { try accounts.write(accountID, "binding.json") }
+    }
+
+    private func autoFillScope(in state: URL) -> URL {
+        let config = VaultCoding.digest(Data((transport.container + ":" + transport.environment).utf8))
+        return state.appendingPathComponent("cloud").appendingPathComponent(config).appendingPathComponent(VaultCoding.digest(Data(accountID.utf8)))
+    }
+    public func removeAutoFillSnapshot(_ id: String, in state: URL) throws {
+        guard let id = UUID(uuidString: id) else { throw MopError.invalidVault }
+        let cache = try CloudCache(directory: autoFillScope(in: state).appendingPathComponent(id.uuidString))
+        try cache.locked {
+            try cache.write(true, "deleted.json")
+            try cache.remove("snapshot.json")
+        }
+    }
+    public func pruneAutoFillSnapshots(keeping ids: Set<String>, in state: URL) throws {
+        let directory = autoFillScope(in: state)
+        let accounts = try CloudCache(directory: directory.deletingLastPathComponent())
+        try accounts.locked { try accounts.write(accountID, "binding.json") }
+        guard FileManager.default.fileExists(atPath: directory.path) else { return }
+        for name in try FileManager.default.contentsOfDirectory(atPath: directory.path) where UUID(uuidString: name) != nil && !ids.contains(name) {
+            try removeAutoFillSnapshot(name, in: state)
+        }
+    }
+
 }

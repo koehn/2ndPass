@@ -25,7 +25,7 @@ and a provisioned signed application with matching Keychain and CloudKit entitle
 Constrain reference commands to this vault. References select their own named vault;
 management commands otherwise use the account-scoped saved default.
 .It Fl -state-directory Ar PATH
-Local metadata/cache directory. Defaults to MOP_STATE_DIRECTORY or ~/.mop.
+Local metadata/cache directory. Defaults to MOP_STATE_DIRECTORY or ~/Library/Application Support/Mop.
 Never synchronize this directory.
 .It Fl -offline
 Use the last authenticated encrypted cache for read, list, run, inject, or export.
@@ -127,7 +127,7 @@ Missing zones are not silently recreated. Old revisions and abandoned staging
 records are retained and consume iCloud quota.
 .Sh FILES
 .Bl -tag -width indent
-.It Pa ~/.mop/cloud/
+.It Pa "~/Library/Application Support/Mop/cloud/"
 Account/container/environment/vault-scoped ciphertext cache, journals, and trust.
 .El
 .Sh EXIT STATUS

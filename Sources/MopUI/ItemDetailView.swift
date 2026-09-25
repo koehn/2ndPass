@@ -1,5 +1,6 @@
 import SwiftUI
 import MopCore
+import MopAppSupport
 
 struct ItemDetailView: View {
     @Bindable var model: AppModel
@@ -56,6 +57,15 @@ struct ItemDetailView: View {
                 Text("Drag the handles to reorder fields. Changes are saved together when you choose Save.")
                     .font(.caption).foregroundStyle(.secondary)
             } else { Text(model.selectedTypedItem?.type.label ?? "Custom").foregroundStyle(.secondary) }
+            if let item = model.itemDraft?.item ?? model.selectedTypedItem, item.type == .login {
+                if let reason = AutoFillEntry.exclusionReason(for: item) {
+                    Label("AutoFill unavailable: " + reason, systemImage: "info.circle")
+                        .font(.callout).foregroundStyle(.secondary)
+                } else {
+                    Label("Fields ready for AutoFill", systemImage: "checkmark.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             ForEach(fields.filter { edits($0) || $0.type != .notes || $0.value != "" }) { field in
                 fieldRow(field)
                     .transition(.opacity.combined(with: .move(edge: .top)))

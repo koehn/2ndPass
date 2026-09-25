@@ -11,6 +11,19 @@ import XCTest
         app.launch()
         return app
     }
+    private func typeReliably(_ text: String, into field: XCUIElement) {
+        // Synchronize key events with SwiftUI relayout; batched simulator input
+        // can drop characters in both the title editor and secure fields.
+        for character in text { field.typeText(String(character)) }
+    }
+    private func dismissSidebar(_ app: XCUIApplication) {
+        // iPad can present the sidebar as an overlay after rotation or a sheet.
+        // Its dismissal consumes a tap that would otherwise target the detail.
+        if app.collectionViews["Sidebar"].exists && app.collectionViews["Sidebar"].isHittable {
+            let toggle = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'sidebar'")).firstMatch
+            if toggle.exists { toggle.tap() }
+        }
+    }
     private func openItems(_ app: XCUIApplication) {
         let item = app.staticTexts["Example Login"].firstMatch
         if !item.waitForExistence(timeout: 3) {
@@ -21,6 +34,7 @@ import XCTest
             all.tap()
         }
         XCTAssertTrue(item.waitForExistence(timeout: 10))
+        dismissSidebar(app)
     }
     func testOTPDisplaysCodeAndValidatesReplacementWithoutRevealingSeed() {
         let app = XCUIApplication()
@@ -29,7 +43,7 @@ import XCTest
         app.launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        let code = app.staticTexts.matching(NSPredicate(format: "identifier BEGINSWITH 'otp-code-'")).firstMatch
+        let code = app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'otp-code-'")).firstMatch
         XCTAssertTrue(code.waitForExistence(timeout: 5))
         let numeric = NSPredicate(format: "label MATCHES '[0-9]{6}'")
         expectation(for: numeric, evaluatedWith: code)
@@ -42,7 +56,7 @@ import XCTest
         let field = app.secureTextFields["otp value"]
         XCTAssertTrue(field.waitForExistence(timeout: 5))
         XCTAssertEqual(field.value as? String, field.placeholderValue ?? "")
-        field.tap(); field.typeText("123456")
+        field.tap(); typeReliably("123456", into: field)
         XCTAssertFalse(app.buttons["Save"].isEnabled)
         XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Enter a valid Base32 secret'")).firstMatch.exists)
         app.buttons["Cancel"].tap()
@@ -50,7 +64,7 @@ import XCTest
         app.buttons["Edit value"].tap()
         let replacement = app.secureTextFields["otp value"]
         XCTAssertTrue(replacement.waitForExistence(timeout: 5))
-        replacement.tap(); replacement.typeText("JBSWY3DPEHPK3PXP")
+        replacement.tap(); typeReliably("JBSWY3DPEHPK3PXP", into: replacement)
         XCTAssertEqual((replacement.value as? String)?.count, 16, "Replacement character count")
         let enabled = NSPredicate(format: "enabled == true")
         expectation(for: enabled, evaluatedWith: app.buttons["Save"])
@@ -67,8 +81,8 @@ import XCTest
         app.launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        let seed = app.staticTexts["otp-code-mop://personal/Example%20Login/otp"]
-        let url = app.staticTexts["otp-code-mop://personal/Example%20Login/otp-url"]
+        let seed = app.descendants(matching: .any)["otp-code-mop://personal/Example%20Login/otp"].firstMatch
+        let url = app.descendants(matching: .any)["otp-code-mop://personal/Example%20Login/otp-url"].firstMatch
         XCTAssertTrue(seed.waitForExistence(timeout: 5))
         XCTAssertTrue(url.waitForExistence(timeout: 5))
         let numeric = NSPredicate(format: "label MATCHES '[0-9]{6}'")
@@ -99,7 +113,7 @@ import XCTest
         menuImage.name = "Search results menu"; menuImage.lifetime = .keepAlways
         add(menuImage)
         result.tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertTrue(app.descendants(matching: .any)["sample@example.test"].firstMatch.exists)
         XCTAssertFalse(result.exists)
     }
@@ -123,7 +137,7 @@ import XCTest
         XCTAssertTrue(server.exists)
         XCTAssertTrue(app.staticTexts["ssh username: sshd"].exists)
         server.tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertTrue(app.descendants(matching: .any)["sshd"].firstMatch.exists)
     }
 
@@ -149,7 +163,9 @@ import XCTest
             if sidebar.exists { sidebar.tap() }
             else if app.buttons["Back"].exists { app.buttons["Back"].tap() }
         }
-        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        let expand = app.buttons["Expand vaults"]
+        if expand.exists { expand.tap() }
+        XCTAssertTrue(settings.waitForExistence(timeout: 5), app.debugDescription)
         settings.tap()
         XCTAssertTrue(app.staticTexts["Vault Settings"].waitForExistence(timeout: 5))
         let settingsImage = XCTAttachment(screenshot: app.screenshot())
@@ -163,7 +179,7 @@ import XCTest
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
         let actions = app.buttons["Actions for password"]
-        XCTAssertTrue(actions.waitForExistence(timeout: 5))
+        XCTAssertTrue(actions.waitForExistence(timeout: 5), app.debugDescription)
         let detailImage = XCTAttachment(screenshot: app.screenshot())
         detailImage.name = "Item detail"
         detailImage.lifetime = .keepAlways
@@ -175,7 +191,7 @@ import XCTest
         actions.tap()
         XCTAssertTrue(app.buttons["Conceal"].waitForExistence(timeout: 5))
         app.buttons["Conceal"].tap()
-        XCTAssertTrue(actions.waitForExistence(timeout: 5))
+        XCTAssertTrue(actions.waitForExistence(timeout: 5), app.debugDescription)
     }
 
     func testDetailHeaderAndInlineFieldActions() {
@@ -186,7 +202,7 @@ import XCTest
         XCTAssertTrue(edit.waitForExistence(timeout: 5))
         let settings = app.buttons["Settings"].firstMatch
         XCTAssertGreaterThanOrEqual(edit.frame.minY, settings.frame.maxY)
-        let value = app.staticTexts["sample@example.test"].firstMatch
+        let value = app.buttons["sample@example.test"].firstMatch
         XCTAssertFalse(app.buttons["Copy username value"].exists)
         XCTAssertFalse(app.buttons["Reveal password"].exists)
         let menu = app.buttons["Actions for username"]
@@ -203,7 +219,7 @@ import XCTest
         let app = launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
         app.buttons["Edit item"].tap()
         let generator = app.buttons["Generate password"].firstMatch
         let detail = app.scrollViews["Item detail"]
@@ -220,10 +236,10 @@ import XCTest
             detail.swipeDown()
         }
         app.buttons["Save"].tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
         app.buttons["Lock"].tap()
         XCTAssertFalse(app.textFields["password value"].exists)
-        XCTAssertFalse(app.staticTexts["sample@example.test"].exists)
+        XCTAssertFalse(app.buttons["sample@example.test"].exists)
     }
     func testCreateAndAdaptToRotation() {
         let app = launch()
@@ -232,18 +248,30 @@ import XCTest
         let name = app.textFields["Item name"]
         XCTAssertTrue(name.waitForExistence(timeout: 5))
         name.tap()
-        name.typeText("Created in UI")
+        typeReliably("Created in UI", into: name)
+        XCTAssertEqual(name.value as? String, "Created in UI")
         XCUIDevice.shared.orientation = .landscapeLeft
+        let landscape = NSPredicate { _, _ in app.frame.width > app.frame.height }
+        expectation(for: landscape, evaluatedWith: app)
+        waitForExpectations(timeout: 5)
         XCTAssertTrue(name.waitForExistence(timeout: 5))
         XCTAssertEqual(name.value as? String, "Created in UI")
         XCUIDevice.shared.orientation = .portrait
+        let portrait = NSPredicate { _, _ in app.frame.height > app.frame.width }
+        expectation(for: portrait, evaluatedWith: app)
+        waitForExpectations(timeout: 5)
+        XCTAssertEqual(name.value as? String, "Created in UI")
+        dismissSidebar(app)
+        let beforeSave = XCTAttachment(screenshot: app.screenshot())
+        beforeSave.name = "Creation after rotation"; beforeSave.lifetime = .keepAlways
+        add(beforeSave)
         let detail = app.scrollViews["Item detail"]
         for _ in 0..<4 {
             if app.buttons["Save"].isHittable { break }
             detail.swipeDown()
         }
         app.buttons["Save"].tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
         XCUIDevice.shared.orientation = .portrait
     }
     func testTrustFailureDoesNotAutomaticallyRetry() {
@@ -271,7 +299,7 @@ import XCTest
         app.buttons["Done"].tap()
         XCUIDevice.shared.press(.home)
         app.activate()
-        XCTAssertTrue(app.staticTexts["sample@example.test"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["sample@example.test"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["Edit item"].exists)
         XCTAssertFalse(app.buttons["Unlock"].exists)
     }

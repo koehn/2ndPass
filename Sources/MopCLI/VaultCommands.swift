@@ -9,11 +9,11 @@ import MopCloudKit
 
 struct VaultOptions: ParsableArguments {
     @Option(help: "Vault name or UUID. Constrains references; management commands otherwise use the saved default.") var vault: String?
-    @Option(help: "Local state directory; defaults to MOP_STATE_DIRECTORY or ~/.mop. Never synchronize this directory.", completion: .directory) var stateDirectory: String?
+    @Option(help: "Local state directory; defaults to MOP_STATE_DIRECTORY or ~/Library/Application Support/Mop. Never synchronize this directory.", completion: .directory) var stateDirectory: String?
     @Flag(help: "Explicitly use a previously verified encrypted cache for read-only commands.") var offline = false
 
     var stateURL: URL {
-        URL(fileURLWithPath: stateDirectory ?? ProcessInfo.processInfo.environment["MOP_STATE_DIRECTORY"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".mop").path, isDirectory: true).standardizedFileURL
+        URL(fileURLWithPath: stateDirectory ?? ProcessInfo.processInfo.environment["MOP_STATE_DIRECTORY"] ?? URL.applicationSupportDirectory.appendingPathComponent("Mop", isDirectory: true).path, isDirectory: true).standardizedFileURL
     }
     var selection: String? { vault }
     func validate() throws {

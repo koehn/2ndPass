@@ -16,6 +16,8 @@ if [[ ! -f "$MOP_PROVISION_PROFILE" ]]; then
     printf 'Provisioning profile not found: %s\nSet MOP_PROVISION_PROFILE to the downloaded .provisionprofile file.\n' "$MOP_PROVISION_PROFILE" >&2
     exit 8
 fi
+: "${MOP_AUTOFILL_PROVISION_PROFILE:?Set MOP_AUTOFILL_PROVISION_PROFILE to the macOS AutoFill extension provisioning profile.}"
+export MOP_AUTOFILL=1
 mkdir -p dist
 stage=$(mktemp -d "$PWD/dist/.package.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT
@@ -23,6 +25,14 @@ app="$stage/$bundle_name.app"
 mkdir -p "$app/Contents/MacOS"
 security cms -D -i "$MOP_PROVISION_PROFILE" > "$stage/profile.plist"
 python3 scripts/signing-config.py "$stage/profile.plist" "$bundle_id" "$product" "$app/Contents/Info.plist" "$stage/entitlements.plist"
+# Validate both profiles before compiling. The extension needs its own App ID.
+if [[ ! -f "$MOP_AUTOFILL_PROVISION_PROFILE" ]]; then
+    printf 'AutoFill provisioning profile not found: %s\n' "$MOP_AUTOFILL_PROVISION_PROFILE" >&2
+    exit 8
+fi
+security cms -D -i "$MOP_AUTOFILL_PROVISION_PROFILE" > "$stage/extension-profile.plist"
+python3 scripts/signing-config.py "$stage/extension-profile.plist" "$bundle_id.AutoFill" MopAutoFill \
+    "$stage/extension-info.plist" "$stage/extension-entitlements.plist"
 cp "$MOP_PROVISION_PROFILE" "$app/Contents/embedded.provisionprofile"
 swift build -c release --product "$product"
 bin_dir=$(swift build -c release --show-bin-path)
@@ -41,6 +51,30 @@ if [[ "$product" == mop ]]; then
     codesign --force --sign "$MOP_SIGN_IDENTITY" --identifier "$bundle_id" --options runtime --timestamp \
         --entitlements "$stage/entitlements.plist" "$app/Contents/MacOS/mop"
 fi
+# Build the native extension for both Mac architectures and sign it before the app.
+xcodebuild -project Apple/Mop.xcodeproj -scheme MopAutoFill -configuration Release \
+    -destination 'generic/platform=macOS' -derivedDataPath "$PWD/.build/autofill" \
+    CODE_SIGNING_ALLOWED=NO MOP_HOST_BUNDLE_ID="$bundle_id" \
+    PRODUCT_BUNDLE_IDENTIFIER="$bundle_id.AutoFill" \
+    MOP_CLOUD_ENVIRONMENT="${MOP_CLOUD_ENVIRONMENT:-Production}" build
+mkdir -p "$app/Contents/PlugIns"
+cp -R .build/autofill/Build/Products/Release/MopAutoFill.appex "$app/Contents/PlugIns/"
+extension="$app/Contents/PlugIns/MopAutoFill.appex"
+cp "$MOP_AUTOFILL_PROVISION_PROFILE" "$extension/Contents/embedded.provisionprofile"
+python3 - "$app/Contents/Info.plist" "$extension/Contents/Info.plist" <<'PYINFO'
+import plistlib, sys
+with open(sys.argv[1], 'rb') as source:
+    host_info = plistlib.load(source)
+with open(sys.argv[2], 'rb') as source:
+    extension_info = plistlib.load(source)
+for key in ('CFBundleVersion', 'CFBundleShortVersionString'):
+    extension_info[key] = host_info[key]
+with open(sys.argv[2], 'wb') as destination:
+    plistlib.dump(extension_info, destination)
+PYINFO
+codesign --force --sign "$MOP_SIGN_IDENTITY" --options runtime --timestamp \
+    --entitlements "$stage/extension-entitlements.plist" "$extension"
+codesign --verify --strict "$extension"
 codesign --force --sign "$MOP_SIGN_IDENTITY" --options runtime --timestamp \
     --entitlements "$stage/entitlements.plist" "$app"
 codesign --verify --strict "$app"

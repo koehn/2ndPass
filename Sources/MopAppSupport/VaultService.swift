@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import LocalAuthentication
 import Synchronization
 import MopCore
@@ -119,7 +120,7 @@ private final class SessionControl: Sendable {
 
 /// A FIFO permit, held across suspension points. Actor reentrancy alone would
 /// allow a second mutation to enter while the first waits for CloudKit.
-private actor OperationGate {
+actor OperationGate {
     private var occupied = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
     func enter() async {
@@ -137,10 +138,12 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     private let control = SessionControl()
     private let gate = OperationGate()
     private let worker: Worker
+    private var publishesAutoFill = false
     public var authenticatedAt: TimeInterval? { control.authenticatedAt }
 
     public init(state: URL? = nil, configuration: any VaultPlatformConfiguration = DefaultVaultPlatformConfiguration(),
                 documents: any DocumentAccessing = SystemDocumentAccess()) {
+        publishesAutoFill = state == nil && Bundle.main.object(forInfoDictionaryKey: "MopPublishesAutoFill") as? Bool == true
         let state = state ?? configuration.stateDirectory
         worker = Worker(state: state.standardizedFileURL, documents: documents, identityKeys: SynchronizedIdentityStore(), accountAuthentication: { register in
             let context = try Authentication.authorize(reason: "unlock your Mop vaults", contextCreated: { context in
@@ -204,12 +207,24 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 }
                 try control.check(token)
                 try worker.publishSnapshots(control: control, token: token)
+                if publishesAutoFill {
+                    do { try await worker.publishAutoFill(operation, selection: vault, result: result) }
+                    catch { Logger(subsystem: "com.koehn.mop", category: "AutoFill").error("Could not refresh AutoFill; unlock or refresh Mop to retry.") }
+                }
                 await gate.leave()
                 return result
             } catch {
                 if let error = error as? MopError,
                    [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(error) {
                     if control.generation == token { control.lock() }
+                }
+                if publishesAutoFill {
+                    if (error as? MopError) == .cloudAccount { await AutoFillStorage.invalidate() }
+                    else if let failure = error as? MopError,
+                            [.vaultMissing, .notVaultMember, .vaultUntrusted, .invalidIdentity].contains(failure), let vault {
+                        try? worker.repository?.removeAutoFillSnapshot(vault, in: AutoFillStorage.directory())
+                        try? await AutoFillPublisher.shared.remove(vaultID: vault)
+                    }
                 }
                 // A failed operation cannot leave a partially mutated store reusable.
                 worker.closeStores()
@@ -255,6 +270,21 @@ private final class Worker {
         try control.check(token)
         try published.update(stores: stores, dates: snapshotDates, offline: repository?.offline == true,
                              opener: accountIdentity.map { $0 as any VaultKeyOpener }, generation: token)
+    }
+
+    func publishAutoFill(_ operation: VaultOperation, selection: String?, result: VaultResult) async throws {
+        let directory = try AutoFillStorage.directory()
+        if case .discover = operation {
+            let ids = Set(result.vaults.filter { $0.supported && $0.enrolled }.map(\.id))
+            try await AutoFillPublisher.shared.prune(keeping: ids)
+            try repository?.pruneAutoFillSnapshots(keeping: ids, in: directory)
+        } else if case .deleteVault = operation, let selection {
+            try repository?.removeAutoFillSnapshot(selection, in: directory)
+            try await AutoFillPublisher.shared.remove(vaultID: selection)
+        } else if let catalog = result.catalog, let selection, let id = UUID(uuidString: selection), let store = stores[id] {
+            try repository?.exportAutoFillSnapshot(id, expected: store.snapshot, to: directory)
+            try await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: selection)
+        }
     }
 
     func userIdentity(_ repo: CloudRepository, control: SessionControl, token: Int) async throws -> AccountIdentity {

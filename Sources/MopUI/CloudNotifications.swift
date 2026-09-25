@@ -25,7 +25,7 @@ extension Notification.Name {
         UIApplication.shared.registerForRemoteNotifications()
         #endif
         accountObserver = NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.subscribe() }
+            Task { @MainActor in await AutoFillStorage.invalidate(); self?.subscribe() }
         }
         networkObserver = NotificationCenter.default.addObserver(forName: NetworkAvailability.changed, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.subscribe() }

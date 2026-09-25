@@ -10,7 +10,7 @@ public enum SigningIdentity {
     public static func accessGroup() throws -> String {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "MopKeychainAccessGroup") as? String,
               let identifier = Bundle.main.bundleIdentifier,
-              group.hasSuffix("." + identifier), !group.contains("$"), !group.contains("*") else {
+              group.hasSuffix("." + (identifier.hasSuffix(".AutoFill") ? String(identifier.dropLast(".AutoFill".count)) : identifier)), !group.contains("$"), !group.contains("*") else {
             throw MopError.signing
         }
         let context = LAContext()

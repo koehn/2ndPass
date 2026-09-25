@@ -46,7 +46,7 @@ copy, which is removed when the recovery form closes.
 Creating a vault first saves a durable intent with its UUID and recovery key in
 private application storage. Export the recovery key, confirm offline custody,
 then Continue to authenticate and publish. Reopening Create Vault resumes any
-unfinished intent. Names and biometric policy cannot be changed after preparation. You can discard
+unfinished intent. Names cannot be changed after preparation. You can discard
 an unsubmitted setup to start over; submitted attempts must be reconciled.
 The initial encrypted snapshot and account binding are persisted before submission.
 

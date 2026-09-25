@@ -17,7 +17,7 @@ public enum SigningIdentity {
               let entitlements = info[kSecCodeInfoEntitlementsDict as String] as? [String: Any],
               let applicationID = entitlements["com.apple.application-identifier"] as? String,
               let groups = entitlements["keychain-access-groups"] as? [String],
-              groups == [applicationID], !applicationID.contains("*"),
+              !applicationID.contains("*"),
               entitlements["com.apple.security.get-task-allow"] as? Bool != true,
               entitlements["get-task-allow"] as? Bool != true,
               entitlements["com.apple.security.cs.disable-library-validation"] as? Bool != true,
@@ -30,6 +30,11 @@ public enum SigningIdentity {
               applicationID.hasSuffix("." + bundleID),
               FileManager.default.fileExists(atPath: bundle.bundleURL.appendingPathComponent("Contents/embedded.provisionprofile").path)
         else { throw MopError.signing }
+        let extensionRole = bundle.bundleURL.pathExtension == "appex"
+        let group = extensionRole ? String(applicationID.dropLast(".AutoFill".count)) : applicationID
+        guard !extensionRole || (bundleID.hasSuffix(".AutoFill") &&
+            entitlements["com.apple.developer.authentication-services.autofill-credential-provider"] as? Bool == true),
+            groups == [group] else { throw MopError.signing }
         // Let securityd verify the provisioned entitlement too. This query cannot
         // prompt and asks only for a nonexistent diagnostic item, never key data.
         let context = LAContext()
@@ -37,12 +42,12 @@ public enum SigningIdentity {
         defer { context.invalidate() }
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
             kSecUseDataProtectionKeychain as String: true,
-            kSecAttrAccessGroup as String: applicationID,
+            kSecAttrAccessGroup as String: group,
             kSecAttrService as String: "mop.identity-check",
             kSecAttrAccount as String: UUID().uuidString,
             kSecUseAuthenticationContext as String: context]
         guard SecItemCopyMatching(query as CFDictionary, nil) == errSecItemNotFound else { throw MopError.signing }
-        return applicationID
+        return group
     }
 
     public static func cloudConfiguration() throws -> (container: String, environment: String) {
@@ -72,7 +77,7 @@ public enum SigningIdentity {
         let contents = macOS.deletingLastPathComponent()
         let root = contents.deletingLastPathComponent()
         guard macOS.lastPathComponent == "MacOS", contents.lastPathComponent == "Contents",
-              root.pathExtension == "app", let bundle = Bundle(url: root) else { return nil }
+              ["app", "appex"].contains(root.pathExtension), let bundle = Bundle(url: root) else { return nil }
         // Foundation may report the running nested helper as the bundle's
         // executable. Read the declared entry point from the sealed plist instead.
         guard let data = try? Data(contentsOf: contents.appendingPathComponent("Info.plist")),

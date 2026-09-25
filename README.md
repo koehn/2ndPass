@@ -44,6 +44,14 @@ renaming and password-strength indicators. Offline browsing is explicit and read
 open dist/Mop.app
 ```
 
+## Password AutoFill
+
+Mop includes an iOS/macOS AutoFill extension. Enable Mop in system AutoFill settings,
+then open and unlock the app to publish website/username suggestions. System AutoFill
+handles authentication for suggested credentials; choosing “Mop…” opens its picker
+with Mop authentication. Both read a shared encrypted snapshot and work offline.
+See [AutoFill setup and provisioning](docs/AUTOFILL.md).
+
 ## Item templates and field types
 
 **New item** offers Login, Password, API credential, Secure note, and Database
@@ -126,7 +134,7 @@ installation. Run the script as your normal user. Manpages and completions go un
 `/usr/local/share`; ensure `/usr/local/bin` is on your PATH. If an older installation
 at `~/.local/bin/mop` takes precedence, remove that old symlink or place
 `/usr/local/bin` earlier in PATH; check with `command -v mop`. Existing vault state
-in `~/.mop` is unchanged. For isolated test installs,
+is preserved by the installer. For isolated test installs,
 set both `MOP_INSTALL_ROOT` (CLI/resources prefix) and `MOP_APPLICATIONS_DIR`.
 
 Packaging defaults to `Production` and rejects profiles without the matching
@@ -203,12 +211,20 @@ reconcile. Exit 27 means remote deletion could not be confirmed; exit 28 means
 remote deletion succeeded but local cleanup needs retrying. Mop checks remote
 absence before local cleanup and never automatically repeats a delete request.
 
-Local metadata defaults to `~/.mop`, overridden by `--state-directory` or
+Local metadata defaults to `~/Library/Application Support/Mop`, overridden by `--state-directory` or
 `MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains account-scoped
 ciphertext caches, commit journals, and trust pins.
 Account private keys live in iCloud Keychain. Old device metadata is ignored;
 removing legacy support does not delete existing files or Keychain items.
 Secret output cannot target the state directory.
+
+Older macOS versions used `~/.mop`. Before first launching this version, quit Mop
+and stop any running CLI commands, then move that directory to
+`~/Library/Application Support/Mop` if the destination does not already exist.
+This preserves cached vaults, trust pins, pending operations, and the default
+vault selection. If both directories already exist, do not overwrite either;
+use `MOP_STATE_DIRECTORY` to select the existing state explicitly. The app does
+not automatically migrate or merge state directories.
 
 ## Use another Mac, iPhone, or iPad
 

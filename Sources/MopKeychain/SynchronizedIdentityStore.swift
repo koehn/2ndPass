@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 import MopCore
 
 /// Immutable identity items. Never update or delete an identity during retries:
@@ -9,7 +10,8 @@ public protocol IdentityKeyStore {
     func insert(_ material: Data, scope: String, id: UUID) throws
 }
 public struct SynchronizedIdentityStore: IdentityKeyStore {
-    public init() {}
+    private let allowUserInteraction: Bool
+    public init(allowUserInteraction: Bool = true) { self.allowUserInteraction = allowUserInteraction }
     static func query(scope: String, id: UUID, group: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecUseDataProtectionKeychain as String: true,
@@ -20,6 +22,11 @@ public struct SynchronizedIdentityStore: IdentityKeyStore {
     }
     public func read(scope: String, id: UUID) throws -> Data? {
         var query = Self.query(scope: scope, id: id, group: try SigningIdentity.accessGroup())
+        if !allowUserInteraction {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            query[kSecUseAuthenticationContext as String] = context
+        }
         query[kSecReturnData as String] = true; query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)

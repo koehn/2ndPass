@@ -614,3 +614,78 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     #expect(try await operation(f, .read(SecretReference("mop://personal/item/token"))).value == "value")
     #expect(try SafeFile.read(f.directory.appendingPathComponent("device.json")) == Data("not a legacy credential".utf8))
 }
+
+@Test func autoFillExportSupportsAuthenticatedOfflineFillAndDeletion() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let id = f.vaults[0].id.uuidString
+    let catalog = try await operation(f, .catalog).requireCatalog()
+    let item = VaultItem(name: "Website", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "alice"),
+        ItemField(path: "password", type: .password, value: "secret-password"),
+        ItemField(path: "website", type: .website, value: "https://example.com")])
+    let saved = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true))).requireCatalog()
+    let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
+    let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
+    let exported = f.directory.appendingPathComponent("extension")
+    try repo.exportAutoFillSnapshot(f.vaults[0].id, expected: f.vaults[0].cached().0, to: exported)
+    let count = Counter()
+    let extensionService = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
+        count.value.withLock { $0 += 1 }; return {}
+    })
+    defer { extensionService.lock() }
+    let credential = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: extensionService)
+    #expect(credential.user == "alice")
+    #expect(credential.password == "secret-password")
+    #expect(count.value.withLock { $0 } == 1)
+    extensionService.lock()
+    try repo.removeAutoFillSnapshot(id, in: exported)
+    await #expect(throws: MopError.vaultMissing) {
+        _ = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: extensionService)
+    }
+}
+
+@Test func autoFillRequiresAuthenticationAndRejectsStaleUsernames() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let id = f.vaults[0].id.uuidString
+    let original = try await operation(f, .catalog).requireCatalog()
+    var item = VaultItem(name: "Login", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "alice"),
+        ItemField(path: "password", type: .password, value: "secret"),
+        ItemField(path: "website", type: .website, value: "example.com")])
+    let saved = try await operation(f, .save(ItemEdit(revision: original.revision, item: item, create: true))).requireCatalog()
+    let old = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
+    let denied = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })
+    defer { denied.lock() }
+    await #expect(throws: MopError.authentication) {
+        _ = try await AutoFillAccess.credential(recordIdentifier: old.recordIdentifier, service: denied)
+    }
+    item.fields[0].value = "bob"
+    _ = try await operation(f, .save(ItemEdit(revision: saved.revision, item: item, create: false)))
+    await #expect(throws: MopError.notFound) {
+        _ = try await AutoFillAccess.credential(recordIdentifier: old.recordIdentifier, service: f.service)
+    }
+}
+
+@Test func autoFillSystemRequestLocksAfterSuccessAndFailure() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let id = f.vaults[0].id.uuidString
+    let catalog = try await operation(f, .catalog).requireCatalog()
+    let item = VaultItem(name: "Login", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "alice"),
+        ItemField(path: "password", type: .password, value: "secret"),
+        ItemField(path: "website", type: .website, value: "example.com")])
+    let saved = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true))).requireCatalog()
+    let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
+    // Model the system-authenticated path without an application challenge.
+    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in {} })
+    let credential = try await AutoFillAccess.systemCredential(recordIdentifier: entry.recordIdentifier, service: service)
+    #expect(credential.user == "alice" && credential.password == "secret")
+    #expect(!service.isAuthenticated)
+
+    // An obsolete locator must still be rejected after the catalog was opened.
+    let stale = String(entry.recordIdentifier.dropLast()) + (entry.recordIdentifier.last == "0" ? "1" : "0")
+    await #expect(throws: MopError.notFound) {
+        _ = try await AutoFillAccess.systemCredential(recordIdentifier: stale, service: service)
+    }
+    #expect(!service.isAuthenticated)
+}

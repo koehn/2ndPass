@@ -42,7 +42,7 @@ brew update
 brew upgrade koehn/mop/mop
 ```
 
-Keep your `~/.mop` directory when upgrading. It contains your default vault,
+Keep your `~/Library/Application Support/Mop` directory when upgrading. It contains your default vault,
 caches and trusted vault fingerprints. If you share a vault between
 Macs, check the [upgrade notes](../README.md#file-boundaries-and-upgrades) before
 using a new file format.
