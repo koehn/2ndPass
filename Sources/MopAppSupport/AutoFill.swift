@@ -1,11 +1,9 @@
 @preconcurrency import AuthenticationServices
 import Foundation
 import CryptoKit
-import OSLog
 import MopCore
 import MopVault
 import MopCloudKit
-import MopKeychain
 
 public enum AutoFillKind: String, Codable, Sendable, CaseIterable {
     case password, oneTimeCode
@@ -224,35 +222,12 @@ actor AutoFillPublisher {
 }
 
 public enum AutoFillAccess {
-    /// Only for provideCredentialWithoutUserInteraction. OTP requests must use
-    /// the interactive authentication path. Passwords retain their existing
-    /// system-suggestion behavior; the returned credential goes directly to the
-    /// system, never to a caller or a reusable unlocked app session. The picker
-    /// must continue using a normally authenticated NativeVaultService.
+    /// Every suggestion must enter the presented extension and authenticate.
+    /// Selection alone is not proof of authentication, regardless of credential kind.
     @MainActor public static func completeSystemRequest(recordIdentifier: String, kind: AutoFillKind = .password,
                                                        context: ASCredentialProviderExtensionContext) async throws {
-        // A suggestion being selected is not proof of authentication. Return
-        // before constructing a service or opening the snapshot so the extension
-        // requests userInteractionRequired and authenticates in its presented UI.
-        guard kind == .password else {
-            throw NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userInteractionRequired.rawValue)
-        }
-        let extensionInfo = Bundle.main.object(forInfoDictionaryKey: "NSExtension") as? [String: Any]
-        guard extensionInfo?["NSExtensionPointIdentifier"] as? String == "com.apple.authentication-services-credential-provider-ui"
-        else { throw MopError.authentication }
-        let configuration = DefaultVaultPlatformConfiguration()
-        let service = NativeVaultService(state: try AutoFillStorage.directory(),
-            identityKeys: SynchronizedIdentityStore(allowUserInteraction: false), transport: {
-                let config = try configuration.cloudConfiguration()
-                return AppleCloudTransport(container: config.container, environment: config.environment)
-            }, authenticate: { _ in
-                // AuthenticationServices authenticates the user for the non-UI
-                // request. Do not run a second LocalAuthentication challenge.
-                return {}
-            })
-        let credential = try await systemCredential(recordIdentifier: recordIdentifier, service: service)
-        try Task.checkCancellation()
-        context.completeRequest(withSelectedCredential: credential, completionHandler: nil)
+        // Never construct a service, open a snapshot, or return a value here.
+        throw NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userInteractionRequired.rawValue)
     }
 
     /// Use a normally authenticated service, scoped to this fill request.
@@ -271,11 +246,12 @@ public enum AutoFillAccess {
         return ASOneTimeCodeCredential(code: String(decoding: bytes, as: UTF8.self))
     }
 
-    static func systemCredential(recordIdentifier: String, service: any VaultService) async throws -> ASPasswordCredential {
+    /// Use a normally authenticated service, scoped to this fill request.
+    public static func credential(recordIdentifier: String, service: any VaultService) async throws -> ASPasswordCredential {
         defer { service.lock() }
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            return try await credential(recordIdentifier: recordIdentifier, service: service)
+            return try await resolvedCredential(recordIdentifier: recordIdentifier, service: service)
         } onCancel: {
             service.lock()
         }
@@ -283,7 +259,7 @@ public enum AutoFillAccess {
 
     /// Re-resolve the locator from the authenticated catalog. Never trust the
     /// username or reference supplied by the system's potentially stale index.
-    public static func credential(recordIdentifier: String, service: any VaultService) async throws -> ASPasswordCredential {
+    private static func resolvedCredential(recordIdentifier: String, service: any VaultService) async throws -> ASPasswordCredential {
         let (entry, secret) = try await resolve(recordIdentifier: recordIdentifier, kind: .password, service: service)
         guard let bytes = secret.value else { throw MopError.notFound }
         return ASPasswordCredential(user: entry.username, password: String(decoding: bytes, as: UTF8.self))

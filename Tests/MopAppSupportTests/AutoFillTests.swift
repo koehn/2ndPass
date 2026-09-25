@@ -246,18 +246,29 @@ private final class CodeReadService: VaultService, Sendable {
     #expect(!mismatch.isAuthenticated)
 }
 
-@MainActor @Test func autoFillCodeSuggestionRequiresInteractionBeforeVaultAccess() async throws {
+@MainActor @Test(arguments: AutoFillKind.allCases)
+func autoFillSuggestionRequiresInteractionBeforeVaultAccess(kind: AutoFillKind) async throws {
     // No app-group configuration or extension bundle exists in this test host.
-    // The OTP policy must reject the noninteractive request before consulting
+    // Every credential kind must reject the noninteractive request before consulting
     // either, constructing a service, or accessing the encrypted snapshot.
     let context = ASCredentialProviderExtensionContext()
-    let identifier = "mop-autofill-otp-v1:\(UUID().uuidString):" + String(repeating: "a", count: 64)
+    let identifier = "\(kind.prefix):\(UUID().uuidString):" + String(repeating: "a", count: 64)
     do {
-        try await AutoFillAccess.completeSystemRequest(recordIdentifier: identifier, kind: .oneTimeCode, context: context)
-        Issue.record("A code suggestion must require user interaction")
+        try await AutoFillAccess.completeSystemRequest(recordIdentifier: identifier, kind: kind, context: context)
+        Issue.record("Every suggestion must require user interaction")
     } catch {
         let error = error as NSError
         #expect(error.domain == ASExtensionErrorDomain)
         #expect(error.code == ASExtensionError.userInteractionRequired.rawValue)
     }
+}
+
+@Test func autoFillPasswordCancellationReturnsNoCredentialAndLocks() async throws {
+    let service = CodeReadService(outcome: .cancel)
+    let entry = try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: UUID().uuidString).first { $0.kind == .password })
+    let task = Task {
+        try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: service)
+    }
+    await #expect(throws: CancellationError.self) { try await task.value }
+    #expect(!service.isAuthenticated)
 }

@@ -21,6 +21,17 @@ mop is a macOS secret manager with a native Mac app, a command-line interface, C
 account identities synchronized through iCloud Keychain. It supplies credentials to commands and templates
 using references such as `mop://personal/service/token`.
 
+Mop is an Apple-native password and secrets manager built for the
+command line. Its direction is independence from a separate password-manager
+vendor, reliable runtime access, and the freedom to move your data elsewhere.
+See the [project direction and roadmap](docs/ROADMAP.md) for priorities,
+distribution plans, and features deferred until users need them.
+
+Start with [how Mop protects your secrets](docs/SECURITY-EXPLAINER.md) for a
+developer-friendly explanation of encryption, Apple services, authentication,
+runtime access, synchronization, and recovery. No Apple security background is
+required.
+
 **CloudKit implementation: signed two-Mac and production acceptance are still
 required before release.** See [validation](docs/VALIDATION.md).
 
@@ -47,9 +58,9 @@ open dist/Mop.app
 ## Password and TOTP AutoFill
 
 Mop includes an iOS/macOS AutoFill extension. Enable Mop in system AutoFill settings,
-then open and unlock the app to publish password and TOTP website/username suggestions. Password suggestions retain system AutoFill authentication behavior; TOTP suggestions
-require Mop authentication before generating a code. Choosing “Mop…” opens its
-picker with Mop authentication. Both read a shared encrypted snapshot and work offline.
+then open and unlock the app to publish password and TOTP website/username suggestions. Every fill requires Mop authentication, including password and TOTP suggestions
+and username-only insertion. Choosing “Mop…” opens its searchable picker; selecting
+an entry authenticates before filling. Both read a shared encrypted snapshot and work offline.
 See [AutoFill setup and provisioning](docs/AUTOFILL.md).
 
 ## Item templates and field types

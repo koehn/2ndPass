@@ -20,22 +20,19 @@ item titles, passwords, OTP seeds and vault keys are not indexed. The shared
 index uses private file permissions and iOS file protection; its contents are
 available to Mop and its extension without a vault-unlock prompt.
 
-Password suggestions use `provideCredentialWithoutUserInteraction`: the extension
-opens the encrypted snapshot through shared Mop libraries, verifies the selected
-identifier against its catalog, and reads the password and hands it directly to
-AuthenticationServices without displaying a Mop window. AutoFill owns user
-authentication according to the device's settings on this path. No Touch ID
-token is exported to Mop, and no second LocalAuthentication challenge is issued.
-The scoped service locks before returning the credential to AutoFill. Keychain
-reads disallow UI; if access requires interaction, the extension falls back to
-interactive authentication.
+All password and OTP suggestions return `userInteractionRequired` from
+`provideCredentialWithoutUserInteraction`, before opening a vault or decrypting
+any secret. The system then presents Mop’s selected-credential interface, which
+creates a fresh service and requests biometrics or device-owner authentication.
+Selecting a suggestion is never treated as proof of authentication. The extension
+verifies the selected identifier against the authenticated catalog before reading
+its value. Cancelling the prompt leaves the field unchanged; the service locks
+after every request. Recent app unlocks or fills do not bypass this requirement.
 
-OTP suggestions always return `userInteractionRequired` from the noninteractive
-callback, before opening a vault or decrypting a seed. The system then presents
-Mop’s selected-credential interface, which creates a fresh authenticated service
-and requests biometrics or device-owner authentication before generating the code.
-Selecting a suggestion is not treated as proof of authentication. Cancelling the
-prompt leaves the field unchanged; the service locks after every code request.
+Username-only insertion uses the same authenticated credential resolution as
+password insertion; it never inserts a username directly from the shared index.
+Website and username metadata remain visible in suggestions and the searchable
+picker before authentication. Every action that fills a value requires authentication.
 
 Choosing “Mop…” opens the searchable account picker. Selecting an account there
 authenticates through LocalAuthentication (biometrics or the system's device-owner
@@ -71,8 +68,7 @@ revoked vaults remove their cached snapshots and suggestions. Account-change
 notifications invalidate the offline binding and clear suggestions.
 
 Websites and usernames are deliberately available to the system without unlocking
-Mop. Passwords and OTP seeds remain encrypted on disk; the non-UI suggestion path decrypts only
-for delivery to system AutoFill, which controls authentication before filling.
+Mop. Passwords and OTP seeds remain encrypted on disk; the extension decrypts only after Mop authentication for delivery to system AutoFill.
 Apple manages the metadata
 store, excludes it from device backups and clears it when the provider is disabled.
 This version provides existing passwords and TOTP codes. Passkeys and saving or
@@ -110,9 +106,10 @@ an iPhone/iPad and Mac to check:
 - Open the code picker and verify only code accounts appear, with working search.
 - Fill codes before and after a TOTP rollover and compare with Mop’s current code.
 - Browse/search the extension while Mop is locked or terminated, without a prompt.
-- Select a suggestion, authenticate with the system and fill the correct account
-  without a Mop window or additional prompt. Choose “Mop…” and verify the picker
-  opens and requires authentication before filling.
+- Select a password suggestion and verify Mop requires authentication before filling.
+  Repeat immediately after an app unlock and after a successful fill. Cancel and
+  confirm neither username nor password is filled. Choose “Mop…” and verify its
+  picker also requires authentication before filling.
 - Cancel system authentication and confirm no fields are filled; then retry.
 - On iOS, long-press a text field and choose AutoFill → Passwords. Verify Mop
   appears, its list can be searched, and Username/Password/Code inserts only the

@@ -704,7 +704,7 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     }
 }
 
-@Test func autoFillSystemRequestLocksAfterSuccessAndFailure() async throws {
+@Test func autoFillPasswordAndUsernameRequireAuthenticationForEachFill() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let id = f.vaults[0].id.uuidString
     let catalog = try await operation(f, .catalog).requireCatalog()
@@ -714,16 +714,29 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
         ItemField(path: "website", type: .website, value: "example.com")])
     let saved = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true))).requireCatalog()
     let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
-    // Model the system-authenticated path without an application challenge.
-    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in {} })
-    let credential = try await AutoFillAccess.systemCredential(recordIdentifier: entry.recordIdentifier, service: service)
+    let count = Counter()
+    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
+        count.value.withLock { $0 += 1 }; return {}
+    })
+    let credential = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: service)
     #expect(credential.user == "alice" && credential.password == "secret")
+    #expect(count.value.withLock { $0 } == 1)
     #expect(!service.isAuthenticated)
+    // Username-only insertion takes its value from this same authenticated path.
+    let username = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: service).user
+    #expect(username == "alice")
+    #expect(count.value.withLock { $0 } == 2)
+    #expect(!service.isAuthenticated)
+    let denied = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })
+    await #expect(throws: MopError.authentication) {
+        _ = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: denied).user
+    }
+    #expect(!denied.isAuthenticated)
 
     // An obsolete locator must still be rejected after the catalog was opened.
     let stale = String(entry.recordIdentifier.dropLast()) + (entry.recordIdentifier.last == "0" ? "1" : "0")
     await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.systemCredential(recordIdentifier: stale, service: service)
+        _ = try await AutoFillAccess.credential(recordIdentifier: stale, service: service)
     }
     #expect(!service.isAuthenticated)
 }
@@ -757,7 +770,7 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     #expect(count.value.withLock { $0 } == 1)
     #expect(!service.isAuthenticated)
     await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.systemCredential(recordIdentifier: entry.recordIdentifier, service: service)
+        _ = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: service)
     }
     #expect(!service.isAuthenticated)
     let denied = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })

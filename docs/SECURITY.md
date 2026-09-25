@@ -1,5 +1,9 @@
 # Security and key management
 
+For an introduction without assumed cryptography or Apple platform knowledge,
+read [how Mop protects your secrets](SECURITY-EXPLAINER.md). This document is the
+technical reference for the current implementation.
+
 Mop accepts only `mop-vault-v5` vaults and backups. It does not open legacy device
 credentials, enroll or pair devices, convert older vaults, or restore pre-v5
 history. Existing server objects and old local credentials are left untouched.
