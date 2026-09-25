@@ -146,7 +146,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         publishesAutoFill = state == nil && Bundle.main.object(forInfoDictionaryKey: "MopPublishesAutoFill") as? Bool == true
         let state = state ?? configuration.stateDirectory
         worker = Worker(state: state.standardizedFileURL, documents: documents, identityKeys: SynchronizedIdentityStore(), accountAuthentication: { register in
-            let context = try Authentication.authorize(reason: "unlock your Mop vaults", contextCreated: { context in
+            let context = try await Authentication.authorizeAsync(reason: "unlock your Mop vaults", contextCreated: { context in
                 let invalidator = ContextInvalidator(context)
                 try register { invalidator.invalidate() }
             })
@@ -163,7 +163,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
          authenticate: @escaping AccountAuthenticationFactory) {
         worker = Worker(state: state, identityKeys: identityKeys, accountAuthentication: authenticate, transport: transport)
     }
-    typealias AccountAuthenticationFactory = ((@escaping @Sendable () -> Void) throws -> Void) throws -> (@Sendable () -> Void)
+    typealias AccountAuthenticationFactory = ((@escaping @Sendable () -> Void) throws -> Void) async throws -> (@Sendable () -> Void)
 
     public func lock() {
         control.lock()
@@ -291,7 +291,7 @@ private final class Worker {
         try control.check(token)
         if let accountIdentity { return accountIdentity }
         if !control.authenticated {
-            let close = try accountAuthentication { try control.register($0, token: token) }
+            let close = try await accountAuthentication { try control.register($0, token: token) }
             do { try control.check(token); try control.authorized(token) } catch { close(); throw error }
             accountAuthenticationClose?()
             accountAuthenticationClose = close

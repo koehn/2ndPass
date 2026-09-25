@@ -33,6 +33,12 @@ fallback), since AutoFill does not authenticate on behalf of a presented extensi
 No CLI or running containing app is needed. The extension locks after completion,
 failure, cancellation or dismissal. App and CLI authentication are unchanged.
 
+On iOS, the text-field menu's AutoFill → Passwords action uses the separate text
+insertion API. Mop advertises `ProvidesTextToInsert` and presents its searchable
+login list with Username and Password buttons. Choosing either authenticates,
+revalidates the credential, and inserts only that value into the focused field.
+Passwords are never shown in the list or copied to the clipboard.
+
 ## Storage and refresh
 
 The app exports only verified encrypted snapshots, revision watermarks and the
@@ -87,6 +93,9 @@ an iPhone/iPad and Mac to check:
   without a Mop window or additional prompt. Choose “Mop…” and verify the picker
   opens and requires authentication before filling.
 - Cancel system authentication and confirm no fields are filled; then retry.
+- On iOS, long-press a text field and choose AutoFill → Passwords. Verify Mop
+  appears, its list can be searched, and Username/Password inserts only the
+  chosen value after authentication. Cancelling must leave the field unchanged.
 - Cancel authentication and retry; dismiss the extension during authentication.
 - Fill offline, update a password/username, rename/trash/delete items and vaults,
   refresh Mop, and confirm old suggestions cannot fill removed credentials.

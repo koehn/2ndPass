@@ -284,16 +284,35 @@ private func operation(_ f: Fixture, _ op: VaultOperation, index: Int = 0, offli
 private final class AuthenticationBarrier: Sendable {
     let entered = Mutex(false)
     let invalidated = Mutex(false)
-    let release = DispatchSemaphore(value: 0)
+    private let state = Mutex<(released: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let released = state.withLock { state in
+                if state.released { return true }
+                state.waiter = continuation
+                return false
+            }
+            if released { continuation.resume() }
+        }
+    }
+    func release() {
+        let waiter = state.withLock { state in
+            state.released = true
+            let waiter = state.waiter
+            state.waiter = nil
+            return waiter
+        }
+        waiter?.resume()
+    }
 }
 @Test func lockCancelsPendingAuthenticationWithoutInstallingItsDevice() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let barrier = AuthenticationBarrier()
     let cloud = f.cloud
     let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { cloud }, authenticate: { register in
-        try register { barrier.invalidated.withLock { $0 = true } }
+        try register { barrier.invalidated.withLock { $0 = true }; barrier.release() }
         barrier.entered.withLock { $0 = true }
-        guard barrier.release.wait(timeout: .now() + 5) == .success else { throw MopError.authentication }
+        await barrier.wait()
         return {}
     })
     let id = f.vaults[0].id.uuidString
@@ -305,9 +324,28 @@ private final class AuthenticationBarrier: Sendable {
     #expect(barrier.entered.withLock { $0 })
     service.lock()
     #expect(barrier.invalidated.withLock { $0 })
-    barrier.release.signal()
     await #expect(throws: MopError.authentication) { _ = try await pending.value }
     #expect(!service.isAuthenticated)
+}
+
+@Test func cancelledAsyncAuthenticationAllowsAnotherFill() async throws {
+    let f = try await fixture(); defer { f.cleanup() }
+    let attempts = Counter()
+    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
+        await Task.yield()
+        let attempt = attempts.value.withLock { $0 += 1; return $0 }
+        if attempt == 1 { throw MopError.authentication }
+        return {}
+    })
+    defer { service.lock() }
+    let id = f.vaults[0].id.uuidString
+    await #expect(throws: MopError.authentication) {
+        _ = try await service.execute(.catalog, vault: id, offline: true)
+    }
+    #expect(!service.isAuthenticated)
+    let result = try await service.execute(.read(SecretReference("mop://personal/item/token")), vault: id, offline: true)
+    #expect(result.value == "value")
+    #expect(attempts.value.withLock { $0 } == 2)
 }
 @Test func nativeExportPreservesNoOverwriteAndStateDirectoryProtection() async throws {
     let f = try await fixture(); defer { f.cleanup() }

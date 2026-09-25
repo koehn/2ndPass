@@ -4,6 +4,26 @@ import MopCore
 import Synchronization
 
 public enum Authentication {
+    /// GUI and extension callers must suspend while the system authenticates,
+    /// rather than occupying a Swift concurrency worker with a semaphore wait.
+    public static func authorizeAsync(reason: String, contextCreated: (LAContext) throws -> Void = { _ in }) async throws -> LAContext {
+        let context = LAContext()
+        do {
+            try contextCreated(context)
+            try Task.checkCancellation()
+            context.touchIDAuthenticationAllowableReuseDuration = 0
+            context.localizedReason = reason
+            guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: nil) else { throw MopError.authentication }
+            guard try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) else { throw MopError.authentication }
+            try Task.checkCancellation()
+            context.interactionNotAllowed = true
+            return context
+        } catch {
+            context.invalidate()
+            throw MopError.authentication
+        }
+    }
+
     public static func authorize(reason: String = "access secrets for this mop command", contextCreated: (LAContext) throws -> Void = { _ in }) throws -> LAContext {
         let context = LAContext()
         do { try contextCreated(context) } catch { context.invalidate(); throw error }

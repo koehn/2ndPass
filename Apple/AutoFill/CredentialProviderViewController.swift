@@ -13,19 +13,31 @@ import MopCore
     private let model = CredentialListModel()
 
     override func loadView() {
-        let content = CredentialListView(model: model, select: { [weak self] in self?.fill($0) }, cancel: { [weak self] in self?.cancel() })
+        let content = CredentialListView(model: model, select: { [weak self] in self?.fill($0, field: $1) }, cancel: { [weak self] in self?.cancel() })
         #if os(macOS)
         let host = NSHostingController(rootView: content)
-        #else
-        let host = UIHostingController(rootView: content)
-        #endif
         addChild(host)
         view = host.view
+        #else
+        let host = UIHostingController(rootView: content)
+        // Keep the hosting view inside a separate container so UIKit can manage
+        // the extension's presentation and the child's layout independently.
+        view = UIView()
+        view.backgroundColor = .systemBackground
+        addChild(host)
+        host.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(host.view)
+        NSLayoutConstraint.activate([
+            host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            host.view.topAnchor.constraint(equalTo: view.topAnchor),
+            host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        host.didMove(toParent: self)
+        #endif
         observeAccountChanges()
         #if os(macOS)
         updatePreferredContentSize()
-        #else
-        host.didMove(toParent: self)
         #endif
     }
 
@@ -43,6 +55,7 @@ import MopCore
         stop()
         pendingIdentity = nil
         model.showsPicker = true
+        model.textInsertion = false
         updatePreferredContentSize()
         model.loading = true
         model.message = nil
@@ -70,6 +83,17 @@ import MopCore
             model.loading = false
         }
     }
+    override func prepareCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier], requestParameters: ASPasskeyCredentialRequestParameters) {
+        // A website may have an active passkey request while the user chooses
+        // Passwords. Mop still offers its passwords through this entry point.
+        prepareCredentialList(for: serviceIdentifiers)
+    }
+    #if os(iOS)
+    override func prepareInterfaceForUserChoosingTextToInsert() {
+        prepareCredentialList(for: [])
+        model.textInsertion = true
+    }
+    #endif
     override func provideCredentialWithoutUserInteraction(for credentialRequest: any ASCredentialRequest) {
         guard let identity = credentialRequest.credentialIdentity as? ASPasswordCredentialIdentity else { cancel(); return }
         provideCredentialWithoutUserInteraction(for: identity)
@@ -105,6 +129,7 @@ import MopCore
         stop()
         pendingIdentity = nil
         model.showsPicker = false
+        model.textInsertion = false
         model.entries = []
         updatePreferredContentSize()
         model.message = nil
@@ -123,7 +148,12 @@ import MopCore
         super.viewDidAppear(animated)
         if let identity = pendingIdentity { pendingIdentity = nil; fill(identity) }
     }
-    override func viewDidDisappear(_ animated: Bool) { super.viewDidDisappear(animated); stop() }
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // A system authentication presentation may temporarily cover the picker.
+        // Only cancel for dismissal/removal, not every visibility transition.
+        if isBeingDismissed || isMovingFromParent { stop() }
+    }
     #endif
 
     private func updatePreferredContentSize() {
@@ -134,7 +164,7 @@ import MopCore
         #endif
     }
 
-    private func fill(_ identity: ASPasswordCredentialIdentity) {
+    private func fill(_ identity: ASPasswordCredentialIdentity, field: CredentialField? = nil) {
         guard let identifier = identity.recordIdentifier else { cancel(); return }
         stop()
         model.message = nil
@@ -146,7 +176,19 @@ import MopCore
                 let credential = try await AutoFillAccess.credential(recordIdentifier: identifier, service: service)
                 try Task.checkCancellation()
                 service.lock(); self.service = nil
-                extensionContext.completeRequest(withSelectedCredential: credential, completionHandler: nil)
+                let completed: @Sendable (Bool) -> Void = { expired in
+                    Logger(subsystem: "com.koehn.mop", category: "AutoFill").notice("Interactive request completion callback; expired=\(expired)")
+                }
+                #if os(iOS)
+                if let field {
+                    let text = field == .username ? credential.user : credential.password
+                    Logger(subsystem: "com.koehn.mop", category: "AutoFill").notice("Returning authenticated text.")
+                    extensionContext.completeRequest(withTextToInsert: text, completionHandler: completed)
+                    return
+                }
+                #endif
+                Logger(subsystem: "com.koehn.mop", category: "AutoFill").notice("Returning authenticated credential.")
+                extensionContext.completeRequest(withSelectedCredential: credential, completionHandler: completed)
             } catch {
                 guard !Task.isCancelled else { return }
                 service?.lock(); service = nil
@@ -162,17 +204,25 @@ import MopCore
             }
         }
     }
-    private func stop() { task?.cancel(); task = nil; service?.lock(); service = nil }
+    private func stop() {
+        let wasLoading = task != nil && model.loading
+        task?.cancel(); task = nil; service?.lock(); service = nil
+        model.loading = false
+        if wasLoading { model.message = "The request was interrupted. Select an account to try again." }
+    }
     private func cancel() {
         stop()
         extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userCanceled.rawValue))
     }
 }
 
+private enum CredentialField { case username, password }
+
 @MainActor @Observable private final class CredentialListModel {
     // Start without a picker so a selected-credential request cannot flash the list
     // while AuthenticationServices is loading the view.
     var showsPicker = false
+    var textInsertion = false
     var entries: [ASPasswordCredentialIdentity] = []
     var loading = true
     var message: String?
@@ -180,7 +230,7 @@ import MopCore
 
 private struct CredentialListView: View {
     @Bindable var model: CredentialListModel
-    let select: (ASPasswordCredentialIdentity) -> Void
+    let select: (ASPasswordCredentialIdentity, CredentialField?) -> Void
     let cancel: () -> Void
     @State private var search = ""
     var body: some View {
@@ -189,6 +239,7 @@ private struct CredentialListView: View {
             if model.loading { ProgressView(model.showsPicker ? "Please wait…" : "Unlocking to fill your login…") }
             if let message = model.message { Text(message).font(.callout) }
             if model.showsPicker {
+                if model.textInsertion { Text("Choose the username or password to insert into the selected field.").font(.callout) }
                 if !model.loading && model.entries.isEmpty && model.message == nil {
                     Text("No logins are available in this AutoFill list. Open and unlock Mop to refresh it, then try again.")
                 }
@@ -196,12 +247,23 @@ private struct CredentialListView: View {
                     .textFieldStyle(.roundedBorder)
                 List {
                     ForEach(model.entries.filter { search.isEmpty || $0.user.localizedCaseInsensitiveContains(search) || $0.serviceIdentifier.identifier.localizedCaseInsensitiveContains(search) }, id: \.recordIdentifier) { entry in
-                        Button { select(entry) } label: {
-                            VStack(alignment: .leading) {
+                        if model.textInsertion {
+                            VStack(alignment: .leading, spacing: 8) {
                                 Text(entry.serviceIdentifier.identifier).font(.headline)
                                 Text(entry.user).font(.subheadline)
-                            }.frame(maxWidth: .infinity, alignment: .leading)
-                        }.buttonStyle(.plain).disabled(model.loading)
+                                HStack {
+                                    Button("Username") { select(entry, .username) }
+                                    Button("Password") { select(entry, .password) }
+                                }.buttonStyle(.bordered).disabled(model.loading)
+                            }
+                        } else {
+                            Button { select(entry, nil) } label: {
+                                VStack(alignment: .leading) {
+                                    Text(entry.serviceIdentifier.identifier).font(.headline)
+                                    Text(entry.user).font(.subheadline)
+                                }.frame(maxWidth: .infinity, alignment: .leading)
+                            }.buttonStyle(.plain).disabled(model.loading)
+                        }
                     }
                 }
             }

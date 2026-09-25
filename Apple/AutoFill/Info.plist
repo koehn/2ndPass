@@ -36,6 +36,8 @@
 				<false/>
 				<key>ProvidesPasswords</key>
 				<true/>
+				<key>ProvidesTextToInsert</key>
+				<true/>
 			</dict>
 		</dict>
 		<key>NSExtensionPointIdentifier</key>
