@@ -20,15 +20,22 @@ item titles, passwords, OTP seeds and vault keys are not indexed. The shared
 index uses private file permissions and iOS file protection; its contents are
 available to Mop and its extension without a vault-unlock prompt.
 
-System suggestions use `provideCredentialWithoutUserInteraction`: the extension
+Password suggestions use `provideCredentialWithoutUserInteraction`: the extension
 opens the encrypted snapshot through shared Mop libraries, verifies the selected
-identifier against its catalog, and generates the current TOTP code or reads the password and hands it directly to
+identifier against its catalog, and reads the password and hands it directly to
 AuthenticationServices without displaying a Mop window. AutoFill owns user
 authentication according to the device's settings on this path. No Touch ID
 token is exported to Mop, and no second LocalAuthentication challenge is issued.
 The scoped service locks before returning the credential to AutoFill. Keychain
 reads disallow UI; if access requires interaction, the extension falls back to
 interactive authentication.
+
+OTP suggestions always return `userInteractionRequired` from the noninteractive
+callback, before opening a vault or decrypting a seed. The system then presents
+Mop’s selected-credential interface, which creates a fresh authenticated service
+and requests biometrics or device-owner authentication before generating the code.
+Selecting a suggestion is not treated as proof of authentication. Cancelling the
+prompt leaves the field unchanged; the service locks after every code request.
 
 Choosing “Mop…” opens the searchable account picker. Selecting an account there
 authenticates through LocalAuthentication (biometrics or the system's device-owner
@@ -38,7 +45,7 @@ failure, cancellation or dismissal. App and CLI authentication are unchanged.
 
 On iOS, the text-field menu's AutoFill → Passwords action uses the separate text
 insertion API. Mop advertises `ProvidesTextToInsert` and presents its searchable
-login list with Username, Password and Code actions as applicable. Choosing either authenticates,
+login list with Username, Password and Code actions as applicable. Choosing an action authenticates,
 revalidates the credential, and inserts only that value into the focused field.
 Passwords and codes are never shown in the list or copied to the clipboard.
 The code picker lists only eligible code accounts; search and website prioritization
@@ -98,6 +105,8 @@ an iPhone/iPad and Mac to check:
 
 - Enable provider, unlock Mop, and see website/username suggestions in Safari.
 - Verify TOTP suggestions in a code field, including a login without a password.
+  Selecting a code must present Mop authentication before filling, even after
+  a recent app unlock or code fill. Cancel the prompt and verify nothing fills.
 - Open the code picker and verify only code accounts appear, with working search.
 - Fill codes before and after a TOTP rollover and compare with Mop’s current code.
 - Browse/search the extension while Mop is locked or terminated, without a prompt.

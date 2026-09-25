@@ -224,12 +224,19 @@ actor AutoFillPublisher {
 }
 
 public enum AutoFillAccess {
-    /// Only for provideCredentialWithoutUserInteraction. AutoFill owns user
-    /// authentication on this path; the returned credential goes directly to the
+    /// Only for provideCredentialWithoutUserInteraction. OTP requests must use
+    /// the interactive authentication path. Passwords retain their existing
+    /// system-suggestion behavior; the returned credential goes directly to the
     /// system, never to a caller or a reusable unlocked app session. The picker
     /// must continue using a normally authenticated NativeVaultService.
     @MainActor public static func completeSystemRequest(recordIdentifier: String, kind: AutoFillKind = .password,
                                                        context: ASCredentialProviderExtensionContext) async throws {
+        // A suggestion being selected is not proof of authentication. Return
+        // before constructing a service or opening the snapshot so the extension
+        // requests userInteractionRequired and authenticates in its presented UI.
+        guard kind == .password else {
+            throw NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userInteractionRequired.rawValue)
+        }
         let extensionInfo = Bundle.main.object(forInfoDictionaryKey: "NSExtension") as? [String: Any]
         guard extensionInfo?["NSExtensionPointIdentifier"] as? String == "com.apple.authentication-services-credential-provider-ui"
         else { throw MopError.authentication }
@@ -243,27 +250,21 @@ public enum AutoFillAccess {
                 // request. Do not run a second LocalAuthentication challenge.
                 return {}
             })
-        switch kind {
-        case .password:
-            let credential = try await systemCredential(recordIdentifier: recordIdentifier, service: service)
-            try Task.checkCancellation()
-            context.completeRequest(withSelectedCredential: credential, completionHandler: nil)
-        case .oneTimeCode:
-            let credential = try await systemOneTimeCode(recordIdentifier: recordIdentifier, service: service)
-            try Task.checkCancellation()
-            context.completeOneTimeCodeRequest(using: credential, completionHandler: nil)
-        }
+        let credential = try await systemCredential(recordIdentifier: recordIdentifier, service: service)
+        try Task.checkCancellation()
+        context.completeRequest(withSelectedCredential: credential, completionHandler: nil)
     }
 
-    static func systemOneTimeCode(recordIdentifier: String, service: any VaultService) async throws -> ASOneTimeCodeCredential {
+    /// Use a normally authenticated service, scoped to this fill request.
+    public static func oneTimeCode(recordIdentifier: String, service: any VaultService) async throws -> ASOneTimeCodeCredential {
         defer { service.lock() }
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            return try await oneTimeCode(recordIdentifier: recordIdentifier, service: service)
+            return try await resolvedOneTimeCode(recordIdentifier: recordIdentifier, service: service)
         } onCancel: { service.lock() }
     }
 
-    public static func oneTimeCode(recordIdentifier: String, service: any VaultService) async throws -> ASOneTimeCodeCredential {
+    private static func resolvedOneTimeCode(recordIdentifier: String, service: any VaultService) async throws -> ASOneTimeCodeCredential {
         let (_, secret) = try await resolve(recordIdentifier: recordIdentifier, kind: .oneTimeCode, service: service)
         guard let bytes = secret.value, let expiry = secret.otpExpiresAt, expiry > Date(),
               let period = secret.otpPeriod, period > 0 else { throw MopError.invalidOTP }

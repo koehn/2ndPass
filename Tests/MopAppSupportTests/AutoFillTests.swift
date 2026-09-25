@@ -226,14 +226,14 @@ private final class CodeReadService: VaultService, Sendable {
         let service = CodeReadService(outcome: outcome)
         let entry = try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: id).first { $0.kind == .oneTimeCode })
         await #expect(throws: MopError.invalidOTP) {
-            _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
+            _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
         }
         #expect(!service.isAuthenticated)
     }
     let service = CodeReadService(outcome: .cancel)
     let entry = try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: id).first { $0.kind == .oneTimeCode })
     let task = Task {
-        try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
+        try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
     }
     await #expect(throws: CancellationError.self) { try await task.value }
     #expect(!service.isAuthenticated)
@@ -241,7 +241,23 @@ private final class CodeReadService: VaultService, Sendable {
     let mismatch = CodeReadService(outcome: .valid)
     let password = try #require(AutoFillEntry.entries(catalog: mismatch.catalog, vaultID: id).first { $0.kind == .password })
     await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: password.recordIdentifier, service: mismatch)
+        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: password.recordIdentifier, service: mismatch)
     }
     #expect(!mismatch.isAuthenticated)
+}
+
+@MainActor @Test func autoFillCodeSuggestionRequiresInteractionBeforeVaultAccess() async throws {
+    // No app-group configuration or extension bundle exists in this test host.
+    // The OTP policy must reject the noninteractive request before consulting
+    // either, constructing a service, or accessing the encrypted snapshot.
+    let context = ASCredentialProviderExtensionContext()
+    let identifier = "mop-autofill-otp-v1:\(UUID().uuidString):" + String(repeating: "a", count: 64)
+    do {
+        try await AutoFillAccess.completeSystemRequest(recordIdentifier: identifier, kind: .oneTimeCode, context: context)
+        Issue.record("A code suggestion must require user interaction")
+    } catch {
+        let error = error as NSError
+        #expect(error.domain == ASExtensionErrorDomain)
+        #expect(error.code == ASExtensionError.userInteractionRequired.rawValue)
+    }
 }

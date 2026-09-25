@@ -748,7 +748,7 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
         count.value.withLock { $0 += 1 }; return {}
     })
     let before = Date()
-    let credential = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
+    let credential = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
     let after = Date()
     let otp = try TimeBasedOTP(seed)
     let expectedCodes = try [otp.code(at: before), otp.code(at: after)]
@@ -762,17 +762,17 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     #expect(!service.isAuthenticated)
     let denied = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })
     await #expect(throws: MopError.authentication) {
-        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: denied)
+        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: denied)
     }
     #expect(!denied.isAuthenticated)
     let stale = String(entry.recordIdentifier.dropLast()) + (entry.recordIdentifier.last == "0" ? "1" : "0")
     await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: stale, service: service)
+        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: stale, service: service)
     }
     #expect(!service.isAuthenticated)
     try repo.removeAutoFillSnapshot(id, in: exported)
     await #expect(throws: MopError.vaultMissing) {
-        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
+        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
     }
     #expect(!service.isAuthenticated)
 
@@ -781,7 +781,7 @@ private final class TestIdentityKeys: IdentityKeyStore, Sendable {
     item.fields[0].value = "bob"
     _ = try await operation(f, .save(ItemEdit(revision: saved.revision, item: item, create: false)))
     await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.systemOneTimeCode(recordIdentifier: entry.recordIdentifier, service: f.service)
+        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: f.service)
     }
     #expect(!f.service.isAuthenticated)
 }

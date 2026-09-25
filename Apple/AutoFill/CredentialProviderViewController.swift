@@ -119,6 +119,10 @@ import MopCore
                 try await AutoFillAccess.completeSystemRequest(recordIdentifier: identifier, kind: identity.kind, context: extensionContext)
             } catch {
                 guard !Task.isCancelled else { return }
+                if (error as NSError).domain == ASExtensionErrorDomain {
+                    extensionContext.cancelRequest(withError: error)
+                    return
+                }
                 let code: ASExtensionError.Code
                 switch error as? MopError {
                 case .authentication: code = .userInteractionRequired
