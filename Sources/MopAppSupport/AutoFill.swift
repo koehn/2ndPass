@@ -2,12 +2,10 @@
 import Foundation
 import CryptoKit
 import MopCore
-import MopVault
-import MopCloudKit
 
 public enum AutoFillKind: String, Codable, Sendable, CaseIterable {
     case password, oneTimeCode
-    var prefix: String { self == .password ? "mop-autofill-v1" : "mop-autofill-otp-v1" }
+    var prefix: String { self == .password ? "mop-autofill-v6" : "mop-autofill-otp-v6" }
 }
 
 /// Only websites, usernames, credential kinds and opaque locators leave the encrypted catalog.
@@ -86,7 +84,7 @@ public struct AutoFillEntry: Equatable, Sendable {
     public static func vaultID(_ identifier: String) -> String? {
         let parts = identifier.split(separator: ":", omittingEmptySubsequences: false)
         guard parts.count == 3, AutoFillKind.allCases.contains(where: { $0.prefix == parts[0] }), let id = UUID(uuidString: String(parts[1])),
-              VaultTrust.validFingerprint(String(parts[2])) else { return nil }
+              parts[2].count == 64 && parts[2].utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
         return id.uuidString
     }
     public var identity: any ASCredentialIdentity { AutoFillIdentity(entry: self).identity }
@@ -133,25 +131,37 @@ public struct AutoFillIndex: Sendable {
     private let directory: URL
     public init(directory: URL) { self.directory = directory }
     private var file: URL { directory.appendingPathComponent("identities.json") }
-    private func read() throws -> [AutoFillIdentity] {
+    private func read(rebuildingInvalidCache: Bool = false) throws -> [AutoFillIdentity] {
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
-        let entries = try JSONDecoder().decode([AutoFillIdentity].self, from: SafeFile.read(file, privateFile: true))
+        // Filesystem security failures must never be treated as an empty cache.
+        let data = try LocalFile.read(file, privateFile: true)
+        let entries: [AutoFillIdentity]
+        do { entries = try JSONDecoder().decode([AutoFillIdentity].self, from: data) }
+        catch {
+            if rebuildingInvalidCache { return [] }
+            throw MopError.invalidVault
+        }
         guard entries.allSatisfy({ AutoFillEntry.vaultID($0.recordIdentifier) != nil && $0.recordIdentifier.hasPrefix($0.kind.prefix + ":") && AutoFillEntry.website($0.website) == $0.website }),
-              Set(entries.map(\.recordIdentifier)).count == entries.count else { throw MopError.invalidVault }
+              Set(entries.map(\.recordIdentifier)).count == entries.count else {
+            if rebuildingInvalidCache { return [] }
+            throw MopError.invalidVault
+        }
         return entries
     }
     public func load() throws -> [AutoFillIdentity] {
-        let cache = try CloudCache(directory: directory)
+        let cache = try LocalDirectory(directory: directory)
         return try cache.locked { try read() }
     }
     @discardableResult
     func update(_ transform: ([AutoFillIdentity]) -> [AutoFillIdentity]) throws -> [AutoFillIdentity] {
-        let cache = try CloudCache(directory: directory)
+        let cache = try LocalDirectory(directory: directory)
         return try cache.locked {
-            let entries = transform(try read()).sorted { $0.recordIdentifier < $1.recordIdentifier }
+            // This is derived metadata, not vault data. Rebuild an unusable
+            // index from authenticated catalogs instead of preserving a refresh loop.
+            let entries = transform(try read(rebuildingInvalidCache: true)).sorted { $0.recordIdentifier < $1.recordIdentifier }
             let data = try JSONEncoder().encode(entries)
-            guard data.count <= VaultCoding.maximumFileSize else { throw MopError.invalidVault }
-            try SafeFile.write(data, to: file, replace: FileManager.default.fileExists(atPath: file.path))
+            guard data.count <= 16 * 1024 * 1024 else { throw MopError.invalidVault }
+            try LocalFile.write(data, to: file, replace: FileManager.default.fileExists(atPath: file.path))
             return entries
         }
     }
@@ -160,14 +170,7 @@ public struct AutoFillIndex: Sendable {
 public enum AutoFillStorage {
     /// Account changes invalidate offline access as well as visible suggestions.
     public static func invalidate() async {
-        if let directory = try? directory() {
-            let cloud = directory.appendingPathComponent("cloud")
-            for name in (try? FileManager.default.contentsOfDirectory(atPath: cloud.path)) ?? [] {
-                guard VaultTrust.validFingerprint(name) else { continue }
-                let binding = cloud.appendingPathComponent(name).appendingPathComponent("binding.json")
-                try? FileManager.default.removeItem(at: binding)
-            }
-        }
+        try? NextAccountBinding.invalidate(state: AppStorageLocation.defaultState)
         try? await AutoFillPublisher.shared.prune(keeping: [])
     }
 
@@ -232,6 +235,7 @@ public enum AutoFillAccess {
 
     /// Use a normally authenticated service, scoped to this fill request.
     public static func oneTimeCode(recordIdentifier: String, service: any VaultService) async throws -> ASOneTimeCodeCredential {
+        service.lock()
         defer { service.lock() }
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -248,6 +252,7 @@ public enum AutoFillAccess {
 
     /// Use a normally authenticated service, scoped to this fill request.
     public static func credential(recordIdentifier: String, service: any VaultService) async throws -> ASPasswordCredential {
+        service.lock()
         defer { service.lock() }
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()

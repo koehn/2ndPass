@@ -1,4 +1,6 @@
-> Historical design plan, retained for context. It is not the current implementation or acceptance runbook. See [MOBILE.md](MOBILE.md), [ACCOUNT-IDENTITY.md](ACCOUNT-IDENTITY.md), and [VALIDATION.md](VALIDATION.md) for v5-only behavior.
+> Historical design plan, retained for context. It is not the current implementation or acceptance runbook. See [MOBILE.md](MOBILE.md), [ACCOUNT-IDENTITY.md](ACCOUNT-IDENTITY.md), and [VALIDATION.md](VALIDATION.md) for current v6 behavior.
+
+**V6 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](VAULT-NEXT-VALIDATION.md); remaining physical acceptance is not implied by historical build notes below.
 
 # iOS and iPadOS application plan
 

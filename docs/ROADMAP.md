@@ -1,5 +1,7 @@
 # Project direction and roadmap
 
+**V6 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](VAULT-NEXT-VALIDATION.md); remaining physical acceptance is not implied by historical build notes below.
+
 Mop is an open-source, Apple-native password and secrets manager built for the
 command line. It began with a practical need: keep passwords and other secrets
 in an encrypted vault and make them available to commands at runtime, without
@@ -26,7 +28,7 @@ runtime secrets in one native application. A useful, sustainable project for
 that audience is a successful outcome without becoming a general-purpose
 commercial password-manager business.
 
-Mop still depends on Apple platforms, iCloud Keychain, and CloudKit. Independence
+Mop still depends on Apple platforms, Secure Enclave, and CloudKit. Independence
 from a separate password-manager service does not mean independence from Apple.
 Portable exports and a documented vault format should preserve users' options.
 Cross-platform clients and alternate synchronization providers are not current
@@ -41,10 +43,10 @@ export path suitable for moving to another tool. Document the vault format and
 recovery process so data access does not depend solely on the official app.
 Handle plaintext interchange files explicitly and explain their exposure.
 
-Current import/export supports encrypted v5 Mop backups only; general migration
+Current import/export supports encrypted v6 Mop backups only; general migration
 support is planned. For future format changes, prioritize preserving access to
 existing user data and provide an explicit compatibility or migration path.
-This does not change the current rejection of pre-v5 formats.
+This does not change the current rejection of pre-v6 formats.
 
 ### 2. Make runtime access exceptionally reliable
 
@@ -92,14 +94,14 @@ paid, maintained distribution can coexist.
 ## Features deferred until there is a demonstrated need
 
 - **Passkeys:** Add when the maintainer or users need them to use Mop as their
-  primary credential manager. They fit the existing individual-user scope and
-  would take priority over sharing for a broader consumer release.
-- **Shared vaults:** Add only when family or collaborative use becomes a chosen
-  audience. Sharing requires a new authorization model covering invitations,
-  membership changes, concurrent writers, recovery, and key changes when members
-  leave. Removing access cannot retract secrets already copied by a recipient.
+  primary credential manager. Their hardware and recovery model needs a separate
+  design and acceptance effort.
 
-Neither feature is a prerequisite for an initial open-source release. Prioritize
+Shared vaults are now implemented together with device hardware protection in v6.
+Their cross-account and physical-device release gates remain outstanding. Removing
+access cannot retract secrets already copied by a recipient.
+
+Passkeys are not a prerequisite for an initial open-source release. Prioritize
 the original runtime-secrets problem, user control, and reliable operation over
 feature parity. Future expansion should follow the maintainer's needs or evidence
 from people actually using Mop.

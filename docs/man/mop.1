@@ -1,176 +1,95 @@
-.Dd September 24, 2026
+.Dd September 25, 2026
 .Dt MOP 1
 .Os
 .Sh NAME
 .Nm mop
-.Nd access encrypted CloudKit secrets using a synchronized account identity
+.Nd use hardware-protected personal and shared CloudKit vaults
 .Sh SYNOPSIS
 .Nm
 .Ar command
 .Op Ar options
 .Sh DESCRIPTION
-.Nm
-stores independently encrypted secrets in a private CloudKit database.
-Each named vault has a stable UUID and a custom record zone.
-Every command accessing secrets authenticates afresh with Touch ID or the
-system password. Authentication is application policy, not a per-use Keychain
-ACL. Software encryption/signing keys synchronize through iCloud Keychain.
-CloudKit receives ciphertext, discoverable vault names, and signed public membership.
+Mop v6 generates device private keys in Secure Enclave. Personal vaults are the
+one-member case of shared vaults. Every additional device requires explicit
+owner approval. The application, AutoFill and CLI share device-local encrypted
+checkpoints and device-only Keychain representations. There is no software-key
+fallback, old-format reader, migration or portable recovery private key.
 .Pp
-Requires macOS 15 or later, an available user session, iCloud Passwords & Keychain,
-and a provisioned signed application with matching Keychain and CloudKit entitlements.
-.Sh VAULT SELECTION
-.Bl -tag -width indent
-.It Fl -vault Ar NAME-OR-UUID
-Constrain reference commands to this vault. References select their own named vault;
-management commands otherwise use the account-scoped saved default.
-.It Fl -state-directory Ar PATH
-Local metadata/cache directory. Defaults to MOP_STATE_DIRECTORY or ~/Library/Application Support/Mop.
-Never synchronize this directory.
-.It Fl -offline
-Use the last authenticated encrypted cache for read, list, run, inject, or export.
-Local authentication is still required. Cache age is printed to stderr.
-Remote revocation cannot be checked. Offline mutations are rejected.
-.El
+Plaintext passwords and temporary record keys reach application memory.
+Commands receiving a password receive plaintext. Removing access protects later
+changes, but cannot erase copied secrets or old backups.
+.Sh COMMANDS
+Use
+.Nm command --help
+for complete arguments. Secret commands are read, write, list, delete, run,
+inject and item. Values are supplied by hidden prompt or stdin, never positional
+password arguments. References use mop://vault/item/[section/]field.
 .Pp
-Normal commands fetch current cloud state. There is no automatic offline fallback.
-Legacy vault formats are unsupported; no migration is provided.
-.Sh SECRET COMMANDS
-.Bl -tag -width indent
-.It Cm read Ar REFERENCE
-Read a UTF-8 secret, followed by a newline unless -n is supplied.
-OTP fields return the generated value for the current time, never the stored seed or provisioning URL.
-.It Cm write Op Fl -replace Ar REFERENCE
-Read a secret from hidden terminal input or UTF-8 stdin. Never provide a secret
-as a command argument. Ordinary writes refuse existing fields; --replace requires one.
-.It Cm list Op Fl -vault Ar NAME Op Fl -json
-List references without values across all owned named vaults using one authentication
-per command, or select one by
-name or UUID. An included vault failure produces no partial output.
-.It Cm delete Ar REFERENCE
-Delete a field after authentication and server confirmation.
-.It Cm run Op Fl -env-file Ar FILE Op Fl -no-masking Fl - Ar COMMAND Op Ar ARGS
-Resolve environment references and execute directly, without an implicit shell.
-Dotenv files are literal; later files override inherited and earlier variables.
-Exact nonempty fetched secrets are masked on stdout/stderr unless --no-masking is set.
-.It Cm inject Op Fl i Ar FILE
-Resolve {{ mop://... }} template placeholders from stdin or a UTF-8 file.
-.El
+Device request creates a public enrollment document; --recovery selects this
+device's separate hardware recovery identity. Vault init creates a vault on this
+device without recovery by default. Optional --recovery-request and --fingerprint
+must be supplied together. Use replace-recovery to add hardware recovery later.
 .Pp
-References use mop://vault/item/[section/]field. Vault names contain 1-63 lowercase
-letters/digits separated by single hyphens; other components are percent-encoded.
-Run and inject may resolve references from several vaults.
-$NAME and ${NAME} expand reference components from the environment.
-Fetched values are never expanded recursively. Commands without secret references
-require neither cloud access nor authentication.
+Vault invite, accept and approve exchange public documents, independently
+compared fingerprints/checkpoints and (for other accounts) a private iCloud
+share URL. An iCloud invitation alone cannot decrypt the vault. Members,
+remove-member, remove-device, role and reconcile-share manage access.
 .Pp
-Read and inject support -o/--out-file, -f/--force, and --file-mode OCTAL.
-Output is atomic after all references resolve, defaults to mode 0600, and cannot
-target the local state directory. Existing files require --force.
-.Sh VAULT COMMANDS
-.Bl -tag -width indent
-.It Cm vault init Ar NAME Fl -recovery-file Ar PATH
-Create a CloudKit vault and an exclusive offline recovery file. Prints the UUID
-and fingerprints. Retain any recovery file after an interrupted initialization.
-.It Cm vault list Op Fl -json
-Discover vault names, UUIDs, account membership, and format without unlocking.
-.It Cm vault rename Ar NAME-OR-UUID Ar NEW-NAME
-Authenticate and rename a vault without changing its UUID or records. Update
-existing references; no old-name alias is retained.
-.It Cm vault delete Ar NAME-OR-UUID Op Fl -yes
-Permanently delete the cloud vault, history, and this Mac's vault cache/trust.
-Type the name (UUID for legacy vaults) to confirm. Without a terminal, --yes is
-required; fresh local authentication is still required. UUID selection supports
-legacy or unreadable vaults without decrypting them. Backups, the shared account identity,
-and caches on other Macs remain. Offline deletion is rejected. Retry uncertain
-results with the same UUID; local cleanup happens only after confirmed absence.
-.It Cm vault use Ar NAME-OR-UUID
-Set the account-scoped default for management commands only.
-.It Cm vault sync
-Fetch ciphertext and reconcile interrupted commits without unlocking secrets.
-.It Cm vault status
-Show cached revision, fetch time, and pending commit status.
-.It Cm vault import Fl -file Ar PATH
-Verify/import a v5 encrypted backup into an absent cloud head. Preserves UUID,
-recovery relationships, and the source file. --fingerprint or --revision can
-establish trust using independent evidence. --recovery-file can rewrap a verified v5 backup to the destination account identity.
-An owned backup may also be verified with its synchronized identity. Older formats
-are rejected without conversion.
-.It Cm vault export Fl -out-file Ar PATH Op Fl -force Op Fl -offline
-Write a verified encrypted v5 backup. Does not export the recovery private key.
-.It Cm vault trust Fl -fingerprint Ar HASH
-Use the account identity to verify an independent vault fingerprint. Alternatively use --revision HASH
-from a known-good backup. Never derive trust evidence solely from cloud data.
-.It Cm vault fingerprint
-Display the vault fingerprint after authentication and trust verification.
-.It Cm vault conflicts
-List committed v5 revision hashes, newest first, stopping before a v4 ancestor.
-.It Cm vault resolve Fl -revision Ar HASH
-Restore a committed v5 revision decryptable by the current owner under current
-name, keys, and membership. Pre-v5 history is unsupported.
-.It Cm vault recover Fl -recovery-file Ar PATH
-Recover v5 access for a usable account identity with offline recovery and local
-authentication. Accepts independent --fingerprint/--revision
-evidence. A missing synchronized identity is not implicitly reset.
-.El
-.Sh SIGNING DIAGNOSTIC
-.Nm mop Cm device identity
-verifies signing and displays the private Keychain group without prompting.
-Device credentials, pairing, enrollment, approval, and per-device revocation are
-not supported. All devices receiving the account identity have owner access.
-.Sh CONCURRENCY AND RECOVERY
-A conditional CloudKit head save publishes immutable encrypted records and a
-manifest. A stale writer fails rather than overwriting another revision.
-Retry conflicts explicitly. Exit 22 indicates an uncertain commit: run vault sync
-to reconcile before another write. Mutations are never automatically replayed.
-Missing zones are not silently recreated. Old revisions and abandoned staging
-records are retained and consume iCloud quota.
-.Sh FILES
-.Bl -tag -width indent
-.It Pa "~/Library/Application Support/Mop/cloud/"
-Account/container/environment/vault-scoped ciphertext cache, journals, and trust.
-.El
-.Sh EXIT STATUS
-.Bl -tag -width indent
-.It 2
-Invalid arguments, legacy file configuration, or unsupported offline mutation.
-.It 3
-Authentication failure.
-.It 4
-Missing secret.
-.It 5
-Duplicate secret/vault or existing output.
-.It 6 / 8
-Keychain failure / invalid signed identity or provisioning.
-.It 7 / 15
-I/O failure / unsafe file or protected output path.
-.It 9 / 10 / 11
-Missing vault/default / invalid vault / concurrent write conflict.
-.It 13 / 14 / 16
-Identity not a vault member / invalid identity or recovery / untrusted vault.
-Exit 12 is reserved.
-.It 17 / 18 / 19 / 20 / 21 / 22
-Cloud unavailable / account unavailable / quota / throttling / permission / uncertain commit.
-.It 23 / 24 / 25 / 26
-Invalid vault name / ambiguous name / selection mismatch / unsupported legacy format.
-.It 27 / 28
-Unconfirmed vault deletion / confirmed cloud deletion with incomplete local cleanup.
-.It 29
-CloudKit rejected the request configuration; verify container, entitlements, and record types.
-.It 30
-The synchronized account identity is not yet available; wait for Keychain delivery.
-.It 126 / 127
-Cannot launch command / executable missing.
-.El
+Vault list includes trusted roots and untrusted iCloud enrollment hints. Rename changes references. Sync verifies
+signed descendants and reconciles uncertain commits without replaying edits.
+Export writes an encrypted checkpoint; import requires independent checkpoint
+evidence and an already enrolled device.
 .Pp
-Otherwise child exit status or termination signal is propagated.
+Vault recover runs on the enrolled hardware recovery device with a verified
+backup and replacement public requests. --copy creates a new UUID/root under
+the current account, preserving the source. Losing every authorized and recovery
+device makes recovery impossible even with a backup.
+.Pp
+Vault delete requires --vault UUID --confirm UUID. It deletes the cloud zone;
+existing local ciphertext and exported backups remain.
+.Sh OPTIONS
+.Fl -vault Ar NAME-OR-UUID
+constrains selection. Management requires an explicit selection when multiple
+vaults are registered.
+.Pp
+.Fl -offline
+uses a previously verified checkpoint read-only. Remote revocation and
+unobserved account changes cannot be detected offline.
+.Pp
+.Fl -state-directory Ar PATH
+or MOP_STATE_DIRECTORY overrides device-local state. Never synchronize it.
 .Sh SECURITY
-Recovery credentials are a full alternate decryption capability; store offline.
-Local decrypted keys and values enter process memory. Masking cannot hide
-transformed secrets or deliberate child-process bypasses. Freshness is limited by
-observed state; offline reads cannot detect remote revocation or unseen account changes.
-CloudKit sharing with other Apple Accounts is not implemented in this version.
-.Sh SEE ALSO
-.Nm mop Cm --help
+Operational access requires a provisioned signed application, matching Keychain
+access group/CloudKit environment, Secure Enclave and local authentication.
+Every fill starts fresh authorization. GUI contexts last until lock/expiry;
+hardware handles and individual secret keys are released after operations.
 .Pp
-README.md, docs/CLOUDKIT.md, and docs/VALIDATION.md in the source distribution.
+Conflicting edits fail. Submitted operations may finish after cancellation;
+journals and conditional version barriers determine their outcome. Do not
+blindly repeat an uncertain mutation. No existing old-format data is deleted.
+.Sh SEE ALSO
+The project README, docs/SECURITY.md and docs/VAULT-NEXT-VALIDATION.md describe
+workflows, precise platform boundaries and remaining physical-device checks.
+
+.SH ICLOUD DEVICE ENROLLMENT
+Use vault enrollment request on the new device, inbox on an existing owner,
+status and confirm --code MATCHING_CODE on the new device, then approve --request-id UUID --code MATCHING_CODE on
+the owner after comparing both displays. A final status finishes enrollment.
+The app performs these exchanges automatically; explicit owner approval remains
+required. Decline rejects a request. Requests expire after one day. This flow
+is for the same Apple Account; sharing with another account remains separate.
+
+Use enrollment restart on the new device to replace a stuck request without
+replacing its hardware keys. Enrollment cancel stops the pending request.
+Neither command deletes vault contents or revokes access already granted.
+The app displays request status, expiry and the last successful iCloud check.
+.SH DEVICE REMOVAL
+.B mop vault devices
+lists own-account devices across enrolled personal vaults.
+.B mop vault devices --remove UUID
+revokes a device across those vaults. The last owner device cannot be removed.
+The removed device clears its local access after observing the signed revocation.
+.B mop vault enrollment reconnect
+explicitly permits fresh-key enrollment after removal; follow it with
+.B mop vault enrollment request --vault UUID
+while another owner device is unlocked.

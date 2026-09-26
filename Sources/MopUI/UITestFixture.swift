@@ -5,7 +5,6 @@ import Foundation
 import Synchronization
 import MopCore
 import MopAppSupport
-import MopVault
 
 final class UITestVaultService: VaultService, Sendable {
     static let vaultID = "00000000-0000-0000-0000-000000000001"
@@ -28,7 +27,7 @@ final class UITestVaultService: VaultService, Sendable {
             var result = VaultResult()
             switch operation {
             case .discover:
-                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-vault-v5", enrolled: true)]
+                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-vault-v6", enrolled: true)]
                 result.defaultVault = Self.vaultID
                 return result
             case .catalog:

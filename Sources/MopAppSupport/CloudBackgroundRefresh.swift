@@ -1,19 +1,23 @@
 import Foundation
-import MopCloudKit
+import MopVaultNext
 
-/// Refresh ciphertext without opening a Keychain identity or authenticating the
-/// user. Downloaded revisions become offline snapshots only after verification
-/// by the normal authenticated vault service.
+/// Only signed descendants of locally trusted roots become cached checkpoints.
+/// Background refresh neither opens keys nor invents trust for discovered zones.
 public enum CloudBackgroundRefresh {
     public static func download() async throws {
         guard NetworkAvailability.shared.isOnline else { return }
-        let configuration = DefaultVaultPlatformConfiguration()
-        let cloud = try configuration.cloudConfiguration()
-        let transport = AppleCloudTransport(container: cloud.container, environment: cloud.environment)
-        let repository = try await CloudRepository.open(transport: transport, state: configuration.stateDirectory)
-        for id in try await repository.list() {
+        let configuration = DefaultVaultPlatformConfiguration(), config = try configuration.cloudConfiguration()
+        let transport = try CloudRevisionTransport(container: config.container, environment: config.environment)
+        let account = try await transport.account()
+        let registry = try NextRegistry(state: configuration.stateDirectory, container: config.container, environment: config.environment, account: account)
+        guard try !registry.removed() else { return }
+        for var entry in try registry.entries() where entry.ready {
             try Task.checkCancellation()
-            _ = try await repository.vault(id).sync()
+            let storage = try registry.storage(entry)
+            let root = try VerifiedVault(checkpoint: entry.checkpoint, independentlyVerifiedDigest: entry.digest)
+            let coordinator = try PublicationCoordinator(address: entry.address, checkpoint: root, transport: transport, storage: storage)
+            _ = try await coordinator.refresh()
+            entry.name = await coordinator.offlineSnapshot().0.name; try registry.put(entry)
         }
     }
 }

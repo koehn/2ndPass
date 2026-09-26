@@ -167,15 +167,15 @@ import XCTest
         if expand.exists { expand.tap() }
         XCTAssertTrue(settings.waitForExistence(timeout: 5), app.debugDescription)
         settings.tap()
-        XCTAssertTrue(app.staticTexts["Vault Settings"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Settings"].waitForExistence(timeout: 5))
         let settingsImage = XCTAttachment(screenshot: app.screenshot())
-        settingsImage.name = "Vault Settings"
+        settingsImage.name = "Settings — devices and vault"
         settingsImage.lifetime = .keepAlways
         add(settingsImage)
         XCTAssertTrue(app.buttons["Export encrypted backup…"].exists)
-        app.buttons["Recover access…"].tap()
-        XCTAssertTrue(app.staticTexts["Recover vault access"].waitForExistence(timeout: 5))
-        app.buttons["Cancel"].tap()
+        XCTAssertTrue(app.staticTexts["devices"].exists)
+        XCTAssertTrue(app.staticTexts["vault"].exists)
+        app.buttons["Done"].tap()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
         let actions = app.buttons["Actions for password"]

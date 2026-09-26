@@ -187,7 +187,7 @@ import MopCore
         model.loading = true
         task = Task {
             do {
-                let service = NativeVaultService(state: try AutoFillStorage.directory())
+                let service = NativeVaultService()
                 self.service = service
                 if identity.kind == .oneTimeCode {
                     let credential = try await AutoFillAccess.oneTimeCode(recordIdentifier: identifier, service: service)

@@ -5,6 +5,9 @@ import MopAppSupport
 struct ContentView: View {
     @Bindable var model: AppModel
     @State private var settingsPresented = false
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
     @State private var availableWidth: CGFloat = 0
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -88,9 +91,10 @@ struct ContentView: View {
                     }.padding()
                     if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
                         ContentUnavailableView {
-                            Label("Account access unavailable", systemImage: model.vaultIcon(descriptor))
+                            Label("Connect this device", systemImage: model.vaultIcon(descriptor))
                         } description: {
-                            Text("Enable iCloud Passwords & Keychain using the owning Apple Account, then refresh. Older vault formats are unsupported.")
+                            Text("This vault is in iCloud, but this device has not been approved. Use an existing owner device to enroll it.")
+                            Button("Connect this device…") { model.sheet = .enrollDevice }
                         }
                     } else if model.authenticated {
                         ItemSearchView(model: model, selected: { showDetail() }).padding(.horizontal).padding(.bottom, 8).zIndex(1)
@@ -143,6 +147,12 @@ struct ContentView: View {
                             }
                         }.padding(.top, 60)
                     }
+                    if let notice = model.deviceAddedNotice {
+                        HStack {
+                            Text(notice).font(.callout)
+                            Button("Dismiss") { model.deviceAddedNotice = nil }
+                        }
+                    }
                     if let notice = model.notice {
                         Text(notice).font(.callout).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading).padding()
@@ -194,10 +204,10 @@ struct ContentView: View {
         .onChange(of: model.selectedItem) { _, _ in model.selected = nil; if model.itemDraft?.isNew != true { model.cancelItemEditing() } }
         .onChange(of: model.selected) { _, _ in model.conceal() }
         .onChange(of: model.page) { _, _ in model.cancelItemEditing() }
-        .sheet(item: $model.sheet) { sheet in
+        .sheet(item: Binding<AppSheet?>(get: { model.settingsVisible ? nil : model.sheet }, set: { model.sheet = $0 })) { sheet in
             AppSheetView(model: model, kind: sheet).id(model.editorGeneration)
         }
-        .alert("Operation not completed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+        .alert("Operation not completed", isPresented: Binding(get: { !model.settingsVisible && model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
         } message: { Text(model.error ?? "") }
         .confirmationDialog("Move item to Recently Deleted?", isPresented: Binding(get: { model.itemToDelete != nil }, set: { if !$0 { model.itemToDelete = nil } }), titleVisibility: .visible) {
@@ -215,7 +225,11 @@ struct ContentView: View {
         Button {
             if model.prepareVaultAction(vault.id) {
                 model.notice = nil
-                model.sheet = .vaultSettings
+                #if os(macOS)
+                openSettings()
+                #else
+                settingsPresented = true
+                #endif
             }
         } label: {
             Image(systemName: "ellipsis").frame(width: 24, height: 24).mopControlTarget()

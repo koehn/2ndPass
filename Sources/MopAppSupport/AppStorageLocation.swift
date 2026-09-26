@@ -17,10 +17,12 @@ public struct DefaultVaultPlatformConfiguration: VaultPlatformConfiguration {
 public enum AppStorageLocation {
     public static var defaultState: URL {
         #if os(macOS)
-        URL(fileURLWithPath: ProcessInfo.processInfo.environment["MOP_STATE_DIRECTORY"]
-            ?? URL.applicationSupportDirectory.appendingPathComponent("Mop", isDirectory: true).path, isDirectory: true)
-        #else
-        URL.applicationSupportDirectory.appendingPathComponent("Mop", isDirectory: true)
+        if let override = ProcessInfo.processInfo.environment["MOP_STATE_DIRECTORY"] { return URL(fileURLWithPath: override, isDirectory: true) }
         #endif
+        if let group = Bundle.main.object(forInfoDictionaryKey: "MopAppGroup") as? String,
+           let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) {
+            return root.appendingPathComponent("MopV6", isDirectory: true)
+        }
+        return URL.applicationSupportDirectory.appendingPathComponent("Mop", isDirectory: true)
     }
 }

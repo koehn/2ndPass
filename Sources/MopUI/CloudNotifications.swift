@@ -37,24 +37,27 @@ extension Notification.Name {
         subscriptionTask = Task {
             guard NetworkAvailability.shared.isOnline,
                   let config = try? DefaultVaultPlatformConfiguration().cloudConfiguration() else { return }
-            let database = CKContainer(identifier: config.container).privateCloudDatabase
-            let subscription = CKDatabaseSubscription(subscriptionID: "mop-private-database-v1")
+            let container = CKContainer(identifier: config.container)
+            let databases = [(container.privateCloudDatabase, "mop-private-database-v6"), (container.sharedCloudDatabase, "mop-shared-database-v6")]
+            for (database, subscriptionID) in databases {
+            let subscription = CKDatabaseSubscription(subscriptionID: subscriptionID)
             let info = CKSubscription.NotificationInfo()
             info.shouldSendContentAvailable = true
             subscription.notificationInfo = info
             // Retry transient subscription failures without prompting for secret access.
             while !Task.isCancelled {
-                do { _ = try await database.save(subscription); return }
+                do { _ = try await database.save(subscription); break }
                 catch {
                     do { try await Task.sleep(for: .seconds(60)) }
                     catch { return }
                 }
             }
         }
+        }
     }
     private func received(_ userInfo: [AnyHashable: Any]) -> Bool {
         guard let notification = CKNotification(fromRemoteNotificationDictionary: userInfo),
-              notification.subscriptionID == "mop-private-database-v1" else { return false }
+              ["mop-private-database-v6", "mop-shared-database-v6"].contains(notification.subscriptionID ?? "") else { return false }
         NotificationCenter.default.post(name: .mopCloudChanged, object: nil)
         return true
     }

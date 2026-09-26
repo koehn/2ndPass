@@ -1,4 +1,4 @@
-# mop
+# Mop
 
 Source repository: [koehn/2ndPass](https://github.com/koehn/2ndPass).
 
@@ -17,96 +17,190 @@ For licensing inquiries, contact Koehn Consulting, Inc.
 
 See the [copyright notice](LICENSE). Build, installation, and operational instructions in this repository are for the copyright holder and separately authorized users; they do not grant permission. Third-party dependencies retain their own licenses.
 
-mop is a macOS secret manager with a native Mac app, a command-line interface, CloudKit synchronization, and
-account identities synchronized through iCloud Keychain. It supplies credentials to commands and templates
-using references such as `mop://personal/service/token`.
+Mop is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. Personal and shared vaults use the same v6 format. Each device has independent Secure Enclave keys; signing into an Apple Account does not enroll a device.
 
-Mop is an Apple-native password and secrets manager built for the
-command line. Its direction is independence from a separate password-manager
-vendor, reliable runtime access, and the freedom to move your data elsewhere.
-See the [project direction and roadmap](docs/ROADMAP.md) for priorities,
-distribution plans, and features deferred until users need them.
+**This is a coordinated format replacement.** There is no old-format reader, migration, synchronized software private key, or portable recovery private key. Existing files, cloud zones, backups and Keychain items are left untouched. Keep a compatible older client separately if you still need old data.
 
-Start with [how Mop protects your secrets](docs/SECURITY-EXPLAINER.md) for a
-developer-friendly explanation of encryption, Apple services, authentication,
-runtime access, synchronization, and recovery. No Apple security background is
-required.
+Read [the plain-language security explanation](docs/SECURITY-EXPLAINER.md), [architecture](docs/VAULT-NEXT.md), and [concrete validation results and outstanding physical checks](docs/VAULT-NEXT-VALIDATION.md). Cross-account sharing code is implemented; actual participant-side acceptance with a second Apple Account remains a required release check.
 
-**CloudKit implementation: signed two-Mac and production acceptance are still
-required before release.** See [validation](docs/VALIDATION.md).
+## Start a vault
 
-Requires macOS 15+ or iOS/iPadOS 18+, an Apple Account with iCloud Passwords &
-Keychain enabled, and a provisioned signed application. See the
-[account identity and membership model](docs/ACCOUNT-IDENTITY.md).
-
-## Native Mac app
-
-Open the packaged `Mop.app` to browse secrets, copy references, view account
-membership, create vaults, and export encrypted backups. The app authenticates once per
-session across owned vaults and locks after configurable inactivity (1–60
-minutes, default 5). It calls the native vault libraries using the synchronized account
-identity. Both apps start locked and automatically authenticate all connected vaults together.
-Interaction resets the timeout; switching apps retains the session until it expires.
-Unconnected vaults have a distinct icon. A collapsible vault
-sidebar and All Vaults view keep items organized; editing supports inline item
-renaming and password-strength indicators. Offline browsing is explicit and read only. See [the Mac app guide](docs/GUI.md).
+Open the signed Mac, iPhone or iPad app. If no v6 vaults exist in iCloud, Mop
+prompts you to create one. Choose a name and authenticate: this device’s Secure
+Enclave keys are generated automatically, and you can save secrets immediately.
+The CLI equivalent is:
 
 ```sh
-open dist/Mop.app
+mop vault init personal
 ```
 
-## Password and TOTP AutoFill
+Recovery is optional. Until another device or hardware recovery is added, losing
+this device means losing access. No second device is required for creation.
 
-Mop includes an iOS/macOS AutoFill extension. Enable Mop in system AutoFill settings,
-then open and unlock the app to publish password and TOTP website/username suggestions. Every fill requires Mop authentication, including password and TOTP suggestions
-and username-only insertion. Choosing “Mop…” opens its searchable picker; selecting
-an entry authenticates before filling. Both read a shared encrypted snapshot and work offline.
-See [AutoFill setup and provisioning](docs/AUTOFILL.md).
+If v6 vaults exist in iCloud but this device has no trusted enrollment, Mop opens
+**Connect this device** instead. Discovery is only a hint: it neither trusts a
+checkpoint nor grants decryption rights. A CloudKit failure is reported, not
+treated as an empty account. Old-format zones are ignored and preserved.
 
-## Item templates and field types
+For another device on your Apple Account, Mop automatically submits an enrollment
+request through iCloud. Open Mop on any enrolled owner device and unlock it.
+The unlocked owner device quietly grants access. The new device shows progress
+and opens its vault automatically. Existing devices show an in-app notice when
+they next check the signed membership. No comparison or confirmation is required.
+If all existing devices are locked, unlock Mop on one of them.
 
-**New item** offers Login, Password, API credential, Secure note, and Database
-templates. **Edit item** changes the item/field types, adds or removes fields,
-and moves fields up or down. Order is saved with the item and synchronized across Macs.
+Same-account enrollment now trusts access to the private iCloud mailbox for
+bootstrap identity. An attacker with that account access can enroll while an
+owner device is unlocked. Secure Enclave private keys still never transfer.
+Cross-account sharing does not use automatic enrollment.
 
-Username, website, email, text, and notes fields are visible after unlocking the
-index. Password and concealed fields remain hidden until explicitly read. The CLI
-authenticates each command; the GUI reuses its unlocked session.
-All values remain encrypted in storage, backups, and iCloud. OTP fields display
-the current time-based code. CLI reads, template injection, and environment
-reference substitution return that code rather than the seed or provisioning URL.
+Sharing with another account remains a separate **Share with another person**
+flow with editor/viewer permissions and file-based invitations.
 
-Existing untyped fields default to concealed in a Custom item. Only v5 vaults and
-backups are supported. Older formats are rejected; no conversion is provided.
+## Add optional recovery later
 
-`mop item catalog --vault personal` returns JSON with the current revision, item
-and field types, saved order, and visible values (never concealed values).
-`mop item save --vault personal` accepts an `ItemEdit` JSON object through stdin:
-`revision`, `create` (boolean), and `item` (`name`, `type`, ordered `fields`). Each
-field has `path` (canonical percent-encoded `field` or `section/field`), `type`, and
-an optional `value`. An omitted/null value preserves an existing value; an empty
-string replaces it with empty text. Fields omitted from an existing item's edit
-are deleted. Stale revisions fail without overwriting another writer. Ordinary
-`mop list --json` still returns references only.
+Use **Set up or replace hardware recovery** in Settings → vault. On a separate
+recovery device, create its public recovery request; import that request on the
+owner device and compare its fingerprint. Existing secret keys are wrapped for
+the recovery device. Replacing an existing recovery device rotates current keys.
+The CLI equivalent is:
 
-## Storage and authentication
+```sh
+# On the recovery device:
+mop device request --recovery > recovery-request.json
+# On the owner device:
+mop vault replace-recovery --vault personal recovery-request.json --fingerprint VERIFIED_REQUEST_FINGERPRINT
+mop vault export --vault personal personal-backup.json
+mop vault fingerprint --vault personal
+```
 
-Mop encrypts each vault using `mop-vault-v5`, with independent AES-GCM keys
-wrapped for its account owner and offline recovery credential. The owner's
-synchronized identity signs membership and every revision. CloudKit stores
-immutable ciphertext and publishes changes with conditional, journaled commits.
+Retain the encrypted backup and independently recorded checkpoint. Recovery,
+when configured, remains hardware-only; there is no software recovery key.
+Losing every authorized device and any configured recovery device makes the
+vault unrecoverable. Optional recovery can also be supplied during CLI creation
+with paired `--recovery-request` and `--fingerprint` options.
 
-The app authenticates once per session; CLI secret commands authenticate per
-command. Account private keys synchronize through iCloud Keychain and are not
-Secure Enclave keys. Legacy device credentials are not used. Account access replaces enrollment and pairing.
+## Add devices and share
 
-Each named vault has its own stable UUID, CloudKit zone, signed membership, recovery
-credential, and trust fingerprint. In `mop://personal/service/token`, `personal`
-selects that encrypted vault, `service` is an item, and `token` is a field.
-Vault names are discoverable metadata visible to CloudKit; item/field names and
-values remain encrypted. Names use 1–63 lowercase ASCII letters/digits with
-single internal hyphens. Multiple independent vaults are supported. Cross-account sharing is not yet
-implemented; each zone is private to its owner's Apple Account.
+The app handles own-account enrollment automatically. CLI equivalents are:
+
+```sh
+# New device (use the UUID shown by vault list):
+mop vault enrollment request --vault VAULT_UUID --name 'My Mac'
+# Existing owner device:
+mop vault enrollment inbox --vault personal
+# New device: receive the invitation and send acceptance:
+mop vault enrollment status --vault VAULT_UUID
+# After comparing both displays, confirm on the new device:
+mop vault enrollment confirm --vault VAULT_UUID --code MATCHING_CODE
+# Existing owner: refresh inbox and approve:
+mop vault enrollment inbox --vault personal
+mop vault enrollment approve --vault personal --request-id REQUEST_UUID --code MATCHING_CODE
+# New device: finish enrollment:
+mop vault enrollment status --vault VAULT_UUID
+```
+
+`enrollment decline --request-id REQUEST_UUID` declines a request. On the new
+device, `enrollment restart --vault VAULT_UUID` sends a fresh request while
+preserving its keys; `enrollment cancel --vault VAULT_UUID` cancels the pending
+request. The app provides Restart connection, Cancel request, visible progress
+and the last successful iCloud check. All operations
+require online access. Only enrolled owners can approve. CLI status checks are
+explicit; the app polls automatically while active and authorized.
+
+For another account, or advanced manual enrollment:
+
+On the new device:
+
+```sh
+mop device request > device-request.json
+```
+
+On an owner device, independently compare the request fingerprint:
+
+```sh
+mop vault invite --vault personal device-request.json --fingerprint REQUEST_FINGERPRINT --role editor > invitation.json
+```
+
+Use `--role owner` only for another device on the existing owner account. Other accounts can be editors or viewers. The invitation's checkpoint and, for another account, private iCloud share URL are printed to stderr. Transfer them and compare the checkpoint independently.
+
+On the new device:
+
+```sh
+mop vault accept invitation.json --checkpoint VERIFIED_CHECKPOINT --share-url ICLOUD_SHARE_URL > acceptance.json
+```
+
+Omit `--share-url` for another device on the same account. Return acceptance to the owner:
+
+```sh
+mop vault approve --vault personal acceptance.json --fingerprint REQUEST_FINGERPRINT
+mop vault members --vault personal
+```
+
+Refresh on the receiving device. Invitations expire after one day in the clients and bind the exact checkpoint. If another write wins before approval, issue a fresh invitation; do not overwrite the competing revision.
+
+```sh
+mop vault remove-device --vault personal DEVICE_UUID
+mop vault remove-member --vault personal ACCOUNT_UUID
+mop vault role --vault personal ACCOUNT_UUID viewer
+mop vault reconcile-share --vault personal
+```
+
+Removal rotates keys and ciphertext for current contents. The final command retries CloudKit permissions after a roster change if its separate transport update failed. Copied passwords, prior ciphertext and old backups cannot be revoked.
+
+## Read, write, run and inject
+
+```sh
+mop write mop://personal/service/token          # hidden prompt or stdin
+mop read mop://personal/service/token
+mop list --vault personal --json
+mop run --env-file .env -- command arguments
+mop inject --in-file template.conf --out-file rendered.conf
+mop item catalog --vault personal
+mop item save --vault personal < edited-item.json
+```
+
+References have the form `mop://vault/item/[section/]field`. Values are encrypted individually; listing opens the catalog only. Visible metadata such as usernames and websites is inside the encrypted catalog. Passwords, concealed fields and OTP seeds are omitted from catalog values. OTP reads return the current code. `item save` accepts an `ItemEdit` with the catalog revision, item name/type/ordered fields, `create`, and optionally `originalName`. A null field value preserves it; omitted fields are deleted. Stale edits fail.
+
+`--vault NAME-OR-UUID` constrains selection. With multiple vaults, management commands require a selection. Names are not aliases; renaming changes references:
+
+```sh
+mop vault rename --vault VAULT_UUID new-name
+mop vault sync --vault VAULT_UUID
+mop read --offline mop://personal/service/token
+```
+
+Offline access uses a previously verified encrypted checkpoint and is read-only. It cannot detect remote revocation or prove freshness. Observed account changes invalidate offline account bindings. Local state must never be synchronized: packaged app/CLI/AutoFill share a device-local app-group directory; the CLI permits `--state-directory` or `MOP_STATE_DIRECTORY` for explicit isolation.
+
+The GUI retains an authenticated session context until lock/expiry, while releasing hardware key handles and individual secret keys after operations. CLI commands own their session. AutoFill always starts fresh authentication and locks after filling. Plaintext necessarily reaches Mop, clipboard destinations, and commands receiving secrets.
+
+## Hardware recovery
+
+Generate ordinary and recovery requests on the replacement owner device and a new separate recovery device. Compare both fingerprints. On the **currently enrolled recovery device**:
+
+```sh
+mop vault recover backup.json --checkpoint VERIFIED_BACKUP_CHECKPOINT \
+  --owner-request new-owner.json --owner-fingerprint VERIFIED_OWNER_REQUEST \
+  --recovery-request new-recovery.json --recovery-fingerprint VERIFIED_RECOVERY_REQUEST > recovered.json
+```
+
+This verifies newer signed descendants when the account is still available, then replaces the old roster. On the replacement owner device, import the returned checkpoint using the independently transmitted new digest:
+
+```sh
+mop vault import recovered.json --checkpoint VERIFIED_NEW_CHECKPOINT
+```
+
+If account access is lost, use `--copy` on the recovery device signed into the new account. First generate that device's ordinary request for `--owner-request`. This creates a new vault UUID/root under the new account and preserves the source. Then enroll additional devices normally. No software recovery key is imported or exported.
+
+## Backups and deletion
+
+Export returns an encrypted v6 checkpoint; record its digest independently. Import requires that digest and an already enrolled device. For a shared-database checkpoint, also supply `--shared-owner` with its actual zone owner record name. Import never creates or overwrites a cloud zone.
+
+```sh
+mop vault delete --vault VAULT_UUID --confirm VAULT_UUID
+```
+
+Deletion requires owner authorization, removes the cloud zone, and forgets its active registry entry. Existing local ciphertext and exported backups remain. Old-format data cannot be selected or deleted through v6 commands.
 
 ## Build and provision
 
@@ -154,256 +248,30 @@ entitlements, without debugging exceptions. Moving the executable out of its app
 bundle breaks access; the installer uses a symlink to the bundled executable.
 Developer profiles/environments are distinct from production data.
 
-## Create and select a vault
+
+## Platform checks
+
+`mop-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VAULT-NEXT-VALIDATION.md) for live CloudKit/Enclave probes, modeled scenarios and checks still requiring separate physical devices/accounts. Do not treat software fixtures or simulator builds as hardware evidence.
+
+## Remove a device or repeat enrollment testing
+
+On macOS, iOS, and iPadOS, **Settings → devices → Remove…**
+revokes the selected device across your personal vaults enrolled on the managing
+device. Removal rotates encryption material and retires the old device UUID.
+The removed device clears local access when it next verifies the removal online,
+then offers **Reconnect** instead of enrolling automatically. Reconnection
+creates fresh device keys. The final owner device cannot be removed.
+
+CLI equivalents for repeatable testing:
 
 ```sh
-mop vault init personal --recovery-file "$HOME/mop-recovery.key"
-mop vault list
-mop vault use VAULT_UUID
+mop vault devices
+mop vault devices --remove DEVICE_UUID
+# On the removed device, detect revocation:
+mop vault sync --vault VAULT_UUID
+# Explicitly opt back in, then request enrollment:
+mop vault enrollment reconnect
+mop vault enrollment request --vault VAULT_UUID --name "Test iPad"
 ```
 
-Initialization prints the vault UUID, account identity, and vault fingerprint.
-Move the recovery file offline and retain the vault fingerprint with it. The
-recovery credential is a full alternative decryption capability: never put it
-in CloudKit or keep it next to a synchronized backup. A failed initialization
-retains any recovery file already written.
-
-References select their vault by name, independent of any saved default.
-`mop list` lists all owned named vaults with one authentication per command;
-`mop list --vault personal` selects one.
-Use `--vault NAME-OR-UUID` to constrain a reference command or select a management
-command's vault. `vault use` saves an account-scoped default for management only.
-A missing or ambiguous name is an error, never a fallback to another vault.
-`--cloud-vault` has been removed; `MOP_CLOUD_VAULT` no longer selects a vault.
-A new device discovers owned vaults after its account identity arrives through iCloud Keychain.
-`vault list --json` returns descriptors with `id`, `name`, `format`, and `enrolled`.
-The retained JSON field `enrolled` means that the account identity is a member;
-it does not describe per-device enrollment.
-Discovery names/membership claims are unverified until authentication.
-
-```sh
-mop vault rename personal private
-mop vault rename VAULT_UUID personal   # also resolves a duplicate-name conflict
-```
-
-Renaming keeps the UUID, keys, records, and recovery credentials. Update references
-in scripts and configuration: there are no old-name aliases. Offline reads use
-names from verified snapshots and may retain an old name until reconnecting.
-Concurrent creation/rename on separate Macs can produce duplicate names; select
-by UUID to rename one. Name availability checks do not provide a global lock.
-
-Only v5 vaults and backups are accepted. Existing v5 vaults remain supported,
-including ones converted by an older release. Pre-v5 vaults, credentials, and
-history have no supported conversion/access path. Existing cloud data is left
-untouched; use an older compatible client separately if you need that data.
-
-### Delete a vault
-
-```sh
-mop vault delete personal       # type its name, then authenticate
-mop vault delete LEGACY_UUID    # type the UUID for an unnamed legacy vault
-mop vault delete VAULT_UUID --yes  # skip typing; authentication still required
-```
-
-Deletion permanently removes the entire cloud zone, including history and staged
-records. It also clears that vault's local cache/trust and its saved default, if
-selected. The shared account identity and Keychain keys are preserved. Exported backups
-and caches on other Macs remain. Offline deletion is refused. Legacy deletion by
-UUID does not require decrypting the old format or being a member of that vault.
-
-The GUI offers **Export backup…** and **Delete vault…** under **Vault actions**.
-The delete dialog requires typing the name (UUID for legacy vaults) and offers
-backup export for supported vaults. Use an older client to back up legacy data.
-No backup is forced. Exported backups remain encrypted; retain recovery credentials.
-
-`--yes` is required without a terminal and only bypasses typed confirmation. If
-the outcome is uncertain, local data is retained; retry with the same UUID to
-reconcile. Exit 27 means remote deletion could not be confirmed; exit 28 means
-remote deletion succeeded but local cleanup needs retrying. Mop checks remote
-absence before local cleanup and never automatically repeats a delete request.
-
-Local metadata defaults to `~/Library/Application Support/Mop`, overridden by `--state-directory` or
-`MOP_STATE_DIRECTORY`. **Never synchronize this directory.** It contains account-scoped
-ciphertext caches, commit journals, and trust pins.
-Account private keys live in iCloud Keychain. Old device metadata is ignored;
-removing legacy support does not delete existing files or Keychain items.
-Secret output cannot target the state directory.
-
-Older macOS versions used `~/.mop`. Before first launching this version, quit Mop
-and stop any running CLI commands, then move that directory to
-`~/Library/Application Support/Mop` if the destination does not already exist.
-This preserves cached vaults, trust pins, pending operations, and the default
-vault selection. If both directories already exist, do not overwrite either;
-use `MOP_STATE_DIRECTORY` to select the existing state explicitly. The app does
-not automatically migrate or merge state directories.
-
-## Use another Mac, iPhone, or iPad
-
-Sign into the same Apple Account, enable iCloud Passwords & Keychain, and open Mop.
-Owned vaults appear automatically once the identity reaches the device. There is
-no QR pairing or device enrollment step. If Mop reports that it is waiting for
-its identity, let Keychain synchronize and refresh the vault list.
-
-Old device credentials and v4 vaults cannot be opened by this version. There is no
-per-device revocation: all devices holding the account identity have the owner's
-access. See [account identities](docs/ACCOUNT-IDENTITY.md).
-
-## Read, write, run, and inject
-
-```sh
-mop write mop://personal/service/token              # hidden prompt or UTF-8 stdin
-mop write --replace mop://personal/service/token
-mop read mop://personal/service/token
-mop read -n -o /private/tmp/token mop://personal/service/token
-mop list --vault personal --json
-mop delete mop://personal/service/token
-
-TOKEN=mop://personal/service/token mop run -- your-command arg
-mop run --env-file ./development.env -- your-command
-printf '%s' '{{ mop://personal/service/token }}' | mop inject
-mop inject -i template.conf -o generated.conf
-```
-
-Secrets are never accepted as positional arguments. `write --replace` requires an
-existing field; ordinary `write` refuses to overwrite one. Reads add a newline
-unless `-n` is set. File output is atomic, defaults to mode `0600`, and requires
-`--force` to replace an existing regular file. `--file-mode` accepts octal modes.
-References support `mop://vault/item/[section/]field`; percent-encode item, section, and field components.
-`run` and `inject` can resolve references from multiple vaults in one command.
-
-`run` reads literal dotenv files in order, overriding inherited variables. Values
-starting with `mop://` resolve once; `$NAME` and `${NAME}` reference components
-expand from the merged environment. `inject` expands `{{ mop://… }}` placeholders.
-Fetched secrets are not recursively expanded. All references resolve before a
-child starts or output is written. Repeated references are fetched once per command.
-Commands and literal templates with no references need neither CloudKit nor Touch ID.
-
-`run` masks exact nonempty fetched secret byte strings on stdout and stderr with
-`[concealed by mop]`, including across stream chunks. `--no-masking` uses direct
-execution and preserves terminal behavior. Masking cannot hide transformed secrets,
-files or `/dev/tty` written by children, or deliberate bypasses. See
-[examples](docs/EXAMPLES.md) for more command workflows.
-
-## Automatic app updates and offline availability
-
-The Mac, iPhone, and iPad apps automatically use the last verified encrypted
-snapshot when disconnected. No offline toggle or separate Sync action is needed.
-Local authentication is still required. Cached data is read-only; saving changes
-requires iCloud. The status shows when cached data is in use.
-
-CloudKit database change notifications trigger refreshes. Returning to the app,
-reconnecting, and periodic checks while active also reconcile updates. Refreshes
-wait until an open editor is finished. Background notifications can download
-ciphertext without prompting; the next authenticated opening verifies it before
-it becomes the offline snapshot. Push delivery and background execution are
-scheduled by the operating system, so updates are not guaranteed to be immediate.
-
-Only connection unavailability permits cached reads. Account, permission, trust,
-ownership, and missing-vault errors remain errors. A device needs an initial
-online authenticated opening before its vault is available offline.
-
-### Command-line offline operation
-
-Online commands fetch the current head before opening the vault. Writes succeed
-only after server confirmation. No mutations are queued offline.
-
-```sh
-mop vault sync
-mop vault status
-mop read --offline mop://personal/service/token
-mop run --offline -- your-command
-mop vault export --offline --out-file /path/to/backup.mopfile
-```
-
-Only `read`, `list`, `item catalog`, `run`, `inject`, and encrypted `export` accept offline mode.
-They use the last authenticated cache, require local authentication, and print its
-fetch time to stderr. There is no implicit fallback after network errors. A sync
-without authentication downloads ciphertext but does not promote it to the
-verified offline snapshot. Offline use cannot detect remote ownership changes or an
-account change not yet observed locally. An observed sign-out invalidates the
-account binding; caches and defaults are isolated by account, container, environment,
-and vault UUID.
-
-Concurrent writes return exit code 11; rerun against current state. If a response
-is lost, exit code 22 means the outcome is uncertain. Run `vault sync` online to
-reconcile its recorded revision against committed ancestry before another write.
-A live local writer holds a process lock. Interrupted staging is never exposed as
-a committed vault and is never automatically replayed.
-
-## Backups, v5 history, and recovery
-
-Operational storage uses named CloudKit vaults.
-References select named vaults. Import accepts only v5 backups:
-
-```sh
-mop vault import --file /path/to/existing.mopfile
-mop vault export --out-file /path/to/backup.mopfile
-```
-
-An owned backup can be verified using the synchronized identity. Recovery-key
-imports require established local trust or `--fingerprint` / `--revision` evidence
-obtained independently. It preserves vault
-identity and recovery relationships, refuses an existing destination head, and
-never deletes or modifies the source file. Export creates a verified encrypted v5
-backup; it does not include the recovery private key. Preserve the printed UUID.
-
-```sh
-mop vault conflicts
-mop vault resolve --revision COMMITTED_REVISION_HASH
-mop vault recover --recovery-file /offline/recovery.key \
-  --fingerprint INDEPENDENT_VAULT_FINGERPRINT
-```
-
-History lists only committed v5 ancestry, never abandoned uploads, and stops at
-the first v4 ancestor. Pre-v5 history cannot be restored. Restoration requires a
-v5 revision decryptable by the current owner and keeps
-the current vault name, recipients, and keys. Imported history starts at the imported snapshot;
-file-vault backends and external `.history` directories are no longer supported.
-Encrypted backup import/export remains supported. Immutable cloud revisions and
-abandoned staged records are retained in this version and count toward quota.
-
-Recovery restores vault access for the destination account after local authentication and trust verification.
-For a deleted cloud zone, explicitly import an encrypted export. If the backup belongs to another account, use `vault import --file BACKUP --recovery-file KEY --fingerprint
-FINGERPRINT` to verify the backup and wrap its keys for the account before publication.
-The source backup remains unchanged.
-Missing zones are never silently recreated by ordinary commands.
-
-## Security limits and diagnostics
-
-CloudKit's encryption supplements mop's encryption; secret confidentiality does
-not depend on Advanced Data Protection being enabled. The service can observe
-record sizes, update timing, and public membership metadata. It can delete data or
-withhold changes. Local key pins and verified generation/digest watermarks reject
-observed rollback and substitution. New devices establish owner trust through
-the identity delivered by iCloud Keychain, but cannot infer global freshness
-from the service alone.
-
-Requested plaintext and unwrapped symmetric keys enter mop's process memory.
-Compromised authorized code could request other secrets. Recovery remains an
-alternative to the account identity. There is no guarantee of secure
-erasure from Swift-managed memory or from historical copies.
-
-Diagnostics go to stderr without secret values or arbitrary CloudKit error text.
-Exit codes: 2 invalid arguments/offline mutation/legacy file options; 3 authentication;
-4 missing secret; 5 duplicate/output exists; 6 Keychain; 7 I/O; 8 signing;
-9 missing vault/default; 10 invalid vault; 11 conflict; 12 reserved;
-13 identity not a vault member; 14 invalid identity/recovery; 15 unsafe file;
-16 untrusted vault/rollback; 17 cloud unavailable; 18 cloud account;
-19 quota; 20 throttling; 21 cloud permission; 22 uncertain commit;
-126 launch failure; 127 executable missing. Child status is otherwise propagated.
-
-```sh
-mop completion bash
-mop completion zsh
-mop completion fish
-```
-
-See [CloudKit provisioning](docs/CLOUDKIT.md) and [validation](docs/VALIDATION.md)
-before distributing a production build.
-
-### iPhone and iPad application
-
-The Mac, iPhone, and iPad interfaces share the `MopUI` SwiftUI library. Open
-`Apple/Mop.xcodeproj` to build the mobile application; see [mobile application
-instructions](docs/MOBILE.md) for simulator tests, TestFlight archives, and device
-acceptance. The existing Mac packaging and CLI installation remain supported.
+Keep another enrolled device unlocked to complete the new request.

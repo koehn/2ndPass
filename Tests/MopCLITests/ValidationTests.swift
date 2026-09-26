@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 import MopCore
 @testable import MopCLI
@@ -28,7 +29,7 @@ import MopCore
 }
 
 @Test(arguments: [
-    ["device", "request"], ["device", "requests"], ["device", "list"],
+    ["device", "requests"], ["device", "list"],
     ["device", "add", "request", "--fingerprint", String(repeating: "a", count: 64)],
     ["device", "remove", String(repeating: "a", count: 64)],
     ["vault", "init", "personal", "--recovery-file", "/tmp/unused", "--device-name", "old-device"],
@@ -43,4 +44,24 @@ import MopCore
     ["vault", "recover", "--recovery-file", "/tmp/unused", "--strict-biometrics"]
 ]) func removedStrictBiometricsOptionIsRejected(arguments: [String]) {
     #expect(throws: (any Error).self) { try Mop.parseAsRoot(arguments) }
+}
+
+@Test func deviceRequestsAndSharingCommandsAreAvailable() throws {
+    #expect(try Mop.parseAsRoot(["device", "request", "--recovery"]) is Device.Request)
+    #expect(try Mop.parseAsRoot(["vault", "members"]) is Vault.Members)
+    #expect(try Mop.parseAsRoot(["vault", "remove-device", UUID().uuidString]) is Vault.RemoveDevice)
+}
+
+@Test func creationNeedsNoRecoveryAndRejectsHalfSpecifiedRecovery() throws {
+    let plain = try Mop.parseAsRoot(["vault", "init", "personal"])
+    #expect(plain is Vault.Initialize)
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "init", "personal", "--recovery-request", "/tmp/unused"]) }
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "init", "personal", "--fingerprint", String(repeating: "a", count: 64)]) }
+}
+
+@Test func cloudEnrollmentCommandsRequireExplicitApprovalArguments() throws {
+    #expect(try Mop.parseAsRoot(["vault", "enrollment", "request", "--vault", UUID().uuidString]) is Vault.Enrollment)
+    #expect(try Mop.parseAsRoot(["vault", "enrollment", "approve", "--request-id", UUID().uuidString, "--code", "ABCD"]) is Vault.Enrollment)
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "enrollment", "approve", "--request-id", UUID().uuidString]) }
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "enrollment", "confirm"]) }
 }

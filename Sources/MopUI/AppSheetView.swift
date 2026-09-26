@@ -1,201 +1,122 @@
 import SwiftUI
 import MopCore
 import MopAppSupport
+import MopVaultNext
 import UniformTypeIdentifiers
 
 struct AppSheetView: View {
     @Bindable var model: AppModel
     let kind: AppSheet
-    @State private var vaultName = "personal"
+    @State private var name = "personal"
     @State private var fingerprint = ""
-    @State private var confirmed = false
-    @State private var recoveryURL: URL?
-    @State private var choosingRecoveryFolder = false
-    @State private var importingRecovery = false
-    @State private var pending: PendingVaultCreation?
+    @State private var confirmation = ""
     @State private var localError: String?
-    @State private var discardingSetup = false
-    @State private var fileRequestGeneration = 0
-    @State private var deletionTarget: VaultDescriptor?
-    @State private var deletionConfirmation = ""
-
-    private var validFingerprint: Bool {
-        fingerprint.count == 64 && fingerprint.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
-    }
-    private var title: String {
-        switch kind {
-        case .vaultSettings: "Vault Settings"
-        case .renameVault: "Rename vault"
-        case .deleteVault: "Delete vault"
-        case .createVault: "Create a vault"
-        case .trust: "Verify vault trust"
-        case .recover: "Recover vault access"
-        }
-    }
-    private var canSubmit: Bool {
-        switch kind {
-        case .vaultSettings: true
-        case .createVault: (try? VaultName.validate(vaultName)) != nil && pending?.exported == true && confirmed
-        case .renameVault: (try? VaultName.validate(vaultName)) != nil
-        case .deleteVault: deletionTarget != nil && !model.offline && deletionConfirmation == (deletionTarget?.name ?? deletionTarget?.id)
-        case .trust: validFingerprint
-        case .recover: validFingerprint && recoveryURL != nil
-        }
-    }
     var body: some View {
-        ScrollView { VStack(alignment: .leading, spacing: 20) {
-            Text(title).font(.title2).fontWeight(.semibold)
+        ScrollView { VStack(alignment: .leading, spacing: 18) {
             switch kind {
-            case .vaultSettings:
-                vaultSettings
             case .createVault:
-                Text("Create a named encrypted vault in your private iCloud account. Vault names are visible to CloudKit; item and field names remain encrypted.")
-                TextField("Vault name", text: $vaultName).disabled(pending != nil)
-                Text("Your Mop identity synchronizes through iCloud Keychain. Mop authenticates locally before opening it.").font(.caption).foregroundStyle(.secondary)
-                Button(pending?.exported == true ? "Export another recovery key copy…" : "Export recovery key…") {
-                    do {
-                        pending = try PendingVaultCreation.prepare(name: vaultName, state: AppStorageLocation.defaultState)
-                        fileRequestGeneration = model.editorGeneration
-                        choosingRecoveryFolder = true
-                    } catch { localError = safeMessage(error) }
-                }.disabled((try? VaultName.validate(vaultName)) == nil)
-                if let pending {
-                    Text("Vault UUID: " + pending.id.uuidString).font(.caption).textSelection(.enabled)
-                    Text(pending.exported ? "Recovery credential exported. Continue to create or reconcile this vault." : "Choose a folder outside Mop to save the recovery credential.").font(.caption)
-                    if !pending.submitted {
-                        Button("Discard unfinished setup…", role: .destructive) { discardingSetup = true }
-                    }
+                Text("Create a vault").font(.title2)
+                TextField("Vault name", text: $name)
+                Text("Mop will create this device’s protected keys automatically. You can start saving passwords immediately and add other devices or hardware recovery later.")
+                Button("Create vault") { model.createVault(name: name) }
+                    .disabled((try? VaultName.validate(name)) == nil)
+                Text("Until you add another device or recovery, losing this device means losing access to your vault.").font(.caption)
+                Divider()
+                Button("Connect to an existing vault…") { model.sheet = .enrollDevice }
+                Button("Set up this device for recovery…") { model.sheet = .setupRecovery }
+                Button("Recover an existing vault…") { model.sheet = .recover }
+            case .enrollDevice:
+                if model.deviceRemoved {
+                    Text("This device was removed").font(.title2)
+                    Text(model.removalCleanupPending ? "Local cleanup could not finish. Reconnect will retry cleanup before adding this device again." : "Its local account access has been cleared. Reconnect only if you want to add this device again.")
+                    Button("Reconnect") { model.reconnectDevice() }
+                } else {
+                Text("Connect this device").font(.title2)
+                Text("Mop connects automatically through your Apple Account. Keep Mop unlocked on another device until setup finishes.")
+                ForEach(model.vaults.filter { !$0.enrolled }) { vault in
+                    Text(vault.name ?? vault.id).font(.caption)
                 }
-                Toggle("I will move the recovery key offline and retain the vault fingerprint separately.", isOn: $confirmed)
-                Text("The recovery key grants full access. Keep it out of iCloud and away from encrypted backups. If creation fails after writing the key, the file is retained.").font(.caption).foregroundStyle(.secondary)
-            case .deleteVault:
-                if let target = deletionTarget {
-                    Text(target.name ?? "Legacy or unnamed vault").font(.headline)
-                    Text(target.id).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                    Text("Permanently delete all cloud contents and history, and this device’s cached vault data. Backups and caches on other devices remain. This cannot be undone without a backup.")
-                    if model.canExportBackup {
-                        Button("Export backup…") { model.chooseExportBackup() }
-                        Text("The backup is encrypted. Keep its recovery key separately.").font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        Text("To export a legacy vault, use an older Mop client before deleting it.").font(.caption).foregroundStyle(.secondary)
-                    }
-                    TextField("Type \(target.name ?? target.id) to delete", text: $deletionConfirmation)
+                CloudEnrollmentView(model: model, owner: false)
+                DisclosureGroup("Join another person’s shared vault") { SharingView(model: model, setup: true, flow: .connect) }
+                Button("Refresh vaults") { model.sheet = nil; model.discover(autoUnlock: true) }
+                Button("Create a different vault…") { model.sheet = .createVault }
+                Button("No approved device? Recover…") { model.sheet = .recover }
                 }
-            case .renameVault:
-                Text("Renaming changes references. Update scripts and configuration; the old name will no longer work.")
-                TextField("New vault name", text: $vaultName)
+            case .addDevice:
+                Text("Add my device").font(.title2)
+                Text("Open Mop on your new device using the same Apple Account. Keep this device unlocked; Mop will connect the new device automatically and notify you when it joins.")
+                CloudEnrollmentView(model: model, owner: true)
+            case .shareAccount:
+                Text("Share with another person").font(.title2)
+                Text("Ask the other person to open Mop and choose Connect to an existing vault. Choose what they may do, exchange the invitation, then approve their response.")
+                SharingView(model: model, setup: false, flow: .share)
+            case .setupRecovery:
+                Text("Optional hardware recovery").font(.title2)
+                Text("On a separate device, create a recovery request. On your owner device, import that request to add recovery to existing secrets. Keep encrypted backups as well as the recovery device.")
+                SharingView(model: model, setup: model.selectedVault == nil, flow: .recovery)
             case .recover:
-                Text("Restore vault access using an offline recovery key and a vault fingerprint obtained independently. Return the key offline afterward.")
-                TextField("Vault fingerprint", text: $fingerprint)
-                Button("Choose recovery key…") { fileRequestGeneration = model.editorGeneration; importingRecovery = true }
-                if let recoveryURL { Text(recoveryURL.lastPathComponent).font(.caption) }
+                Text("Hardware recovery").font(.title2)
+                SharingView(model: model, setup: false, recoveryMode: true)
             case .trust:
-                Text("Enter the full vault fingerprint obtained independently from a trusted device. Do not use a fingerprint supplied only by the cloud service.")
-                TextField("Vault fingerprint", text: $fingerprint)
-                    .font(.system(.body, design: .monospaced))
+                Text("Verify current checkpoint").font(.title2)
+                TextField("Independently obtained checkpoint", text: $fingerprint)
+                Button("Verify") { model.management(.trust(fingerprint: fingerprint)) }.disabled(fingerprint.count != 64)
+            case .renameVault:
+                Text("Rename vault").font(.title2)
+                Text("Update scripts and references after renaming. The old name is not retained.")
+                TextField("Name", text: $name)
+                Button("Rename") { model.renameVault(to: name) }.disabled((try? VaultName.validate(name)) == nil)
+            case .deleteVault:
+                Text("Delete cloud vault").font(.title2)
+                Text("Permanently delete cloud contents and history. Existing backups and local encrypted checkpoints remain.")
+                Text(model.vault).textSelection(.enabled)
+                TextField("Type the vault name to confirm", text: $confirmation)
+                Button("Delete", role: .destructive) {
+                    if let target = model.selectedVaultDescriptor { model.deleteVault(target: target, confirmation: confirmation) }
+                }.disabled(confirmation != model.vaultName)
             }
-            if kind == .deleteVault || kind == .vaultSettings, let notice = model.notice { Text(notice).font(.callout).textSelection(.enabled) }
-            if model.busy { HStack { ProgressView().controlSize(.small); Text("Waiting for authentication or iCloud…").font(.caption) } }
-            HStack {
-                Spacer()
-                Button(kind == .vaultSettings ? "Done" : "Cancel", role: .cancel) { model.sheet = nil }.keyboardShortcut(.cancelAction).disabled(model.busy)
-                if kind != .vaultSettings {
-                Button(kind == .deleteVault ? "Delete vault" : "Continue", role: kind == .deleteVault ? .destructive : nil) { submit() }
-                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(model.busy || !canSubmit)
-                }
-            }
-        }.padding(28) }.mopSheetWidth(540).disabled(model.busy)
-        .interactiveDismissDisabled(model.busy)
-        .confirmationDialog("Discard this unpublished vault setup?", isPresented: $discardingSetup, titleVisibility: .visible) {
-            Button("Discard setup", role: .destructive) {
-                do {
-                    try PendingVaultCreation.discardUnsubmitted(state: AppStorageLocation.defaultState)
-                    pending = nil; confirmed = false
-                } catch { localError = safeMessage(error) }
-            }
-        } message: { Text("No vault has been submitted. Any recovery copies you exported are no longer needed for this setup.") }
+            if let notice = model.notice { Text(notice).font(.callout).textSelection(.enabled) }
+            if model.busy { ProgressView("Waiting for authentication or iCloud…") }
+            Button("Done") { model.sheet = nil }.disabled(model.busy)
+        }.padding(24) }.mopSheetWidth(640)
+        .disabled(model.busy).interactiveDismissDisabled(model.busy)
         .documentTransfers(model: model, inSheet: true)
-        .fileImporter(isPresented: $choosingRecoveryFolder, allowedContentTypes: [.folder]) { result in
-            guard fileRequestGeneration == model.editorGeneration, model.sheet == kind else { return }
-            do {
-                let folder = try result.get()
-                guard var intent = pending else { return }
-                let url = folder.appendingPathComponent("mop-recovery-" + intent.id.uuidString + "-" + UUID().uuidString + ".key")
-                try model.documents.write(to: url) { destination in
-                    try intent.export(to: destination, state: AppStorageLocation.defaultState)
-                }
-                pending = intent
-            } catch { localError = safeMessage(error) }
-        }
-        .fileImporter(isPresented: $importingRecovery, allowedContentTypes: [.data, .plainText]) { result in
-            guard fileRequestGeneration == model.editorGeneration, model.sheet == kind else { return }
-            do {
-                if let recoveryURL { try? FileManager.default.removeItem(at: recoveryURL) }
-                recoveryURL = try model.documents.importRecovery(result.get(), state: AppStorageLocation.defaultState)
-            } catch { localError = safeMessage(error) }
-        }
-        .onDisappear { if let recoveryURL { try? FileManager.default.removeItem(at: recoveryURL) } }
-        .onAppear {
-            if kind == .createVault {
-                do {
-                    pending = try PendingVaultCreation.load(state: AppStorageLocation.defaultState)
-                    if let pending { vaultName = pending.name }
-                } catch { localError = safeMessage(error) }
-            }
-            if kind == .renameVault { vaultName = model.vaultName }
-            if kind == .deleteVault, !model.vault.isEmpty {
-                deletionTarget = model.selectedVaultDescriptor ?? VaultDescriptor(id: model.vault, name: nil, format: "unknown", enrolled: false)
-            }
-        }
-        .onChange(of: model.editorGeneration) { _, _ in fingerprint = "" }
+        .onAppear { if kind == .renameVault { name = model.vaultName } }
         .alert("Operation not completed", isPresented: Binding(get: { model.error != nil || localError != nil }, set: { if !$0 { model.error = nil; localError = nil } })) {
             Button("OK") { model.error = nil; localError = nil }
         } message: { Text(localError ?? model.error ?? "") }
     }
-    private func safeMessage(_ error: Error) -> String {
-        (error as? MopError)?.errorDescription ?? "The document operation failed. Choose a writable folder supporting exclusive file creation, or try a different file."
-    }
-    private func submit() {
-        switch kind {
-        case .createVault:
-            if let pending { model.createPreparedVault(pending) }
-        case .deleteVault:
-            if let deletionTarget { model.deleteVault(target: deletionTarget, confirmation: deletionConfirmation) }
-        case .renameVault:
-            model.renameVault(to: vaultName)
-        case .trust:
-            model.management(.trust(fingerprint: fingerprint))
-        case .recover:
-            if let recoveryURL { model.management(.recover(file: recoveryURL, fingerprint: fingerprint)) }
-        case .vaultSettings: break
-        }
-    }
+}
 
-    private var vaultSettings: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text(model.vaultName).font(.headline)
-            Button("Rename vault…") { model.sheet = .renameVault }.disabled(model.offline)
-            Divider()
-            Text("Account access").font(.headline)
-            Text("Connected vaults are available on devices using your Apple Account and iCloud Keychain.")
-                .foregroundStyle(.secondary)
-            Button("Verify account membership") { model.loadMembers() }.disabled(model.offline)
-            if !model.members.isEmpty {
-                Label("Your Apple Account · Owner", systemImage: "person.crop.circle.badge.checkmark")
+private struct CloudEnrollmentView: View {
+    @Bindable var model: AppModel
+    let owner: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(model.enrollmentStatus).accessibilityIdentifier("enrollment-status")
+            if !owner && !model.cloudEnrollments.contains(where: { $0.rejected }) {
+                ProgressView("Connecting through iCloud…")
+                Text("If setup is waiting, open and unlock Mop on a device that already has this vault. No approval is needed there.")
             }
-            Divider()
-            Text("Recovery and backups").font(.headline)
-            Button("Export encrypted backup…") { model.chooseExportBackup() }.disabled(!model.canExportBackup)
-            Button("Recover access…") { model.sheet = .recover }.disabled(model.offline)
-            DisclosureGroup("Advanced security") {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Vault ID: " + model.vault).font(.caption).textSelection(.enabled)
-                    Button("Show vault fingerprint") { model.management(.fingerprint, keepSheet: true) }.disabled(model.offline)
-                    Button("Verify vault fingerprint…") { model.sheet = .trust }.disabled(model.offline)
-                }.padding(.top, 8)
+            if model.cloudEnrollments.contains(where: { $0.rejected }) {
+                Text("Connection cancelled. Tap Restart connection to try again.")
             }
-            Divider()
-            Button("Delete vault…", role: .destructive) { model.sheet = .deleteVault }.disabled(model.offline)
+            Button("Check iCloud now") { model.pollCloudEnrollment(owner: owner) }.disabled(model.busy)
+            if !owner {
+                Button("Restart connection") { model.restartCloudEnrollment() }.disabled(model.busy)
+                Button("Cancel request", role: .destructive) { model.cancelCloudEnrollment() }.disabled(model.busy)
+                Text("Restart tries the connection again without deleting your vault or device keys.").font(.caption)
+            }
+        }
+        .task {
+            var first = true
+            while !Task.isCancelled {
+                if model.isActive && !model.busy && !model.refreshing {
+                    model.pollCloudEnrollment(owner: owner, automatic: !first)
+                    first = false
+                }
+                try? await Task.sleep(for: .seconds(5))
+            }
         }
     }
 }

@@ -272,3 +272,31 @@ func autoFillSuggestionRequiresInteractionBeforeVaultAccess(kind: AutoFillKind) 
     await #expect(throws: CancellationError.self) { try await task.value }
     #expect(!service.isAuthenticated)
 }
+
+@Test func autoFillRefreshRebuildsInvalidCacheFromCatalog() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let index = AutoFillIndex(directory: root)
+    let id = UUID().uuidString
+    let catalog = ItemCatalog(vault: "v", revision: "", items: [login()])
+    let expected = AutoFillEntry.entries(catalog: catalog, vaultID: id).map(AutoFillIdentity.init)
+    let published = PublishedAutoFillIdentities()
+    let publisher = AutoFillPublisher(directory: root, publish: { await published.save($0) })
+    try index.update { _ in [] }
+    let file = root.appendingPathComponent("identities.json")
+    let valid = try JSONEncoder().encode(expected)
+    let obsolete = Data(String(decoding: valid, as: UTF8.self)
+        .replacingOccurrences(of: "mop-autofill-v6", with: "mop-autofill-v1").utf8)
+    for invalid in [Data("{broken".utf8), obsolete] {
+        try LocalFile.write(invalid, to: file, replace: true)
+        #expect(throws: MopError.invalidVault) { try index.load() }
+        try await publisher.publish(catalog: catalog, vaultID: id)
+        #expect(try index.load() == expected)
+        #expect(await published.rows == expected)
+    }
+    // Repair must not bypass insecure permissions or republish untrusted metadata.
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+    await #expect(throws: MopError.filePermissions) {
+        try await publisher.publish(catalog: catalog, vaultID: id)
+    }
+}

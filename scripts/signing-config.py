@@ -90,7 +90,7 @@ with open(entitlements_path, 'wb') as f:
 with open(info_path, 'wb') as f:
     plistlib.dump({'CFBundleIdentifier': bundle_id, 'CFBundleExecutable': executable,
                   'CFBundleName': 'mop', 'CFBundlePackageType': 'APPL',
-                  'CFBundleVersion': '0.5.0', 'CFBundleShortVersionString': '0.5.0',
+                  'CFBundleVersion': '0.6.0', 'CFBundleShortVersionString': '0.6.0',
                   'LSMinimumSystemVersion': '15.0'}, f)
 
 if autofill:

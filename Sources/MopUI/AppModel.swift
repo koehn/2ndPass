@@ -1,9 +1,10 @@
 import SwiftUI
 import MopCore
 import MopAppSupport
+import MopVaultNext
 
 enum AppPage: String, CaseIterable { case secrets = "Secrets", recentlyDeleted = "Recently Deleted" }
-enum AppSheet: String, Identifiable { case createVault, renameVault, deleteVault, vaultSettings, trust, recover
+enum AppSheet: String, Identifiable { case createVault, enrollDevice, addDevice, shareAccount, setupRecovery, renameVault, deleteVault, trust, recover
     var id: String { rawValue }
 }
 
@@ -32,6 +33,10 @@ final class AppModel {
     var selected: SecretReference?
     var search = ""
     var members: [VaultMemberRecord] = []
+    var settingsVisible = false
+    var devices: [VaultDeviceRecord] = []
+    var deviceRemoved = false
+    var removalCleanupPending = false
     var offline = false
     private var cloudRefreshPending = false
     private var nextCloudRefresh = Date.distantPast
@@ -111,6 +116,7 @@ final class AppModel {
                     guard !Task.isCancelled else { return }
                     self?.checkExpiration()
                     self?.checkRetention()
+                    self?.checkEnrollmentInboxIfNeeded()
                     self?.refreshCloudIfNeeded()
                 }
             }
@@ -269,6 +275,7 @@ final class AppModel {
         guard !busy else { return }
         allVaults = false; page = .secrets; vault = id
         changedVault()
+        if vaults.first(where: { $0.id == id })?.enrolled == false { sheet = .enrollDevice; return }
         scheduleAutomaticUnlock()
     }
     /// Target the row's vault without starting an unlock that could race the action.
@@ -546,6 +553,9 @@ final class AppModel {
             do { try await action(token) }
             catch {
                 if token == generation {
+                    if error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
+                        self.showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending); return
+                    }
                     self.automaticUnlockBlocked = true
                     // A trust/account/data failure needs repair. Taps and Face ID
                     // lifecycle notifications must not repeat the same failure.
@@ -557,7 +567,7 @@ final class AppModel {
                     // Framework errors may contain arbitrary diagnostics. Only
                     // domain errors have user-safe messages.
                     if error as? MopError == .vaultUntrusted {
-                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Refresh after iCloud Keychain finishes syncing. For a v5 vault, verify independent fingerprint evidence or use recovery. Older vault formats are unsupported."
+                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Approve this device from an authorized owner device or use the separate hardware recovery device. Older vault formats are unsupported."
                     } else {
                         self.error = (error as? MopError)?.errorDescription ?? "The operation could not be completed."
                     }
@@ -577,6 +587,7 @@ final class AppModel {
         if !autoUnlock { automaticUnlockBlocked = false }
         perform { token in
             let result = try await self.service.execute(.discover, vault: nil, offline: false)
+            if result.deviceRemoved { self.showDeviceRemoved(); return }
             self.offline = result.usingCache
             let rows = result.vaults
             let ids = rows.map(\.id)
@@ -589,9 +600,18 @@ final class AppModel {
                 if let id = result.defaultVault, ids.contains(id) { self.vault = id }
             } else if !ids.contains(self.vault) {
                 self.vault = ""; self.lock(); self.automaticUnlockBlocked = false
+                if rows.isEmpty { self.sheet = .createVault }
+                else if !rows.contains(where: { $0.supported && $0.enrolled }) { self.sheet = .enrollDevice }
                 return
             }
             self.status = ids.isEmpty ? "Create your first vault" : "Vaults available"
+            if self.sheet == nil {
+                if rows.isEmpty { self.sheet = .createVault }
+                else if !rows.contains(where: { $0.supported && $0.enrolled }) {
+                    self.status = "Connect this device to your iCloud vault"
+                    self.sheet = .enrollDevice
+                }
+            }
             if self.authenticated && self.requestedVaultIDs.contains(where: { self.catalogs[$0] == nil }) {
                 self.authenticated = false
             }
@@ -632,7 +652,7 @@ final class AppModel {
             if lastActivity == nil { lastActivity = now() }
             for (id, catalog) in loaded {
                 vaults.removeAll { $0.id == id }
-                vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v5", enrolled: true))
+                vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v6", enrolled: true))
             }
             if let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
             if let selected, !references.contains(selected) { self.selected = nil }
@@ -737,6 +757,43 @@ final class AppModel {
             self.notice = "Secret deleted. Historical encrypted copies remain."
         }
     }
+    func loadDevices() {
+        guard !offline else { return }
+        perform { token in
+            let result = try await self.service.execute(.manage(.devices), vault: self.selectedVault, offline: false)
+            guard self.current(token) else { return }
+            self.devices = result.devices
+        }
+    }
+    func removeDevice(_ id: UUID) {
+        guard !offline else { return }
+        perform { token in
+            let result = try await self.service.execute(.manage(.removeAccountDevice(id)), vault: self.selectedVault, offline: false)
+            guard self.current(token) else { return }
+            self.devices = result.devices
+            self.notice = result.message
+        }
+    }
+    private func showDeviceRemoved(pending: Bool = false) {
+        removalCleanupPending = pending
+        for vault in vaults { defaults.removeObject(forKey: "enrollment-notified-" + vault.id) }
+        lock(); deviceAddedNotice = nil
+        deviceRemoved = true; vaults = []; vault = ""; devices = []; cloudEnrollments = []
+        error = nil; sheet = .enrollDevice
+        enrollmentPaused = true
+    }
+    func reconnectDevice() {
+        perform { token in
+            _ = try await self.service.execute(.manage(.reconnect), vault: nil, offline: false)
+            guard self.current(token) else { return }
+            self.deviceRemoved = false; self.removalCleanupPending = false; self.enrollmentPaused = false
+            self.automaticUnlockBlocked = false
+            let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
+            self.vaults = discovery.vaults
+            self.sheet = .enrollDevice
+            self.enrollmentStatus = "Ready to connect."
+        }
+    }
     func loadMembers() {
         guard !offline else { return }
         perform { token in
@@ -757,7 +814,155 @@ final class AppModel {
             self.automaticUnlockNeedsRepair = false; self.automaticUnlockBlocked = false
         }
     }
+    var deviceAddedNotice: String?
+    var enrollmentSessionActive: Bool { service.isAuthenticated }
+    var cloudEnrollments: [EnrollmentExchange] = []
+    var enrollmentVault: String?
+    var enrollmentStatus = "Ready to check iCloud."
+    var enrollmentLastCheck: Date?
+    var enrollmentLastAttempt: Date?
+    var enrollmentPaused = false
+    private var nextEnrollmentPoll = Date.distantPast
+    func checkEnrollmentInboxIfNeeded() {
+        guard sheet == nil, error == nil, authenticated, service.isAuthenticated, wallNow() >= nextEnrollmentPoll else { return }
+        nextEnrollmentPoll = wallNow().addingTimeInterval(15)
+        pollCloudEnrollment(owner: true, automatic: true)
+    }
+    func pollCloudEnrollment(owner: Bool, automatic: Bool = false) {
+        #if os(macOS)
+        let canRun = isActive || (owner && service.isAuthenticated)
+        #else
+        let canRun = isActive
+        #endif
+        guard !deviceRemoved, canRun, !busy, !refreshing, itemDraft == nil else { return }
+        guard !offline else { enrollmentStatus = "Offline. Reconnect to iCloud, then tap Check iCloud now."; return }
+        if automatic && (enrollmentPaused || error != nil || !service.isAuthenticated) {
+            if !service.isAuthenticated { enrollmentStatus = "Checking paused: unlock to continue. Tap Check iCloud now to authenticate." }
+            return
+        }
+        if !automatic { enrollmentPaused = false }
+        let ids = owner ? vaults.filter { $0.enrolled }.map(\.id) : vaults.filter { !$0.enrolled }.map(\.id)
+        guard !ids.isEmpty else { enrollmentStatus = "No vault selected for enrollment. Refresh the vault list."; return }
+        enrollmentLastAttempt = wallNow(); enrollmentStatus = "Contacting iCloud…"
+        perform { token in
+            for id in ids {
+                self.enrollmentVault = id
+                let result: VaultResult
+                do {
+                    result = try await self.service.execute(.manage(owner ? .automaticEnrollment : .requestEnrollment(name: ProcessInfo.processInfo.hostName)), vault: id, offline: false)
+                } catch {
+                    guard self.current(token) else { return }
+                    if error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
+                        self.showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending); return
+                    }
+                    if owner, error as? MopError == .cloudPermission { continue }
+                    self.cloudEnrollments = []
+                    if error as? MopError == .vaultConflict {
+                        self.enrollmentStatus = "Connecting… Another device updated the request; retrying shortly."
+                        return
+                    }
+                    self.enrollmentPaused = true
+                    self.enrollmentStatus = (error as? MopError)?.errorDescription ?? "Could not check the enrollment request."
+                    self.enrollmentStatus += " Tap Check iCloud now to retry, or Restart connection for a new request."
+                    return
+                }
+                guard self.current(token), (owner || self.isActive) else { return }
+                self.enrollmentLastCheck = self.wallNow()
+                if owner {
+                    let notificationKey = "enrollment-notified-" + id
+                    var seen = Set(self.defaults.stringArray(forKey: notificationKey) ?? [])
+                    let added = result.addedDevices.map(\.uuidString).filter { !seen.contains($0) }
+                    if !added.isEmpty {
+                        self.deviceAddedNotice = added.count == 1 ? "A new device has been added to your vault." : "\(added.count) devices have been added to your vault."
+                        seen.formUnion(added)
+                        self.defaults.set(Array(seen), forKey: notificationKey)
+                    }
+                }
+                if result.enrollmentCompleted {
+                    // Existing peers are the baseline on the joining device.
+                    self.defaults.set(result.addedDevices.map(\.uuidString), forKey: "enrollment-notified-" + id)
+                    self.enrollmentStatus = "Approved. Opening the vault…"
+                    self.vault = id; self.allVaults = false
+                    self.vaults = self.vaults.map { $0.id == id ? VaultDescriptor(id: id, name: $0.name, format: "mop-vault-v6", enrolled: true) : $0 }
+                    self.sheet = nil; self.cloudEnrollments = []
+                    try await self.unlockContents(token)
+                    return
+                }
+                if !result.enrollments.isEmpty {
+                    self.cloudEnrollments = result.enrollments
+                    self.enrollmentStatus = result.message.isEmpty ? "Connecting securely to your vault…" : result.message
+                    self.enrollmentPaused = result.enrollments.allSatisfy(\.rejected)
+                    // Owner enrollment runs quietly; completion is shown as a notice.
+                    return
+                }
+            }
+            self.cloudEnrollments = []
+            self.enrollmentStatus = owner ? "Connected to iCloud. No pending requests." : "No pending request found. Restart connection to send one."
+        }
+    }
+    func restartCloudEnrollment() { changeCloudEnrollment(restart: true) }
+    func cancelCloudEnrollment() { changeCloudEnrollment(restart: false) }
+    private func changeCloudEnrollment(restart: Bool) {
+        guard !busy, let id = enrollmentVault ?? vaults.first(where: { !$0.enrolled })?.id else { return }
+        guard !offline else { enrollmentStatus = "Reconnect to iCloud before changing the request."; return }
+        cloudEnrollments = []; enrollmentPaused = !restart
+        enrollmentStatus = restart ? "Replacing the request in iCloud…" : "Cancelling the request…"
+        enrollmentLastAttempt = wallNow()
+        perform { token in
+            do {
+                let action: VaultManagement = restart ? .restartEnrollment(name: ProcessInfo.processInfo.hostName) : .cancelEnrollment
+                let result = try await self.service.execute(.manage(action), vault: id, offline: false)
+                guard self.current(token) else { return }
+                self.enrollmentVault = id; self.cloudEnrollments = result.enrollments
+                self.enrollmentLastCheck = self.wallNow(); self.enrollmentStatus = result.message
+            } catch {
+                guard self.current(token) else { return }
+                self.enrollmentPaused = true
+                self.enrollmentStatus = "iCloud did not confirm the change. " + ((error as? MopError)?.errorDescription ?? "Please retry.")
+            }
+        }
+    }
+    func confirmCloudEnrollment(_ exchange: EnrollmentExchange) {
+        guard let id = enrollmentVault, let code = exchange.verificationCode else { return }
+        perform { token in
+            let result = try await self.service.execute(.manage(.confirmEnrollment(code: code)), vault: id, offline: false)
+            guard self.current(token) else { return }
+            self.cloudEnrollments = result.enrollments; self.notice = result.message
+            self.enrollmentStatus = result.message; self.enrollmentLastCheck = self.wallNow()
+        }
+    }
+    func rejectCloudEnrollment(_ request: EnrollmentExchange) {
+        guard let id = enrollmentVault else { return }
+        perform { token in
+            let result = try await self.service.execute(.manage(.rejectEnrollment(id: request.id)), vault: id, offline: false)
+            guard self.current(token) else { return }
+            self.cloudEnrollments = result.enrollments; self.notice = result.message
+            self.enrollmentStatus = result.message; self.enrollmentLastCheck = self.wallNow()
+        }
+    }
+    func approveCloudEnrollment(_ request: EnrollmentExchange) {
+        guard let id = enrollmentVault, let code = request.verificationCode else { return }
+        perform { token in
+            let result = try await self.service.execute(.manage(.approveEnrollment(id: request.id, code: code)), vault: id, offline: false)
+            guard self.current(token) else { return }
+            self.cloudEnrollments = result.enrollments; self.notice = result.message
+            self.enrollmentStatus = result.message; self.enrollmentLastCheck = self.wallNow()
+        }
+    }
+    var exchangeOutput = ""
+    func exchange(_ action: VaultManagement) {
+        guard !offline else { return }
+        perform { token in
+            let result = try await self.service.execute(.manage(action), vault: self.selectedVault, offline: false)
+            guard self.current(token) else { return }
+            self.exchangeOutput = result.document.map { String(decoding: $0, as: UTF8.self) } ?? ""
+            self.notice = result.message
+            if let catalog = result.catalog { try self.applyCatalog(catalog) }
+            self.cloudRefreshPending = true
+        }
+    }
     func cloudChanged() {
+        nextEnrollmentPoll = .distantPast
         cloudRefreshPending = true
         nextCloudRefresh = .distantPast
         refreshCloudIfNeeded()
@@ -807,6 +1012,9 @@ final class AppModel {
                 status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
+                if error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
+                    showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending); return
+                }
                 if let failure = error as? MopError,
                    [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(failure) {
                     lock()
@@ -817,38 +1025,20 @@ final class AppModel {
             }
         }
     }
-    func createPreparedVault(_ intent: PendingVaultCreation) {
-        guard !offline, !busy, intent.exported else { return }
-        clearView()
-        allVaults = false; vault = intent.id.uuidString
-        if !vaults.contains(where: { $0.id == vault }) {
-            vaults.append(VaultDescriptor(id: vault, name: intent.name, format: "mop-vault-v5", enrolled: true))
-        }
-        status = "Creating or reconciling vault " + vault
-        perform { token in
-            let result = try await self.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
-            guard self.current(token) else { return }
-            try self.applyCatalog(result.requireCatalog())
-            try await self.unlockContents(token, refresh: false)
-            self.sheet = nil; self.notice = result.message
-            self.status = "Vault created"
-        }
-    }
-
-    func createVault(name: String, recovery: URL) {
+    func createVault(name: String, recovery: URL? = nil, fingerprint: String? = nil) {
         guard !offline, !busy else { return }
         conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; members = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
-            self.allVaults = false; self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v5", enrolled: true))
-            self.status = "Creating vault \(id) · retain any recovery file written"
-            let result = try await self.service.execute(.create(name: name, recovery: recovery), vault: id, offline: false)
+            self.allVaults = false; self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v6", enrolled: true))
+            self.status = "Creating vault \(id) · retain this UUID if publication is interrupted"
+            let result = try await self.service.execute(.create(name: name, recovery: recovery, fingerprint: fingerprint), vault: id, offline: false)
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
             try await self.unlockContents(token, refresh: false)
             self.selected = nil; self.sheet = nil
-            self.notice = result.message; self.status = "Vault created · move the recovery credential offline"
+            self.notice = result.message; self.status = "Vault created · add devices or optional recovery in settings"
         }
     }
     func renameVault(to name: String) {
@@ -895,7 +1085,7 @@ final class AppModel {
         let id = vault
         perform { token in
             _ = try await self.service.execute(.export(url), vault: id, offline: false)
-            guard self.current(token) else { return }; self.notice = "Encrypted backup exported. Keep your recovery key separately."
+            guard self.current(token) else { return }; self.notice = "Encrypted backup exported. Keep your hardware recovery device separately."
         }
     }
 }

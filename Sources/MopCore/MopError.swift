@@ -27,6 +27,9 @@ public enum MopError: Error, LocalizedError, Equatable {
     case invalidVault
     case vaultConflict
     case vaultUntrusted
+    case deviceRemovalPending
+    case lastOwnerDevice
+    case deviceRemoved
     case notVaultMember
     case invalidIdentity
     case invalidRecovery
@@ -37,7 +40,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .identityPending: 30
         case .vaultDeleteUncertain: 27
         case .vaultDeleteCleanup: 28
-        case .confirmationRequired, .operationCancelled: 2
+        case .confirmationRequired, .operationCancelled, .lastOwnerDevice: 2
         case .invalidVaultName: 23
         case .ambiguousVault: 24
         case .vaultSelectionMismatch: 25
@@ -63,7 +66,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .invalidVault: 10
         case .vaultConflict: 11
         case .vaultUntrusted: 16
-        case .notVaultMember: 13
+        case .notVaultMember, .deviceRemoved, .deviceRemovalPending: 13
         case .invalidIdentity, .invalidRecovery: 14
         case .filePermissions: 15
         }
@@ -72,16 +75,19 @@ public enum MopError: Error, LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .invalidOTP: "Enter a valid Base32 secret or otpauth://totp URL (SHA1, SHA256, or SHA512; 6 or 8 digits)."
-        case .identityPending: "Waiting for your Mop identity in iCloud Keychain. Enable iCloud Passwords & Keychain on this device using the same Apple Account, then refresh. No replacement identity was created."
+        case .deviceRemovalPending: "This device was removed, but local cleanup could not finish. Reconnect to retry cleanup before adding it again."
+        case .lastOwnerDevice: "Add another owner device before removing this one. Every personal vault must retain an owner device."
+        case .deviceRemoved: "This device was removed. Its local account access has been cleared. Choose Reconnect to add it again."
+        case .identityPending: "This device has no usable enrolled hardware identity. Enroll it through an authorized owner device or use the separate recovery device."
         case .vaultDeleteUncertain: "Vault deletion could not be confirmed. Local data was retained. Retry mop vault delete with the same UUID to reconcile."
         case .vaultDeleteCleanup: "The cloud vault was deleted, but local cleanup failed. Retry mop vault delete with the same UUID to finish cleanup."
-        case .confirmationRequired: "Vault deletion requires interactive confirmation or --yes. Authentication is still required with --yes."
+        case .confirmationRequired: "Vault deletion requires the exact vault UUID and --confirm. Authentication is still required."
         case .operationCancelled: "Operation cancelled; no vault was deleted."
         case .invalidVaultName: "Invalid vault name; use 1–63 lowercase letters or digits separated by single hyphens."
         case .ambiguousVault: "Multiple vaults have this name. Select a UUID and rename the conflicting vault."
         case .vaultSelectionMismatch: "The reference does not match the selected vault or its authenticated name."
         case .legacyVault: "Legacy vault format is unsupported. Use an older Mop client to access it; no migration is provided."
-        case .cloudInvalidRequest: "CloudKit rejected the request configuration. Verify the deployed record types and query indexes in the signed CloudKit environment; enrollment queries require MopRequest with a queryable recordName index."
+        case .cloudInvalidRequest: "CloudKit rejected the request configuration. Verify the MopV6Revision, MopV6Head and MopV6Enrollment record types in the signed CloudKit environment."
         case .cloudUnavailable: "CloudKit is unavailable. Retry online or explicitly select --offline for cached reads."
         case .cloudAccount: "An available iCloud account matching this local binding is required."
         case .cloudQuota: "The iCloud storage quota is exceeded."
@@ -106,11 +112,11 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .launch: "Unable to execute the requested program."
         case .vaultMissing: "Vault not found. Use mop vault init or select --vault NAME-OR-UUID."
         case .invalidVault: "Vault is invalid, unsupported, or failed integrity verification."
-        case .vaultConflict: "Vault changed concurrently. No committed changes were overwritten; retry the command."
-        case .vaultUntrusted: "Vault key is not trusted in this local binding. Use 'mop vault trust' with a fingerprint from a trusted Mac or a revision hash of a known-good backup. Never trust a hash obtained only from the suspect file."
-        case .notVaultMember: "This account identity is not a vault member. Use the owning Apple Account or a v5 backup and recovery credential."
-        case .invalidIdentity: "Account identity or recipient key is invalid, unavailable, or does not match the expected fingerprint."
-        case .invalidRecovery: "Recovery key is invalid or does not belong to this vault."
+        case .vaultConflict: "Vault changed concurrently. Refresh and review the current values before submitting the change again."
+        case .vaultUntrusted: "Vault checkpoint is not trusted in this local binding. Import an encrypted checkpoint with an independently verified digest. Never trust a digest obtained only from the suspect file."
+        case .notVaultMember: "This device is not an authorized vault member. Request enrollment from the owner or use the separate hardware recovery device."
+        case .invalidIdentity: "Device identity or recipient key is invalid, unavailable, or does not match the expected fingerprint."
+        case .invalidRecovery: "Hardware recovery identity or recovery request is invalid or does not belong to this vault."
         case .filePermissions: "Unsafe file type, permissions, or protected output path."
         }
     }

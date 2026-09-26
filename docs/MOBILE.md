@@ -1,5 +1,7 @@
 # Shared Apple application
 
+**V6 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](VAULT-NEXT-VALIDATION.md); remaining physical acceptance is not implied by historical build notes below.
+
 Mop uses the same SwiftUI views and application model on macOS, iPhone, and iPad.
 `Sources/MopUI` owns the interface; `MopApp` is a thin entry point. The existing
 Mac CLI, packaging, signing checks, and installer remain supported.
@@ -57,7 +59,7 @@ existing CLI recovery/import tools or investigate cloud state before removing an
 pending intent. Mop does not automatically abandon an uncertain creation.
 
 Private mobile state uses complete Data Protection and is excluded from device
-backup. Account access requires the synchronized identity; copying app storage alone does
+backup. Account access requires an explicitly approved hardware device identity; copying app storage alone does
 not transfer the account private keys.
 
 ## Mobile sessions
@@ -84,7 +86,7 @@ invalidate authorization. Submitted writes may still complete and need refresh.
 
 The project uses team `VE3U9KBEW4`, bundle identifier `com.koehn.mop`, and the existing
 `iCloud.com.koehn.mop` container. Debug uses Development CloudKit; Release uses
-Production. Keep the mobile App ID associated with that same container. The account identity synchronizes through iCloud Keychain. Verify matching
+Production. Keep the mobile App ID associated with that same container. Device private keys never synchronize; approve each device explicitly. Verify matching
 provisioned access groups; sharing a CloudKit container alone is insufficient.
 
 Before creating a distribution archive, configure the Apple account in Xcode and
@@ -127,7 +129,7 @@ SwiftPM.
 The host has Apple Development signing identities but no Apple Distribution identity,
 and no physical iPhone or iPad is connected.
 No distribution-signed archive, TestFlight upload, or Production CloudKit acceptance
-has been completed. Real-device biometrics, passcode policy, account identity synchronization,
+has been completed. Real-device biometrics, passcode policy, device enrollment and hardware key persistence,
 suspension, file-provider behavior, and VoiceOver/keyboard acceptance remain required.
 
 Automated tests do not replace these checks with a Mac, iPhone, and iPad on a test
@@ -135,7 +137,7 @@ account:
 
 - Face ID, Touch ID on supported hardware, passcode fallback,
   cancellation, changed biometric enrollment, and pending authentication at lock.
-- Account identity delivery across devices, independent recovery evidence, v5
+- Explicit hardware device enrollment, independent recovery evidence, v6
   backup recovery, ownership-change key rotation, concurrent edits, and account changes.
 - Verified offline reads, automatic fallback on disconnection and refresh on reconnection, Recently Deleted,
   and confirmation that remote changes cannot erase previously obtained offline data.
@@ -154,7 +156,7 @@ metadata access for private or explicitly selected files, following Apple’s
 
 ## Account access
 
-Mop identities synchronize through iCloud Keychain. New devices discover all
+Mop device identities require explicit approval. New devices must enroll before opening
 account-owned vaults without QR pairing. See [account identities](ACCOUNT-IDENTITY.md)
 for waiting states, recovery, and physical acceptance.
 

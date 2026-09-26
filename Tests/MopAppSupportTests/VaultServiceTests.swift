@@ -1,800 +1,523 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import Synchronization
 import Testing
 import MopCore
-import MopKeychain
-import MopVault
-import MopCloudKit
+@testable import MopVaultNext
 @testable import MopAppSupport
 
-private actor TestCloud: CloudTransport {
-    nonisolated let container = "iCloud.test.session"
-    nonisolated let environment = "Development"
-    var user = "user"
-    var failure: MopError?
-    func fail(with error: MopError?) { failure = error }
-    var data: [UUID: [String: CloudObject]] = [:]
-    var loseResponse = false
-    var rejectHead = false
-    var holdManifest = false
-    var holdHead = false
-    var holdFetch = false
-    var waiting: CheckedContinuation<Void, Never>?
-    var readRequests = 0
-    func account() throws -> String { readRequests += 1; if let failure { throw failure }; return user }
-    func changeAccount() { user = "other" }
-    func zones() -> [UUID] { Array(data.keys) }
-    func createZone(_ id: UUID) { data[id] = data[id] ?? [:] }
-    func deleteZone(_ id: UUID) { data[id] = nil }
-    func fetch(_ id: String, vault: UUID) async throws -> CloudObject? {
-        if holdFetch { holdFetch = false; await withCheckedContinuation { waiting = $0 } }
-        readRequests += 1
-        guard let zone = data[vault] else { throw MopError.vaultMissing }; return zone[id]
+// Software fixtures test application behavior only, never hardware protection.
+private final class Material {
+    let encryption = P256.KeyAgreement.PrivateKey(), signing = P256.Signing.PrivateKey()
+    let member: UUID, id = UUID()
+    init(_ member: UUID) { self.member = member }
+    var identity: DevicePublicKey { try! DevicePublicKey(member: member, device: id, encryption: encryption.publicKey.x963Representation, signing: signing.publicKey.x963Representation) }
+}
+private final class TestHandle: DeviceOperations {
+    let material: Material
+    var closed = false
+    init(_ material: Material) { self.material = material }
+    var identity: DevicePublicKey { material.identity }
+    func sign(_ bytes: Data) throws -> Data { guard !closed else { throw MopError.authentication }; return try material.signing.signature(for: bytes).rawRepresentation }
+    func unwrap(_ envelope: KeyEnvelope, context: Data) throws -> SymmetricKey { guard !closed else { throw MopError.authentication }; return try envelope.open(using: material.encryption, context: context) }
+    func close() { closed = true }
+}
+private final class TestHardware: @unchecked Sendable {
+    private let lock = NSLock()
+    private var keys: [String: Material] = [:]
+    private var deletionBlocked = false
+    func blockDeletion(_ blocked: Bool) { lock.lock(); defer { lock.unlock() }; deletionBlocked = blocked }
+    func remove(_ scope: String, _ member: UUID) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !deletionBlocked else { throw MopError.keychain(-1) }
+        keys.removeValue(forKey: scope + member.uuidString)
     }
-    func save(_ id: String, kind: CloudKind, data bytes: Data, vault: UUID, expected: Data?) async throws -> CloudObject {
-        if id.hasPrefix("m-") && holdManifest { await withCheckedContinuation { waiting = $0 }; holdManifest = false }
-        if kind == .head && holdHead { await withCheckedContinuation { waiting = $0 }; holdHead = false }
-        if kind == .head && rejectHead { rejectHead = false; throw MopError.vaultConflict }
-        guard data[vault]?[id]?.version == expected else { throw MopError.vaultConflict }
-        let object = CloudObject(data: bytes, version: Data(UUID().uuidString.utf8))
-        data[vault, default: [:]][id] = object
-        if kind == .head && loseResponse { loseResponse = false; throw MopError.cloudUnavailable }
-        return object
-    }
-    func requests(vault: UUID) -> [String] { data[vault]?.keys.filter { $0.hasPrefix("q-") } ?? [] }
-    func pauseManifest() { holdManifest = true }
-    func pauseHead() { holdHead = true }
-    func pauseFetch() { holdFetch = true }
-    func releaseHead() { waiting?.resume(); waiting = nil }
-    var isWaiting: Bool { waiting != nil }
-    func loseNextResponse() { loseResponse = true }
-    func rejectNextHead() { rejectHead = true }
-
-}
-private final class Counter: Sendable {
-    let value = Mutex(0)
-}
-private struct Fixture {
-    let directory: URL
-    let cloud: TestCloud
-    let key: AccountIdentity
-    let keys: TestIdentityKeys
-    let vaults: [CloudVault]
-    let service: NativeVaultService
-    let authentications: Counter
-    func cleanup() { service.lock(); try? FileManager.default.removeItem(at: directory) }
-}
-private func fixture() async throws -> Fixture {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-native-session-" + UUID().uuidString)
-    let cloud = TestCloud(), keys = TestIdentityKeys()
-    let repo = try await CloudRepository.open(transport: cloud, state: directory)
-    let key = try await repo.accountIdentity(keys: keys, create: true)
-    let device = key
-    var vaults: [CloudVault] = []
-    for name in ["personal", "work"] {
-        let bytes = try VaultSession.createAccountSnapshot(name: name, owner: device, recovery: RecoveryKey())
-        let document = try VaultDocument.decode(bytes)
-        let slot = try #require(document.header.recipients.first { $0.publicKey == device.publicKey })
-        let fingerprint = try VaultTrust.fingerprint(document: document, key: device.unwrap(slot, vaultID: document.header.vaultID))
-        let vault = try await repo.create(bytes, fingerprint: fingerprint)
-        let store = try CloudSecretStore(vault: vault, snapshot: bytes, opener: device)
-        try await store.write(SecretReference(vault: name, item: "item", field: "token"), value: "value", replace: false)
-        store.close(); vaults.append(vault)
-    }
-    let count = Counter()
-    let service = NativeVaultService(state: directory, identityKeys: keys, transport: { cloud }, authenticate: { _ in
-        count.value.withLock { $0 += 1 }
-        return {}
-    })
-    return Fixture(directory: directory, cloud: cloud, key: key, keys: keys, vaults: vaults, service: service, authentications: count)
-
-}
-private func operation(_ f: Fixture, _ op: VaultOperation, index: Int = 0, offline: Bool = false) async throws -> VaultResult {
-    try await f.service.execute(op, vault: f.vaults[index].id.uuidString, offline: offline)
-}
-
-@Test func nativeSessionReusesAuthenticationAcrossReadsEditsAndVaults() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let ref = try SecretReference("mop://personal/item/token")
-    #expect(try await operation(f, .read(ref)).value == "value")
-    _ = try await operation(f, .write(ref, "updated", replace: true))
-    _ = try await operation(f, .catalog, index: 1)
-    #expect(try await operation(f, .read(ref)).value == "updated")
-    #expect(f.authentications.value.withLock { $0 } == 1)
-    f.service.lock(); #expect(!f.service.isAuthenticated)
-    _ = try await operation(f, .read(ref))
-    #expect(f.authentications.value.withLock { $0 } == 2)
-}
-@Test func authenticatedReadsAndStrengthUseSnapshotWithoutCloudRequests() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let count = await f.cloud.readRequests
-    await f.cloud.fail(with: .cloudUnavailable)
-    let ref = try SecretReference("mop://personal/item/token")
-    for _ in 0..<3 {
-        #expect(try await operation(f, .read(ref)).value == "value")
-        _ = try await operation(f, .passwordQuality(item: "item"))
-    }
-    #expect(await f.cloud.readRequests == count)
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-
-@Test func authenticatedSnapshotChangesOnlyAfterRefresh() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let ref = try SecretReference("mop://personal/item/token")
-    let remote = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: f.key)
-    defer { remote.close() }
-    try await remote.write(ref, value: "remote", replace: true)
-    #expect(try await operation(f, .read(ref)).value == "value")
-    _ = try await operation(f, .catalog)
-    let count = await f.cloud.readRequests
-    #expect(try await operation(f, .read(ref)).value == "remote")
-    #expect(await f.cloud.readRequests == count)
-}
-
-@Test func snapshotReadDoesNotWaitForCloudRefresh() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let service = f.service, id = f.vaults[0].id.uuidString
-    await f.cloud.pauseFetch()
-    let refresh = Task { try await service.execute(.catalog, vault: id, offline: false) }
-    for _ in 0..<500 {
-        if await f.cloud.isWaiting { break }
-        try await Task.sleep(for: .milliseconds(10))
-    }
-    #expect(await f.cloud.isWaiting)
-    let completed = Mutex(false)
-    let read = Task {
-        let result = try await service.execute(.read(SecretReference("mop://personal/item/token")), vault: id, offline: false)
-        completed.withLock { $0 = true }; return result
-    }
-    for _ in 0..<100 {
-        if completed.withLock({ $0 }) { break }
-        try await Task.sleep(for: .milliseconds(10))
-    }
-    #expect(completed.withLock { $0 })
-    await f.cloud.releaseHead()
-    #expect(try await read.value.value == "value")
-    _ = try await refresh.value
-}
-
-@Test func snapshotReadDoesNotWaitForOrExposePendingWrite() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let ref = try SecretReference("mop://personal/item/token")
-    await f.cloud.pauseHead()
-    let service = f.service, id = f.vaults[0].id.uuidString
-    let write = Task { try await service.execute(.write(ref, "new", replace: true), vault: id, offline: false) }
-    for _ in 0..<500 {
-        if await f.cloud.isWaiting { break }
-        try await Task.sleep(for: .milliseconds(10))
-    }
-    #expect(await f.cloud.isWaiting)
-    let completed = Mutex(false)
-    let read = Task {
-        let result = try await service.execute(.read(ref), vault: id, offline: false)
-        completed.withLock { $0 = true }; return result
-    }
-    for _ in 0..<100 {
-        if completed.withLock({ $0 }) { break }
-        try await Task.sleep(for: .milliseconds(10))
-    }
-    #expect(completed.withLock { $0 })
-    await f.cloud.releaseHead()
-    #expect(try await read.value.value == "value")
-    _ = try await write.value
-    #expect(try await operation(f, .read(ref)).value == "new")
-}
-
-@Test func nativeOTPReadsReturnCodesAndInvalidateCachedKeysAfterReplacement() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let catalog = try await operation(f, .catalog).requireCatalog()
-    let secret = "JBSWY3DPEHPK3PXP"
-    let item = VaultItem(name: "otp-login", type: .login, fields: [
-        ItemField(path: "otp", type: .otp, value: secret),
-        ItemField(path: "otp-url", type: .otp, value: "otpauth://totp/Mop:test@example.com?secret=\(secret)&issuer=Mop")
-    ])
-    _ = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true)))
-    let ref = try SecretReference("mop://personal/otp-login/otp")
-    let start = Date()
-    let result = try await operation(f, .read(ref))
-    let otp = try TimeBasedOTP(secret)
-    #expect(result.value != SecretBytes(utf8: secret))
-    #expect(result.valueIsConcealed)
-    let Expected = try [SecretBytes(utf8: otp.code(at: start)), SecretBytes(utf8: otp.code())]
-    #expect(Expected.contains { $0 == result.value })
-    let urlStart = Date()
-    let urlResult = try await operation(f, .read(SecretReference("mop://personal/otp-login/otp-url")))
-    let urlExpected = try [SecretBytes(utf8: otp.code(at: urlStart)), SecretBytes(utf8: otp.code())]
-    #expect(urlExpected.contains { $0 == urlResult.value })
-    _ = try await operation(f, .read(ref))
-    let replacement = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
-    _ = try await operation(f, .write(ref, SecretBytes(utf8: replacement), replace: true))
-    let nextStart = Date(), next = try await operation(f, .read(ref))
-    let nextOTP = try TimeBasedOTP(replacement)
-    let nextExpected = try [SecretBytes(utf8: nextOTP.code(at: nextStart)), SecretBytes(utf8: nextOTP.code())]
-    #expect(nextExpected.contains { $0 == next.value })
-    f.service.lock()
-    let coldStart = Date(), cold = try await operation(f, .read(ref))
-    let coldExpected = try [SecretBytes(utf8: nextOTP.code(at: coldStart)), SecretBytes(utf8: nextOTP.code())]
-    #expect(coldExpected.contains { $0 == cold.value })
-}
-
-@Test func staleEditsConflictButSharedAuthorizationSurvives() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let catalog = try await operation(f, .catalog).requireCatalog()
-    let ref = try SecretReference("mop://personal/item/token")
-    let remote = try CloudSecretStore(vault: f.vaults[0], snapshot: await f.vaults[0].sync(), opener: f.key)
-    defer { remote.close() }
-    try await remote.write(ref, value: "remote", replace: true)
-    let edit = ItemEdit(revision: catalog.revision, item: catalog.items[0], create: false)
-    await #expect(throws: MopError.vaultConflict) { _ = try await operation(f, .save(edit)) }
-    #expect(try await operation(f, .read(ref)).value == "remote")
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-@Test func accountChangeInvalidatesEntireSession() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    await f.cloud.changeAccount()
-    await #expect(throws: MopError.cloudAccount) { _ = try await operation(f, .catalog) }
-    #expect(!f.service.isAuthenticated)
-}
-@Test func cacheTransitionPreservesSessionAndRejectsOfflineWrites() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let result = try await operation(f, .catalog, offline: true)
-    #expect(result.offlineDate != nil)
-    #expect(f.authentications.value.withLock { $0 } == 1)
-    await #expect(throws: MopError.offlineWrite) {
-        _ = try await operation(f, .write(SecretReference("mop://personal/item/token"), "forbidden", replace: true), offline: true)
+    func open(_ scope: String, _ member: UUID, _ context: LAContext, _ create: Bool) throws -> any DeviceOperations {
+        lock.lock(); defer { lock.unlock() }
+        let id = scope + member.uuidString
+        if keys[id] == nil { guard create else { throw MopError.invalidIdentity }; keys[id] = Material(member) }
+        return TestHandle(keys[id]!)
     }
 }
-@Test func uncertainCommitReconcilesBeforeNextMutation() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let ref = try SecretReference("mop://personal/item/token")
-    _ = try await operation(f, .catalog)
-    await f.cloud.loseNextResponse()
-    await #expect(throws: MopError.cloudUncertain) { _ = try await operation(f, .write(ref, "committed", replace: true)) }
-    #expect(try await operation(f, .read(ref)).value == "committed")
-    _ = try await operation(f, .write(ref, "next", replace: true))
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-@Test func lockWhilePublishingRejectsResultAndNextUnlockAuthenticates() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let ref = try SecretReference("mop://personal/item/token")
-    _ = try await operation(f, .catalog)
-    await f.cloud.pauseHead()
-    let service = f.service, id = f.vaults[0].id.uuidString
-    let pending = Task { try await service.execute(.write(ref, "submitted", replace: true), vault: id, offline: false) }
-    for _ in 0..<500 {
-        if await f.cloud.isWaiting { break }
-        try await Task.sleep(for: .milliseconds(10))
+private actor Server {
+    struct State { var head: String; var version: Int; var revisions: [String: Data] }
+    var vaults: [UUID: State] = [:]
+    var inboxes: [String: (EnrollmentMailbox, Int)] = [:]
+    func enrollment(_ address: VaultAddress) -> EnrollmentInbox {
+        let saved = inboxes[address.binding]
+        return EnrollmentInbox(mailbox: saved?.0 ?? EnrollmentMailbox(), version: saved.map { Data(String($0.1).utf8) })
     }
-    #expect(await f.cloud.isWaiting)
-    service.lock(); #expect(!service.isAuthenticated)
-    await f.cloud.releaseHead()
-    await #expect(throws: MopError.authentication) { _ = try await pending.value }
-    #expect(try await operation(f, .read(ref)).value == "submitted")
-    #expect(f.authentications.value.withLock { $0 } == 2)
-}
-
-private final class AuthenticationBarrier: Sendable {
-    let entered = Mutex(false)
-    let invalidated = Mutex(false)
-    private let state = Mutex<(released: Bool, waiter: CheckedContinuation<Void, Never>?)>((false, nil))
-    func wait() async {
-        await withCheckedContinuation { continuation in
-            let released = state.withLock { state in
-                if state.released { return true }
-                state.waiter = continuation
-                return false
-            }
-            if released { continuation.resume() }
-        }
+    func saveEnrollment(_ value: EnrollmentMailbox, _ version: Data?, _ address: VaultAddress) throws {
+        guard enrollment(address).version == version else { throw MopError.vaultConflict }
+        inboxes[address.binding] = (value, (inboxes[address.binding]?.1 ?? 0) + 1)
     }
-    func release() {
-        let waiter = state.withLock { state in
-            state.released = true
-            let waiter = state.waiter
-            state.waiter = nil
-            return waiter
-        }
-        waiter?.resume()
+    var addresses: [UUID: VaultAddress] = [:]
+    func discover(_ account: String) -> [VaultAddress] { addresses.values.filter { $0.account == account } }
+    func remember(_ address: VaultAddress) { addresses[address.vault] = address }
+    var dropAcknowledgement = false
+    func initialize(_ root: VerifiedVault) throws {
+        guard vaults[root.id] == nil else { throw MopError.vaultConflict }
+        vaults[root.id] = State(head: root.digest, version: 1, revisions: [root.digest: root.bytes])
     }
-}
-@Test func lockCancelsPendingAuthenticationWithoutInstallingItsDevice() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let barrier = AuthenticationBarrier()
-    let cloud = f.cloud
-    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { cloud }, authenticate: { register in
-        try register { barrier.invalidated.withLock { $0 = true }; barrier.release() }
-        barrier.entered.withLock { $0 = true }
-        await barrier.wait()
-        return {}
-    })
-    let id = f.vaults[0].id.uuidString
-    let pending = Task { try await service.execute(.catalog, vault: id, offline: false) }
-    for _ in 0..<500 {
-        if barrier.entered.withLock({ $0 }) { break }
-        try await Task.sleep(for: .milliseconds(5))
+    func head(_ id: UUID) throws -> RevisionHead { guard let value = vaults[id] else { throw MopError.vaultMissing }; return RevisionHead(digest: value.head, version: Data(String(value.version).utf8)) }
+    func revision(_ digest: String, _ id: UUID) throws -> Data { guard let bytes = vaults[id]?.revisions[digest] else { throw MopError.vaultMissing }; return bytes }
+    func upload(_ bytes: Data, _ digest: String, _ id: UUID) throws { guard vaults[id] != nil, Codec.digest(bytes) == digest else { throw MopError.invalidVault }; vaults[id]!.revisions[digest] = bytes }
+    func publish(_ digest: String, _ version: Data, _ id: UUID) throws {
+        guard var value = vaults[id], version == Data(String(value.version).utf8) else { throw MopError.vaultConflict }
+        guard value.revisions[digest] != nil else { throw MopError.invalidVault }
+        value.head = digest; value.version += 1; vaults[id] = value
+        if dropAcknowledgement { dropAcknowledgement = false; throw MopError.cloudUnavailable }
     }
-    #expect(barrier.entered.withLock { $0 })
-    service.lock()
-    #expect(barrier.invalidated.withLock { $0 })
-    await #expect(throws: MopError.authentication) { _ = try await pending.value }
-    #expect(!service.isAuthenticated)
+    func dropNext() { dropAcknowledgement = true }
+    func delete(_ id: UUID) { vaults[id] = nil }
 }
-
-@Test func cancelledAsyncAuthenticationAllowsAnotherFill() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let attempts = Counter()
-    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
-        await Task.yield()
-        let attempt = attempts.value.withLock { $0 += 1; return $0 }
-        if attempt == 1 { throw MopError.authentication }
-        return {}
-    })
-    defer { service.lock() }
-    let id = f.vaults[0].id.uuidString
-    await #expect(throws: MopError.authentication) {
-        _ = try await service.execute(.catalog, vault: id, offline: true)
+private struct Transport: VaultTransport {
+    let server: Server, accountID: String
+    func enrollment(at address: VaultAddress) async throws -> EnrollmentInbox { await server.enrollment(address) }
+    func saveEnrollment(_ mailbox: EnrollmentMailbox, version: Data?, at address: VaultAddress) async throws { try await server.saveEnrollment(mailbox, version, address) }
+    func discover() async throws -> [VaultAddress] { await server.discover(accountID) }
+    func account() async throws -> String { accountID }
+    func validateOfflineAccount() async throws {}
+    func initialize(_ genesis: VerifiedVault, at address: VaultAddress) async throws { try await server.initialize(genesis); await server.remember(address) }
+    func head(at address: VaultAddress) async throws -> RevisionHead { try await server.head(address.vault) }
+    func revision(_ digest: String, at address: VaultAddress) async throws -> Data { try await server.revision(digest, address.vault) }
+    func upload(_ bytes: Data, digest: String, at address: VaultAddress) async throws { try await server.upload(bytes, digest, address.vault) }
+    func publish(_ digest: String, expectedVersion: Data, at address: VaultAddress) async throws { try await server.publish(digest, expectedVersion, address.vault) }
+    func share(with account: String, role: MemberRole, at address: VaultAddress) async throws -> URL { URL(string: "https://www.icloud.com/share/model")! }
+    func reconcileShare(_ membership: Membership, at address: VaultAddress) async throws {}
+    func acceptShare(_ url: URL, vault: UUID, expectedOwner: String) async throws -> VaultAddress { try VaultAddress(container: "iCloud.test", environment: "Development", account: accountID, database: .shared, owner: "a", vault: vault) }
+    func delete(at address: VaultAddress) async throws { await server.delete(address.vault) }
+}
+private struct Configuration: VaultPlatformConfiguration {
+    let stateDirectory: URL
+    func cloudConfiguration() -> (container: String, environment: String) { ("iCloud.test", "Development") }
+}
+private final class Counter: @unchecked Sendable {
+    private let mutex = NSLock()
+    private var value = 0
+    func withLock<T>(_ body: (inout Int) -> T) -> T { mutex.lock(); defer { mutex.unlock() }; return body(&value) }
+}
+private final class Client {
+    let state = FileManager.default.temporaryDirectory.appendingPathComponent("mop-v6-service-test-" + UUID().uuidString)
+    let hardware = TestHardware()
+    let calls = Counter()
+    let server: Server, account: String
+    var service: NativeVaultService!
+    init(_ server: Server, _ account: String) {
+        self.server = server; self.account = account
+        reopen()
     }
-    #expect(!service.isAuthenticated)
-    let result = try await service.execute(.read(SecretReference("mop://personal/item/token")), vault: id, offline: true)
-    #expect(result.value == "value")
-    #expect(attempts.value.withLock { $0 } == 2)
-}
-@Test func nativeExportPreservesNoOverwriteAndStateDirectoryProtection() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mopfile")
-    defer { try? FileManager.default.removeItem(at: output) }
-    _ = try await operation(f, .export(output))
-    let exported = try Data(contentsOf: output)
-    #expect(try VaultDocument.decode(exported).header.vaultID == f.vaults[0].id)
-    await #expect(throws: (any Error).self) { _ = try await operation(f, .export(output)) }
-    #expect(try Data(contentsOf: output) == exported)
-    await #expect(throws: (any Error).self) { _ = try await operation(f, .export(f.directory.appendingPathComponent("backup"))) }
-}
-
-@Test func concurrentMutationsHoldPermitAcrossCloudSuspensions() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    let service = f.service, id = f.vaults[0].id.uuidString
-    let ref = try SecretReference("mop://personal/item/token")
-    await f.cloud.pauseHead()
-    let first = Task { try await service.execute(.write(ref, "first", replace: true), vault: id, offline: false) }
-    for _ in 0..<500 {
-        if await f.cloud.isWaiting { break }
-        try await Task.sleep(for: .milliseconds(5))
+    func reopen() {
+        let hardware = hardware, calls = calls
+        service = NativeVaultService(state: state, configuration: Configuration(stateDirectory: state), transport: Transport(server: server, accountID: account),
+            openDevice: { try hardware.open($0, $1, $2, $3) }, deleteDevice: { try hardware.remove($0, $1) }, authenticate: { callback in
+                calls.withLock { $0 += 1 }; let context = LAContext(); try callback(context); return context
+            })
     }
-    #expect(await f.cloud.isWaiting)
-    let second = Task { try await service.execute(.write(ref, "second", replace: true), vault: id, offline: false) }
-    // Give the second operation an opportunity to enter while the first is
-    // suspended; without the permit it would collide with the live writer lease.
-    try await Task.sleep(for: .milliseconds(30))
-    await f.cloud.releaseHead()
-    _ = try await first.value
-    _ = try await second.value
-    #expect(try await operation(f, .read(ref)).value == "second")
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-
-@Test func passwordScoresReturnNoPlaintextAndNeverOpenALockedSession() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    var catalog = try await operation(f, .catalog).requireCatalog()
-    catalog.items[0].fields[0].type = .password
-    catalog.items[0].fields[0].value = "password"
-    _ = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: catalog.items[0], create: false)))
-    let result = try await operation(f, .passwordQuality(item: "item"))
-    #expect(result.passwordQuality["token"] != nil)
-    #expect(result.value == nil && result.catalog == nil && result.message.isEmpty)
-    #expect(f.authentications.value.withLock { $0 } == 1)
-    f.service.lock()
-    await #expect(throws: MopError.authentication) { _ = try await operation(f, .passwordQuality(item: "item")) }
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-
-@Test func nativeTrashRestoreAndOfflineRestrictions() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let initial = try await operation(f, .catalog).requireCatalog()
-    let deleted = try await operation(f, .trashItem(name: "item", revision: initial.revision))
-    #expect(try deleted.requireCatalog().items.isEmpty)
-    let archived = try #require(deleted.deletedCatalog?.items.first)
-    let deletion = try #require(archived.deletion)
-    #expect(deletion.originalName == "item")
-    #expect(try await operation(f, .recentlyDeleted).deletedCatalog?.items.count == 1)
-    let restored = try await operation(f, .restoreItem(id: deletion.id, revision: deleted.requireCatalog().revision))
-    #expect(try restored.requireCatalog().items.map(\.name) == ["item"])
-    #expect(restored.deletedCatalog?.items.isEmpty == true)
-    #expect(f.authentications.value.withLock { $0 } == 1)
-    f.service.lock()
-    _ = try await operation(f, .catalog, offline: true)
-    await #expect(throws: MopError.offlineWrite) {
-        _ = try await operation(f, .trashItem(name: "item", revision: restored.requireCatalog().revision), offline: true)
+    deinit { try? FileManager.default.removeItem(at: state) }
+    func request(_ recovery: Bool = false) async throws -> (Data, DeviceRequest) {
+        let result = try await service.execute(.manage(.deviceRequest(recovery: recovery)), vault: nil)
+        let bytes = try #require(result.document)
+        return (bytes, try ExchangeFile.decode(DeviceRequest.self, from: bytes))
     }
 }
-
-@Test func uncertainTrashCommitReconcilesWithoutDuplicatingDeletedItem() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let catalog = try await operation(f, .catalog).requireCatalog()
-    await f.cloud.loseNextResponse()
-    // The cloud layer may reconcile a committed head immediately, or surface uncertainty.
-    do { _ = try await operation(f, .trashItem(name: "item", revision: catalog.revision)) } catch {}
-    let reconciled = try await operation(f, .catalog)
-    #expect(try reconciled.requireCatalog().items.isEmpty)
-    #expect(reconciled.deletedCatalog?.items.count == 1)
-    await #expect(throws: MopError.vaultConflict) {
-        _ = try await operation(f, .trashItem(name: "item", revision: catalog.revision))
-    }
+private func create(_ owner: Client, recovery: Client) async throws -> String {
+    let (bytes, request) = try await recovery.request(true)
+    try FileManager.default.createDirectory(at: owner.state, withIntermediateDirectories: true)
+    let file = owner.state.appendingPathComponent("recovery-request.json"); try bytes.write(to: file)
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal", recovery: file, fingerprint: request.fingerprint), vault: id)
+    return id
+}
+private func enroll(_ client: Client, owner: Client, vault: String, role: MemberRole) async throws {
+    let (request, info) = try await client.request()
+    let invitation = try await owner.service.execute(.manage(.invite(request: request, fingerprint: info.fingerprint, role: role)), vault: vault)
+    let bytes = try #require(invitation.document), packet = try ExchangeFile.decode(InvitationPacket.self, from: bytes)
+    let accepted = try await client.service.execute(.manage(.accept(packet: bytes, checkpoint: packet.invitation.checkpoint, shareURL: URL(string: "https://www.icloud.com/share/model"))), vault: nil)
+    _ = try await owner.service.execute(.manage(.approve(packet: #require(accepted.document), fingerprint: info.fingerprint)), vault: vault)
 }
 
-@Test func onlineCatalogPurgesExpiredTrashFromCloudSnapshot() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let vault = f.vaults[0]
-    let remote = try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.key)
-    defer { remote.close() }
-    try await remote.trashItem(name: "item", revision: remote.catalog().revision,
-                               at: Date().addingTimeInterval(-ItemDeletion.retention - 10))
-    #expect(try VaultDocument.decode(remote.snapshot).records.count == 1)
-    let result = try await operation(f, .catalog)
-    #expect(try result.requireCatalog().items.isEmpty && result.deletedCatalog?.items.isEmpty == true)
-    #expect(try VaultDocument.decode(await vault.sync()).records.isEmpty)
+@Test func integratedTwoAccountsFourDevicesRemovalAndHardwareRecoveryModel() async throws {
+    let cloud = Server()
+    let owner = Client(cloud, "a"), a2 = Client(cloud, "a"), b1 = Client(cloud, "b"), b2 = Client(cloud, "b"), recovery = Client(cloud, "a")
+    let id = try await create(owner, recovery: recovery)
+    let reference = try SecretReference("mop://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "secret"), replace: false), vault: id)
+    try await enroll(a2, owner: owner, vault: id, role: .owner)
+    try await enroll(b1, owner: owner, vault: id, role: .editor)
+    try await enroll(b2, owner: owner, vault: id, role: .editor)
+    #expect(try await b1.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "secret"))
+    let (_, b1Request) = try await b1.request()
+    _ = try await owner.service.execute(.manage(.removeDevice(b1Request.device.device)), vault: id)
+    await #expect(throws: MopError.deviceRemoved) { try await b1.service.execute(.read(reference), vault: id) }
+    #expect(try await b2.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "secret"))
+    _ = try await owner.service.execute(.manage(.removeMember(b1Request.device.member)), vault: id)
+    await #expect(throws: MopError.deviceRemoved) { try await b2.service.execute(.read(reference), vault: id) }
+    let backup = FileManager.default.temporaryDirectory.appendingPathComponent("mop-v6-backup-test-" + UUID().uuidString + ".json")
+    defer { try? FileManager.default.removeItem(at: backup) }
+    _ = try await owner.service.execute(.export(backup), vault: id)
+    let checkpoint = try await owner.service.execute(.manage(.fingerprint), vault: id).message
+    let replacement = Client(cloud, "a"), nextRecovery = Client(cloud, "a")
+    let ownerRequest = try await replacement.request().0, recoveryRequest = try await nextRecovery.request(true).0
+    let recovered = try await recovery.service.execute(.manage(.recoverHardware(backup: Data(contentsOf: backup), checkpoint: checkpoint,
+        owner: ownerRequest, recovery: recoveryRequest, copy: false)), vault: nil)
+    let bytes = try #require(recovered.document)
+    _ = try await replacement.service.execute(.manage(.importCheckpoint(document: bytes, fingerprint: Codec.digest(bytes), sharedOwner: nil)), vault: nil)
+    #expect(try await replacement.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "secret"))
+    await #expect(throws: MopError.deviceRemoved) { try await owner.service.execute(.read(reference), vault: id) }
 }
 
-@Test func readsReportCurrentFieldConcealmentForClipboardPolicy() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let ref = try SecretReference("mop://personal/item/token")
-    #expect(try await operation(f, .read(ref)).valueIsConcealed)
-    var catalog = try await operation(f, .catalog).requireCatalog()
-    catalog.items[0].fields[0].type = .text
-    _ = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: catalog.items[0], create: false)))
-    #expect(try await !operation(f, .read(ref)).valueIsConcealed)
-}
-
-@Test func unchangedUnlockedVaultsReuseAuthenticationWhenReadingAndSwitching() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    _ = try await operation(f, .catalog, index: 1)
-    for _ in 0..<3 {
-        for (index, name) in ["personal", "work"].enumerated() {
-            _ = try await operation(f, .catalog, index: index)
-            #expect(try await operation(f, .read(SecretReference("mop://" + name + "/item/token")), index: index).value == "value")
-        }
-    }
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-
-@Test func preparedCreationRequiresExportAndRetainsIdentity() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "prepared", state: f.directory)
-    let reloaded = try PendingVaultCreation.prepare(name: "prepared", state: f.directory)
-    #expect(intent.id == reloaded.id)
-    let key = try RecoveryKey(file: PendingVaultCreation.recoveryURL(state: f.directory)).publicKey
-    await #expect(throws: MopError.invalidRecovery) {
-        try await f.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
-    }
-    #expect(!(await f.cloud.zones()).contains(intent.id))
-    let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
-    defer { try? FileManager.default.removeItem(at: output) }
-    try intent.export(to: output, state: f.directory)
-    #expect(try RecoveryKey(file: output).publicKey == key)
-    #expect(throws: MopError.outputExists) { try intent.export(to: output, state: f.directory) }
-    #expect(try RecoveryKey(file: output).publicKey == key)
-    let result = try await f.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
-    #expect(try result.requireCatalog().vault == "prepared")
-    #expect(try PendingVaultCreation.load(state: f.directory) == nil)
-    #expect(FileManager.default.fileExists(atPath: output.path))
-}
-
-@Test func preparedCreationReconcilesLostResponseWithoutNewKeyOrVault() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "interrupted", state: f.directory)
-    let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
-    defer { try? FileManager.default.removeItem(at: output) }
-    try intent.export(to: output, state: f.directory)
-    await f.cloud.loseNextResponse()
-    await #expect(throws: MopError.cloudUncertain) {
-        try await f.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
-    }
-    let pending = try #require(try PendingVaultCreation.load(state: f.directory))
-    #expect(pending.id == intent.id && pending.submitted)
-    let snapshot = try #require(pending.snapshot)
-    f.service.lock()
-    let result = try await f.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
-    #expect(try result.requireCatalog().vault == "interrupted")
-    let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
-    #expect(try await repo.vault(intent.id).sync() == snapshot)
-    #expect(try PendingVaultCreation.load(state: f.directory) == nil)
-}
-
-@Test func submittedCreationCannotResurrectDeletedVault() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    var intent = try PendingVaultCreation.prepare(name: "removed", state: f.directory)
-    let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".key")
-    defer { try? FileManager.default.removeItem(at: output) }
-    try intent.export(to: output, state: f.directory)
-    await f.cloud.loseNextResponse()
-    await #expect(throws: MopError.cloudUncertain) {
-        try await f.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
-    }
-    await f.cloud.deleteZone(intent.id)
-    await #expect(throws: MopError.cloudUncertain) {
-        try await f.service.execute(.createPrepared, vault: intent.id.uuidString, offline: false)
-    }
-    #expect(!(await f.cloud.zones()).contains(intent.id))
-    #expect(try PendingVaultCreation.load(state: f.directory)?.id == intent.id)
-}
-
-@Test func recoveryImportStagesBoundedPrivateCopyWithoutChangingSource() throws {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    try SafeFile.privateDirectory(directory)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let source = directory.appendingPathComponent("source.key")
-    let recovery = RecoveryKey()
-    try recovery.save(to: source)
-    let staged = try DocumentAccess.importRecovery(source, state: directory.appendingPathComponent("state"))
-    #expect(staged != source)
-    #expect(try RecoveryKey(file: staged).publicKey == recovery.publicKey)
-    #expect(try RecoveryKey(file: source).publicKey == recovery.publicKey)
-    let large = directory.appendingPathComponent("large.key")
-    try SafeFile.write(Data(repeating: 65, count: 1025), to: large)
-    #expect(throws: MopError.invalidVault) { try DocumentAccess.importRecovery(large, state: directory.appendingPathComponent("state")) }
-}
-
-private final class TestIdentityKeys: IdentityKeyStore, Sendable {
-    let values = Mutex<[String: Data]>([:])
-    func read(scope: String, id: UUID) throws -> Data? { values.withLock { $0[scope + id.uuidString] } }
-    func insert(_ material: Data, scope: String, id: UUID) throws {
-        try values.withLock {
-            let key = scope + id.uuidString
-            guard $0[key] == nil || $0[key] == material else { throw MopError.invalidIdentity }
-            $0[key] = material
-        }
-    }
-}
-
-@Test func synchronizedIdentityOpensAllVaultsOnUnenrolledDevice() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let keys = f.keys
-    let existing = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _ in {} })
-    defer { existing.lock() }
-    for vault in f.vaults { _ = try await existing.execute(.catalog, vault: vault.id.uuidString) }
-    let count = Counter()
-    let fresh = NativeVaultService(state: f.directory.appendingPathComponent("new-device"), identityKeys: keys, transport: { f.cloud }, authenticate: { _ in
-        count.value.withLock { $0 += 1 }; return {}
-    })
-    defer { fresh.lock() }
-    let discovered = try await fresh.execute(.discover, vault: nil)
-    #expect(discovered.vaults.count == 2 && discovered.vaults.allSatisfy { $0.enrolled && $0.format == "mop-vault-v5" })
-    for vault in f.vaults {
-        let catalog = try await fresh.execute(.catalog, vault: vault.id.uuidString).requireCatalog()
-        let read = try await fresh.execute(.read(SecretReference(vault: catalog.vault, item: "item", field: "token")), vault: vault.id.uuidString)
-        #expect(read.value == "value")
-        let members = try await fresh.execute(.members, vault: vault.id.uuidString)
-        #expect(members.members.count == 1 && members.members[0].role == "owner")
-    }
-    #expect(count.value.withLock { $0 } == 1)
-    fresh.lock()
-    _ = try await fresh.execute(.catalog, vault: f.vaults[0].id.uuidString)
-    #expect(count.value.withLock { $0 } == 2)
-    let waiting = NativeVaultService(state: f.directory.appendingPathComponent("waiting-device"), identityKeys: TestIdentityKeys(), transport: { f.cloud }, authenticate: { _ in {} })
-    defer { waiting.lock() }
-    await #expect(throws: MopError.identityPending) { try await waiting.execute(.catalog, vault: f.vaults[0].id.uuidString) }
-}
-
-
-@Test func newAccountVaultHasOnlyOwnerAndRecoveryFromItsFirstRevision() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let keys = f.keys
-    let service = NativeVaultService(state: f.directory, identityKeys: keys, transport: { f.cloud }, authenticate: { _ in {} })
-    defer { service.lock() }
-    let recoveryFile = f.directory.appendingPathExtension("account-recovery.key")
-    defer { try? FileManager.default.removeItem(at: recoveryFile) }
-    let id = UUID()
-    _ = try await service.execute(.create(name: "account-vault", recovery: recoveryFile), vault: id.uuidString)
-    let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
-    let vault = try repo.vault(id)
-    #expect(try await vault.revisions().count == 1)
-    let snapshot = try await vault.sync(), document = try VaultDocument.decode(snapshot)
-    #expect(document.header.format == "mop-vault-v5")
-    #expect(Set(document.header.recipients.map(\.kind)) == ["member", "recovery"])
-    let recovery = try RecoveryKey(file: recoveryFile)
-    let recovered = try CloudSecretStore(vault: vault, snapshot: snapshot, opener: recovery)
-    #expect(try recovered.catalog().vault == "account-vault")
-}
-
-@Test func unavailableCloudAutomaticallyUsesVerifiedCacheAndReconnects() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let ref = try SecretReference("mop://personal/item/token")
-    _ = try await operation(f, .catalog)
-    await f.cloud.fail(with: .cloudUnavailable)
-    _ = try await operation(f, .catalog)
-    let cached = try await operation(f, .read(ref))
-    #expect(cached.usingCache && cached.offlineDate != nil)
-    #expect(try cached.value?.withUnsafeBytes { String(decoding: $0, as: UTF8.self) } == "value")
-    #expect(f.service.isAuthenticated)
-    await #expect(throws: MopError.cloudUnavailable) {
-        _ = try await operation(f, .write(ref, "must not queue", replace: true))
-    }
-    await f.cloud.fail(with: nil)
-    let online = try await operation(f, .catalog)
-    #expect(!online.usingCache && online.offlineDate == nil)
-    #expect(f.authentications.value.withLock { $0 } == 1)
-}
-@Test func cacheFallbackNeverMasksPermissionAccountOrMissingVaultErrors() async throws {
-    for failure in [MopError.cloudPermission, .cloudAccount, .vaultMissing, .invalidVault] {
-        let f = try await fixture()
-        _ = try await operation(f, .catalog)
-        await f.cloud.fail(with: failure)
-        await #expect(throws: failure) { _ = try await operation(f, .catalog) }
-        f.cleanup()
-    }
-}
-@Test func automaticCacheReadSurvivesLockAndRestart() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    _ = try await operation(f, .catalog)
-    f.service.lock()
-    await f.cloud.fail(with: .cloudUnavailable)
-    let result = try await operation(f, .catalog)
-    #expect(result.usingCache && result.catalog != nil)
-    #expect(f.service.isAuthenticated)
-}
-
-@Test func nativeAccountAccessIgnoresLegacyDeviceMetadata() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    // Invalid legacy metadata would have failed the former LocalDevice path.
-    try SafeFile.write(Data("not a legacy credential".utf8), to: f.directory.appendingPathComponent("device.json"))
-    let discovered = try await f.service.execute(.discover, vault: nil)
-    #expect(discovered.vaults.count == 2 && discovered.vaults.allSatisfy(\.enrolled))
-    #expect(try await operation(f, .read(SecretReference("mop://personal/item/token"))).value == "value")
-    #expect(try SafeFile.read(f.directory.appendingPathComponent("device.json")) == Data("not a legacy credential".utf8))
-}
-
-@Test func autoFillExportSupportsAuthenticatedOfflineFillAndDeletion() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let id = f.vaults[0].id.uuidString
-    let catalog = try await operation(f, .catalog).requireCatalog()
-    let item = VaultItem(name: "Website", type: .login, fields: [
-        ItemField(path: "username", type: .username, value: "alice"),
-        ItemField(path: "password", type: .password, value: "secret-password"),
-        ItemField(path: "website", type: .website, value: "https://example.com")])
-    let saved = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true))).requireCatalog()
+@Test func integratedTypedCatalogAutoFillAndConflicts() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), recovery = Client(cloud, "a")
+    let id = try await create(owner, recovery: recovery)
+    let initial = try await owner.service.execute(.catalog, vault: id).requireCatalog()
+    let item = VaultItem(name: "login", type: .login, fields: [ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "website", type: .website, value: "https://example.com"), ItemField(path: "password", type: .password, value: "secret")])
+    let edit = ItemEdit(revision: initial.revision, item: item, create: true)
+    let saved = try await owner.service.execute(.save(edit), vault: id).requireCatalog()
+    #expect(saved.items[0].fields.first { $0.type == .password }?.value == nil)
     let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
-    let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
-    let exported = f.directory.appendingPathComponent("extension")
-    try repo.exportAutoFillSnapshot(f.vaults[0].id, expected: f.vaults[0].cached().0, to: exported)
-    let count = Counter()
-    let extensionService = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
-        count.value.withLock { $0 += 1 }; return {}
-    })
-    defer { extensionService.lock() }
-    let credential = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: extensionService)
-    #expect(credential.user == "alice")
-    #expect(credential.password == "secret-password")
-    #expect(count.value.withLock { $0 } == 1)
-    extensionService.lock()
-    try repo.removeAutoFillSnapshot(id, in: exported)
-    await #expect(throws: MopError.vaultMissing) {
-        _ = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: extensionService)
-    }
-}
-
-@Test func autoFillRequiresAuthenticationAndRejectsStaleUsernames() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let id = f.vaults[0].id.uuidString
-    let original = try await operation(f, .catalog).requireCatalog()
-    var item = VaultItem(name: "Login", type: .login, fields: [
-        ItemField(path: "username", type: .username, value: "alice"),
-        ItemField(path: "password", type: .password, value: "secret"),
-        ItemField(path: "website", type: .website, value: "example.com")])
-    let saved = try await operation(f, .save(ItemEdit(revision: original.revision, item: item, create: true))).requireCatalog()
-    let old = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
-    let denied = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })
-    defer { denied.lock() }
-    await #expect(throws: MopError.authentication) {
-        _ = try await AutoFillAccess.credential(recordIdentifier: old.recordIdentifier, service: denied)
-    }
-    item.fields[0].value = "bob"
-    _ = try await operation(f, .save(ItemEdit(revision: saved.revision, item: item, create: false)))
-    await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.credential(recordIdentifier: old.recordIdentifier, service: f.service)
-    }
-}
-
-@Test func autoFillPasswordAndUsernameRequireAuthenticationForEachFill() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let id = f.vaults[0].id.uuidString
-    let catalog = try await operation(f, .catalog).requireCatalog()
-    let item = VaultItem(name: "Login", type: .login, fields: [
-        ItemField(path: "username", type: .username, value: "alice"),
-        ItemField(path: "password", type: .password, value: "secret"),
-        ItemField(path: "website", type: .website, value: "example.com")])
-    let saved = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true))).requireCatalog()
-    let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
-    let count = Counter()
-    let service = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
-        count.value.withLock { $0 += 1 }; return {}
-    })
-    let credential = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: service)
+    let before = owner.calls.withLock { $0 }
+    let credential = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: owner.service)
     #expect(credential.user == "alice" && credential.password == "secret")
-    #expect(count.value.withLock { $0 } == 1)
-    #expect(!service.isAuthenticated)
-    // Username-only insertion takes its value from this same authenticated path.
-    let username = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: service).user
-    #expect(username == "alice")
-    #expect(count.value.withLock { $0 } == 2)
-    #expect(!service.isAuthenticated)
-    let denied = NativeVaultService(state: f.directory, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })
-    await #expect(throws: MopError.authentication) {
-        _ = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: denied).user
-    }
-    #expect(!denied.isAuthenticated)
+    #expect(owner.calls.withLock { $0 } > before)
+    #expect(!owner.service.isAuthenticated)
+    await #expect(throws: MopError.vaultConflict) { try await owner.service.execute(.save(edit), vault: id) }
+    let reference = try SecretReference("mop://personal/login/username")
+    let changed = try await owner.service.execute(.write(reference, SecretBytes(utf8: "bob"), replace: true), vault: id).requireCatalog()
+    #expect(changed.items[0].fields.first { $0.type == .username }?.value == "bob")
+    await #expect(throws: MopError.notFound) { try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: owner.service) }
+    let deleted = try await owner.service.execute(.trashItem(name: "login", revision: changed.revision), vault: id)
+    #expect(deleted.catalog?.items.isEmpty == true)
+    let tombstone = try #require(deleted.deletedCatalog?.items.first?.deletion)
+    let restored = try await owner.service.execute(.restoreItem(id: tombstone.id, revision: deleted.requireCatalog().revision), vault: id)
+    #expect(restored.catalog?.items.first?.name == "login")
+}
 
-    // An obsolete locator must still be rejected after the catalog was opened.
-    let stale = String(entry.recordIdentifier.dropLast()) + (entry.recordIdentifier.last == "0" ? "1" : "0")
-    await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.credential(recordIdentifier: stale, service: service)
+@Test func integratedUncertainWriteOfflineAccountInvalidationAndReopen() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), recovery = Client(cloud, "a")
+    let id = try await create(owner, recovery: recovery), reference = try SecretReference("mop://personal/item/password")
+    await cloud.dropNext()
+    await #expect(throws: MopError.cloudUncertain) { try await owner.service.execute(.write(reference, SecretBytes(utf8: "committed"), replace: false), vault: id) }
+    owner.reopen()
+    _ = try await owner.service.execute(.sync, vault: id)
+    #expect(try await owner.service.execute(.read(reference), vault: id, offline: true).value == SecretBytes(utf8: "committed"))
+    await #expect(throws: MopError.offlineWrite) { try await owner.service.execute(.delete(reference), vault: id, offline: true) }
+    try NextAccountBinding.invalidate(state: owner.state)
+    await #expect(throws: MopError.cloudAccount) { try await owner.service.execute(.read(reference), vault: id, offline: true) }
+}
+
+@Test func invitationAddressCannotSubstituteAnotherCloudOwner() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), recipient = Client(cloud, "b"), recovery = Client(cloud, "a")
+    let id = try await create(owner, recovery: recovery)
+    let (request, identity) = try await recipient.request()
+    let issued = try await owner.service.execute(.manage(.invite(request: request, fingerprint: identity.fingerprint, role: .editor)), vault: id)
+    let packet = try ExchangeFile.decode(InvitationPacket.self, from: #require(issued.document))
+    let address = try VaultAddress(container: "iCloud.test", environment: "Development", account: "attacker", database: .private, owner: "__defaultOwner__", vault: packet.address.vault)
+    let forged = InvitationPacket(request: packet.request, invitation: packet.invitation, address: address, checkpoint: packet.checkpoint)
+    await #expect(throws: MopError.vaultUntrusted) {
+        try await recipient.service.execute(.manage(.accept(packet: ExchangeFile.encode(forged), checkpoint: packet.invitation.checkpoint, shareURL: URL(string: "https://www.icloud.com/share/model"))), vault: nil)
     }
+}
+
+private actor AuthenticationGate {
+    var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async { entered = true; await withCheckedContinuation { continuation = $0 } }
+    func release() { continuation?.resume(); continuation = nil }
+}
+@Test func lockingDuringAuthenticationNeverOpensDeviceKeysOrReturnsLateAuthorization() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-v6-auth-test-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let gate = AuthenticationGate(), opened = Counter()
+    let service = NativeVaultService(state: directory, configuration: Configuration(stateDirectory: directory), transport: Transport(server: Server(), accountID: "a"), openDevice: { _, _, _, _ in
+        opened.withLock { $0 += 1 }; throw MopError.invalidIdentity
+    }, authenticate: { callback in
+        let context = LAContext(); try callback(context); await gate.wait(); return context
+    })
+    let task = Task { try await service.execute(.manage(.deviceRequest(recovery: false)), vault: nil) }
+    while !(await gate.entered) { await Task.yield() }
+    service.lock(); await gate.release()
+    await #expect(throws: MopError.authentication) { try await task.value }
+    #expect(opened.withLock { $0 } == 0)
     #expect(!service.isAuthenticated)
 }
 
-@Test func autoFillCodeExportFillsOfflineAndLocks() async throws {
-    let f = try await fixture(); defer { f.cleanup() }
-    let id = f.vaults[0].id.uuidString
-    let catalog = try await operation(f, .catalog).requireCatalog()
-    let seed = "JBSWY3DPEHPK3PXP"
-    var item = VaultItem(name: "Code", type: .login, fields: [
-        ItemField(path: "username", type: .username, value: "alice"),
-        ItemField(path: "otp", type: .otp, value: seed),
-        ItemField(path: "website", type: .website, value: "example.com")])
-    let saved = try await operation(f, .save(ItemEdit(revision: catalog.revision, item: item, create: true))).requireCatalog()
-    let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
-    let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory)
-    let exported = f.directory.appendingPathComponent("code-extension")
-    try repo.exportAutoFillSnapshot(f.vaults[0].id, expected: f.vaults[0].cached().0, to: exported)
-    await f.cloud.fail(with: .cloudUnavailable)
-    let count = Counter()
-    let service = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in
-        count.value.withLock { $0 += 1 }; return {}
-    })
-    let before = Date()
-    let credential = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
-    let after = Date()
-    let otp = try TimeBasedOTP(seed)
-    let expectedCodes = try [otp.code(at: before), otp.code(at: after)]
-    #expect(expectedCodes.contains(credential.code))
-    #expect(credential.code != seed)
-    #expect(count.value.withLock { $0 } == 1)
-    #expect(!service.isAuthenticated)
-    await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: service)
+@Test func firstDeviceCreatesWithoutRecoveryAndDiscoveryDoesNotGrantAccess() async throws {
+    let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a"), other = Client(server, "b")
+    #expect(try await owner.service.execute(.discover, vault: nil).vaults.isEmpty)
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let reference = try SecretReference("mop://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "hello"), replace: false), vault: id)
+    let discovery = try await newDevice.service.execute(.discover, vault: nil)
+    #expect(discovery.vaults.count == 1)
+    #expect(discovery.vaults[0].id == id && !discovery.vaults[0].enrolled)
+    #expect(discovery.defaultVault == nil)
+    #expect(newDevice.calls.withLock { $0 } == 0)
+    #expect(try await other.service.execute(.discover, vault: nil).vaults.isEmpty)
+    let (request, info) = try await other.request()
+    await #expect(throws: MopError.invalidIdentity) {
+        try await owner.service.execute(.manage(.inviteOwnDevice(request: request, fingerprint: info.fingerprint)), vault: id)
     }
-    #expect(!service.isAuthenticated)
-    let denied = NativeVaultService(state: exported, identityKeys: f.keys, transport: { f.cloud }, authenticate: { _ in throw MopError.authentication })
-    await #expect(throws: MopError.authentication) {
-        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: denied)
+    let (ownRequest, ownInfo) = try await newDevice.request()
+    await #expect(throws: MopError.invalidIdentity) {
+        try await owner.service.execute(.manage(.inviteAccount(request: ownRequest, fingerprint: ownInfo.fingerprint, role: .editor)), vault: id)
     }
-    #expect(!denied.isAuthenticated)
-    let stale = String(entry.recordIdentifier.dropLast()) + (entry.recordIdentifier.last == "0" ? "1" : "0")
-    await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: stale, service: service)
-    }
-    #expect(!service.isAuthenticated)
-    try repo.removeAutoFillSnapshot(id, in: exported)
-    await #expect(throws: MopError.vaultMissing) {
-        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: service)
-    }
-    #expect(!service.isAuthenticated)
+    try await enroll(newDevice, owner: owner, vault: id, role: .owner)
+    #expect(try await newDevice.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "hello"))
+    let recovery = Client(server, "a")
+    let (recoveryRequest, recoveryInfo) = try await recovery.request(true)
+    _ = try await owner.service.execute(.manage(.replaceRecovery(request: recoveryRequest, fingerprint: recoveryInfo.fingerprint)), vault: id)
+    #expect(try await owner.service.execute(.members, vault: id).members.contains { $0.role.hasPrefix("hardware recovery") })
+}
 
-    // Current catalog changes invalidate the old code locator.
-    await f.cloud.fail(with: nil)
-    item.fields[0].value = "bob"
-    _ = try await operation(f, .save(ItemEdit(revision: saved.revision, item: item, create: false)))
-    await #expect(throws: MopError.notFound) {
-        _ = try await AutoFillAccess.oneTimeCode(recordIdentifier: entry.recordIdentifier, service: f.service)
+@Test func cloudEnrollmentNeedsOwnerApprovalAndSurvivesReopening() async throws {
+    let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let reference = try SecretReference("mop://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "hello"), replace: false), vault: id)
+    let request = try await newDevice.service.execute(.manage(.requestEnrollment(name: "New Mac")), vault: id)
+    #expect(request.enrollments.count == 1)
+    let offer = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    #expect(offer.enrollments.count == 1 && offer.enrollments[0].acceptance == nil)
+    let response = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id)
+    #expect(response.enrollments[0].verificationCode == offer.enrollments[0].verificationCode)
+    #expect(try await newDevice.service.execute(.discover, vault: nil).vaults[0].enrolled == false)
+    let pending = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    let exchange = try #require(pending.enrollments.first), code = try #require(exchange.verificationCode)
+    await #expect(throws: MopError.vaultConflict) { try await owner.service.execute(.manage(.approveEnrollment(id: exchange.id, code: "wrong")), vault: id) }
+    #expect(try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted == false)
+    _ = try await newDevice.service.execute(.manage(.confirmEnrollment(code: code)), vault: id)
+    newDevice.reopen()
+    _ = try await owner.service.execute(.manage(.approveEnrollment(id: exchange.id, code: code)), vault: id)
+    #expect(try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted)
+    #expect(try await newDevice.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "hello"))
+}
+
+@Test func cloudEnrollmentConflictsRequireFreshComparisonAndDeclineGrantsNothing() async throws {
+    let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a"), stranger = Client(server, "b")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    await #expect(throws: MopError.vaultMissing) { try await stranger.service.execute(.manage(.requestEnrollment(name: "stranger")), vault: id) }
+    _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "New Mac")), vault: id)
+    _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    let first = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollments[0]
+    let reference = try SecretReference("mop://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "change"), replace: false), vault: id)
+    await #expect(throws: MopError.vaultConflict) { try await owner.service.execute(.manage(.approveEnrollment(id: first.id, code: first.verificationCode!)), vault: id) }
+    _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    let second = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollments[0]
+    #expect(first.verificationCode != second.verificationCode)
+    _ = try await owner.service.execute(.manage(.rejectEnrollment(id: second.id)), vault: id)
+    #expect(try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted == false)
+    #expect(try await owner.service.execute(.manage(.enrollmentInbox), vault: id).enrollments.isEmpty)
+}
+
+@Test func anotherOwnerCanApproveAndRetryAnUncertainEnrollmentCommit() async throws {
+    let server = Server(), owner = Client(server, "a"), approver = Client(server, "a"), newDevice = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    try await enroll(approver, owner: owner, vault: id, role: .owner)
+    _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "New Mac")), vault: id)
+    _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    let reply = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollments[0]
+    _ = try await newDevice.service.execute(.manage(.confirmEnrollment(code: reply.verificationCode!)), vault: id)
+    await server.dropNext()
+    await #expect(throws: (any Error).self) { try await approver.service.execute(.manage(.approveEnrollment(id: reply.id, code: reply.verificationCode!)), vault: id) }
+    #expect(try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted == false)
+    _ = try await approver.service.execute(.manage(.approveEnrollment(id: reply.id, code: reply.verificationCode!)), vault: id)
+    #expect(try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted)
+}
+
+@Test func sameAccountCloudApprovalCompletesWithoutConfirmation() async throws {
+    let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "New Mac")), vault: id)
+    _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    let response = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollments[0]
+    _ = try await owner.service.execute(.manage(.approveEnrollment(id: response.id, code: response.verificationCode!)), vault: id)
+    let address = try #require(await server.discover("a").first)
+    let inbox = await server.enrollment(address)
+    var forged = inbox.mailbox
+    forged.exchanges[0].confirmedCode = response.verificationCode
+    try await server.saveEnrollment(forged, inbox.version, address)
+    #expect(try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted)
+    #expect(try await newDevice.service.execute(.discover, vault: nil).vaults[0].enrolled == true)
+}
+
+@Test func malformedRegistryFailsWithTypedErrorAndPreservesItsBytes() async throws {
+    let server = Server(), owner = Client(server, "a")
+    _ = try await owner.service.execute(.create(name: "personal"), vault: UUID().uuidString)
+    let member = AccountScope.member(container: "iCloud.test", environment: "Development", account: "a")
+    let file = owner.state.appendingPathComponent("v6/" + member.uuidString + "/vaults.json")
+    var rows = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [[String: Any]]
+    var address = rows[0]["address"] as! [String: Any]
+    address.removeValue(forKey: "namespace"); rows[0]["address"] = address
+    let bytes = try JSONSerialization.data(withJSONObject: rows)
+    try LocalFile.write(bytes, to: file, replace: true)
+    await #expect(throws: MopError.invalidVault) { try await owner.service.execute(.discover, vault: nil) }
+    #expect(try Data(contentsOf: file) == bytes)
+}
+
+@Test func enrollmentRestartRetiresOldRequestAndPreservesDeviceKeys() async throws {
+    let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: id)
+    _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    let old = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollments[0]
+    _ = try await newDevice.service.execute(.manage(.confirmEnrollment(code: old.verificationCode!)), vault: id)
+    let fresh = try await newDevice.service.execute(.manage(.restartEnrollment(name: "iPad")), vault: id).enrollments[0]
+    #expect(fresh.id != old.id)
+    #expect(fresh.request.request.device == old.request.request.device)
+    #expect(fresh.confirmedCode == nil && fresh.verificationCode == nil)
+    let pending = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    #expect(pending.enrollments.map(\.id) == [fresh.id])
+    await #expect(throws: MopError.invalidIdentity) { try await owner.service.execute(.manage(.approveEnrollment(id: old.id, code: old.verificationCode!)), vault: id) }
+    _ = try await newDevice.service.execute(.manage(.cancelEnrollment), vault: id)
+    newDevice.reopen()
+    let cancelled = try await newDevice.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: id)
+    #expect(cancelled.enrollments[0].rejected)
+    #expect(try await owner.service.execute(.manage(.enrollmentInbox), vault: id).enrollments.isEmpty)
+    let retry = try await newDevice.service.execute(.manage(.restartEnrollment(name: "iPad")), vault: id).enrollments[0]
+    #expect(retry.id != fresh.id && retry.request.request.device == fresh.request.request.device)
+}
+
+@Test func removedCloudInvitationClearsTheCachedComparisonCode() async throws {
+    let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: id)
+    _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    let offer = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollments[0]
+    _ = try await newDevice.service.execute(.manage(.confirmEnrollment(code: offer.verificationCode!)), vault: id)
+    let address = try #require(await server.discover("a").first)
+    let inbox = await server.enrollment(address)
+    var mailbox = inbox.mailbox
+    mailbox.exchanges[0].invitation = nil; mailbox.exchanges[0].acceptance = nil
+    try await server.saveEnrollment(mailbox, inbox.version, address)
+    let result = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id)
+    #expect(result.enrollments[0].verificationCode == nil)
+    #expect(result.enrollments[0].confirmedCode == nil)
+    #expect(!result.enrollmentCompleted)
+}
+
+@Test func automaticEnrollmentWaitsForUnlockAndGrantsWithoutConfirmation() async throws {
+    let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let reference = try SecretReference("mop://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "hello"), replace: false), vault: id)
+    _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: id)
+    owner.service.lock()
+    let calls = owner.calls.withLock { $0 }
+    await #expect(throws: MopError.authentication) {
+        try await owner.service.execute(.manage(.automaticEnrollment), vault: id)
     }
-    #expect(!f.service.isAuthenticated)
+    #expect(owner.calls.withLock { $0 } == calls)
+    _ = try await owner.service.execute(.catalog, vault: id)
+    _ = try await owner.service.execute(.manage(.automaticEnrollment), vault: id)
+    _ = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id)
+    let granted = try await owner.service.execute(.manage(.automaticEnrollment), vault: id)
+    #expect(granted.addedDevices.count == 1)
+    #expect(try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted)
+    #expect(try await newDevice.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "hello"))
+    let repeated = try await owner.service.execute(.manage(.automaticEnrollment), vault: id)
+    #expect(repeated.addedDevices == granted.addedDevices)
+}
+
+@Test func deviceRemovalClearsAccountAndRequiresExplicitFreshKeyReconnect() async throws {
+    let server = Server(), owner = Client(server, "a"), tablet = Client(server, "a")
+    let first = UUID().uuidString, second = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "one"), vault: first)
+    _ = try await owner.service.execute(.create(name: "two"), vault: second)
+    for id in [first, second] { try await enroll(tablet, owner: owner, vault: id, role: .owner) }
+    let old = try await tablet.request().1.device
+    let devices = try await owner.service.execute(.manage(.devices), vault: first).devices
+    #expect(devices.count == 2)
+    #expect(devices.first(where: { $0.id == old.device })?.isCurrent == false)
+    _ = try await owner.service.execute(.manage(.removeAccountDevice(old.device)), vault: first)
+    // Retrying a completed account removal is harmless.
+    _ = try await owner.service.execute(.manage(.removeAccountDevice(old.device)), vault: first)
+    for id in [first, second] {
+        #expect(try await owner.service.execute(.members, vault: id).devices.count == 1)
+    }
+    await #expect(throws: MopError.deviceRemoved) {
+        try await tablet.service.execute(.sync, vault: first)
+    }
+    tablet.reopen()
+    #expect(try await tablet.service.execute(.discover, vault: nil).deviceRemoved)
+    let registry = try NextRegistry(state: tablet.state, container: "iCloud.test", environment: "Development", account: "a")
+    #expect(try registry.entries().isEmpty)
+    let checkpointFiles = try FileManager.default.contentsOfDirectory(atPath: registry.cache.directory.appendingPathComponent("checkpoints").path)
+    #expect(!checkpointFiles.contains { $0.hasSuffix(".json") })
+    await #expect(throws: MopError.deviceRemoved) {
+        try await tablet.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: first)
+    }
+    await #expect(throws: MopError.deviceRemoved) {
+        try await tablet.service.execute(.catalog, vault: second, offline: true)
+    }
+    #expect(throws: MopError.invalidIdentity) {
+        try tablet.hardware.open("iCloud.test/Development/device", registry.member, LAContext(), false)
+    }
+    _ = try await tablet.service.execute(.manage(.reconnect), vault: nil)
+    _ = try await tablet.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: first)
+    let fresh = try await tablet.request().1.device
+    #expect(fresh.device != old.device && fresh.encryption != old.encryption)
+    _ = try await owner.service.execute(.manage(.automaticEnrollment), vault: first)
+    _ = try await tablet.service.execute(.manage(.checkEnrollment), vault: first)
+    _ = try await owner.service.execute(.manage(.automaticEnrollment), vault: first)
+    #expect(try await tablet.service.execute(.manage(.checkEnrollment), vault: first).enrollmentCompleted)
+}
+
+@Test func interruptedRemovalCleanupRemainsBlockedAcrossRelaunch() async throws {
+    let server = Server(), owner = Client(server, "a"), tablet = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    try await enroll(tablet, owner: owner, vault: id, role: .owner)
+    let old = try await tablet.request().1.device
+    // A second outstanding request using the old keys must never restore access.
+    _ = try await tablet.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: id)
+    _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
+    _ = try await tablet.service.execute(.manage(.checkEnrollment), vault: id)
+    await server.dropNext()
+    await #expect(throws: MopError.cloudUncertain) {
+        try await owner.service.execute(.manage(.removeAccountDevice(old.device)), vault: id)
+    }
+    _ = try await owner.service.execute(.manage(.removeAccountDevice(old.device)), vault: id)
+    let inbox = try await owner.service.execute(.manage(.automaticEnrollment), vault: id)
+    #expect(inbox.enrollments.isEmpty)
+    #expect(try await owner.service.execute(.members, vault: id).devices.count == 1)
+    tablet.hardware.blockDeletion(true)
+    await #expect(throws: MopError.deviceRemovalPending) {
+        try await tablet.service.execute(.catalog, vault: id)
+    }
+    tablet.reopen()
+    await #expect(throws: MopError.deviceRemovalPending) {
+        try await tablet.service.execute(.discover, vault: nil)
+    }
+    tablet.hardware.blockDeletion(false)
+    #expect(try await tablet.service.execute(.discover, vault: nil).deviceRemoved)
+    await #expect(throws: MopError.deviceRemoved) {
+        try await tablet.service.execute(.manage(.restartEnrollment(name: "iPad")), vault: id)
+    }
+}
+
+@Test func removingThisDeviceAndLastOwnerProtection() async throws {
+    let server = Server(), owner = Client(server, "a"), tablet = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let own = try await owner.request().1.device
+    await #expect(throws: MopError.lastOwnerDevice) {
+        try await owner.service.execute(.manage(.removeAccountDevice(own.device)), vault: id)
+    }
+    try await enroll(tablet, owner: owner, vault: id, role: .owner)
+    await #expect(throws: MopError.deviceRemoved) {
+        try await owner.service.execute(.manage(.removeAccountDevice(own.device)), vault: id)
+    }
+    #expect(try await owner.service.execute(.discover, vault: nil).deviceRemoved)
+    #expect(try await tablet.service.execute(.members, vault: id).devices.count == 1)
 }

@@ -1,14 +1,13 @@
 import ArgumentParser
 import Foundation
 import MopCore
-import MopVault
 
 @main
 struct Mop: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mop",
         abstract: "Read and manage an encrypted vault using your Mac's Secure Enclave.",
-        version: "0.5.0",
+        version: "0.6.0",
         subcommands: [Item.self, Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Completion.self, Device.self]
     )
 
@@ -138,7 +137,7 @@ struct Item: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         func run() async throws {
             let store = try await storage.open(); defer { store.close() }
-            try IO.output(String(decoding: JSONEncoder().encode(store.catalog()), as: UTF8.self) + "\n")
+            try IO.output(String(decoding: JSONEncoder().encode(await store.catalog()), as: UTF8.self) + "\n")
         }
     }
     struct Save: AsyncParsableCommand {
@@ -149,7 +148,7 @@ struct Item: AsyncParsableCommand {
             let edit = try input.withFoundationData { try JSONDecoder().decode(ItemEdit.self, from: $0) }
             let store = try await storage.open(); defer { store.close() }
             try await store.saveItem(edit)
-            try IO.output(String(decoding: JSONEncoder().encode(store.catalog()), as: UTF8.self) + "\n")
+            try IO.output(String(decoding: JSONEncoder().encode(await store.catalog()), as: UTF8.self) + "\n")
         }
     }
 }

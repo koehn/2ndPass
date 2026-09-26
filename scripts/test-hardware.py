@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Opt-in live v5 account-identity checks. Requires interactive authentication approvals.
-Creates a disposable CloudKit vault; retains local state and recovery files.
-Uses or creates the test Apple Account's shared identity; never delete it as vault cleanup.
+"""Opt-in live v6 device-identity checks. Requires interactive authentication approvals.
+Creates a disposable CloudKit vault; retains local state and encrypted checkpoints.
+Uses or creates a device-local hardware identity; optionally accepts a separate recovery device request.
 See docs/VALIDATION.md. Never reads an existing vault.
 """
+import argparse
 import hashlib
 import os
 from pathlib import Path
@@ -12,11 +13,20 @@ import sys
 import tempfile
 import uuid
 
-mop = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app/Contents/MacOS/mop').resolve())
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('mop', nargs='?', default='dist/Mop.app/Contents/MacOS/mop')
+parser.add_argument('--recovery-request', type=Path)
+parser.add_argument('--fingerprint', help='Independently verified recovery request fingerprint')
+options = parser.parse_args()
+if (options.recovery_request is None) != (options.fingerprint is None):
+    parser.error("Supply both --recovery-request and --fingerprint, or neither.")
+mop = str(Path(options.mop).resolve())
+if subprocess.check_output([mop, '--version'], text=True).strip() != '0.6.0':
+    raise SystemExit('This check requires the v6 (0.6.0) executable; no old-format probe will run.')
 if os.environ.get('MOP_LIVE_CLOUD_TEST') != '1':
     raise SystemExit('Set MOP_LIVE_CLOUD_TEST=1 to create a disposable vault in the signed build CloudKit environment.')
 # Retain recovery material and state until the operator deletes the remote test zone.
-directory = tempfile.mkdtemp(prefix='mop-cloud-hardware-v5-')
+directory = tempfile.mkdtemp(prefix='mop-cloud-hardware-v6-')
 root = Path(directory)
 vault_id = str(uuid.uuid4())
 environment = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
@@ -42,7 +52,10 @@ def command(label, args, data=b'', extra=None, code=0):
         raise SystemExit(f'{label} failed with code {result.returncode}; expected {code}')
     return result
 
-command('Initialize disposable vault', ['vault', 'init', vault_name, '--recovery-file', str(root / 'recovery.key')])
+initialization = ['vault', 'init', vault_name]
+if options.recovery_request is not None:
+    initialization += ['--recovery-request', str(options.recovery_request.resolve()), '--fingerprint', options.fingerprint]
+command('Initialize disposable vault', initialization)
 command('Write sectioned multiline field', ['write', ref_a], first)
 command('Write second field', ['write', ref_b], second)
 # Hash assertions verify delivery without placing secret values in argv.

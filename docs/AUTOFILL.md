@@ -52,20 +52,9 @@ fail without inserting anything; Mop does not wait for the next TOTP period.
 
 ## Storage and refresh
 
-The app exports only verified encrypted snapshots, revision watermarks and the
-public account anchor to `AutoFill/cloud` inside its App Group. It leaves existing
-app/CLI storage in place. The extension shares the app's existing Keychain access
-group; private account keys are never copied into files or the identity store.
-The existing vault library verifies signed contents and account membership.
+The app, CLI and extension use the same device-local App Group `MopV6` directory and non-synchronizable hardware key namespace. Verified encrypted checkpoints, private journals and trust pins are scoped by container, environment, account, database and actual owner. There is no exported synchronized account anchor or software private key. An exclusive local lease prevents overlapping writers.
 
-Suggestions and snapshots refresh after authenticated app reads/edits. Opening
-and unlocking Mop after enabling/re-enabling the provider populates the store.
-Changes made remotely or through the CLI appear after the app refreshes. The
-extension fills from the last exported snapshot, including offline; it does not
-fetch the latest cloud revision. As with offline vault access, changes or
-revocations on another device cannot be known until refreshed. Known missing or
-revoked vaults remove their cached snapshots and suggestions. Account-change
-notifications invalidate the offline binding and clear suggestions.
+Suggestions refresh after authenticated app catalog reads/edits. The extension resolves a selected locator against the last verified local catalog and requires fresh authentication for each fill, then releases key handles and locks. It does not establish remote freshness while offline. Observed account-change notifications invalidate the offline binding and clear suggestions. Old ciphertext is retained rather than silently deleted. A copied suggestion cannot bypass catalog membership or decryption checks.
 
 Websites and usernames are deliberately available to the system without unlocking
 Mop. Passwords and OTP seeds remain encrypted on disk; the extension decrypts only after Mop authentication for delivery to system AutoFill.
@@ -120,3 +109,10 @@ an iPhone/iPad and Mac to check:
 - Switch/sign out of the Apple Account and verify suggestions/offline access clear.
 - Disable/re-enable the provider and repopulate by unlocking Mop.
 - Upgrade an existing installation and verify its app and CLI identities still work.
+
+An invalid local AutoFill metadata index is rebuilt on the next successful
+authenticated catalog refresh. This includes stale locator formats and malformed
+JSON; the extension continues to reject them until the app refreshes. Rebuilding
+does not modify vaults, secrets, device keys, or trust checkpoints. Other vaults'
+suggestions return as their catalogs are refreshed. Filesystem permission and
+access failures remain errors and are not bypassed as part of cache repair.
