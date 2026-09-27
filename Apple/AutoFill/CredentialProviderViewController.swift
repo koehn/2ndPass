@@ -279,6 +279,7 @@ private struct CredentialListView: View {
     let chooseAnother: () -> Void
     let cancel: () -> Void
     @State private var search = ""
+    @State private var showsOtherAccounts = false
     @State private var selection: String?
     @State private var unrelated: AutoFillChoice?
     @State private var insertionField: CredentialField?
@@ -287,8 +288,10 @@ private struct CredentialListView: View {
         model.entries.filter { search.isEmpty || [$0.identity.website, $0.identity.username, $0.itemName, $0.vaultName].contains { $0.localizedCaseInsensitiveContains(search) } }
     }
     private var ordered: [AutoFillChoice] {
-        filtered.filter { model.hosts.contains($0.identity.website) } + filtered.filter { !model.hosts.contains($0.identity.website) }
+        matching + (model.hosts.isEmpty || showsOtherAccounts ? other : [])
     }
+    private var matching: [AutoFillChoice] { filtered.filter { model.hosts.contains($0.identity.website) } }
+    private var other: [AutoFillChoice] { filtered.filter { !model.hosts.contains($0.identity.website) } }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack { Text("Mop AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel).keyboardShortcut(.cancelAction) }
@@ -306,11 +309,24 @@ private struct CredentialListView: View {
                     .onSubmit { fillSelected() }
                     .onKeyPress(.downArrow) { moveSelection(1); return .handled }
                     .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
-                if filtered.isEmpty { ContentUnavailableView.search(text: search) }
+                if !model.hosts.isEmpty {
+                    if !model.entries.contains(where: { model.hosts.contains($0.identity.website) }) {
+                        Text("No accounts match this website exactly.").foregroundStyle(.secondary)
+                    }
+                    Button(showsOtherAccounts ? "Hide other accounts" : "Show other accounts") {
+                        showsOtherAccounts.toggle()
+                        selection = ordered.first?.id
+                    }
+                }
+                if ordered.isEmpty {
+                    if !search.isEmpty { ContentUnavailableView.search(text: search) }
+                }
                 else {
                     List(selection: $selection) {
-                        if !model.hosts.isEmpty { section("For This Website", entries: filtered.filter { model.hosts.contains($0.identity.website) }) }
-                        section(model.hosts.isEmpty ? "Accounts" : "Other Accounts", entries: filtered.filter { !model.hosts.contains($0.identity.website) })
+                        if !model.hosts.isEmpty { section("For This Website", entries: matching) }
+                        if model.hosts.isEmpty || showsOtherAccounts {
+                            section(model.hosts.isEmpty ? "Accounts" : "Other Accounts", entries: other)
+                        }
                     }
                     .onKeyPress(.return) { fillSelected(); return .handled }
                     if !model.textInsertion {
@@ -321,7 +337,10 @@ private struct CredentialListView: View {
         }.padding().frame(minWidth: 280, minHeight: model.showsPicker ? 300 : 120)
         .onChange(of: model.entries) { _, _ in
             selection = ordered.first?.id; searchFocused = !model.entries.isEmpty
-            if model.entries.isEmpty { unrelated = nil; search = "" }
+            if model.entries.isEmpty { unrelated = nil; search = ""; showsOtherAccounts = false }
+        }
+        .onChange(of: model.hosts) { _, _ in
+            showsOtherAccounts = false; unrelated = nil; selection = ordered.first?.id
         }
         .onChange(of: search) { _, _ in selection = ordered.first?.id }
         .confirmationDialog("Use this account for another website?", isPresented: Binding(get: { unrelated != nil }, set: { if !$0 { unrelated = nil } }), titleVisibility: .visible) {
