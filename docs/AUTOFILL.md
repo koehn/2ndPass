@@ -5,65 +5,68 @@ Mop includes a native credential provider extension for iOS/iPadOS 18+ and macOS
 unlock Mop. Each authenticated catalog refresh publishes login websites,
 usernames and opaque password/code credential identifiers to Mop's Apple credential identity
 store. Mop also writes the same metadata fields plus credential kind to a shared local index;
-the extension reads that index for its searchable picker without unlocking. It
-does not depend on Apple returning its stored suggestions to the extension.
-Only undeleted Login items with a usable typed username/email and valid HTTP(S)
-website are indexed. Password suggestions require a primary typed Password field.
-Code suggestions require a primary typed OTP field, but do not require a password.
-The `otp` field takes priority; otherwise exactly one OTP field is required.
-Ambiguous OTP layouts are excluded from code suggestions without affecting passwords. The standard `username` and `password` fields take priority
-over extra fields. Username takes priority over a contact email; email is used
-when no nonempty Username field exists. Without standard field names, multiple
-distinct usernames or passwords need an explicit primary field. The item view
-explains any field-layout exclusion. Multiple websites are supported; URL paths, queries,
-item titles, passwords, OTP seeds and vault keys are not indexed. The shared
-index uses private file permissions and iOS file protection; its contents are
-available to Mop and its extension without a vault-unlock prompt.
+the extension reads that index, then authenticates before showing encrypted account
+labels in its picker. It does not depend on Apple returning its stored suggestions to the extension.
+Only undeleted Login items with a usable username and valid HTTP(S) website are
+indexed. Edit Item → Use for AutoFill provides explicit username, password, and
+verification-code field choices. Choices are encrypted catalog metadata; missing
+choices retain automatic selection of standard fields. Usernames must use a
+nonsecret Username, Email, or Text field; passwords use Password or Concealed;
+codes use OTP. Missing or incompatible explicit choices never fall back silently.
+The editor can add correctly typed fields and websites. Optional OTP absence is
+not a broken-password warning. Existing items need no migration; mixed older
+writing clients are not supported for preserving the new mappings.
 
-All password and OTP suggestions return `userInteractionRequired` from
-`provideCredentialWithoutUserInteraction`, before opening a vault or decrypting
-any secret. The system then presents Mop’s selected-credential interface, which
-creates a fresh service and requests biometrics or device-owner authentication.
-Selecting a suggestion is never treated as proof of authentication. The extension
-verifies the selected identifier against the authenticated catalog before reading
-its value. Cancelling the prompt leaves the field unchanged; the service locks
-after every request. Recent app unlocks or fills do not bypass this requirement.
+Settings → AutoFill shows provider enabled state, publication health, and the last
+successful system suggestion update. Enable AutoFill uses Apple’s supported prompt;
+Open AutoFill Settings and Open Verification Code Settings use supported settings
+APIs. Refresh Suggestions rebuilds from authenticated catalogs. A publication
+failure is reported separately and never makes a successful vault save fail.
+Unavailable vaults retain their prior suggestions during a partial refresh. Catalog
+eligibility alone is not proof that the system accepted publication.
 
-Username-only insertion uses the same authenticated credential resolution as
-password insertion; it never inserts a username directly from the shared index.
-Website and username metadata remain visible in suggestions and the searchable
-picker before authentication. Every action that fills a value requires authentication.
+Only website, username, kind, and opaque locator leave the encrypted catalog.
+Item/vault names, field paths, passwords, OTP seeds, and keys are not published or
+written to the shared index. Publication health stores a timestamp, generic status, and opaque IDs of vaults
+whose catalogs still need refreshing. Files use private permissions and iOS data protection.
 
-Choosing “Mop…” opens the searchable account picker. Selecting an account there
-authenticates through LocalAuthentication (biometrics or the system's device-owner
-fallback), since AutoFill does not authenticate on behalf of a presented extension.
-No CLI or running containing app is needed. The extension locks after completion,
-failure, cancellation or dismissal. App and CLI authentication are unchanged.
+All no-interaction password and code requests return `userInteractionRequired`
+before opening a vault. A selected suggestion authenticates in the presented
+extension. Opening Mop’s picker also authenticates, then loads item and vault names
+from verified encrypted catalogs into memory. One fresh request session authorizes
+one fill for at most 60 seconds. It never reuses the containing app’s authentication
+or a prior fill. Dismissal, cancellation, backgrounding, account changes, failures,
+and expiry release the session and clear labels. System authentication presentation
+does not itself count as leaving the request.
 
-On iOS, the text-field menu's AutoFill → Passwords action uses the separate text
-insertion API. Mop advertises `ProvidesTextToInsert` and presents its searchable
-login list with Username, Password and Code actions as applicable. Choosing an action authenticates,
-revalidates the credential, and inserts only that value into the focused field.
-Passwords and codes are never shown in the list or copied to the clipboard.
-The code picker lists only eligible code accounts; search and website prioritization
-work like the password picker. Codes are generated after authentication at fill time,
-using the saved algorithm, digit count and period. Invalid seeds or expired results
-fail without inserting anything; Mop does not wait for the next TOTP period.
+The picker groups exact normalized-host matches under For This Website, with Other
+Accounts below. Search includes decrypted item/vault names. Arrow keys select, Return
+fills, and Escape cancels. Choosing an unrelated account requires confirmation that
+names both sites. Empty searches and unavailable vaults have explicit explanations.
+Errors offer Retry and Choose Another Account; setup instructions point to Mop’s
+AutoFill settings without relying on an unsupported extension-to-app launch route.
+
+Immediately before filling, the extension re-resolves the identifier against the
+authenticated catalog. It does not trust cached usernames or references. Passwords
+and codes are never displayed or copied to the clipboard. On iOS, text insertion
+provides Username, Password, and Code actions under the same authentication policy.
+Codes are generated after authentication and checked for expiration immediately
+before completion; an expired result requires a fresh authenticated Retry.
 
 ## Storage and refresh
 
-The app, CLI and extension use the same device-local App Group `MopV6` directory and non-synchronizable hardware key namespace. Verified encrypted checkpoints, private journals and trust pins are scoped by container, environment, account, database and actual owner. There is no exported synchronized account anchor or software private key. An exclusive local lease prevents overlapping writers.
+The app, CLI, and extension share device-local App Group `MopV6` checkpoints and the
+non-synchronizable hardware key namespace. Account changes invalidate offline access
+and clear suggestions. Removed/stale suggestions cannot bypass catalog resolution.
+Offline filling uses the last verified catalog and cannot establish remote freshness.
+The system suggestions still reveal websites and usernames before authentication;
+item/vault names are visible only inside the authenticated picker.
 
-Suggestions refresh after authenticated app catalog reads/edits. The extension resolves a selected locator against the last verified local catalog and requires fresh authentication for each fill, then releases key handles and locks. It does not establish remote freshness while offline. Observed account-change notifications invalidate the offline binding and clear suggestions. Old ciphertext is retained rather than silently deleted. A copied suggestion cannot bypass catalog membership or decryption checks.
-
-Websites and usernames are deliberately available to the system without unlocking
-Mop. Passwords and OTP seeds remain encrypted on disk; the extension decrypts only after Mop authentication for delivery to system AutoFill.
-Apple manages the metadata
-store, excludes it from device backups and clears it when the provider is disabled.
-This version provides existing passwords and TOTP codes. Passkeys and saving or
-generating new credentials through AutoFill are not implemented.
-Existing password index rows upgrade automatically on refresh; password identifiers
-remain stable and codes use a separate identifier namespace. No vault migration is needed.
+This version fills existing passwords and verification codes. Passkeys, saving new
+credentials, and generating passwords inside AutoFill are not implemented. Disabling
+the provider clears Apple’s store; enable it again and refresh suggestions in Mop.
+An invalid derived metadata cache is rebuilt from authenticated catalogs. Filesystem
+permission failures remain errors and are never bypassed during repair.
 
 ## Provisioning and building
 
@@ -94,11 +97,11 @@ an iPhone/iPad and Mac to check:
   a recent app unlock or code fill. Cancel the prompt and verify nothing fills.
 - Open the code picker and verify only code accounts appear, with working search.
 - Fill codes before and after a TOTP rollover and compare with Mop’s current code.
-- Browse/search the extension while Mop is locked or terminated, without a prompt.
+- Open the picker with Mop locked or terminated; authenticate before names appear. Verify identical website/username accounts are distinguishable by item and vault.
 - Select a password suggestion and verify Mop requires authentication before filling.
   Repeat immediately after an app unlock and after a successful fill. Cancel and
   confirm neither username nor password is filled. Choose “Mop…” and verify its
-  picker also requires authentication before filling.
+  picker authenticates once, then fills without a second prompt within that request.
 - Cancel system authentication and confirm no fields are filled; then retry.
 - On iOS, long-press a text field and choose AutoFill → Passwords. Verify Mop
   appears, its list can be searched, and Username/Password/Code inserts only the
@@ -116,3 +119,9 @@ JSON; the extension continues to reject them until the app refreshes. Rebuilding
 does not modify vaults, secrets, device keys, or trust checkpoints. Other vaults'
 suggestions return as their catalogs are refreshed. Filesystem permission and
 access failures remain errors and are not bypassed as part of cache repair.
+
+Additional acceptance: wait 60 seconds before choosing, switch apps during selection,
+dismiss during authentication, and verify nothing fills from the invalidated session.
+Check Return/Escape/arrow keys, VoiceOver, text sizing, contrast, no-results search,
+and confirmation before choosing an unrelated site. Test disabled/enabled provider
+states and publication failure independently from a successful vault save.

@@ -29,14 +29,19 @@ private struct DocumentTransfers: ViewModifier {
             // A folder picker plus an exclusive writer preserves the Mac's no-overwrite
             // rule. File exporters can offer replacement of an existing credential.
             guard let request = pending,
-                  model.editorGeneration == request.generation, model.vault == request.vault else { return }
+                  model.securityGeneration == request.generation else { return }
             model.documentRequest = nil
             pending = nil
             switch result {
             case .success(let folder):
                 model.completeBackupSelection(folder: folder, request: request)
-            case .failure:
+            case .failure(let error):
+                guard (error as NSError).code != NSUserCancelledError else { return }
+                #if os(macOS)
+                model.error = "The folder could not be opened. Choose a writable folder in Finder."
+                #else
                 model.error = "The folder could not be opened. Choose a writable folder in Files."
+                #endif
             }
         }.onChange(of: model.documentRequest?.id) { _, _ in
             if let request = model.documentRequest { pending = request }

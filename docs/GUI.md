@@ -6,7 +6,7 @@ device-local identity. Old-format vaults are not displayed or converted.
 ## Guided setup
 
 Successful iCloud discovery with no v6 vaults opens **Create a vault**. Enter a
-name and authenticate; Mop generates the device’s hardware keys and opens the
+name (the displayed Personal default creates `personal`) and authenticate; Mop generates the device’s hardware keys and opens the
 vault immediately. Recovery is optional and does not block creation. A notice
 explains the risk of losing the only authorized device.
 
@@ -15,16 +15,16 @@ device** opens instead. Selecting an unenrolled vault also opens that flow.
 Discovery does not authenticate cloud data or create a local trust pin. Failed
 CloudKit discovery reports an error rather than claiming the account is empty.
 
-On your own new device, Mop generates keys and submits a signed request through
+On your own new device, select the desired vaults and choose **Connect**. Mop generates keys and submits signed requests through
 iCloud. An unlocked owner device processes it automatically without a dialog.
 The new device shows progress and asks you to unlock Mop elsewhere if waiting.
-It opens the vault when the signed grant arrives. Existing owner devices show an
+Each vault reports its own result when the signed grant arrives. Completion does not replace your current selection or discard an item draft. Existing owner devices show an
 in-app notice once per added device, based on signed membership, including after
 the enrollment mailbox expires.
 
-Polling runs every 15 seconds on the unlocked owner app (macOS can also process
-while its window is inactive; iOS requires the app to be active), or every 5 seconds
-on the connection screen. Locked or suspended apps cannot grant access; automatic
+A model-owned coordinator checks every 15 seconds while unlocked. Closing the
+connection screen keeps submitted requests active. macOS can also process while
+its window is inactive; iOS/iPadOS resume checks when the app is active. Locked or suspended apps cannot grant access; automatic
 processing does not authenticate or extend the inactivity timeout. Delivery while
 the OS suspends an app is not guaranteed. Retry and restart remain available.
 
@@ -44,7 +44,29 @@ checkpoint import and cloud permission reconciliation.
 
 The existing item editor supports typed fields, renaming, password-strength metadata, concealed values, TOTP, trash/restore and encrypted backup export. Catalog browsing opens its own key; revealing a password opens that record's key. Values passed to an edit are plaintext inside Mop. The catalog stores concealed fields without values.
 
-The app retains its authenticated LocalAuthentication context until lock/expiry. Device key handles and individual encryption keys are released after operations. Switching apps does not itself revoke the session; explicit lock and inactivity expiry invalidate it and reject late results. Concurrent edits fail instead of silently overwriting another revision. Refresh and review before making a new edit.
+Mop attempts authentication once at launch while active. After cancelling, locking,
+inactivity expiry, or waking from system lock, choose **Unlock Mop** to authenticate.
+Pointer movement, typing, returning to the app, and Refresh do not unlock a locked
+session. Refresh discovers vaults while locked and updates catalogs while unlocked.
+Settings can be opened without authenticating; protected device details offer Unlock.
+
+The app retains its authenticated LocalAuthentication context until lock/expiry.
+Device key handles and individual encryption keys are released after operations.
+Password editors start concealed and have an explicit reveal button. Switching apps
+conceals revealed values and password inputs without discarding the in-memory draft;
+returning does not reveal them again. The same rule applies to brief mobile backgrounding.
+
+Leaving a modified item, changing its vault context, refreshing, or normally closing
+or quitting the Mac app offers **Save Changes**, **Discard Changes**, or **Cancel**.
+Saving completes the requested action only after the save succeeds. Invalid or offline
+drafts can be retained or discarded. Recoverable failures preserve edits. Concurrent
+changes retain the draft and block further saves until you explicitly discard it and
+refresh; Mop never silently overwrites another revision.
+
+Explicit lock, inactivity expiry, system lock/sleep, account loss, device revocation,
+and termination clear drafts and reject late results immediately. Security locking
+never waits for an unsaved-changes dialog. Drafts are not persisted across lock or
+restart; save important changes before leaving the session.
 
 Offline browsing is explicit and read-only. It cannot establish remote freshness or revocation. The CLI and GUI share device-local app-group checkpoints; never synchronize their local state directory.
 
@@ -56,29 +78,31 @@ If all authorized and recovery device keys are gone, neither a backup nor accoun
 
 ## Enrollment status and restarting
 
-The connection screen shows the current stage, request ID/expiry, check start time
-and last successful iCloud contact. Authentication and network failures are shown
-inline instead of silently stopping the polling loop. **Check iCloud now** retries
-and authenticates if needed. Background/inactive sessions do not poll.
+The connection screen reports each selected vault separately: contacting iCloud,
+waiting for another unlocked device, paused, offline, connected, cancelled, or
+failed. Only active work animates. Last successful contact appears as a relative
+time. Failed checks show **Retry**; paused authentication shows **Unlock and Retry**.
+Automatic checks never start a new authentication prompt.
 
-If the two devices disagree, choose **Restart connection** on the new device.
-This creates a fresh signed request, clears the old comparison/confirmation, and
-retires prior pending requests in iCloud. Connection proceeds automatically.
-No vault contents or device keys are deleted. A durable list of replaced request
-IDs lets a later retry finish retirement after an interrupted cloud update.
-**Cancel request** pauses enrollment and retires the current pending request;
-ordinary polling does not silently recreate it. Cancellation is retried if iCloud
-did not confirm it. Neither action revokes access that was already granted.
+Closing the screen continues submitted requests while unlocked. **Cancel Request**,
+under Troubleshooting for each vault, retires that request; the UI reports cancellation
+only after iCloud confirms it. An uncertain response remains an error. **Restart
+Connection** replaces the request without deleting vault contents or device keys.
+Neither action revokes access already granted. Conflicts retry on a later check;
+other failures need an explicit Retry.
 
-A missing server invitation clears the locally displayed comparison code. A
-conflict clears stale UI state and triggers another check. A network/authentication
-failure pauses polling with an explicit retry message; it does not present cached
-state as proof that the server accepted a request. These controls require updated
-builds on the participating devices.
+Background enrollment does not disable browsing or editing. Native service writes
+remain serialized. Device notices identify the connected device and vault and offer
+**Review Devices**. Settings shows names first, with IDs and affected vaults in Details.
+Removal explains last-owner limits and reports confirmed progress if a later vault
+fails. Removing this device remains explicit and requires Reconnect to join again.
+
+After creation, a dismissible checklist offers another device, hardware recovery,
+and AutoFill setup. Sharing/recovery remain separate tasks under More Options.
 
 ## Remove and reconnect a device
 
-On Mac, iPhone, or iPad, open **Settings → devices**. The list
+On Mac, iPhone, or iPad, open **Settings → Devices**. The list
 shows device names where available, UUIDs, and which device you are using. Select
 **Remove…** and confirm. Removal covers the personal vaults enrolled on the
 managing device; it does not claim to revoke access to vaults that device has
@@ -102,13 +126,38 @@ Only that action opts it back in. Connection then uses fresh hardware keys and
 the normal automatic same-account flow. An offline device cannot learn about
 revocation until it reconnects; previously copied plaintext cannot be revoked.
 
-## Settings layout
+## Settings and Vault Details
 
 Open **Mop → Settings…** (Command-comma) on Mac, or the Settings gear on iPhone
-and iPad. The **devices** section contains the device list, removal, and Add my
-device. The **vault** section has a vault picker plus rename, checkpoint, backup,
-membership, sharing, recovery, advanced access management, and deletion controls.
-The vault row's ellipsis opens this same Settings interface for that vault.
-There is no separate Vault Settings dialog. Action sheets and backup destination
-selection are presented from Settings. The iOS Done button remains visible while
-scrolling through the sections.
+and iPad. Security, AutoFill, Devices, and Advanced are separate categories. Mop
+remembers the last category. Security offers inactivity presets and a custom
+minute value. Opening Settings neither selects a vault nor authenticates.
+Devices loads protected information only while unlocked.
+
+Use **Vault Details** in the toolbar or a vault’s context menu for rename,
+backup, sharing, hardware recovery, and deletion. Details appears in the main
+pane and returns to the previously selected item. Checkpoints, membership, and
+advanced access operations are under Security Details. Leaving a modified item
+uses the same Save Changes, Discard Changes, or Cancel decision as navigation.
+
+Action sheets capture their vault when opened. Their action buttons stay below
+scrolling content; errors appear with the form. Cancel or Escape asks before
+discarding modified inputs. Interactive dismissal is disabled while inputs are
+unsaved. Sharing steps retain their input when switching between steps. File
+picker cancellation is silent, and backup names include the vault, date, and a
+unique suffix. Mac users can reveal a completed backup in Finder.
+
+## Search and item layout
+
+Command-F focuses native search. Search filters the current scope, including
+Recently Deleted, and retains its query when changing scopes. Only item names,
+vault names, and nonsecret field names/values match. Filtering does not replace
+the open item or discard a draft. Return opens the highlighted result; arrow keys
+move the search highlight. Clear Search restores the full list.
+
+The sidebar uses native collapsible sections. Item fields use separators and
+visible Copy controls. Nonsecret text and notes support text selection; clicking
+a value does not copy it. Website fields offer Open Website. Passwords retain
+explicit reveal/conceal and protected clipboard behavior. Mobile controls retain
+44-point targets and adapt for accessibility text sizes. The app respects the
+user’s split-view column visibility rather than resetting it as windows resize.

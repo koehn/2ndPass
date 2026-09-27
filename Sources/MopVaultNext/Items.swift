@@ -44,6 +44,7 @@ public extension VaultEngine {
         guard original == edit.item.name || !current.contains(where: { $0.name == edit.item.name }),
               edit.item.deletion == nil, !edit.item.fields.isEmpty,
               Set(edit.item.fields.map(\.path)).count == edit.item.fields.count else { throw MopError.invalidVault }
+        guard edit.item.autoFill?.validationError(in: edit.item.fields) == nil else { throw MopError.invalidVault }
         var item = edit.item
         var kept = Set<String>()
         for index in item.fields.indices {

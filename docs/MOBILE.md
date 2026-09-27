@@ -12,6 +12,13 @@ navigation split view; larger windows show columns. Settings, item editors,
 password generation, Recently Deleted, account membership, and vault administration
 use the same views on every platform. One mobile window is supported.
 
+Settings uses a category list for Security, AutoFill, Devices, and Advanced;
+Vault Details lives in the main navigation, with a return to the selected item.
+Native search filters the current scope without replacing an open draft. Field
+values support selection where nonsecret, and visible Copy buttons retain
+44-point targets. Task sheets keep primary and cancel actions below scrolling
+content; modified inputs require an explicit discard decision through Cancel.
+
 ## Build and test
 
 ```sh
@@ -28,8 +35,8 @@ available iPhone and one iPad. Install a simulator runtime through Xcode Setting
 first if none is available. The Apple applications CI workflow runs these commands.
 
 UI automation explicitly sets `MOP_UI_TESTING=1` to use sample data. That fixture is
-compiled only in Debug simulator builds. It cannot authenticate, contact a real
-vault, or establish hardware security results. Release and device builds always
+compiled only in Debug simulator and Mac builds. It cannot authenticate, contact a real
+vault, or establish hardware security results. Release and physical iOS device builds always
 use the native service. Shared vault tests use injected transports and test keys.
 
 Keep using `scripts/package.sh` for the distributable Mac bundle and its embedded
@@ -45,35 +52,36 @@ different writable folder. Mop does not fall back to an overwrite-capable export
 Recovery imports use coordinated, security-scoped access and a bounded private
 copy, which is removed when the recovery form closes.
 
-Creating a vault first saves a durable intent with its UUID and recovery key in
-private application storage. Export the recovery key, confirm offline custody,
-then Continue to authenticate and publish. Reopening Create Vault resumes any
-unfinished intent. Names cannot be changed after preparation. You can discard
-an unsubmitted setup to start over; submitted attempts must be reconciled.
-The initial encrypted snapshot and account binding are persisted before submission.
+Creating a vault authenticates and creates this device’s protected keys. Hardware
+recovery is optional; there is no recovery-key export gate. A dismissible checklist
+offers another device, hardware recovery, and AutoFill after creation. An uncertain
+cloud creation retains the same UUID for reconciliation rather than creating a
+second vault.
 
-If a response is lost, Continue reconciles the same snapshot and UUID with cloud
-history. If a previously submitted creation has no cloud head, Mop fails closed
-instead of recreating a possibly deleted vault. Retain the exported key and use the
-existing CLI recovery/import tools or investigate cloud state before removing any
-pending intent. Mop does not automatically abandon an uncertain creation.
+Connect This Device lists the available vaults for explicit selection and reports
+progress separately for each. Closing the screen continues submitted requests
+while unlocked and active. iOS/iPadOS suspension pauses checks until foregrounding;
+security lock requires an explicit Unlock/Retry. Cancel Request is separate from
+closing and is reported as successful only after iCloud confirms it.
 
 Private mobile state uses complete Data Protection and is excluded from device
-backup. Account access requires an explicitly approved hardware device identity; copying app storage alone does
+backup. Account access requires an enrolled hardware device identity; copying app storage alone does
 not transfer the account private keys.
 
 ## Mobile sessions
 
 Temporary inactivity immediately covers the entire window, including sheets, and
 conceals revealed values. An authentication prompt does not cancel its own session.
-Both apps launch locked and automatically authenticate all connected vaults while
-active. There is no Unlock button. Vaults open together; any failure clears the
-entire session. Unconnected vaults have a distinct add-device icon and are excluded.
-Entering the background conceals the interface and discards unsaved drafts, but
-preserves authorization until the inactivity deadline. Returning before that
-deadline reuses the session. Activity resets the 1–60 minute timeout (default 5);
-background work does not. Expiry requires fresh authentication. Cancelling a prompt
-pauses automatic retries until another interaction or background/foreground cycle.
+Both apps attempt authentication once at launch while active. After cancellation,
+manual lock, timeout, or system lock, choose Unlock Mop to try again. Activity,
+foregrounding, and Refresh do not start authentication. Vaults open together;
+any opening failure clears the entire session. Unconnected vaults are excluded.
+Entering the background conceals the interface and retains unsaved drafts and
+authorization until the inactivity deadline. Returning before that deadline reuses
+the session but keeps password inputs concealed. Activity resets the 1–60 minute
+timeout (default 5); background work does not. Security locking clears drafts
+immediately. Ordinary navigation offers Save Changes, Discard Changes, or Cancel;
+failed saves keep edits unless access is invalidated.
 
 Copied concealed values remain available during ordinary app switching for their
 original 30-second lifetime. The iOS pasteboard enforces expiration even while Mop
@@ -156,8 +164,9 @@ metadata access for private or explicitly selected files, following Apple’s
 
 ## Account access
 
-Mop device identities require explicit approval. New devices must enroll before opening
-account-owned vaults without QR pairing. See [account identities](ACCOUNT-IDENTITY.md)
+New device identities must enroll before opening account-owned vaults. Same-account
+enrollment proceeds automatically while another owner device is unlocked; cross-account
+sharing requires explicit approval. See [account identities](ACCOUNT-IDENTITY.md)
 for waiting states, recovery, and physical acceptance.
 
 Authenticated item reads use the current verified in-memory snapshot and do not
@@ -173,3 +182,16 @@ key-value storage across the same Apple Account. App signatures must include
 `com.koehn.mop` identifier on macOS and iOS. Regenerate provisioning profiles if
 this capability is not yet authorized. Sync delivery is asynchronous; the setting
 remains locally usable while offline.
+
+## AutoFill setup and repair
+
+Settings → AutoFill shows provider state and suggestion publication health. Enable
+Mop using the native system prompt, or open password/code provider settings. Refresh
+Suggestions requires an unlocked session. Publication failures do not undo a saved
+vault edit. Edit Item → Use for AutoFill chooses the username, password, or optional
+verification-code field without renaming existing fields. Mappings stay encrypted.
+
+The picker authenticates before showing item and vault names. One request session
+can fill once and lasts at most 60 seconds; backgrounding, dismissal, cancellation,
+or completion clears it. Passwords and OTP seeds are never shown in the picker.
+See [AutoFill](AUTOFILL.md) for metadata privacy and signed-device acceptance.

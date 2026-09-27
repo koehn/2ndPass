@@ -55,9 +55,17 @@ struct ItemDraft: Identifiable {
     var name: String
     var type: ItemType
     var fields: [Field]
+    var autoFill: AutoFillMapping
     var mode: Mode
+    private let initialVault: String
+    private let initialItem: VaultItem
+
+    /// Compare the save projection, not transient IDs or decrypted password loads.
+    var isModified: Bool { vault != initialVault || item != initialItem }
 
     init(vault: String, revision: String, item: VaultItem, mode: Mode = .item, isNew: Bool = false) {
+        autoFill = item.autoFill ?? AutoFillMapping()
+        initialVault = vault
         self.isNew = isNew
         self.vault = vault; self.revision = revision; originalName = item.name; name = item.name; type = item.type
         fields = item.fields.map { field in
@@ -68,10 +76,17 @@ struct ItemDraft: Identifiable {
         if case .value(let path) = mode, let index = fields.firstIndex(where: { $0.path == path }), fields[index].type != .password && fields[index].type != .otp {
             fields[index].value = fields[index].value ?? ""
         }
+        var baseline = VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field))
+        baseline.autoFill = autoFill.isAutomatic ? nil : autoFill
+        initialItem = baseline
     }
-    var item: VaultItem { VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field)) }
+    var item: VaultItem {
+        var result = VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field))
+        result.autoFill = autoFill.isAutomatic ? nil : autoFill
+        return result
+    }
     func valid(vaultName: String) -> Bool {
-        !fields.isEmpty && fields.allSatisfy { $0.validationError == nil } && Set(fields.map(\.encodedPath)).count == fields.count && fields.allSatisfy {
+        autoFill.validationError(in: fields.map(\.field)) == nil && !fields.isEmpty && fields.allSatisfy { $0.validationError == nil } && Set(fields.map(\.encodedPath)).count == fields.count && fields.allSatisfy {
             guard let ref = try? SecretReference(vault: vaultName, relativePath: SecretReference.encode(item.name) + "/" + $0.encodedPath) else { return false }
             return ref.item == item.name
         }

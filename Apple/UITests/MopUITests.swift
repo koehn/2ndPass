@@ -1,5 +1,7 @@
 import XCTest
 
+#if os(iOS)
+
 @MainActor final class MopUITests: XCTestCase {
     override func setUp() {
         super.setUp()
@@ -10,6 +12,19 @@ import XCTest
         app.launchEnvironment["MOP_UI_TESTING"] = "1"
         app.launch()
         return app
+    }
+    func testEnrollmentWaitsWithoutSpinnerAndCanClose() {
+        let app = XCUIApplication()
+        app.launchEnvironment["MOP_UI_TESTING"] = "1"
+        app.launchEnvironment["MOP_UI_ENROLLMENT"] = "1"
+        app.launch()
+        XCTAssertTrue(app.buttons["Connect"].waitForExistence(timeout: 10))
+        app.buttons["Connect"].tap()
+        let waiting = app.staticTexts["Open and unlock Mop on another connected device."]
+        XCTAssertTrue(waiting.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.activityIndicators.firstMatch.exists)
+        app.buttons["Close"].tap()
+        XCTAssertFalse(waiting.exists)
     }
     private func typeReliably(_ text: String, into field: XCUIElement) {
         // Synchronize key events with SwiftUI relayout; batched simulator input
@@ -100,36 +115,37 @@ import XCTest
         XCTAssertFalse(app.buttons["Use as OTP"].exists)
     }
 
-    func testSearchMenuShowsMatchedFieldAndOpensItem() {
+    func testSearchFiltersListAndOpensItem() {
         let app = launch()
         openItems(app)
-        let search = app.textFields["Search items"]
-        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        let search = app.searchFields.firstMatch
+        if !search.exists, app.buttons["Search"].firstMatch.exists { app.buttons["Search"].firstMatch.tap() }
+        XCTAssertTrue(search.waitForExistence(timeout: 5), app.debugDescription)
         search.tap(); search.typeText("sample@example.test")
-        let result = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'search-result-'")).firstMatch
+        let result = app.staticTexts["Example Login"].firstMatch
         XCTAssertTrue(result.waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["username: sample@example.test"].exists)
         let menuImage = XCTAttachment(screenshot: app.screenshot())
-        menuImage.name = "Search results menu"; menuImage.lifetime = .keepAlways
+        menuImage.name = "Filtered search results"; menuImage.lifetime = .keepAlways
         add(menuImage)
         result.tap()
         XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertTrue(app.descendants(matching: .any)["sample@example.test"].firstMatch.exists)
-        XCTAssertFalse(result.exists)
+        XCTAssertTrue(app.buttons["Copy username value"].exists)
     }
 
-    func testSearchMenuUpdatesWhenMatchesChange() {
+    func testSearchFiltersAsQueryChanges() {
         let app = XCUIApplication()
         app.launchEnvironment["MOP_UI_TESTING"] = "1"
         app.launchEnvironment["MOP_UI_SEARCH_TEST"] = "1"
         app.launch()
         openItems(app)
-        let search = app.textFields["Search items"]
+        let search = app.searchFields.firstMatch
         search.tap(); search.typeText("s")
-        let example = app.buttons["search-result-00000000-0000-0000-0000-000000000001:Example Login"]
+        let example = app.staticTexts["Example Login"].firstMatch
         XCTAssertTrue(example.waitForExistence(timeout: 5))
         search.typeText("s")
-        let server = app.buttons["search-result-00000000-0000-0000-0000-000000000001:SSH Server"]
+        let server = app.staticTexts["SSH Server"].firstMatch
         XCTAssertTrue(server.waitForExistence(timeout: 5))
         XCTAssertFalse(example.exists)
         XCTAssertTrue(app.staticTexts["ssh username: sshd"].exists)
@@ -147,7 +163,7 @@ import XCTest
         app.staticTexts["Example Login"].firstMatch.tap()
         let value = app.descendants(matching: .any)["sample@example.test"].firstMatch
         XCTAssertTrue(value.waitForExistence(timeout: 5))
-        value.tap()
+        app.buttons["Copy username value"].tap()
         let feedback = app.descendants(matching: .any)["copy-feedback-username"].firstMatch
         XCTAssertTrue(feedback.waitForExistence(timeout: 2))
         XCTAssertLessThan(abs(feedback.frame.midY - value.frame.midY), 70)
@@ -157,25 +173,15 @@ import XCTest
 
     func testVaultSettingsAndFieldActions() {
         let app = launch()
-        let settings = app.buttons["Settings for personal"].firstMatch
-        if !settings.waitForExistence(timeout: 3) || !settings.isHittable {
-            let sidebar = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'sidebar'")).firstMatch
-            if sidebar.exists { sidebar.tap() }
-            else if app.buttons["Back"].exists { app.buttons["Back"].tap() }
-        }
-        let expand = app.buttons["Expand vaults"]
-        if expand.exists { expand.tap() }
-        XCTAssertTrue(settings.waitForExistence(timeout: 5), app.debugDescription)
-        settings.tap()
-        XCTAssertTrue(app.staticTexts["Settings"].waitForExistence(timeout: 5))
+        openItems(app)
+        app.buttons["Vault Details"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Export Encrypted Backup…"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(app.buttons["Rename Vault…"].exists)
         let settingsImage = XCTAttachment(screenshot: app.screenshot())
-        settingsImage.name = "Settings — devices and vault"
-        settingsImage.lifetime = .keepAlways
+        settingsImage.name = "Vault Details"; settingsImage.lifetime = .keepAlways
         add(settingsImage)
-        XCTAssertTrue(app.buttons["Export encrypted backup…"].exists)
-        XCTAssertTrue(app.staticTexts["devices"].exists)
-        XCTAssertTrue(app.staticTexts["vault"].exists)
-        app.buttons["Done"].tap()
+        app.buttons["Back to Items"].tap()
+        if app.buttons["Back"].exists { app.buttons["Back"].tap() }
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
         let actions = app.buttons["Actions for password"]
@@ -202,9 +208,9 @@ import XCTest
         XCTAssertTrue(edit.waitForExistence(timeout: 5))
         let settings = app.buttons["Settings"].firstMatch
         XCTAssertGreaterThanOrEqual(edit.frame.minY, settings.frame.maxY)
-        let value = app.buttons["sample@example.test"].firstMatch
-        XCTAssertFalse(app.buttons["Copy username value"].exists)
-        XCTAssertFalse(app.buttons["Reveal password"].exists)
+        let value = app.staticTexts["sample@example.test"].firstMatch
+        XCTAssertTrue(app.buttons["Copy username value"].exists)
+        XCTAssertTrue(app.buttons["Reveal password"].exists)
         let menu = app.buttons["Actions for username"]
         XCTAssertTrue(menu.exists)
         XCTAssertGreaterThan(menu.frame.minX, value.frame.minX)
@@ -239,12 +245,13 @@ import XCTest
         XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
         app.buttons["Lock"].tap()
         XCTAssertFalse(app.textFields["password value"].exists)
-        XCTAssertFalse(app.buttons["sample@example.test"].exists)
+        XCTAssertFalse(app.staticTexts["sample@example.test"].exists)
     }
     func testCreateAndAdaptToRotation() {
         let app = launch()
         openItems(app)
-        app.buttons["New item"].tap()
+        app.buttons["New"].firstMatch.tap()
+        app.buttons["New Item"].tap()
         let name = app.textFields["Item name"]
         XCTAssertTrue(name.waitForExistence(timeout: 5))
         name.tap()
@@ -283,7 +290,7 @@ import XCTest
         XCTAssertTrue(alert.waitForExistence(timeout: 10))
         alert.buttons["OK"].tap()
         app.buttons["Settings"].firstMatch.tap()
-        XCTAssertTrue(app.steppers.firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["inactivity-timeout"].firstMatch.waitForExistence(timeout: 5), app.debugDescription)
         app.buttons["Done"].tap()
         XCUIDevice.shared.press(.home)
         app.activate()
@@ -295,11 +302,11 @@ import XCTest
         app.staticTexts["Example Login"].firstMatch.tap()
         XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 10))
         app.buttons["Settings"].tap()
-        XCTAssertTrue(app.steppers.firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["inactivity-timeout"].firstMatch.waitForExistence(timeout: 5), app.debugDescription)
         app.buttons["Done"].tap()
         XCUIDevice.shared.press(.home)
         app.activate()
-        XCTAssertTrue(app.buttons["sample@example.test"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["sample@example.test"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["Edit item"].exists)
         XCTAssertFalse(app.buttons["Unlock"].exists)
     }
@@ -337,7 +344,7 @@ extension MopUITests {
         app.launch()
         let alert = app.alerts["Operation not completed"]
         XCTAssertTrue(alert.waitForExistence(timeout: 10))
-        XCTAssertTrue(alert.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Waiting for your Mop identity'")).firstMatch.exists)
+        XCTAssertTrue(alert.staticTexts.matching(NSPredicate(format: "label CONTAINS 'no usable enrolled hardware identity'")).firstMatch.exists)
         alert.buttons["OK"].tap()
         app.buttons["Settings"].firstMatch.tap()
         app.buttons["Done"].tap()
@@ -346,3 +353,160 @@ extension MopUITests {
         XCTAssertFalse(alert.waitForExistence(timeout: 3))
     }
 }
+
+extension MopUITests {
+    func testBackgroundKeepsDraftUntilExplicitLock() {
+        let app = launch()
+        openItems(app)
+        app.staticTexts["Example Login"].firstMatch.tap()
+        app.buttons["Edit item"].tap()
+        let field = app.textFields["username value"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap(); field.typeText("edited")
+        let editedValue = field.value as? String
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        XCTAssertEqual(field.value as? String, editedValue)
+        XCTAssertTrue(app.secureTextFields["password value"].exists)
+        app.buttons["Lock"].firstMatch.tap()
+        XCTAssertFalse(field.exists)
+        let unlock = app.buttons["Unlock"].firstMatch
+        XCTAssertTrue(unlock.waitForExistence(timeout: 5))
+        unlock.tap()
+        XCTAssertTrue(app.staticTexts["Example Login"].firstMatch.waitForExistence(timeout: 5))
+    }
+}
+#elseif os(macOS)
+@MainActor final class MopUITests: XCTestCase {
+    private func launch() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchEnvironment["MOP_UI_TESTING"] = "1"
+        app.launch()
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.waitForExistence(timeout: 10), app.debugDescription)
+        return app
+    }
+    private func edit(_ app: XCUIApplication) {
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.click()
+        app.buttons["Edit item"].click()
+        XCTAssertTrue(app.secureTextFields["password value"].waitForExistence(timeout: 5))
+    }
+    private func changeName(_ app: XCUIApplication) {
+        let name = app.textFields["Item name"]
+        name.click()
+        name.typeKey("a", modifierFlags: .command)
+        name.typeText("Changed Login")
+    }
+    func testEnrollmentWaitsWithoutSpinnerAndCanClose() {
+        let app = XCUIApplication()
+        app.launchEnvironment["MOP_UI_TESTING"] = "1"
+        app.launchEnvironment["MOP_UI_ENROLLMENT"] = "1"
+        app.launch()
+        XCTAssertTrue(app.buttons["Connect"].waitForExistence(timeout: 10))
+        app.buttons["Connect"].click()
+        let waiting = app.staticTexts["Open and unlock Mop on another connected device."]
+        XCTAssertTrue(waiting.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.progressIndicators.firstMatch.exists)
+        app.buttons["Close"].click()
+        XCTAssertFalse(waiting.exists)
+    }
+    func testAutoFillMappingControlsAndSettings() {
+        let app = launch()
+        edit(app)
+        XCTAssertTrue(app.descendants(matching: .any)["autofill-mapping-Verification code"].firstMatch.waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(app.descendants(matching: .any)["autofill-mapping-Username"].firstMatch.exists, app.debugDescription)
+        app.buttons["Cancel"].click()
+        app.typeKey(",", modifierFlags: .command)
+        app.buttons["AutoFill"].click()
+        XCTAssertTrue(app.buttons["Open AutoFill Settings…"].waitForExistence(timeout: 5))
+    }
+    func testLockRequiresExplicitUnlock() {
+        let app = launch()
+        app.buttons["Lock"].click()
+        let unlock = app.buttons["Unlock Mop"]
+        XCTAssertTrue(unlock.waitForExistence(timeout: 5))
+        app.buttons["All Items"].click()
+        app.typeKey("r", modifierFlags: .command)
+        XCTAssertTrue(unlock.exists)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.exists)
+        unlock.click()
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.waitForExistence(timeout: 5))
+    }
+    func testEditorConcealsAcrossAppSwitchAndKeepsChanges() {
+        let app = launch()
+        edit(app); changeName(app)
+        app.buttons["Reveal password input"].click()
+        XCTAssertTrue(app.textFields["password value"].exists)
+        let finder = XCUIApplication(bundleIdentifier: "com.apple.finder")
+        finder.activate()
+        app.activate()
+        XCTAssertTrue(app.secureTextFields["password value"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.textFields["password value"].exists)
+        XCTAssertEqual(app.textFields["Item name"].value as? String, "Changed Login")
+    }
+    func testNavigationSaveAndCancel() {
+        let app = launch()
+        edit(app); changeName(app)
+        app.buttons["Recently Deleted"].click()
+        XCTAssertTrue(app.sheets.buttons["Discard Changes"].waitForExistence(timeout: 5), app.windows.debugDescription)
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertEqual(app.textFields["Item name"].value as? String, "Changed Login")
+        app.buttons["Recently Deleted"].click()
+        app.sheets.buttons["Save Changes"].click()
+        XCTAssertTrue(app.staticTexts["No recently deleted items"].waitForExistence(timeout: 5))
+        app.buttons["All Items"].click()
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Changed Login,")).firstMatch.waitForExistence(timeout: 5))
+    }
+    func testCloseAndQuitPromptBeforeDiscarding() {
+        let app = launch()
+        edit(app); changeName(app)
+        app.typeKey("w", modifierFlags: .command)
+        XCTAssertTrue(app.sheets.buttons["Discard Changes"].waitForExistence(timeout: 5), app.windows.debugDescription)
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertEqual(app.textFields["Item name"].value as? String, "Changed Login")
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.sheets.buttons["Discard Changes"].waitForExistence(timeout: 5), app.windows.debugDescription)
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertEqual(app.textFields["Item name"].value as? String, "Changed Login")
+        app.typeKey("q", modifierFlags: .command)
+        app.sheets.buttons["Discard Changes"].click()
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 5))
+    }
+    func testNativeSearchPreservesDraftAndSettingsCategories() {
+        let app = launch()
+        edit(app); changeName(app)
+        app.typeKey("f", modifierFlags: .command)
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5), app.debugDescription)
+        search.typeText("no-match")
+        XCTAssertTrue(app.staticTexts["No Search Results"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.textFields["Item name"].value as? String, "Changed Login")
+        XCTAssertFalse(app.sheets.buttons["Discard Changes"].exists)
+        app.typeKey(",", modifierFlags: .command)
+        XCTAssertTrue(app.buttons["Security"].waitForExistence(timeout: 5), app.debugDescription)
+        app.buttons["Security"].click()
+        XCTAssertTrue(app.popUpButtons["inactivity-timeout"].exists, app.debugDescription)
+        app.buttons["AutoFill"].click()
+        XCTAssertTrue(app.buttons["Open AutoFill Settings…"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Categorized Settings"; shot.lifetime = .keepAlways; add(shot)
+    }
+    func testVaultDetailsAndRenameDiscardGuard() {
+        let app = launch()
+        app.buttons["Vault Details"].click()
+        XCTAssertTrue(app.buttons["Rename Vault…"].waitForExistence(timeout: 5))
+        app.buttons["Rename Vault…"].click()
+        let name = app.sheets.textFields["Name"]
+        XCTAssertTrue(name.waitForExistence(timeout: 5))
+        name.click(); name.typeKey("a", modifierFlags: .command); name.typeText("renamed")
+        app.sheets.buttons["Cancel"].click()
+        XCTAssertTrue(app.sheets.buttons["Keep Editing"].waitForExistence(timeout: 5))
+        app.sheets.buttons["Keep Editing"].click()
+        XCTAssertEqual(name.value as? String, "renamed")
+        app.sheets.buttons["Cancel"].click()
+        app.sheets.buttons["Discard Changes"].click()
+        XCTAssertTrue(app.buttons["Rename Vault…"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Vault Details"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+}
+#endif

@@ -19,6 +19,14 @@ struct ContentView: View {
         false
         #endif
     }
+    private func showSettings(_ category: SettingsCategory = .security) {
+        model.settingsCategory = category
+        #if os(macOS)
+        openSettings()
+        #else
+        settingsPresented = true
+        #endif
+    }
     private func showDetail() {
         compactColumn = .detail
         #if os(iOS)
@@ -32,74 +40,37 @@ struct ContentView: View {
     private var navigation: some View {
         NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $compactColumn) {
             VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 10) {
-                    Image(systemName: "lock.shield.fill").font(.title2).foregroundStyle(Color.accentColor)
-                    Text("Mop").font(.title2.weight(.semibold))
-                    Spacer()
-                }.padding(.horizontal, 24).padding(.top, 8)
                 List(selection: Binding<String?>(get: { model.sidebarSelection }, set: { if let value = $0 { model.sidebarSelection = value } })) {
                     NavigationLink(value: "all") { Label("All Items", systemImage: "square.stack.3d.up") }
-                    Section {
-                        if vaultsExpanded {
-                            ForEach(model.vaults.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }) { vault in
-                                HStack(spacing: 8) {
-                                    NavigationLink(value: "vault:" + vault.id) {
-                                        Label(model.vaultLabel(vault), systemImage: model.vaultIcon(vault))
-                                            .lineLimit(1)
-                                            .truncationMode(.tail)
-                                            .accessibilityValue(model.vaultConnectionLabel(vault))
-                                            .help(model.vaultConnectionLabel(vault))
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    vaultActions(vault)
-                                }.tag("vault:" + vault.id)
-                            }
-                        }
-                    } header: {
-                        HStack(spacing: 4) {
-                            Button { vaultsExpanded.toggle() } label: {
-                                HStack {
-                                    Text("Vaults")
-                                    Image(systemName: vaultsExpanded ? "chevron.down" : "chevron.right")
-                                        .font(.caption2.weight(.semibold))
-                                }.frame(maxWidth: .infinity, alignment: .leading)
-                                    .mopControlTarget()
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(vaultsExpanded ? "Collapse vaults" : "Expand vaults")
-                            Button { model.sheet = .createVault } label: {
-                                Image(systemName: "plus").mopControlTarget()
-                            }
-                            .buttonStyle(.plain).help("Create vault")
-                            .accessibilityLabel("Create vault").disabled(model.offline)
+                    Section("Vaults", isExpanded: $vaultsExpanded) {
+                        ForEach(model.vaults.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }) { vault in
+                            NavigationLink(value: "vault:" + vault.id) {
+                                Label(model.vaultLabel(vault), systemImage: model.vaultIcon(vault))
+                                    .lineLimit(1).accessibilityValue(model.vaultConnectionLabel(vault))
+                            }.tag("vault:" + vault.id)
+                            .contextMenu { Button("Vault Details…") { model.openVaultDetails(vault) }.disabled(model.busy) }
                         }
                     }
                     NavigationLink(value: "deleted") { Label("Recently Deleted", systemImage: "trash") }
-                }.listStyle(.sidebar).disabled(model.busy)
+                }.listStyle(.sidebar).disabled(model.busy).id(model.selectionGeneration)
             }
-            .navigationSplitViewColumnWidth(min: 260, ideal: 290, max: 340)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
             .mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout)
         } content: {
             Group {
                 if model.page == .secrets {
                 VStack(spacing: 0) {
-                    HStack {
-                        Text(model.allVaults ? "All Items" : "Items").font(.headline)
-                        Spacer()
-                        Button { model.beginCreatingItem() } label: { Image(systemName: "plus") }
-                            .help("New item").accessibilityLabel("New item").keyboardShortcut("n").disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil)
-                    }.padding()
+                    SearchSummary(model: model)
                     if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
                         ContentUnavailableView {
                             Label("Connect this device", systemImage: model.vaultIcon(descriptor))
                         } description: {
-                            Text("This vault is in iCloud, but this device has not been approved. Use an existing owner device to enroll it.")
-                            Button("Connect this device…") { model.sheet = .enrollDevice }
+                            Text("This vault is not connected to this device. Open and unlock Mop on another connected device to connect automatically.")
+                            Button("Connect this device…") { model.presentSheet(.enrollDevice) }
                         }
                     } else if model.authenticated {
-                        ItemSearchView(model: model, selected: { showDetail() }).padding(.horizontal).padding(.bottom, 8).zIndex(1)
                         ScrollViewReader { reader in
-                        List(model.displayedItems, selection: $model.selectedRow) { row in
+                        List(model.displayedItems, selection: $model.listSelection) { row in
                             NavigationLink(value: row.id) { HStack(spacing: 10) {
                                 Image(systemName: row.item.type.symbol)
                                     .foregroundStyle(Color.accentColor).frame(width: 22)
@@ -107,20 +78,30 @@ struct ContentView: View {
                                     Text(row.item.name).fontWeight(.medium)
                                     if let subtitle = row.subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                                     if model.allVaults { Text(row.vaultName).font(.caption).foregroundStyle(.secondary) }
+                                    if !model.search.isEmpty, let result = model.searchResults.first(where: { $0.id == row.id }) {
+                                        Text(result.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    }
                                 }
-                            }.padding(.vertical, 5) }.tag(row.id).id(row.id)
+                            }.padding(.vertical, 2) }.tag(row.id).id(row.id)
                                 .contextMenu {
-                                    Button("Delete…", role: .destructive) { model.itemToDelete = row }
+                                    Button("Move to Recently Deleted…", role: .destructive) { model.itemToDelete = row }
                                         .disabled(model.offline || model.busy)
                                 }
-                        }.disabled(model.busy)
+                        }.disabled(model.busy).id(model.selectionGeneration)
                         .onChange(of: model.selectedRow) { _, id in
                             if let id { reader.scrollTo(id, anchor: .center) }
                         }
                         }
-                        if model.displayedItems.isEmpty { Text("No items").foregroundStyle(.secondary).padding() }
+                        if model.displayedItems.isEmpty {
+                            ContentUnavailableView {
+                                Label(model.search.isEmpty ? "No items" : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")
+                            } actions: {
+                                if !model.search.isEmpty { Button("Clear Search") { model.search = "" } }
+                                else { Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy) }
+                            }
+                        }
                     } else {
-                        Label("Items are locked", systemImage: "lock")
+                        Label(model.unlocking ? "Opening items…" : "Items are locked", systemImage: "lock")
                             .foregroundStyle(.secondary).padding()
                         Spacer()
                     }
@@ -131,25 +112,45 @@ struct ContentView: View {
             }.mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout)
         } detail: {
                 ScrollView {
-                    if model.page == .recentlyDeleted { RecentlyDeletedDetail(model: model) }
+                    if let target = model.vaultDetailsTarget { VaultDetailsView(model: model, target: target) }
+                    else if model.page == .recentlyDeleted { RecentlyDeletedDetail(model: model) }
                     else if let draft = model.itemDraft, draft.isNew, model.authenticated {
                         ItemDetailView(model: model, itemName: "").id(draft.id)
                     }
                     else if let item = model.selectedItem, model.authenticated { ItemDetailView(model: model, itemName: item).id(model.vault + ":" + item) }
                     else {
                         ContentUnavailableView {
-                            Label(model.vaults.isEmpty ? "Welcome to Mop" : model.authenticated ? "Select an item" : "Mop is locked", systemImage: "key.horizontal")
+                            Label(model.vaults.isEmpty ? "Welcome to Mop" : model.authenticated ? "Select an item" : model.unlocking ? "Unlocking Mop" : "Mop is locked", systemImage: "key.horizontal")
                         } description: {
-                            Text(model.vaults.isEmpty ? "Create a vault, or refresh to find vaults in your iCloud account." : model.authenticated ? "Choose an item to view its details." : "Authentication opens your connected vaults. Use Refresh to retry if access is interrupted.")
+                            Text(model.vaults.isEmpty ? "Create a vault, or refresh to find vaults in your iCloud account." : model.authenticated ? "Choose an item to view its details." : "Unlock Mop to access your connected vaults.")
                         } actions: {
+                            if model.unlocking {
+                                ProgressView("Unlocking Mop…")
+                            } else if model.hasConnectedVaults && !model.authenticated {
+                                Button("Unlock Mop") { model.unlock() }
+                                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                                    .disabled(!model.canUnlock)
+                            }
                             if model.vaults.isEmpty {
-                                Button("Create vault…") { model.sheet = .createVault }.disabled(model.offline || model.busy)
+                                Button("Create vault…") { model.presentSheet(.createVault) }.disabled(model.offline || model.busy)
                             }
                         }.padding(.top, 60)
+                    }
+                    if model.showsSetupChecklist {
+                        GroupBox("Finish setting up Mop") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Add another connected device or hardware recovery so losing this device does not mean losing access.")
+                                Button("Connect Another Device…") { model.presentSheet(.addDevice) }
+                                Button("Set Up Hardware Recovery…") { model.presentSheet(.setupRecovery) }
+                                Button("Set Up AutoFill…") { showSettings(.autoFill) }
+                                Button("Later") { model.showsSetupChecklist = false }
+                            }
+                        }.padding()
                     }
                     if let notice = model.deviceAddedNotice {
                         HStack {
                             Text(notice).font(.callout)
+                            Button("Review Devices") { showSettings(.devices) }
                             Button("Dismiss") { model.deviceAddedNotice = nil }
                         }
                     }
@@ -165,7 +166,7 @@ struct ContentView: View {
                 HStack(spacing: 8) {
                     if model.busy { ProgressView().controlSize(.small) }
                     Image(systemName: model.offline ? "icloud.slash" : "icloud")
-                    Text(model.status + (model.busy && model.status == "Locked" ? " · submitted operation continues" : ""))
+                    Text(model.sessionStatus)
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     Spacer()
                 }.padding(12)
@@ -175,7 +176,7 @@ struct ContentView: View {
         .navigationSplitViewStyle(.balanced)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
             availableWidth = width
-            if width >= 950 { columnVisibility = .all }
+
         }
         #if os(macOS)
         .toolbar { SessionToolbar(model: model, settings: $settingsPresented) }
@@ -183,6 +184,8 @@ struct ContentView: View {
     }
     private var content: some View {
         navigation
+        .mopSearch(model: model)
+        .onChange(of: model.vaultDetailsTarget?.id) { _, id in if id != nil { showDetail() } }
         .sheet(isPresented: $settingsPresented) { SessionSettings(model: model) }
         .documentTransfers(model: model)
         .task(id: model.notice) {
@@ -201,13 +204,12 @@ struct ContentView: View {
         .onChange(of: model.search) { _, _ in if model.authenticated { model.activity() } }
         .onChange(of: model.selectedRow) { _, row in if row != nil { model.activity(); showDetail() } }
         .onChange(of: model.selectedDeleted) { _, row in if row != nil { showDetail() } }
-        .onChange(of: model.selectedItem) { _, _ in model.selected = nil; if model.itemDraft?.isNew != true { model.cancelItemEditing() } }
+        .onChange(of: model.selectedItem) { _, _ in model.selected = nil }
         .onChange(of: model.selected) { _, _ in model.conceal() }
-        .onChange(of: model.page) { _, _ in model.cancelItemEditing() }
-        .sheet(item: Binding<AppSheet?>(get: { model.settingsVisible ? nil : model.sheet }, set: { model.sheet = $0 })) { sheet in
-            AppSheetView(model: model, kind: sheet).id(model.editorGeneration)
+        .sheet(item: Binding<SheetRequest?>(get: { model.sheetRequest?.inSettings == false ? model.sheetRequest : nil }, set: { if model.sheetRequest?.inSettings == false { model.sheetRequest = $0 } })) { sheet in
+            AppSheetView(model: model, request: sheet)
         }
-        .alert("Operation not completed", isPresented: Binding(get: { !model.settingsVisible && model.error != nil }, set: { if !$0 { model.error = nil } })) {
+        .alert("Operation not completed", isPresented: Binding(get: { !model.settingsVisible && model.sheetRequest == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
         } message: { Text(model.error ?? "") }
         .confirmationDialog("Move item to Recently Deleted?", isPresented: Binding(get: { model.itemToDelete != nil }, set: { if !$0 { model.itemToDelete = nil } }), titleVisibility: .visible) {
@@ -215,28 +217,10 @@ struct ContentView: View {
                 Button("Delete “" + row.item.name + "”…", role: .destructive) { model.trashItem(row) }
             }
         } message: { Text("You can restore the item for 30 days. It stays protected by its original vault.") }
-        .confirmationDialog("Delete this secret?", isPresented: $model.deleteConfirmation, titleVisibility: .visible) {
-            Button("Delete secret", role: .destructive) { model.delete() }
+        .confirmationDialog("Delete Field?", isPresented: $model.deleteConfirmation, titleVisibility: .visible) {
+            Button("Delete Field", role: .destructive) { model.delete() }
         } message: { Text("This deletes the current field after authentication. Historical encrypted copies remain.") }
         .task { model.start() }
     }
 
-    private func vaultActions(_ vault: VaultDescriptor) -> some View {
-        Button {
-            if model.prepareVaultAction(vault.id) {
-                model.notice = nil
-                #if os(macOS)
-                openSettings()
-                #else
-                settingsPresented = true
-                #endif
-            }
-        } label: {
-            Image(systemName: "ellipsis").frame(width: 24, height: 24).mopControlTarget()
-        }
-        .buttonStyle(.borderless)
-        .help("Settings for " + model.vaultLabel(vault))
-        .accessibilityLabel("Settings for " + model.vaultLabel(vault))
-        .disabled(model.busy)
-    }
 }

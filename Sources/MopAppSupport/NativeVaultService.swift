@@ -54,10 +54,11 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             await gate.enter()
             do {
                 try control.check(token)
-                let result = try await run(operation, selection: vault, offline: offline, token: token)
+                var result = try await run(operation, selection: vault, offline: offline, token: token)
                 try control.check(token)
                 if publishesAutoFill, let catalog = result.catalog, let vault, UUID(uuidString: vault) != nil {
-                    try? await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault)
+                    do { try await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault) }
+                    catch { result.autoFillStatus = await AutoFillPublisher.shared.status() }
                 }
                 await gate.leave(); return result
             } catch {
@@ -122,7 +123,11 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 var removingSelf = false
                 for entry in entries {
                     let listing = try await run(.members, selection: entry.address.vault.uuidString, offline: false, token: token)
-                    for device in listing.devices { devices[device.id] = device }
+                    for device in listing.devices {
+                        var combined = devices[device.id] ?? device
+                        combined.vaultNames[entry.address.vault.uuidString] = entry.name ?? "Unnamed vault"
+                        devices[device.id] = combined
+                    }
                     if case .removeAccountDevice(let id) = action,
                        let target = listing.devices.first(where: { $0.id == id }) {
                         // Preflight before any publication: never strand a vault
@@ -132,8 +137,22 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     }
                 }
                 if case .removeAccountDevice(let id) = action {
+                    var completed: [String] = []
                     for entry in affected {
-                        _ = try await run(.manage(.removeDevice(id)), selection: entry.address.vault.uuidString, offline: false, token: token)
+                        do {
+                            _ = try await run(.manage(.removeDevice(id)), selection: entry.address.vault.uuidString, offline: false, token: token)
+                            completed.append(entry.name ?? "Unnamed vault")
+                            devices[id]?.vaultNames.removeValue(forKey: entry.address.vault.uuidString)
+                        } catch {
+                            try control.check(token)
+                            guard !completed.isEmpty else { throw error }
+                            // Remote commits cannot be rolled back. Keep keys on partial self-removal.
+                            result.deviceRemovalIncomplete = true
+                            result.devices = devices.values.sorted { $0.name < $1.name }
+                            let done = completed.isEmpty ? "No removals were confirmed." : "Removed from: " + completed.joined(separator: ", ") + "."
+                            result.message = done + " Removal from " + (entry.name ?? "Unnamed vault") + " was not confirmed; remaining vaults were not changed. Refresh Devices before retrying."
+                            return result
+                        }
                     }
                     devices.removeValue(forKey: id)
                     if removingSelf {

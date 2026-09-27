@@ -6,86 +6,143 @@ import UniformTypeIdentifiers
 
 struct AppSheetView: View {
     @Bindable var model: AppModel
-    let kind: AppSheet
-    @State private var name = "personal"
-    @State private var fingerprint = ""
+    let request: SheetRequest
+    private var kind: AppSheet { request.kind }
+    @State private var controls = SheetControls()
+    @State private var initialName = "Personal"
+    @State private var confirmDiscard = false
+    @State private var submitted = false
+    @State private var nextSheet: AppSheet?
+    @State private var name = "Personal"
     @State private var confirmation = ""
     @State private var localError: String?
     var body: some View {
-        ScrollView { VStack(alignment: .leading, spacing: 18) {
+        VStack(spacing: 0) { ScrollView { VStack(alignment: .leading, spacing: 18) {
             switch kind {
             case .createVault:
-                Text("Create a vault").font(.title2)
+                Text(model.vaults.isEmpty ? "Create Your First Vault" : "Create a Vault").font(.title2)
                 TextField("Vault name", text: $name)
+                if (try? VaultName.validate(creationName)) == nil {
+                    Text("Use letters, numbers, and hyphens for the vault name.").font(.caption).foregroundStyle(.secondary)
+                }
                 Text("Mop will create this device’s protected keys automatically. You can start saving passwords immediately and add other devices or hardware recovery later.")
-                Button("Create vault") { model.createVault(name: name) }
-                    .disabled((try? VaultName.validate(name)) == nil)
                 Text("Until you add another device or recovery, losing this device means losing access to your vault.").font(.caption)
                 Divider()
-                Button("Connect to an existing vault…") { model.sheet = .enrollDevice }
-                Button("Set up this device for recovery…") { model.sheet = .setupRecovery }
-                Button("Recover an existing vault…") { model.sheet = .recover }
+                DisclosureGroup("More Options") {
+                Button("Connect to an existing vault…") { dismissOrConfirm(next: .enrollDevice) }
+                Button("Set up this device for recovery…") { dismissOrConfirm(next: .setupRecovery) }
+                Button("Recover an existing vault…") { dismissOrConfirm(next: .recover) }
+                }
             case .enrollDevice:
                 if model.deviceRemoved {
                     Text("This device was removed").font(.title2)
                     Text(model.removalCleanupPending ? "Local cleanup could not finish. Reconnect will retry cleanup before adding this device again." : "Its local account access has been cleared. Reconnect only if you want to add this device again.")
                     Button("Reconnect") { model.reconnectDevice() }
                 } else {
-                Text("Connect this device").font(.title2)
+                Text(connectTitle).font(.title2)
                 Text("Mop connects automatically through your Apple Account. Keep Mop unlocked on another device until setup finishes.")
-                ForEach(model.vaults.filter { !$0.enrolled }) { vault in
-                    Text(vault.name ?? vault.id).font(.caption)
-                }
                 CloudEnrollmentView(model: model, owner: false)
-                DisclosureGroup("Join another person’s shared vault") { SharingView(model: model, setup: true, flow: .connect) }
-                Button("Refresh vaults") { model.sheet = nil; model.discover(autoUnlock: true) }
-                Button("Create a different vault…") { model.sheet = .createVault }
-                Button("No approved device? Recover…") { model.sheet = .recover }
+                DisclosureGroup("More Options") {
+                DisclosureGroup("Join another person’s shared vault") { SharingView(model: model, setup: true, flow: .connect, target: request.target, controls: controls) }
+                Button("Refresh vaults") { model.sheet = nil; model.refresh() }
+                Button("Create a different vault…") { dismissOrConfirm(next: .createVault) }
+                Button("No connected device? Recover…") { dismissOrConfirm(next: .recover) }
+                }
                 }
             case .addDevice:
-                Text("Add my device").font(.title2)
+                Text("Connect Another Device").font(.title2)
                 Text("Open Mop on your new device using the same Apple Account. Keep this device unlocked; Mop will connect the new device automatically and notify you when it joins.")
                 CloudEnrollmentView(model: model, owner: true)
             case .shareAccount:
                 Text("Share with another person").font(.title2)
                 Text("Ask the other person to open Mop and choose Connect to an existing vault. Choose what they may do, exchange the invitation, then approve their response.")
-                SharingView(model: model, setup: false, flow: .share)
+                SharingView(model: model, setup: false, flow: .share, target: request.target, controls: controls)
             case .setupRecovery:
                 Text("Optional hardware recovery").font(.title2)
                 Text("On a separate device, create a recovery request. On your owner device, import that request to add recovery to existing secrets. Keep encrypted backups as well as the recovery device.")
-                SharingView(model: model, setup: model.selectedVault == nil, flow: .recovery)
+                SharingView(model: model, setup: request.target == nil, flow: .recovery, target: request.target, controls: controls)
             case .recover:
                 Text("Hardware recovery").font(.title2)
-                SharingView(model: model, setup: false, recoveryMode: true)
-            case .trust:
-                Text("Verify current checkpoint").font(.title2)
-                TextField("Independently obtained checkpoint", text: $fingerprint)
-                Button("Verify") { model.management(.trust(fingerprint: fingerprint)) }.disabled(fingerprint.count != 64)
+                SharingView(model: model, setup: false, recoveryMode: true, target: request.target, controls: controls)
             case .renameVault:
                 Text("Rename vault").font(.title2)
                 Text("Update scripts and references after renaming. The old name is not retained.")
                 TextField("Name", text: $name)
-                Button("Rename") { model.renameVault(to: name) }.disabled((try? VaultName.validate(name)) == nil)
+                if (try? VaultName.validate(name)) == nil { Text("Use lowercase letters, numbers, and hyphens.").font(.caption).foregroundStyle(.secondary) }
             case .deleteVault:
                 Text("Delete cloud vault").font(.title2)
                 Text("Permanently delete cloud contents and history. Existing backups and local encrypted checkpoints remain.")
-                Text(model.vault).textSelection(.enabled)
+                Text(request.target?.name ?? "Unnamed vault").font(.headline)
+                Button("Export Backup First…") { model.chooseExportBackup(target: request.target) }.disabled(model.busy)
                 TextField("Type the vault name to confirm", text: $confirmation)
-                Button("Delete", role: .destructive) {
-                    if let target = model.selectedVaultDescriptor { model.deleteVault(target: target, confirmation: confirmation) }
-                }.disabled(confirmation != model.vaultName)
+
             }
+            if let error = model.error ?? controls.error ?? localError { Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
             if let notice = model.notice { Text(notice).font(.callout).textSelection(.enabled) }
             if model.busy { ProgressView("Waiting for authentication or iCloud…") }
-            Button("Done") { model.sheet = nil }.disabled(model.busy)
-        }.padding(24) }.mopSheetWidth(640)
-        .disabled(model.busy).interactiveDismissDisabled(model.busy)
+        }.padding(24).disabled(model.busy) }
+            Divider()
+            HStack {
+                Spacer()
+                Button(submitted || [.enrollDevice, .addDevice].contains(kind) ? "Close" : "Cancel") { dismissOrConfirm() }
+                    .keyboardShortcut(.cancelAction)
+                if kind == .createVault {
+                    Button("Create Vault") { submitted = true; model.createVault(name: creationName) }
+                        .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+                        .disabled(model.busy || (try? VaultName.validate(creationName)) == nil)
+                } else if kind == .renameVault {
+                    Button("Rename") { submitted = true; model.renameVault(to: name, target: request.target) }
+                        .keyboardShortcut(.defaultAction).disabled(model.busy || (try? VaultName.validate(name)) == nil)
+                } else if kind == .deleteVault {
+                    Button("Delete Vault", role: .destructive) {
+                        if let target = request.target { submitted = true; model.deleteVault(target: target, confirmation: confirmation) }
+                    }.disabled(model.busy || request.target == nil || confirmation != (request.target?.name ?? request.target?.id))
+                } else if let title = controls.title {
+                    Button(title) { submitted = true; controls.submit?() }
+                        .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(model.busy || !controls.canSubmit)
+                } else if kind == .enrollDevice && !model.deviceRemoved && model.canStartEnrollment {
+                    Button("Connect") { model.startEnrollment() }
+                        .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+                        .disabled(model.busy || model.enrollmentWorking)
+                }
+            }.padding()
+        }.mopSheetWidth(640)
+        .interactiveDismissDisabled(dirty && !submitted)
         .documentTransfers(model: model, inSheet: true)
-        .onAppear { if kind == .renameVault { name = model.vaultName } }
-        .alert("Operation not completed", isPresented: Binding(get: { model.error != nil || localError != nil }, set: { if !$0 { model.error = nil; localError = nil } })) {
-            Button("OK") { model.error = nil; localError = nil }
-        } message: { Text(localError ?? model.error ?? "") }
+        .onAppear {
+            if kind == .renameVault { name = request.target?.name ?? "" }
+            initialName = name
+            if kind == .enrollDevice { model.prepareEnrollmentSelection() }
+        }
+        .onChange(of: controls.revision) { _, _ in if !model.busy { submitted = false } }
+        .onChange(of: name) { _, _ in submitted = false }
+        .onChange(of: confirmation) { _, _ in submitted = false }
+        .onChange(of: controls.error) { _, error in if error != nil { submitted = false } }
+        .onChange(of: model.busy) { _, busy in if !busy && (model.error != nil || controls.error != nil) { submitted = false } }
+        .confirmationDialog("Discard setup changes?", isPresented: $confirmDiscard, titleVisibility: .visible) {
+            Button("Discard Changes", role: .destructive) { finishDismissal() }
+            Button("Keep Editing", role: .cancel) { nextSheet = nil }
+        }
     }
+    private var dirty: Bool { name != initialName || !confirmation.isEmpty || controls.dirty }
+    private func dismissOrConfirm(next: AppSheet? = nil) {
+        nextSheet = next
+        if dirty && !submitted { confirmDiscard = true } else { finishDismissal() }
+    }
+    private func finishDismissal() {
+        if let nextSheet { model.presentSheet(nextSheet, target: request.target, inSettings: request.inSettings) }
+        else if model.sheetRequest?.id == request.id { model.sheet = nil }
+    }
+
+    private var creationName: String { name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+    private var connectTitle: String {
+        #if os(macOS)
+        "Connect This Mac"
+        #else
+        "Connect This Device"
+        #endif
+    }
+
 }
 
 private struct CloudEnrollmentView: View {
@@ -93,29 +150,42 @@ private struct CloudEnrollmentView: View {
     let owner: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(model.enrollmentStatus).accessibilityIdentifier("enrollment-status")
-            if !owner && !model.cloudEnrollments.contains(where: { $0.rejected }) {
-                ProgressView("Connecting through iCloud…")
-                Text("If setup is waiting, open and unlock Mop on a device that already has this vault. No approval is needed there.")
-            }
-            if model.cloudEnrollments.contains(where: { $0.rejected }) {
-                Text("Connection cancelled. Tap Restart connection to try again.")
-            }
-            Button("Check iCloud now") { model.pollCloudEnrollment(owner: owner) }.disabled(model.busy)
-            if !owner {
-                Button("Restart connection") { model.restartCloudEnrollment() }.disabled(model.busy)
-                Button("Cancel request", role: .destructive) { model.cancelCloudEnrollment() }.disabled(model.busy)
-                Text("Restart tries the connection again without deleting your vault or device keys.").font(.caption)
-            }
-        }
-        .task {
-            var first = true
-            while !Task.isCancelled {
-                if model.isActive && !model.busy && !model.refreshing {
-                    model.pollCloudEnrollment(owner: owner, automatic: !first)
-                    first = false
+            if owner {
+                Text("Connections are checked automatically while Mop is unlocked.")
+                if !model.enrollmentSessionActive { Button("Unlock Mop") { model.unlock() }.disabled(!model.canUnlock) }
+                if model.enrollmentWorking { ProgressView("Checking connections…") }
+            } else {
+                ForEach(model.vaults.filter { !$0.enrolled || model.enrollmentSelection.contains($0.id) }) { vault in
+                    VStack(alignment: .leading, spacing: 8) {
+                        if model.enrollmentProgress[vault.id] == nil {
+                            Toggle(model.vaultLabel(vault), isOn: Binding(get: { model.enrollmentSelection.contains(vault.id) }, set: {
+                                if $0 { model.enrollmentSelection.insert(vault.id) } else { model.enrollmentSelection.remove(vault.id) }
+                            }))
+                        } else {
+                            Text(model.vaultLabel(vault)).font(.headline)
+                        }
+                        if let progress = model.enrollmentProgress[vault.id] {
+                            Text(progress.phase.message).accessibilityIdentifier("enrollment-status")
+                            if progress.phase == .contacting { ProgressView() }
+                            if let date = progress.lastContact { Text("Last checked \(date, style: .relative) ago").font(.caption) }
+                            switch progress.phase {
+                            case .failed, .offline, .paused:
+                                Button(progress.phase == .paused ? "Unlock and Retry" : "Retry") { model.retryEnrollment(vault.id) }
+                                    .disabled(model.busy || model.enrollmentWorking)
+                            default: EmptyView()
+                            }
+                            if progress.phase != .connected {
+                                DisclosureGroup("Troubleshooting") {
+                                    Button("Restart Connection") { model.restartCloudEnrollment(vault.id) }
+                                    Button("Cancel Request", role: .destructive) { model.cancelCloudEnrollment(vault.id) }
+                                    Text("Restart replaces this request without deleting your vault or device keys.").font(.caption)
+                                }.disabled(model.busy || model.enrollmentWorking)
+                            }
+                        }
+                    }.padding(.vertical, 6)
                 }
-                try? await Task.sleep(for: .seconds(5))
+                Text("Closing this window keeps submitted requests active. Mop checks while unlocked; iPhone and iPad resume checks when you return to Mop. Use Cancel Request to stop a connection.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }

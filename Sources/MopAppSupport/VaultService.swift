@@ -15,7 +15,10 @@ public struct VaultDeviceRecord: Sendable, Identifiable {
     public let id: UUID
     public let name: String
     public let isCurrent: Bool
-    public init(id: UUID, name: String, isCurrent: Bool) { self.id = id; self.name = name; self.isCurrent = isCurrent }
+    public var vaultNames: [String: String]
+    public init(id: UUID, name: String, isCurrent: Bool, vaultNames: [String: String] = [:]) {
+        self.id = id; self.name = name; self.isCurrent = isCurrent; self.vaultNames = vaultNames
+    }
 }
 public enum VaultManagement: Sendable {
     case requestEnrollment(name: String), restartEnrollment(name: String), cancelEnrollment, checkEnrollment, enrollmentInbox, automaticEnrollment, confirmEnrollment(code: String)
@@ -53,6 +56,7 @@ extension VaultOperation {
 public struct VaultResult: Sendable {
     public var vaults: [VaultDescriptor] = []
     public var defaultVault: String?
+    public var autoFillStatus: AutoFillPublicationStatus?
     public var catalog: ItemCatalog?
     public var deletedCatalog: ItemCatalog?
     public var value: SecretBytes?
@@ -62,6 +66,7 @@ public struct VaultResult: Sendable {
     public var passwordQuality: [String: PasswordQuality] = [:]
     public var members: [VaultMemberRecord] = []
     public var devices: [VaultDeviceRecord] = []
+    public var deviceRemovalIncomplete = false
     public var deviceRemoved = false
     public var enrollments: [EnrollmentExchange] = []
     public var addedDevices: [UUID] = []

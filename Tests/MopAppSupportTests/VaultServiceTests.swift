@@ -56,6 +56,8 @@ private actor Server {
     func discover(_ account: String) -> [VaultAddress] { addresses.values.filter { $0.account == account } }
     func remember(_ address: VaultAddress) { addresses[address.vault] = address }
     var dropAcknowledgement = false
+    var rejectAfter: Int?
+    func rejectPublication(after successful: Int) { rejectAfter = successful }
     func initialize(_ root: VerifiedVault) throws {
         guard vaults[root.id] == nil else { throw MopError.vaultConflict }
         vaults[root.id] = State(head: root.digest, version: 1, revisions: [root.digest: root.bytes])
@@ -64,6 +66,10 @@ private actor Server {
     func revision(_ digest: String, _ id: UUID) throws -> Data { guard let bytes = vaults[id]?.revisions[digest] else { throw MopError.vaultMissing }; return bytes }
     func upload(_ bytes: Data, _ digest: String, _ id: UUID) throws { guard vaults[id] != nil, Codec.digest(bytes) == digest else { throw MopError.invalidVault }; vaults[id]!.revisions[digest] = bytes }
     func publish(_ digest: String, _ version: Data, _ id: UUID) throws {
+        if let remaining = rejectAfter {
+            if remaining == 0 { rejectAfter = nil; throw MopError.cloudUnavailable }
+            rejectAfter = remaining - 1
+        }
         guard var value = vaults[id], version == Data(String(value.version).utf8) else { throw MopError.vaultConflict }
         guard value.revisions[digest] != nil else { throw MopError.invalidVault }
         value.head = digest; value.version += 1; vaults[id] = value
@@ -172,9 +178,11 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
     let cloud = Server(), owner = Client(cloud, "a"), recovery = Client(cloud, "a")
     let id = try await create(owner, recovery: recovery)
     let initial = try await owner.service.execute(.catalog, vault: id).requireCatalog()
-    let item = VaultItem(name: "login", type: .login, fields: [ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "website", type: .website, value: "https://example.com"), ItemField(path: "password", type: .password, value: "secret")])
+    var item = VaultItem(name: "login", type: .login, fields: [ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "website", type: .website, value: "https://example.com"), ItemField(path: "password", type: .password, value: "secret")])
+    item.autoFill = AutoFillMapping(username: "username", password: "password")
     let edit = ItemEdit(revision: initial.revision, item: item, create: true)
     let saved = try await owner.service.execute(.save(edit), vault: id).requireCatalog()
+    #expect(saved.items[0].autoFill == item.autoFill)
     #expect(saved.items[0].fields.first { $0.type == .password }?.value == nil)
     let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
     let before = owner.calls.withLock { $0 }
@@ -192,6 +200,7 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
     let tombstone = try #require(deleted.deletedCatalog?.items.first?.deletion)
     let restored = try await owner.service.execute(.restoreItem(id: tombstone.id, revision: deleted.requireCatalog().revision), vault: id)
     #expect(restored.catalog?.items.first?.name == "login")
+    #expect(restored.catalog?.items.first?.autoFill == item.autoFill)
 }
 
 @Test func integratedUncertainWriteOfflineAccountInvalidationAndReopen() async throws {
@@ -439,6 +448,7 @@ private actor AuthenticationGate {
     let devices = try await owner.service.execute(.manage(.devices), vault: first).devices
     #expect(devices.count == 2)
     #expect(devices.first(where: { $0.id == old.device })?.isCurrent == false)
+    #expect(devices.first(where: { $0.id == old.device })?.vaultNames.count == 2)
     _ = try await owner.service.execute(.manage(.removeAccountDevice(old.device)), vault: first)
     // Retrying a completed account removal is harmless.
     _ = try await owner.service.execute(.manage(.removeAccountDevice(old.device)), vault: first)
@@ -520,4 +530,21 @@ private actor AuthenticationGate {
     }
     #expect(try await owner.service.execute(.discover, vault: nil).deviceRemoved)
     #expect(try await tablet.service.execute(.members, vault: id).devices.count == 1)
+}
+
+@Test func deviceRemovalReportsConfirmedVaultsBeforeLaterFailure() async throws {
+    let server = Server(), owner = Client(server, "a"), tablet = Client(server, "a")
+    let first = UUID().uuidString, second = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "one"), vault: first)
+    _ = try await owner.service.execute(.create(name: "two"), vault: second)
+    for id in [first, second] { try await enroll(tablet, owner: owner, vault: id, role: .owner) }
+    let device = try await tablet.request().1.device
+    await server.rejectPublication(after: 1)
+    let result = try await owner.service.execute(.manage(.removeAccountDevice(device.device)), vault: first)
+    #expect(result.deviceRemovalIncomplete)
+    #expect(result.message.contains("Removed from:") && result.message.contains("not confirmed"))
+    #expect(result.devices.first { $0.id == device.device }?.vaultNames.count == 1)
+    // A retry reconciles the pending publication and safely completes the remaining scope.
+    _ = try await owner.service.execute(.manage(.removeAccountDevice(device.device)), vault: first)
+    for id in [first, second] { #expect(try await owner.service.execute(.members, vault: id).devices.count == 1) }
 }

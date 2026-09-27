@@ -43,11 +43,33 @@ public struct ItemField: Codable, Equatable, Sendable {
     }
 }
 
+/// Stored only inside the encrypted catalog. Nil means automatic field selection.
+public struct AutoFillMapping: Codable, Equatable, Sendable {
+    public var username: String?
+    public var password: String?
+    public var oneTimeCode: String?
+    public init(username: String? = nil, password: String? = nil, oneTimeCode: String? = nil) {
+        self.username = username; self.password = password; self.oneTimeCode = oneTimeCode
+    }
+    public var isAutomatic: Bool { username == nil && password == nil && oneTimeCode == nil }
+    public func validationError(in fields: [ItemField]) -> String? {
+        for (path, types, label) in [(username, [FieldType.username, .email, .text], "username"),
+                                    (password, [.password, .concealed], "password"),
+                                    (oneTimeCode, [.otp], "verification code")] {
+            if let path, !fields.contains(where: { $0.path == path && types.contains($0.type) }) {
+                return "Choose an existing \(label) field for AutoFill, or choose Automatic."
+            }
+        }
+        return nil
+    }
+}
+
 public struct VaultItem: Codable, Equatable, Sendable {
     public var name: String
     public var type: ItemType
     public var fields: [ItemField]
     public var deletion: ItemDeletion?
+    public var autoFill: AutoFillMapping?
     public func isTemplateField(_ field: ItemField) -> Bool {
         field.isTemplate == true || type.template.contains { $0.path == field.path }
     }

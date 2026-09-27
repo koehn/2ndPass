@@ -1,137 +1,148 @@
 import AuthenticationServices
 import CloudKit
-import OSLog
 import SwiftUI
 import MopAppSupport
 import MopCore
 
 @MainActor final class CredentialProviderViewController: ASCredentialProviderViewController {
-    private var service: NativeVaultService?
+    private var session: AutoFillRequestSession?
     private var task: Task<Void, Never>?
-    private var accountObserver: AccountObservation?
+    private var expiryTask: Task<Void, Never>?
+    private var observations: [AccountObservation] = []
+    private var pendingList = false
     private var pendingIdentity: AutoFillIdentity?
+    private var retryIdentity: AutoFillIdentity?
+    private var retryField: CredentialField?
+    #if os(macOS)
+    private var hostProcess: pid_t?
+    #endif
+    private var generation = 0
     private let model = CredentialListModel()
 
     override func loadView() {
-        let content = CredentialListView(model: model, select: { [weak self] in self?.fill($0, field: $1) }, cancel: { [weak self] in self?.cancel() })
+        let content = CredentialListView(model: model, select: { [weak self] in self?.fill($0, field: $1) },
+                                         retry: { [weak self] in self?.retry() },
+                                         chooseAnother: { [weak self] in self?.prepareList(kind: self?.model.kind) },
+                                         cancel: { [weak self] in self?.cancel() })
         #if os(macOS)
         let host = NSHostingController(rootView: content)
-        addChild(host)
-        view = host.view
+        addChild(host); view = host.view
         #else
         let host = UIHostingController(rootView: content)
-        // Keep the hosting view inside a separate container so UIKit can manage
-        // the extension's presentation and the child's layout independently.
-        view = UIView()
-        view.backgroundColor = .systemBackground
-        addChild(host)
-        host.view.translatesAutoresizingMaskIntoConstraints = false
+        view = UIView(); view.backgroundColor = .systemBackground
+        addChild(host); host.view.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(host.view)
         NSLayoutConstraint.activate([
-            host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            host.view.topAnchor.constraint(equalTo: view.topAnchor),
-            host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor), host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            host.view.topAnchor.constraint(equalTo: view.topAnchor), host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
         host.didMove(toParent: self)
         #endif
-        observeAccountChanges()
-        #if os(macOS)
+        observeLifecycle()
         updatePreferredContentSize()
+    }
+    private func observeLifecycle() {
+        guard observations.isEmpty else { return }
+        observe(.CKAccountChanged) { [weak self] in
+            self?.cancel(); Task { await AutoFillStorage.invalidate() }
+        }
+        #if os(iOS)
+        observe(UIApplication.didEnterBackgroundNotification) { [weak self] in self?.interrupt() }
+        #else
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
+            observations.append(AccountObservation(center: center, token: center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.interrupt() }
+            }))
+        }
+        observations.append(AccountObservation(center: center, token: center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            let application = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            let bundle = application?.bundleIdentifier
+            let process = application?.processIdentifier
+            // Apple's authentication panel can temporarily take focus without leaving the request.
+            guard bundle != "com.apple.SecurityAgent", bundle != "com.apple.CoreAuthUI" else { return }
+            Task { @MainActor in
+                guard let self, self.session != nil, process != self.hostProcess else { return }
+                self.interrupt()
+            }
+        }))
         #endif
     }
-
-    private func observeAccountChanges() {
-        guard accountObserver == nil else { return }
-        accountObserver = AccountObservation(NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                self?.cancel()
-                await AutoFillStorage.invalidate()
-            }
-        })
+    private func observe(_ name: Notification.Name, action: @escaping @MainActor @Sendable () -> Void) {
+        let center = NotificationCenter.default
+        observations.append(AccountObservation(center: center, token: center.addObserver(forName: name, object: nil, queue: .main) { _ in
+            Task { @MainActor in action() }
+        }))
     }
-
     override func prepareCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier]) {
-        prepareList(for: serviceIdentifiers, kind: .password)
+        model.hosts = Set(serviceIdentifiers.compactMap { AutoFillEntry.website($0.identifier) })
+        model.textInsertion = false; prepareList(kind: .password)
     }
     override func prepareOneTimeCodeCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier]) {
-        prepareList(for: serviceIdentifiers, kind: .oneTimeCode)
-    }
-    private func prepareList(for serviceIdentifiers: [ASCredentialServiceIdentifier], kind: AutoFillKind?) {
-        stop()
-        pendingIdentity = nil
-        model.kind = kind
-        model.showsPicker = true
-        model.textInsertion = false
-        updatePreferredContentSize()
-        model.loading = true
-        model.message = nil
-        task = Task {
-            let identities: [AutoFillIdentity]
-            do {
-                let directory = try AutoFillStorage.directory()
-                let entries = try await Task.detached { try AutoFillIndex(directory: directory).load() }.value
-                identities = entries.filter { kind == nil || $0.kind == kind }
-            } catch {
-                guard !Task.isCancelled else { return }
-                Logger(subsystem: "com.koehn.mop", category: "AutoFill").error("Unable to read the shared credential index.")
-                model.entries = []
-                model.message = "Mop couldn’t read its AutoFill list. Open and unlock Mop to refresh it, then try again."
-                model.loading = false
-                return
-            }
-            guard !Task.isCancelled else { return }
-            let hosts = Set(serviceIdentifiers.compactMap { AutoFillEntry.website($0.identifier) })
-            model.entries = identities.sorted {
-                let left = hosts.contains($0.website), right = hosts.contains($1.website)
-                if left != right { return left }
-                return ($0.website, $0.username) < ($1.website, $1.username)
-            }
-            model.loading = false
-        }
+        model.hosts = Set(serviceIdentifiers.compactMap { AutoFillEntry.website($0.identifier) })
+        model.textInsertion = false; prepareList(kind: .oneTimeCode)
     }
     override func prepareCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier], requestParameters: ASPasskeyCredentialRequestParameters) {
-        // A website may have an active passkey request while the user chooses
-        // Passwords. Mop still offers its passwords through this entry point.
         prepareCredentialList(for: serviceIdentifiers)
     }
     #if os(iOS)
     override func prepareInterfaceForUserChoosingTextToInsert() {
-        prepareList(for: [], kind: nil)
-        model.textInsertion = true
+        model.hosts = []; model.textInsertion = true; prepareList(kind: nil)
     }
     #endif
-    override func provideCredentialWithoutUserInteraction(for credentialRequest: any ASCredentialRequest) {
-        guard let identity = AutoFillIdentity(identity: credentialRequest.credentialIdentity) else { identityNotFound(); return }
-        provide(identity)
-    }
-    override func provideCredentialWithoutUserInteraction(for credentialIdentity: ASPasswordCredentialIdentity) {
-        guard let identity = AutoFillIdentity(identity: credentialIdentity) else { identityNotFound(); return }
-        provide(identity)
-    }
-    private func provide(_ identity: AutoFillIdentity) {
-        stop()
-        pendingIdentity = nil
-        observeAccountChanges()
-        let identifier = identity.recordIdentifier
+    private func prepareList(kind: AutoFillKind?) {
+        stop(); pendingIdentity = nil; retryIdentity = nil; retryField = nil
+        model.kind = kind; model.showsPicker = true; model.message = nil; model.loading = true
+        updatePreferredContentSize()
+        guard isViewLoaded, view.window != nil else { pendingList = true; return }
+        pendingList = false
+        let token = generation
         task = Task {
             do {
-                try await AutoFillAccess.completeSystemRequest(recordIdentifier: identifier, kind: identity.kind, context: extensionContext)
+                let directory = try AutoFillStorage.directory()
+                let identities = try await Task.detached { try AutoFillIndex(directory: directory).load() }.value
+                    .filter { kind == nil || $0.kind == kind }
+                guard token == generation, !Task.isCancelled else { return }
+                guard !identities.isEmpty else {
+                    model.loading = false
+                    model.message = "No suggestions are available. Open Mop, unlock it, then choose Settings → AutoFill → Refresh Suggestions."
+                    updatePreferredContentSize(); return
+                }
+                let session = beginSession()
+                let choices = try await session.choices(for: identities)
+                guard token == generation, !Task.isCancelled else { return }
+                model.entries = choices.sorted { ($0.identity.website, $0.identity.username, $0.vaultName, $0.itemName, $0.id) < ($1.identity.website, $1.identity.username, $1.vaultName, $1.itemName, $1.id) }
+                model.loading = false
+                if session.unavailableVaults > 0 { model.message = "Some vaults are unavailable. Open and unlock Mop to refresh them. Available accounts are listed below." }
+                else if choices.isEmpty { model.message = "These suggestions are no longer available. Refresh Suggestions in Mop’s AutoFill settings." }
+                updatePreferredContentSize()
             } catch {
-                guard !Task.isCancelled else { return }
-                if (error as NSError).domain == ASExtensionErrorDomain {
-                    extensionContext.cancelRequest(withError: error)
-                    return
-                }
-                let code: ASExtensionError.Code
-                switch error as? MopError {
-                case .authentication: code = .userInteractionRequired
-                case .notFound, .vaultMissing: code = .credentialIdentityNotFound
-                default: code = .failed
-                }
-                extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: code.rawValue))
+                guard token == generation, !Task.isCancelled else { return }
+                failure(error)
             }
         }
+    }
+    private func beginSession() -> AutoFillRequestSession {
+        session?.end(); expiryTask?.cancel()
+        #if os(macOS)
+        hostProcess = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        #endif
+        let value = AutoFillRequestSession(); session = value
+        let token = generation
+        expiryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(60)) } catch { return }
+            guard let self, self.generation == token else { return }
+            self.stop(); self.model.message = "AutoFill timed out. Authenticate again to continue."; self.updatePreferredContentSize()
+        }
+        return value
+    }
+    override func provideCredentialWithoutUserInteraction(for credentialRequest: any ASCredentialRequest) {
+        requireInteraction()
+    }
+    override func provideCredentialWithoutUserInteraction(for credentialIdentity: ASPasswordCredentialIdentity) { requireInteraction() }
+    private func requireInteraction() {
+        stop()
+        extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userInteractionRequired.rawValue))
     }
     override func prepareInterfaceToProvideCredential(for credentialRequest: any ASCredentialRequest) {
         guard let identity = AutoFillIdentity(identity: credentialRequest.credentialIdentity) else { identityNotFound(); return }
@@ -142,122 +153,112 @@ import MopCore
         prepare(identity)
     }
     private func prepare(_ identity: AutoFillIdentity) {
-        stop()
-        pendingIdentity = nil
-        model.showsPicker = false
-        model.textInsertion = false
-        model.entries = []
+        stop(); retryIdentity = identity; pendingIdentity = identity
+        model.kind = identity.kind; model.showsPicker = false; model.textInsertion = false
+        model.message = nil; model.loading = true
         updatePreferredContentSize()
-        model.message = nil
-        model.loading = true
-        if isViewLoaded, view.window != nil { fill(identity) }
-        else { pendingIdentity = identity }
+        if isViewLoaded, view.window != nil { pendingIdentity = nil; fill(identity) }
     }
     #if os(macOS)
     override func viewDidAppear() {
         super.viewDidAppear()
         if let identity = pendingIdentity { pendingIdentity = nil; fill(identity) }
+        else if pendingList { prepareList(kind: model.kind) }
     }
     override func viewDidDisappear() { super.viewDidDisappear(); stop() }
     #else
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if let identity = pendingIdentity { pendingIdentity = nil; fill(identity) }
+        else if pendingList { prepareList(kind: model.kind) }
     }
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        // A system authentication presentation may temporarily cover the picker.
-        // Only cancel for dismissal/removal, not every visibility transition.
         if isBeingDismissed || isMovingFromParent { stop() }
     }
     #endif
-
     private func updatePreferredContentSize() {
         #if os(macOS)
-        preferredContentSize = model.showsPicker
-            ? NSSize(width: 420, height: 480)
-            : NSSize(width: 360, height: 140)
+        preferredContentSize = model.showsPicker ? NSSize(width: 480, height: 540) : NSSize(width: 440, height: model.message == nil ? 180 : 320)
         #endif
     }
-
     private func fill(_ identity: AutoFillIdentity, field: CredentialField? = nil) {
-        let identifier = identity.recordIdentifier
-        stop()
-        model.message = nil
-        model.loading = true
+        guard !model.loading || session == nil else { return }
+        task?.cancel()
+        retryIdentity = identity; retryField = field
+        model.message = nil; model.loading = true
+        let value = session ?? beginSession()
+        let token = generation
         task = Task {
             do {
-                let service = NativeVaultService()
-                self.service = service
                 if identity.kind == .oneTimeCode {
-                    let credential = try await AutoFillAccess.oneTimeCode(recordIdentifier: identifier, service: service)
-                    try Task.checkCancellation()
-                    service.lock(); self.service = nil
+                    let result = try await value.code(identity)
+                    guard token == generation, !Task.isCancelled else { return }
+                    guard result.expiresAt > Date() else { throw MopError.invalidOTP }
+                    finish()
                     #if os(iOS)
-                    if field == .code {
-                        extensionContext.completeRequest(withTextToInsert: credential.code, completionHandler: nil)
-                        return
+                    if field == .code { extensionContext.completeRequest(withTextToInsert: result.credential.code, completionHandler: nil); return }
+                    #endif
+                    extensionContext.completeOneTimeCodeRequest(using: result.credential, completionHandler: nil)
+                } else {
+                    let credential = try await value.password(identity)
+                    guard token == generation, !Task.isCancelled else { return }
+                    finish()
+                    #if os(iOS)
+                    if let field {
+                        extensionContext.completeRequest(withTextToInsert: field == .username ? credential.user : credential.password, completionHandler: nil); return
                     }
                     #endif
-                    extensionContext.completeOneTimeCodeRequest(using: credential, completionHandler: nil)
-                    return
+                    extensionContext.completeRequest(withSelectedCredential: credential, completionHandler: nil)
                 }
-                let credential = try await AutoFillAccess.credential(recordIdentifier: identifier, service: service)
-                try Task.checkCancellation()
-                service.lock(); self.service = nil
-                let completed: @Sendable (Bool) -> Void = { expired in
-                    Logger(subsystem: "com.koehn.mop", category: "AutoFill").notice("Interactive request completion callback; expired=\(expired)")
-                }
-                #if os(iOS)
-                if let field {
-                    let text = field == .username ? credential.user : credential.password
-                    Logger(subsystem: "com.koehn.mop", category: "AutoFill").notice("Returning authenticated text.")
-                    extensionContext.completeRequest(withTextToInsert: text, completionHandler: completed)
-                    return
-                }
-                #endif
-                Logger(subsystem: "com.koehn.mop", category: "AutoFill").notice("Returning authenticated credential.")
-                extensionContext.completeRequest(withSelectedCredential: credential, completionHandler: completed)
             } catch {
-                guard !Task.isCancelled else { return }
-                service?.lock(); service = nil
-                if !model.showsPicker, (error as? MopError) == .authentication {
-                    cancel()
-                    return
-                }
-                model.loading = false
-                model.message = (error as? MopError) == .authentication
-                    ? "Authentication was cancelled. Select an account to try again."
-                    : "This credential is unavailable. Open and unlock Mop to refresh AutoFill."
-                if model.showsPicker, model.entries.isEmpty { model.entries = [identity] }
+                guard token == generation, !Task.isCancelled else { return }
+                failure(error)
             }
         }
     }
+    private func retry() {
+        if let identity = retryIdentity { fill(identity, field: retryField) }
+        else { prepareList(kind: model.kind) }
+    }
+    private func failure(_ error: Error) {
+        finish(); model.loading = false
+        switch error as? MopError {
+        case .authentication: model.message = "Authentication was cancelled. Retry when you are ready."
+        case .notFound, .vaultMissing: model.message = "This account was changed or removed. Choose another account, or refresh suggestions in Mop."
+        case .deviceRemoved, .deviceRemovalPending, .notVaultMember: model.message = "This device is no longer connected to the vault. Open Mop and reconnect before trying again."
+        case .invalidIdentity, .signing: model.message = "AutoFill needs setup. Open Mop, connect this device, then enable Mop in Settings → AutoFill."
+        case .invalidOTP: model.message = "The verification code expired or is unavailable. Retry to generate a fresh code."
+        default:
+            model.message = error is AutoFillSessionError ? "AutoFill timed out. Retry to authenticate again." : "This vault is unavailable. Retry, choose another account, or open and unlock Mop to refresh it."
+        }
+        updatePreferredContentSize()
+    }
+    private func finish() {
+        session?.end(); session = nil; expiryTask?.cancel(); expiryTask = nil
+        model.entries = []; model.loading = false
+    }
     private func stop() {
-        let wasLoading = task != nil && model.loading
-        task?.cancel(); task = nil; service?.lock(); service = nil
-        model.loading = false
-        if wasLoading { model.message = "The request was interrupted. Select an account to try again." }
+        generation += 1; task?.cancel(); task = nil; pendingIdentity = nil; pendingList = false; finish()
+    }
+    private func interrupt() {
+        stop(); model.message = "AutoFill was interrupted. Retry to authenticate again."; updatePreferredContentSize()
     }
     private func identityNotFound() {
-        stop()
-        extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.credentialIdentityNotFound.rawValue))
+        stop(); model.message = "This suggestion is no longer available. Choose another account."; updatePreferredContentSize()
     }
     private func cancel() {
-        stop()
-        extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userCanceled.rawValue))
+        stop(); extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userCanceled.rawValue))
     }
 }
 
 private enum CredentialField { case username, password, code }
-
 @MainActor @Observable private final class CredentialListModel {
-    // Start without a picker so a selected-credential request cannot flash the list
-    // while AuthenticationServices is loading the view.
     var showsPicker = false
     var textInsertion = false
     var kind: AutoFillKind? = .password
-    var entries: [AutoFillIdentity] = []
+    var entries: [AutoFillChoice] = []
+    var hosts: Set<String> = []
     var loading = true
     var message: String?
 }
@@ -265,53 +266,106 @@ private enum CredentialField { case username, password, code }
 private struct CredentialListView: View {
     @Bindable var model: CredentialListModel
     let select: (AutoFillIdentity, CredentialField?) -> Void
+    let retry: () -> Void
+    let chooseAnother: () -> Void
     let cancel: () -> Void
     @State private var search = ""
+    @State private var selection: String?
+    @State private var unrelated: AutoFillChoice?
+    @State private var insertionField: CredentialField?
+    @FocusState private var searchFocused: Bool
+    private var filtered: [AutoFillChoice] {
+        model.entries.filter { search.isEmpty || [$0.identity.website, $0.identity.username, $0.itemName, $0.vaultName].contains { $0.localizedCaseInsensitiveContains(search) } }
+    }
+    private var ordered: [AutoFillChoice] {
+        filtered.filter { model.hosts.contains($0.identity.website) } + filtered.filter { !model.hosts.contains($0.identity.website) }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Text("Mop AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel) }
-            if model.loading { ProgressView(model.showsPicker ? "Please wait…" : "Unlocking to fill…") }
-            if let message = model.message { Text(message).font(.callout) }
-            if model.showsPicker {
-                if model.textInsertion { Text("Choose the username, password or code to insert into the selected field.").font(.callout) }
-                if !model.loading && model.entries.isEmpty && model.message == nil {
-                    Text(model.kind == .oneTimeCode ? "No codes are available. Open and unlock Mop to refresh AutoFill, then try again." : "No logins are available in this AutoFill list. Open and unlock Mop to refresh it, then try again.")
+            HStack { Text("Mop AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel).keyboardShortcut(.cancelAction) }
+            if !model.hosts.isEmpty { Text("Filling for " + model.hosts.sorted().joined(separator: ", ")).font(.callout) }
+            if model.loading { ProgressView("Authenticating for AutoFill…") }
+            if let message = model.message {
+                Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Retry", action: retry).disabled(model.loading)
+                    Button("Choose Another Account", action: chooseAnother).disabled(model.loading)
                 }
-                TextField("Search websites or usernames", text: $search)
-                    .textFieldStyle(.roundedBorder)
-                List {
-                    ForEach(model.entries.filter { search.isEmpty || $0.username.localizedCaseInsensitiveContains(search) || $0.website.localizedCaseInsensitiveContains(search) }, id: \.recordIdentifier) { entry in
-                        if model.textInsertion {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(entry.website).font(.headline)
-                                Text(entry.username).font(.subheadline)
-                                HStack {
-                                    if entry.kind == .oneTimeCode {
-                                        Button("Code") { select(entry, .code) }
-                                    } else {
-                                        Button("Username") { select(entry, .username) }
-                                        Button("Password") { select(entry, .password) }
-                                    }
-                                }.buttonStyle(.bordered).disabled(model.loading)
-                            }
-                        } else {
-                            Button { select(entry, nil) } label: {
-                                VStack(alignment: .leading) {
-                                    Text(entry.website).font(.headline)
-                                    Text(entry.username).font(.subheadline)
-                                }.frame(maxWidth: .infinity, alignment: .leading)
-                            }.buttonStyle(.plain).disabled(model.loading)
-                        }
+            }
+            if model.showsPicker && !model.entries.isEmpty {
+                TextField("Search accounts, websites, or vaults", text: $search).textFieldStyle(.roundedBorder).focused($searchFocused)
+                    .onSubmit { fillSelected() }
+                    .onKeyPress(.downArrow) { moveSelection(1); return .handled }
+                    .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
+                if filtered.isEmpty { ContentUnavailableView.search(text: search) }
+                else {
+                    List(selection: $selection) {
+                        if !model.hosts.isEmpty { section("For This Website", entries: filtered.filter { model.hosts.contains($0.identity.website) }) }
+                        section(model.hosts.isEmpty ? "Accounts" : "Other Accounts", entries: filtered.filter { !model.hosts.contains($0.identity.website) })
+                    }
+                    .onKeyPress(.return) { fillSelected(); return .handled }
+                    if !model.textInsertion {
+                        Button("Fill") { fillSelected() }.keyboardShortcut(.defaultAction).disabled(selection == nil || model.loading)
                     }
                 }
             }
-        }.padding().frame(minWidth: 280, minHeight: model.showsPicker ? 300 : 80)
+        }.padding().frame(minWidth: 280, minHeight: model.showsPicker ? 300 : 120)
+        .onChange(of: model.entries) { _, _ in
+            selection = ordered.first?.id; searchFocused = !model.entries.isEmpty
+            if model.entries.isEmpty { unrelated = nil; search = "" }
+        }
+        .onChange(of: search) { _, _ in selection = ordered.first?.id }
+        .confirmationDialog("Use this account for another website?", isPresented: Binding(get: { unrelated != nil }, set: { if !$0 { unrelated = nil } }), titleVisibility: .visible) {
+            if let unrelated { Button("Fill Account") { select(unrelated.identity, insertionField); self.unrelated = nil } }
+            Button("Cancel", role: .cancel) { unrelated = nil }
+        } message: {
+            if let unrelated { Text("The requested site is \(model.hosts.sorted().joined(separator: ", ")). This account is for \(unrelated.identity.website): \(unrelated.identity.username) — \(unrelated.itemName), \(unrelated.vaultName).") }
+        }
+    }
+    @ViewBuilder private func section(_ title: String, entries: [AutoFillChoice]) -> some View {
+        if !entries.isEmpty {
+            Section(title) {
+                ForEach(entries) { entry in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(entry.itemName).font(.headline)
+                        Text(entry.identity.website + " · " + entry.identity.username)
+                        Text(entry.vaultName).font(.caption).foregroundStyle(.secondary)
+                        if model.textInsertion {
+                            HStack {
+                                if entry.identity.kind == .oneTimeCode { Button("Code") { choose(entry, field: .code) } }
+                                else {
+                                    Button("Username") { choose(entry, field: .username) }
+                                    Button("Password") { choose(entry, field: .password) }
+                                }
+                            }.buttonStyle(.bordered)
+                        }
+                    }.tag(entry.id).contentShape(Rectangle())
+                    .onTapGesture { selection = entry.id; if !model.textInsertion { choose(entry) } }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityAction(named: "Fill") { choose(entry) }
+                }
+            }
+        }
+    }
+    private func choose(_ entry: AutoFillChoice, field: CredentialField? = nil) {
+        guard !model.loading else { return }
+        if !model.hosts.isEmpty && !model.hosts.contains(entry.identity.website) { insertionField = field; unrelated = entry }
+        else { select(entry.identity, field) }
+    }
+    private func fillSelected() {
+        guard let entry = ordered.first(where: { $0.id == selection }) else { return }
+        choose(entry, field: model.textInsertion ? (entry.identity.kind == .oneTimeCode ? .code : .password) : nil)
+    }
+    private func moveSelection(_ offset: Int) {
+        guard !ordered.isEmpty else { return }
+        let index = ordered.firstIndex { $0.id == selection } ?? 0
+        selection = ordered[min(ordered.count - 1, max(0, index + offset))].id
     }
 }
 
-// The token is immutable and NotificationCenter supports removal on any thread.
 private final class AccountObservation: @unchecked Sendable {
+    let center: NotificationCenter
     let token: NSObjectProtocol
-    init(_ token: NSObjectProtocol) { self.token = token }
-    deinit { NotificationCenter.default.removeObserver(token) }
+    init(center: NotificationCenter, token: NSObjectProtocol) { self.center = center; self.token = token }
+    deinit { center.removeObserver(token) }
 }

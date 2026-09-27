@@ -34,11 +34,25 @@ struct SessionToolbar: ToolbarContent {
     @Binding var settings: Bool
     var body: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            Button("Refresh", systemImage: "arrow.clockwise") { model.discover(autoUnlock: true) }
+            Menu {
+                Button("New Item") { model.beginCreatingItem() }
+                    .disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil || model.page != .secrets)
+                Button("New Vault…") { model.presentSheet(.createVault) }.disabled(model.busy || model.offline)
+            } label: { Label("New", systemImage: "plus") }
+            if let target = model.selectedVaultDescriptor {
+                Button("Vault Details", systemImage: "info.circle") { model.openVaultDetails(target) }
+                    .disabled(model.busy)
+            }
+            Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
                 .accessibilityLabel("Refresh").keyboardShortcut("r")
                 .disabled(model.busy)
-            Button("Lock", systemImage: "lock") { model.lock() }
-                .accessibilityLabel("Lock").keyboardShortcut("l", modifiers: [.command, .shift])
+            if model.authenticated {
+                Button("Lock", systemImage: "lock") { model.lock() }
+                    .accessibilityLabel("Lock").keyboardShortcut("l", modifiers: [.command, .shift])
+            } else {
+                Button("Unlock", systemImage: "lock.open") { model.unlock() }
+                    .accessibilityLabel("Unlock").disabled(!model.canUnlock)
+            }
             #if os(iOS)
             Button("Settings", systemImage: "gear") { settings = true }.accessibilityLabel("Settings")
             #endif
@@ -75,6 +89,10 @@ struct MopRootView: View {
     var body: some View {
         ContentView(model: model)
             .onAppear { model.startMonitoringActivity() }
+            .draftTransitionPrompt(model: model, inSettings: false)
+            #if os(macOS)
+            .background(MacWindowLifecycle(model: model, hasDraft: model.itemDraft != nil))
+            #endif
             #if os(iOS)
             .background(ActivityBridge())
             .privacySensitive()

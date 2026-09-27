@@ -35,6 +35,7 @@ public struct AutoFillEntry: Equatable, Sendable {
     // The Login template's named, typed fields are the primary credentials.
     // Extra contact emails or secondary secrets must not hide a valid login.
     private static func usernameField(in item: VaultItem) -> ItemField? {
+        if let path = item.autoFill?.username { return item.fields.first { $0.path == path && [FieldType.username, .email, .text].contains($0.type) && !($0.value ?? "").isEmpty } }
         let usernames = item.fields.filter { $0.type == .username && !($0.value ?? "").isEmpty }
         if let primary = usernames.first(where: { $0.path == "username" }) { return primary }
         if Set(usernames.compactMap(\.value)).count == 1 { return usernames.first }
@@ -44,11 +45,13 @@ public struct AutoFillEntry: Equatable, Sendable {
         return Set(emails.compactMap(\.value)).count == 1 ? emails.first : nil
     }
     private static func passwordField(in item: VaultItem) -> ItemField? {
+        if let path = item.autoFill?.password { return item.fields.first { $0.path == path && [FieldType.password, .concealed].contains($0.type) } }
         let passwords = item.fields.filter { $0.type == .password }
         if let primary = passwords.first(where: { $0.path == "password" }) { return primary }
         return passwords.count == 1 ? passwords.first : nil
     }
     private static func otpField(in item: VaultItem) -> ItemField? {
+        if let path = item.autoFill?.oneTimeCode { return item.fields.first { $0.path == path && [FieldType.otp].contains($0.type) } }
         let fields = item.fields.filter { $0.type == .otp }
         if let primary = fields.first(where: { $0.path == "otp" }) { return primary }
         return fields.count == 1 ? fields.first : nil
@@ -57,17 +60,22 @@ public struct AutoFillEntry: Equatable, Sendable {
     public static func exclusionReason(for item: VaultItem, kind: AutoFillKind = .password) -> String? {
         guard item.type == .login else { return "Set the item type to Login." }
         guard item.deletion == nil else { return "Restore this deleted login first." }
+        if let mapping = item.autoFill {
+            let relevant = AutoFillMapping(username: mapping.username, password: kind == .password ? mapping.password : nil,
+                                           oneTimeCode: kind == .oneTimeCode ? mapping.oneTimeCode : nil)
+            if let error = relevant.validationError(in: item.fields) { return error }
+        }
         guard usernameField(in: item) != nil else {
-            return "Set a nonempty field’s type to Username (or Email). If there are multiple usernames, name the primary Username field ‘username’."
+            return "Choose a nonempty username in Edit Item → Use for AutoFill, or add a Username field."
         }
         if kind == .password && passwordField(in: item) == nil {
-            return "Set the password field’s type to Password. If there are multiple passwords, name the primary Password field ‘password’."
+            return "Choose a password in Edit Item → Use for AutoFill, or add a Password field."
         }
         if kind == .oneTimeCode && otpField(in: item) == nil {
-            return "Set a field’s type to OTP. If there are multiple OTP fields, name the primary field ‘otp’."
+            return "Choose a verification code in Edit Item → Use for AutoFill, or add an OTP field."
         }
         guard item.fields.contains(where: { $0.type == .website && website($0.value ?? "") != nil }) else {
-            return "Set a field’s type to Website and enter a valid HTTP(S) URL or domain."
+            return "Add a Website field in Edit Item and enter a valid HTTP(S) URL or domain."
         }
         return nil
     }
@@ -181,37 +189,105 @@ public enum AutoFillStorage {
     }
 }
 
+public struct AutoFillPublicationStatus: Codable, Equatable, Sendable {
+    public enum Phase: String, Codable, Sendable { case disabled, updating, current, failed, notUpdated }
+    public var phase: Phase = .notUpdated
+    public var lastSuccess: Date?
+    public var message: String?
+    // Opaque vault IDs only; failed catalog indexing must not be hidden by another vault’s success.
+    public var catalogsNeedingRefresh: Set<String>?
+    public init() {}
+}
+
+public protocol AutoFillPublishing: Sendable {
+    func status() async -> AutoFillPublicationStatus
+    func publish(catalog: ItemCatalog, vaultID: String) async throws
+    func refresh() async throws
+}
+
 /// All app-side publication is serialized, including full-store replacements.
-actor AutoFillPublisher {
-    static let shared = AutoFillPublisher()
+public actor AutoFillPublisher: AutoFillPublishing {
+    public static let shared = AutoFillPublisher()
     private let gate = OperationGate()
     private let indexDirectory: URL?
     private let publishIdentities: @Sendable ([AutoFillIdentity]) async throws -> Void
-    init(directory: URL? = nil, publish: (@Sendable ([AutoFillIdentity]) async throws -> Void)? = nil) {
+    private let enabled: @Sendable () async -> Bool
+    private var health: AutoFillPublicationStatus?
+    init(directory: URL? = nil, publish: (@Sendable ([AutoFillIdentity]) async throws -> Void)? = nil,
+         enabled: (@Sendable () async -> Bool)? = nil) {
         indexDirectory = directory
+        if let enabled { self.enabled = enabled }
+        else if publish != nil { self.enabled = { true } }
+        else { self.enabled = { await ASCredentialIdentityStore.shared.state().isEnabled } }
         publishIdentities = publish ?? { entries in
-            let store = ASCredentialIdentityStore.shared
-            if await store.state().isEnabled {
-                try await store.replaceCredentialIdentities(entries.map(\.identity))
-            }
+            try await ASCredentialIdentityStore.shared.replaceCredentialIdentities(entries.map(\.identity))
         }
     }
-    private func update(_ transform: ([AutoFillIdentity]) -> [AutoFillIdentity]) async throws {
-        await gate.enter()
-        do {
-            let entries = try AutoFillIndex(directory: indexDirectory ?? AutoFillStorage.directory()).update(transform)
-            try await publishIdentities(entries)
-            await gate.leave()
-        } catch { await gate.leave(); throw error }
+    private func directory() throws -> URL { try indexDirectory ?? AutoFillStorage.directory() }
+    private func rememberedStatus() -> AutoFillPublicationStatus {
+        if let health { return health }
+        if let directory = try? directory(),
+           let data = try? LocalFile.read(directory.appendingPathComponent("publication.json"), privateFile: true),
+           let saved = try? JSONDecoder().decode(AutoFillPublicationStatus.self, from: data) {
+            health = saved
+        } else { health = AutoFillPublicationStatus() }
+        return health!
     }
-    func publish(catalog: ItemCatalog, vaultID: String) async throws {
-        try await update { old in
+    private func record(_ state: AutoFillPublicationStatus) {
+        health = state
+        // Health is advisory. A diagnostics write cannot invalidate a successful publication.
+        if let directory = try? directory(), let data = try? JSONEncoder().encode(state) {
+            let file = directory.appendingPathComponent("publication.json")
+            try? LocalFile.write(data, to: file, replace: FileManager.default.fileExists(atPath: file.path))
+        }
+    }
+    public func status() async -> AutoFillPublicationStatus {
+        let isEnabled = await enabled()
+        var value = rememberedStatus()
+        if !isEnabled { value.phase = .disabled }
+        else if value.phase == .disabled { value.phase = value.catalogsNeedingRefresh?.isEmpty == false ? .failed : .notUpdated }
+        if health?.phase != value.phase { record(value) }
+        return value
+    }
+    private func update(scope: String? = nil, retainingScopes: Set<String>? = nil, _ transform: ([AutoFillIdentity]) -> [AutoFillIdentity]) async throws {
+        await gate.enter()
+        var state = rememberedStatus(); state.phase = .updating; state.message = nil; health = state
+        var indexed = false
+        do {
+            let entries = try AutoFillIndex(directory: directory()).update(transform)
+            indexed = true
+            if let scope { state.catalogsNeedingRefresh?.remove(scope) }
+            if let retainingScopes { state.catalogsNeedingRefresh = state.catalogsNeedingRefresh?.intersection(retainingScopes) }
+            if await enabled() {
+                try await publishIdentities(entries)
+                state.phase = .current; state.lastSuccess = Date()
+                if state.catalogsNeedingRefresh?.isEmpty == false {
+                    state.phase = .failed
+                    state.message = "Some vault suggestions still need an update. Choose Refresh Suggestions to retry."
+                }
+            } else { state.phase = .disabled }
+            record(state)
+            await gate.leave()
+        } catch {
+            if !indexed, let scope {
+                if state.catalogsNeedingRefresh == nil { state.catalogsNeedingRefresh = [] }
+                state.catalogsNeedingRefresh?.insert(scope)
+            }
+            state.phase = .failed
+            state.message = "Suggestions could not be updated. Your saved vault changes are safe. Try Refresh Suggestions."
+            record(state)
+            await gate.leave(); throw error
+        }
+    }
+    public func publish(catalog: ItemCatalog, vaultID: String) async throws {
+        try await update(scope: vaultID) { old in
             old.filter { AutoFillEntry.vaultID($0.recordIdentifier) != vaultID }
                 + AutoFillEntry.entries(catalog: catalog, vaultID: vaultID).map(AutoFillIdentity.init)
         }
     }
+    public func refresh() async throws { try await update { $0 } }
     func prune(keeping vaultIDs: Set<String>) async throws {
-        try await update { old in
+        try await update(retainingScopes: vaultIDs) { old in
             old.filter { identity in
                 guard let id = AutoFillEntry.vaultID(identity.recordIdentifier) else { return false }
                 return vaultIDs.contains(id)
@@ -219,9 +295,8 @@ actor AutoFillPublisher {
         }
     }
     func remove(vaultID: String) async throws {
-        try await update { $0.filter { AutoFillEntry.vaultID($0.recordIdentifier) != vaultID } }
+        try await update(scope: vaultID) { $0.filter { AutoFillEntry.vaultID($0.recordIdentifier) != vaultID } }
     }
-
 }
 
 public enum AutoFillAccess {
@@ -270,7 +345,7 @@ public enum AutoFillAccess {
         return ASPasswordCredential(user: entry.username, password: String(decoding: bytes, as: UTF8.self))
     }
 
-    private static func resolve(recordIdentifier: String, kind: AutoFillKind, service: any VaultService) async throws -> (AutoFillEntry, VaultResult) {
+    static func resolve(recordIdentifier: String, kind: AutoFillKind, service: any VaultService) async throws -> (AutoFillEntry, VaultResult) {
         try Task.checkCancellation()
         guard recordIdentifier.hasPrefix(kind.prefix + ":"), let id = AutoFillEntry.vaultID(recordIdentifier) else { throw MopError.notFound }
         let result = try await service.execute(.catalog, vault: id, offline: true)

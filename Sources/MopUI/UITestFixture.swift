@@ -1,6 +1,6 @@
-// Explicit UI automation fixture, never compiled into device or release builds.
+// Explicit UI automation fixture, compiled only into debug Mac and simulator builds.
 // It tests presentation only; cryptographic and hardware acceptance are separate.
-#if DEBUG && targetEnvironment(simulator)
+#if DEBUG && (os(macOS) || targetEnvironment(simulator))
 import Foundation
 import Synchronization
 import MopCore
@@ -27,7 +27,7 @@ final class UITestVaultService: VaultService, Sendable {
             var result = VaultResult()
             switch operation {
             case .discover:
-                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-vault-v6", enrolled: true)]
+                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-vault-v6", enrolled: ProcessInfo.processInfo.environment["MOP_UI_ENROLLMENT"] != "1")]
                 result.defaultVault = Self.vaultID
                 return result
             case .catalog:
@@ -62,6 +62,10 @@ final class UITestVaultService: VaultService, Sendable {
                 state.catalog.revision = UUID().uuidString
             case .passwordQuality: return result
             case .members: return result
+            case .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.cancelEnrollment):
+                state.authenticatedAt = ProcessInfo.processInfo.systemUptime
+                return result
+            case .manage(.devices), .manage(.automaticEnrollment): return result
             case .recentlyDeleted: break
             default: throw MopError.invalidProcess
             }

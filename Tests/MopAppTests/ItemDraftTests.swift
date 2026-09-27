@@ -112,3 +112,56 @@ struct ItemDraftTests {
         #expect(!draft.valid(vaultName: "personal"))
     }
 }
+
+extension ItemDraftTests {
+    @Test func dirtyTrackingIgnoresPasswordLoadingAndDetectsRevertedEdits() {
+        var draft = ItemDraft(vault: "vault", revision: "r1", item: item)
+        #expect(!draft.isModified)
+        draft.fields[1].loadedPassword = "old-password"
+        draft.fields[1].value = "old-password"
+        #expect(!draft.isModified)
+        draft.fields[1].value = "replacement"
+        #expect(draft.isModified)
+        draft.fields[1].value = "old-password"
+        #expect(!draft.isModified)
+        draft.name = "renamed"; #expect(draft.isModified)
+        draft.name = item.name; #expect(!draft.isModified)
+        draft.type = .custom; #expect(draft.isModified)
+        draft.type = item.type; #expect(!draft.isModified)
+        draft.vault = "other"; #expect(draft.isModified)
+        draft.vault = "vault"; #expect(!draft.isModified)
+        draft.fields[0].type = .email; #expect(draft.isModified)
+        draft.fields[0].type = .username; #expect(!draft.isModified)
+        draft.fields[0].path = "other"; #expect(draft.isModified)
+        draft.fields[0].path = "username"; #expect(!draft.isModified)
+        draft.fields.swapAt(0, 1); #expect(draft.isModified)
+        draft.fields.swapAt(0, 1); #expect(!draft.isModified)
+        draft.fields.append(.init(ItemField(path: "extra", value: "value"), existing: false))
+        #expect(draft.isModified)
+        draft.fields.removeLast(); #expect(!draft.isModified)
+    }
+
+    @Test func newItemStartsCleanButGeneratedPasswordAndDestinationAreChanges() {
+        var draft = ItemDraft(vault: "first", revision: "r1",
+            item: VaultItem(name: "", type: .login, fields: ItemType.login.template), isNew: true)
+        #expect(!draft.isModified)
+        draft.vault = "second"; #expect(draft.isModified)
+        draft.vault = "first"; #expect(!draft.isModified)
+        draft.fields[1].value = "generated-password"; #expect(draft.isModified)
+        draft.fields[1].value = ""; #expect(!draft.isModified)
+    }
+}
+
+extension ItemDraftTests {
+    @Test func autoFillMappingIsAnEncryptedDraftChangeAndMustReferenceCompatibleFields() {
+        var draft = ItemDraft(vault: "v", revision: "r", item: item)
+        draft.autoFill.password = "password"
+        #expect(draft.isModified)
+        #expect(draft.item.autoFill?.password == "password")
+        #expect(draft.valid(vaultName: "personal"))
+        draft.autoFill.password = "username"
+        #expect(!draft.valid(vaultName: "personal"))
+        draft.autoFill.password = nil
+        #expect(!draft.isModified)
+    }
+}

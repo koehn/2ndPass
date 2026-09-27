@@ -13,13 +13,58 @@ private struct ExchangeDocument: FileDocument {
     init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
 }
-enum EnrollmentFlow { case connect, addDevice, share, recovery, advanced }
+enum EnrollmentFlow { case connect, share, recovery, advanced }
 
 struct SharingView: View {
     @Bindable var model: AppModel
     let setup: Bool
     var recoveryMode = false
     var flow: EnrollmentFlow = .advanced
+    var target: VaultDescriptor? = nil
+    var controls: SheetControls? = nil
+    @State private var drafts: [String: FormSnapshot] = [:]
+    @State private var importedName = ""
+    private struct FormSnapshot: Equatable {
+        var input: String; var fingerprint: String; var shareURL: String; var member: String
+        var backup: Data; var ownerRequest: String; var ownerFingerprint: String; var nextRecoveryFingerprint: String
+        var role: String; var copy: Bool; var importedName: String
+    }
+    private var snapshot: FormSnapshot { .init(input: input, fingerprint: fingerprint, shareURL: shareURL, member: member, backup: backup, ownerRequest: ownerRequest, ownerFingerprint: ownerFingerprint, nextRecoveryFingerprint: nextRecoveryFingerprint, role: role, copy: copy, importedName: importedName) }
+    private var dirty: Bool { !input.isEmpty || !fingerprint.isEmpty || !member.isEmpty || !shareURL.isEmpty || !backup.isEmpty || !ownerRequest.isEmpty || !ownerFingerprint.isEmpty || !nextRecoveryFingerprint.isEmpty || role != "editor" || copy }
+    private var primaryTitle: String {
+        if recoveryMode { return "Recover and Rotate Access" }
+        switch action {
+        case "request", "recoveryRequest": return "Create Device Request"
+        case "invite": return "Create Invitation"
+        case "accept": return "Accept Invitation"
+        case "approve": return "Approve Device"
+        case "replaceRecovery": return "Enable Recovery"
+        case "import": return "Import Checkpoint"
+        case "removeMember": return "Remove Member"
+        case "role": return "Change Role"
+        default: return "Reconcile Permissions"
+        }
+    }
+    private func validFingerprint(_ value: String) -> Bool { value.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
+    private var canSubmit: Bool {
+        if recoveryMode { return !backup.isEmpty && validFingerprint(fingerprint) && !ownerRequest.isEmpty && validFingerprint(ownerFingerprint) && !input.isEmpty && validFingerprint(nextRecoveryFingerprint) }
+        if ["invite", "accept", "approve", "replaceRecovery", "import"].contains(action) {
+            guard !input.isEmpty, validFingerprint(fingerprint) else { return false }
+            if action == "accept", !shareURL.isEmpty { return URL(string: shareURL)?.scheme == "https" && URL(string: shareURL)?.host != nil }
+        }
+        if ["removeMember", "role"].contains(action) { return UUID(uuidString: member) != nil }
+        return true
+    }
+    private func updateControls() {
+        controls?.title = primaryTitle; controls?.canSubmit = canSubmit && !model.offline
+        controls?.dirty = dirty || drafts.values.contains { !$0.input.isEmpty || !$0.fingerprint.isEmpty || !$0.backup.isEmpty || !$0.member.isEmpty || !$0.shareURL.isEmpty || !$0.ownerRequest.isEmpty || !$0.ownerFingerprint.isEmpty || !$0.nextRecoveryFingerprint.isEmpty || $0.role != "editor" || $0.copy }
+        controls?.error = error; controls?.submit = { submit() }
+    }
+    private func restore(_ value: FormSnapshot) {
+        input = value.input; fingerprint = value.fingerprint; shareURL = value.shareURL; member = value.member
+        backup = value.backup; ownerRequest = value.ownerRequest; ownerFingerprint = value.ownerFingerprint
+        nextRecoveryFingerprint = value.nextRecoveryFingerprint; role = value.role; copy = value.copy; importedName = value.importedName
+    }
     @State private var importingExchange = false
     @State private var exportingExchange = false
     @State private var action = "request"
@@ -56,19 +101,16 @@ struct SharingView: View {
                     case .connect:
                         Text("1. Create this device’s request").tag("request")
                         Text("2. Accept the owner’s invitation").tag("accept")
-                    case .addDevice, .share:
+                    case .share:
                         Text("1. Invite the new device").tag("invite")
                         Text("2. Approve its acceptance").tag("approve")
                     case .recovery:
                         Text("On recovery device: create request").tag("recoveryRequest")
                         if !setup { Text("On owner device: enable recovery").tag("replaceRecovery") }
                     case .advanced:
-                        Text("Enrollment request").tag("request")
-                        Text("Accept invitation").tag("accept")
                         Text("Import trusted checkpoint").tag("import")
                         if !setup {
                             Text("Remove member").tag("removeMember")
-                            Text("Remove device").tag("removeDevice")
                             Text("Change role").tag("role")
                             Text("Reconcile cloud permissions").tag("reconcile")
                         }
@@ -85,8 +127,8 @@ struct SharingView: View {
                 }
                 if action == "import" { TextField("Actual shared zone owner (blank for your own vault)", text: $shareURL) }
                 if action == "accept" { TextField("iCloud share URL (other account only)", text: $shareURL) }
-                if ["removeMember", "removeDevice", "role"].contains(action) { TextField("Account or device UUID from the verified member list", text: $member) }
-                if (action == "invite" && flow != .addDevice) || action == "role" {
+                if ["removeMember", "role"].contains(action) { TextField("Account or device UUID from the verified member list", text: $member) }
+                if action == "invite" || action == "role" {
                     Picker("Role", selection: $role) {
                         Text("Editor").tag("editor"); Text("Viewer").tag("viewer")
 
@@ -94,46 +136,71 @@ struct SharingView: View {
                 }
                 if action.hasPrefix("remove") { Text("This rotates current secret keys. Copied passwords and old backups cannot be revoked.").font(.caption) }
             }
-            Button(recoveryMode ? "Recover and rotate access" : "Continue") { submit() }.disabled(model.busy || model.offline)
+            if controls == nil { Button(primaryTitle) { submit() }.disabled(model.busy || model.offline || !canSubmit) }
+            if !canSubmit { Text("Complete the required inputs and independently verified fingerprints before continuing.").font(.caption).foregroundStyle(.secondary) }
+            if !importedName.isEmpty { Text("Imported: " + importedName).font(.caption) }
             if !model.exchangeOutput.isEmpty {
                 Text("Save this public exchange file and send it to the other device, for example using AirDrop. No private keys are included.").font(.caption)
                 Button("Save file to send…") { exportingExchange = true }
             }
-            if let error { Text(error).foregroundStyle(.red) }
+            if controls == nil, let error { Text(error).foregroundStyle(.red) }
         }
         .onAppear {
             switch flow {
-            case .addDevice, .share: action = "invite"
+            case .share: action = "invite"
             case .recovery: action = setup ? "recoveryRequest" : "replaceRecovery"
+            case .advanced: action = "import"
             default: break
             }
-            model.exchangeOutput = ""
+            model.exchangeOutput = ""; updateControls()
         }
-        .onChange(of: action) { _, _ in input = ""; fingerprint = ""; model.exchangeOutput = ""; model.notice = nil }
+        .onChange(of: snapshot) { _, _ in controls?.revision += 1; updateControls() }
+        .onChange(of: error) { _, _ in updateControls() }
+        .onChange(of: action) { old, new in
+            drafts[old] = snapshot
+            if let saved = drafts[new] { restore(saved) }
+            else { input = ""; fingerprint = ""; shareURL = ""; member = ""; importedName = "" }
+            model.exchangeOutput = ""; model.notice = nil; error = nil; updateControls()
+        }
         .fileExporter(isPresented: $exportingExchange, document: ExchangeDocument(Data(model.exchangeOutput.utf8)), contentType: .json, defaultFilename: "mop-" + action) { result in
-            if case .failure = result { error = "Could not save the exchange file." }
+            if case .failure(let failure) = result, (failure as NSError).code != NSUserCancelledError { error = "Could not save the exchange file." }
         }
         .fileImporter(isPresented: $importingExchange, allowedContentTypes: [.json, .data]) { result in
             do {
                 let url = try result.get(), access = url.startAccessingSecurityScopedResource()
                 defer { if access { url.stopAccessingSecurityScopedResource() } }
-                input = String(decoding: try LocalFile.read(url, limit: 24 * 1024 * 1024), as: UTF8.self)
-            } catch { self.error = "Could not read the exchange file." }
+                let bytes = try LocalFile.read(url, limit: 24 * 1024 * 1024)
+                _ = try JSONSerialization.jsonObject(with: bytes)
+                switch action {
+                case "invite", "replaceRecovery": _ = try ExchangeFile.decode(DeviceRequest.self, from: bytes)
+                case "accept": _ = try ExchangeFile.decode(InvitationPacket.self, from: bytes)
+                case "approve": _ = try ExchangeFile.decode(AcceptancePacket.self, from: bytes)
+                default: break
+                }
+                input = String(decoding: bytes, as: UTF8.self); importedName = url.lastPathComponent
+                error = nil
+            } catch { if (error as NSError).code != NSUserCancelledError { self.error = "Could not read a valid exchange file for this step." } }
         }
         .fileImporter(isPresented: $importingBackup, allowedContentTypes: [.data, .json]) { result in
             do {
                 let url = try result.get(), access = url.startAccessingSecurityScopedResource()
                 defer { if access { url.stopAccessingSecurityScopedResource() } }
                 let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
-                backup = try handle.read(upToCount: 16 * 1024 * 1024 + 1) ?? Data()
-                guard backup.count <= 16 * 1024 * 1024 else { throw MopError.invalidVault }
-            } catch { self.error = "Could not load the encrypted backup." }
+                let bytes = try handle.read(upToCount: 16 * 1024 * 1024 + 1) ?? Data()
+                guard !bytes.isEmpty, bytes.count <= 16 * 1024 * 1024 else { throw MopError.invalidVault }
+                _ = try JSONSerialization.jsonObject(with: bytes)
+                backup = bytes
+                importedName = url.lastPathComponent
+                error = nil
+            } catch { if (error as NSError).code != NSUserCancelledError { self.error = "Could not load the encrypted backup." } }
         }
     }
     private func submit() {
+        guard canSubmit else { error = "Complete the required inputs first."; return }
         do {
             let operation: VaultManagement
             if recoveryMode {
+                _ = try VerifiedVault(checkpoint: backup, independentlyVerifiedDigest: fingerprint)
                 let owner = Data(ownerRequest.utf8), recovery = Data(input.utf8)
                 guard try ExchangeFile.decode(DeviceRequest.self, from: owner).fingerprint == ownerFingerprint,
                       try ExchangeFile.decode(DeviceRequest.self, from: recovery).fingerprint == nextRecoveryFingerprint else { throw MopError.invalidIdentity }
@@ -143,19 +210,20 @@ struct SharingView: View {
                 case "request": operation = .deviceRequest(recovery: false)
                 case "recoveryRequest": operation = .deviceRequest(recovery: true)
                 case "invite":
-                    if flow == .addDevice { operation = .inviteOwnDevice(request: Data(input.utf8), fingerprint: fingerprint) }
-                    else { operation = .inviteAccount(request: Data(input.utf8), fingerprint: fingerprint, role: MemberRole(rawValue: role)!) }
+                    operation = .inviteAccount(request: Data(input.utf8), fingerprint: fingerprint, role: MemberRole(rawValue: role)!)
                 case "accept": operation = .accept(packet: Data(input.utf8), checkpoint: fingerprint, shareURL: shareURL.isEmpty ? nil : URL(string: shareURL))
-                case "import": operation = .importCheckpoint(document: Data(input.utf8), fingerprint: fingerprint, sharedOwner: shareURL.isEmpty ? nil : shareURL)
+                case "import":
+                    _ = try VerifiedVault(checkpoint: Data(input.utf8), independentlyVerifiedDigest: fingerprint)
+                    operation = .importCheckpoint(document: Data(input.utf8), fingerprint: fingerprint, sharedOwner: shareURL.isEmpty ? nil : shareURL)
                 case "approve": operation = .approve(packet: Data(input.utf8), fingerprint: fingerprint)
                 case "replaceRecovery": operation = .replaceRecovery(request: Data(input.utf8), fingerprint: fingerprint)
                 case "reconcile": operation = .reconcileShare
                 default:
                     guard let id = UUID(uuidString: member) else { throw MopError.invalidProcess }
-                    operation = action == "removeMember" ? .removeMember(id) : action == "removeDevice" ? .removeDevice(id) : .role(id, MemberRole(rawValue: role)!)
+                    operation = action == "removeMember" ? .removeMember(id) : .role(id, MemberRole(rawValue: role)!)
                 }
             }
-            error = nil; model.exchange(operation)
+            error = nil; model.exchange(operation, target: target)
         } catch { self.error = (error as? MopError)?.errorDescription ?? "Invalid exchange document." }
     }
 }

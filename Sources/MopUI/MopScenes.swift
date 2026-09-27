@@ -5,7 +5,7 @@ import MopAppSupport
 public struct MopScenes: Scene {
     @State private var model: AppModel
     @MainActor private static func initialModel() -> AppModel {
-        #if DEBUG && targetEnvironment(simulator)
+        #if DEBUG && (os(macOS) || targetEnvironment(simulator))
         if ProcessInfo.processInfo.environment["MOP_UI_TESTING"] == "1" {
             return AppModel(service: UITestVaultService())
         }
@@ -43,12 +43,38 @@ private struct MopCommands: Commands {
             CommandGroup(after: .newItem) {
                 Button("New Item") { model.beginCreatingItem() }
                     .keyboardShortcut("n").disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil || model.page != .secrets)
-                Button("New Vault…") { model.sheet = .createVault }.disabled(model.busy || model.offline)
+                Button("New Vault…") { model.presentSheet(.createVault) }.disabled(model.busy || model.offline)
+            }
+            CommandGroup(after: .textEditing) {
+                Button("Find") { model.searchFocusRequest += 1 }.keyboardShortcut("f")
+                    .disabled(!model.authenticated)
+                Button("Edit Item") { model.beginItemEditing() }.keyboardShortcut("e")
+                    .disabled(model.selectedTypedItem == nil || model.vaultDetailsTarget != nil || model.itemDraft != nil || model.busy || model.offline)
+                Button("Move to Recently Deleted…") {
+                    if let item = model.selectedTypedItem {
+                        model.itemToDelete = ItemRow(id: .init(vault: model.vault, name: item.name), vaultName: model.vaultName, item: item)
+                    }
+                }.keyboardShortcut(.delete, modifiers: .command).disabled(model.selectedTypedItem == nil || model.vaultDetailsTarget != nil || model.itemDraft != nil || model.busy || model.offline)
+                Button("Restore Item") {
+                    if let row = model.selectedDeletedItem { model.restoreDeletedItem(row) }
+                }.keyboardShortcut("r", modifiers: [.command, .shift]).disabled(model.page != .recentlyDeleted || model.selectedDeletedItem == nil || model.busy || model.offline)
             }
             CommandMenu("Vault") {
-                Button("Refresh") { model.discover(autoUnlock: true) }.keyboardShortcut("r").disabled(model.busy)
-                Button("Lock") { model.lock() }.keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("Refresh") { model.refresh() }.keyboardShortcut("r").disabled(model.busy)
+                if model.authenticated {
+                    Button("Lock") { model.lock() }.keyboardShortcut("l", modifiers: [.command, .shift])
+                } else {
+                    Button("Unlock Mop") { model.unlock() }.disabled(!model.canUnlock)
+                }
             }
+    }
+}
+
+enum SettingsCategory: String, CaseIterable, Identifiable {
+    case security = "Security", autoFill = "AutoFill", devices = "Devices", advanced = "Advanced"
+    var id: String { rawValue }
+    var symbol: String {
+        switch self { case .security: "lock.shield"; case .autoFill: "key"; case .devices: "rectangle.connected.to.line.below"; case .advanced: "gearshape.2" }
     }
 }
 
@@ -58,57 +84,99 @@ struct SessionSettings: View {
     @AppStorage("developerToolsEnabled") private var developerTools = false
     @State private var vaultID = ""
     @State private var removal: VaultDeviceRecord?
+    @State private var customTimeout = false
+    @State private var categoryPath: [SettingsCategory] = []
+    private let durations = [1, 5, 10, 15, 30, 60]
     var body: some View {
+        Group {
+            #if os(macOS)
+            TabView(selection: $model.settingsCategory) {
+                ForEach(SettingsCategory.allCases) { category in
+                    categoryView(category).tabItem { Label(category.rawValue, systemImage: category.symbol) }.tag(category)
+                }
+            }.frame(width: 620, height: 560)
+            #else
+            NavigationStack(path: $categoryPath) {
+                List(SettingsCategory.allCases) { category in
+                    NavigationLink(value: category) { Label(category.rawValue, systemImage: category.symbol) }
+                }
+                .navigationTitle("Settings")
+                .navigationDestination(for: SettingsCategory.self) { category in
+                    categoryView(category).navigationTitle(category.rawValue)
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+                }
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            }
+            .onAppear { categoryPath = [model.settingsCategory] }
+            .onChange(of: categoryPath) { _, path in if let category = path.last { model.settingsCategory = category } }
+            #endif
+        }
+        .draftTransitionPrompt(model: model, inSettings: true)
+        .onAppear { model.settingsVisible = true }
+        .onDisappear { model.settingsVisible = false }
+        .sheet(item: Binding<SheetRequest?>(get: { model.sheetRequest?.inSettings == true ? model.sheetRequest : nil }, set: { if model.sheetRequest?.inSettings == true { model.sheetRequest = $0 } })) { request in AppSheetView(model: model, request: request) }
+        .documentTransfers(model: model, inSettings: true)
+        .confirmationDialog("Remove this device?", isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), titleVisibility: .visible) {
+            if let device = removal {
+                Button("Remove " + device.name, role: .destructive) { model.removeDevice(device.id); removal = nil }
+            }
+        } message: {
+            if let device = removal {
+                Text((device.isCurrent ? "This device will lose access" : device.name + " will lose access") + " to: " +
+                    (device.vaultNames.isEmpty ? "your enrolled personal vaults" : device.vaultNames.values.sorted().joined(separator: ", ")) +
+                    ". It must explicitly reconnect to join again. A vault’s last owner device cannot be removed.")
+            }
+        }
+        .alert("Operation not completed", isPresented: Binding(get: { model.sheet == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
+            Button("OK") { model.error = nil }
+        } message: { Text(model.error ?? "") }
+    }
+    private func categoryView(_ category: SettingsCategory) -> some View {
         Form {
-
-            Stepper("Lock after \(model.autoLockMinutes) minutes of inactivity", value: $model.autoLockMinutes, in: 1...60)
-            Section("devices") {
+            switch category {
+            case .security:
+                Section("Session") {
+                    Picker(selection: Binding(get: { customTimeout || !durations.contains(model.autoLockMinutes) ? 0 : model.autoLockMinutes }, set: { value in
+                        customTimeout = value == 0
+                        if value != 0 { model.autoLockMinutes = value }
+                    })) {
+                        ForEach(durations, id: \.self) { Text("\($0) minute\($0 == 1 ? "" : "s")").tag($0) }
+                        Text("Custom…").tag(0)
+                    } label: { Text("Lock after inactivity").fixedSize() }
+                    .accessibilityIdentifier("inactivity-timeout")
+                    if customTimeout || !durations.contains(model.autoLockMinutes) {
+                        Stepper("\(model.autoLockMinutes) minutes", value: $model.autoLockMinutes, in: 1...60)
+                    }
+                    Text("Activity in Mop keeps your session open. Switching apps conceals secrets. Security locking clears unsaved edits immediately.").font(.callout)
+                }
+            case .autoFill: AutoFillSettingsView(model: model)
+            case .devices:
+            Section("Devices") {
                 Text("Devices connected to your enrolled personal vaults.").font(.caption).foregroundStyle(.secondary)
                 ForEach(model.devices) { device in
                     HStack {
                         VStack(alignment: .leading) {
-                            Text(device.name + (device.isCurrent ? " (this device)" : ""))
-                            Text(device.id.uuidString).font(.caption).textSelection(.enabled)
+                            Label(device.name + (device.isCurrent ? " (this device)" : ""), systemImage: "rectangle.connected.to.line.below")
+                            DisclosureGroup("Details") {
+                                Text(device.id.uuidString).font(.caption).textSelection(.enabled)
+                                Text("Vaults: " + device.vaultNames.values.sorted().joined(separator: ", ")).font(.caption)
+                            }
                         }
                         Spacer()
                         Button("Remove…", role: .destructive) { removal = device }
                             .disabled(model.busy || model.offline || model.devices.count < 2)
                     }
                 }
-                if model.devices.isEmpty { Text("Refresh to load enrolled devices.").foregroundStyle(.secondary) }
-                Button("Refresh devices") { model.loadDevices() }.disabled(model.busy || model.offline)
-                Button("Add my device…") { model.sheet = .addDevice }.disabled(model.busy || model.offline)
-            }
-            Section("vault") {
-                if model.vaults.contains(where: { $0.enrolled }) {
-                    Picker("Vault", selection: Binding(get: { model.vault }, set: { _ = model.prepareVaultAction($0) })) {
-                        ForEach(model.vaults.filter { $0.enrolled }) { vault in
-                            Text(model.vaultLabel(vault)).tag(vault.id)
-                        }
-                    }.disabled(model.busy)
-                    Group {
-                        Button("Rename vault…") { model.sheet = .renameVault }
-                        Button("Show checkpoint") { model.management(.fingerprint, keepSheet: true) }
-                        Button("Export encrypted backup…") { if model.prepareVaultAction(model.vault) { model.chooseExportBackup() } }
-                        Button("Verify members and devices") { model.loadMembers() }
-                        ForEach(model.members) { member in
-                            VStack(alignment: .leading) {
-                                Text(member.id)
-                                Text(member.role).font(.caption)
-                            }.textSelection(.enabled)
-                        }
-                        Button("Share with another person…") { model.sheet = .shareAccount }
-                        Button("Set up or replace hardware recovery…") { model.sheet = .setupRecovery }
-                        Button("Recover using this hardware device…") { model.sheet = .recover }
-                        DisclosureGroup("Advanced access management") { SharingView(model: model, setup: false) }
-                        Button("Delete cloud vault…", role: .destructive) { model.sheet = .deleteVault }
-                    }.disabled(model.busy || model.offline || model.selectedVaultDescriptor?.enrolled != true)
+                if model.devices.isEmpty { Text(model.authenticated ? "Refresh to load enrolled devices." : "Unlock Mop to view connected devices.").foregroundStyle(.secondary) }
+                if model.authenticated {
+                    Button("Refresh devices") { model.loadDevices() }.disabled(model.busy || model.offline)
                 } else {
-                    Text("Connect to or create a vault to manage it here.").foregroundStyle(.secondary)
+                    Button("Unlock to view devices") { model.unlock() }.disabled(!model.canUnlock)
                 }
+                Button("Connect Another Device…") { model.presentSheet(.addDevice, inSettings: true) }.disabled(model.busy || model.offline)
             }
-            if model.busy { ProgressView("Waiting for authentication or iCloud…") }
-            if let notice = model.notice { Text(notice).font(.callout).textSelection(.enabled) }
+
+            case .advanced:
             Section("Developer") {
                 Toggle("Show developer tools", isOn: Binding(get: { developerTools }, set: { DeveloperPreferences.shared.set($0) }))
                 Text("Include Copy Reference in field menus for scripts and configuration. Syncs across devices using your Apple Account.")
@@ -123,51 +191,14 @@ struct SessionSettings: View {
                     if !model.vaults.contains(where: { $0.id == id }) {
                         model.vaults.append(VaultDescriptor(id: id, name: nil, format: "unknown", enrolled: false))
                     }
-                    model.chooseVault(id)
-                    dismiss()
+                    model.requestTransition(.vault(id)) { accepted in if accepted { dismiss() } }
                 }.disabled(model.busy || UUID(uuidString: vaultID.trimmingCharacters(in: .whitespacesAndNewlines)) == nil)
             }
-            #if os(macOS)
-            Text("Activity in Mop keeps your session open. Switching apps conceals secrets. Locking your Mac, sleeping, or quitting Mop ends the session immediately.")
-                .font(.caption).foregroundStyle(.secondary)
-            #else
-            Text("Activity in Mop resets the inactivity timer for all connected vaults. Switching apps conceals secrets and discards unsaved edits; returning before the timeout keeps the session open. Copied secrets remain available for up to 30 seconds. Temporary system prompts conceal the interface without ending authentication.").font(.caption).foregroundStyle(.secondary)
-            #endif
-        }
-        .formStyle(.grouped)
-        .mopSheetWidth(640)
-        #if os(iOS)
-        .safeAreaInset(edge: .top) {
-            HStack {
-                Text("Settings").font(.headline)
-                Spacer()
-                Button("Done") { dismiss() }
-            }.padding().background(.regularMaterial)
-        }
-        #endif
-        #if os(macOS)
-        .frame(height: 650)
-        #endif
-        .onAppear {
-            model.settingsVisible = true
-            if model.selectedVaultDescriptor?.enrolled != true,
-               let vault = model.vaults.first(where: { $0.enrolled }) {
-                _ = model.prepareVaultAction(vault.id)
+
             }
-            model.loadDevices()
-        }
-        .onDisappear { model.settingsVisible = false }
-        .sheet(item: $model.sheet) { sheet in
-            AppSheetView(model: model, kind: sheet).id(model.editorGeneration)
-        }
-        .documentTransfers(model: model, inSettings: true)
-        .confirmationDialog("Remove this device?", isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), titleVisibility: .visible) {
-            if let device = removal {
-                Button("Remove " + device.name, role: .destructive) { model.removeDevice(device.id); removal = nil }
-            }
-        } message: { Text("It will lose access and must explicitly reconnect with new device keys to join again.") }
-        .alert("Operation not completed", isPresented: Binding(get: { model.sheet == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
-            Button("OK") { model.error = nil }
-        } message: { Text(model.error ?? "") }
+            if let notice = model.notice { Text(notice).font(.callout).textSelection(.enabled) }
+        }.formStyle(.grouped)
+        .onAppear { if category == .devices && model.settingsCategory == .devices && model.authenticated { model.loadDevices() } }
+        .onChange(of: model.authenticated) { _, unlocked in if unlocked && category == .devices && model.settingsCategory == .devices { model.loadDevices() } }
     }
 }

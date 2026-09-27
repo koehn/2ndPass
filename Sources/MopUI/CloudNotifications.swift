@@ -14,11 +14,15 @@ extension Notification.Name {
 /// Notifications are hints only. The service fetches and authenticates the head
 /// before publishing contents, rather than trusting notification payloads.
 @MainActor public final class MopApplicationDelegate: NSObject {
+    static weak var editingModel: AppModel?
     private var subscriptionTask: Task<Void, Never>?
     private var accountObserver: NSObjectProtocol?
     private var networkObserver: NSObjectProtocol?
 
     private func start() {
+        #if DEBUG && (os(macOS) || targetEnvironment(simulator))
+        if ProcessInfo.processInfo.environment["MOP_UI_TESTING"] == "1" { return }
+        #endif
         #if os(macOS)
         NSApplication.shared.registerForRemoteNotifications()
         #else
@@ -65,6 +69,15 @@ extension Notification.Name {
 #if os(macOS)
 extension MopApplicationDelegate: NSApplicationDelegate {
     public func applicationDidFinishLaunching(_ notification: Notification) { start() }
+    public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model = Self.editingModel else { return .terminateNow }
+        guard !model.busy, model.pendingTransition == nil else { return .terminateCancel }
+        guard model.hasUnsavedChanges else { return .terminateNow }
+        model.requestTransition(.quit) { accepted in
+            sender.reply(toApplicationShouldTerminate: accepted)
+        }
+        return .terminateLater
+    }
     public func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
         guard received(userInfo), !application.isActive else { return }
         Task { try? await CloudBackgroundRefresh.download() }

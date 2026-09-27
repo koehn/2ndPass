@@ -133,7 +133,7 @@ private actor PublishedAutoFillIdentities {
     #expect(entries().first?.reference.field == "secondary")
     item.fields.append(ItemField(path: "third", type: .otp))
     #expect(entries().isEmpty)
-    #expect(AutoFillEntry.exclusionReason(for: item, kind: .oneTimeCode)?.contains("primary") == true)
+    #expect(AutoFillEntry.exclusionReason(for: item, kind: .oneTimeCode)?.contains("Use for AutoFill") == true)
     item.fields.removeAll { $0.path == "third" }
     item.type = .custom
     #expect(entries().isEmpty)
@@ -299,4 +299,115 @@ func autoFillSuggestionRequiresInteractionBeforeVaultAccess(kind: AutoFillKind) 
     await #expect(throws: MopError.filePermissions) {
         try await publisher.publish(catalog: catalog, vaultID: id)
     }
+}
+
+@Test func autoFillExplicitMappingOverridesNamesWithoutExposingLabels() throws {
+    var item = login()
+    item.fields += [ItemField(path: "work-user", type: .text, value: "work"), ItemField(path: "token", type: .concealed)]
+    item.autoFill = AutoFillMapping(username: "work-user", password: "token")
+    let restored = try JSONDecoder().decode(VaultItem.self, from: JSONEncoder().encode(item))
+    #expect(restored == item)
+    let entry = try #require(AutoFillEntry.entries(catalog: ItemCatalog(vault: "private-vault", revision: "", items: [restored]), vaultID: UUID().uuidString).first)
+    #expect(entry.username == "work")
+    #expect(entry.reference.field == "token")
+    let data = try JSONEncoder().encode(AutoFillIdentity(entry: entry))
+    let text = String(decoding: data, as: UTF8.self)
+    #expect(!text.contains("private-vault") && !text.contains("Example") && !text.contains("token"))
+    item.autoFill?.password = "website"
+    #expect(item.autoFill?.validationError(in: item.fields) != nil)
+    #expect(AutoFillEntry.entries(catalog: ItemCatalog(vault: "v", revision: "", items: [item]), vaultID: UUID().uuidString).isEmpty)
+    item.autoFill?.password = "missing"
+    #expect(AutoFillEntry.exclusionReason(for: item) != nil)
+}
+
+private actor AutoFillPublishingSwitch {
+    var enabled = false
+    var fails = false
+    var publications = 0
+    func enable() { enabled = true }
+    func fail(_ value: Bool) { fails = value }
+    func publish() throws { if fails { throw MopError.cloudUnavailable }; publications += 1 }
+}
+@Test func autoFillPublicationHealthSeparatesDisabledFailureAndSuccess() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let state = AutoFillPublishingSwitch()
+    let publisher = AutoFillPublisher(directory: root, publish: { _ in try await state.publish() }, enabled: { await state.enabled })
+    let id = UUID().uuidString
+    try await publisher.publish(catalog: ItemCatalog(vault: "v", revision: "", items: [login()]), vaultID: id)
+    #expect(await publisher.status().phase == .disabled)
+    #expect(await publisher.status().lastSuccess == nil)
+    #expect(await state.publications == 0)
+    await state.enable(); await state.fail(true)
+    await #expect(throws: MopError.cloudUnavailable) { try await publisher.refresh() }
+    #expect(await publisher.status().phase == .failed)
+    #expect(try AutoFillIndex(directory: root).load().count == 1)
+    await state.fail(false)
+    try await publisher.refresh()
+    #expect(await publisher.status().phase == .current)
+    #expect(await publisher.status().lastSuccess != nil)
+    #expect(await state.publications == 1)
+}
+
+private final class PickerService: VaultService, Sendable {
+    struct State { var authenticated = false; var prompts = 0; var reads = 0 }
+    let state = Mutex(State())
+    let catalog = ItemCatalog(vault: "private-vault", revision: "r", items: [login()])
+    var authenticatedAt: TimeInterval? { state.withLock { $0.authenticated ? 0 : nil } }
+    func lock() { state.withLock { $0.authenticated = false } }
+    func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult {
+        state.withLock { if !$0.authenticated { $0.prompts += 1; $0.authenticated = true } }
+        var result = VaultResult()
+        switch operation {
+        case .catalog: result.catalog = catalog
+        case .read: state.withLock { $0.reads += 1 }; result.value = SecretBytes(utf8: "password")
+        default: throw MopError.notFound
+        }
+        return result
+    }
+}
+@MainActor @Test func autoFillPickerAuthenticatesOnceForLabelsAndOneFill() async throws {
+    let service = PickerService()
+    let identity = AutoFillIdentity(entry: try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: UUID().uuidString).first))
+    let session = AutoFillRequestSession(service: service)
+    let choices = try await session.choices(for: [identity])
+    #expect(choices.first?.vaultName == "private-vault")
+    #expect(service.state.withLock { $0.prompts == 1 && $0.reads == 0 })
+    let credential = try await session.password(identity)
+    #expect(credential.password == "password")
+    #expect(service.state.withLock { $0.prompts == 1 && $0.reads == 1 && !$0.authenticated })
+    await #expect(throws: AutoFillSessionError.ended) { try await session.password(identity) }
+}
+@MainActor @Test func autoFillPickerTimeoutAndDismissalCannotFill() async throws {
+    final class Clock { var time: TimeInterval = 0 }
+    let clock = Clock(), service = PickerService()
+    let identity = AutoFillIdentity(entry: try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: UUID().uuidString).first))
+    let session = AutoFillRequestSession(service: service, now: { clock.time })
+    _ = try await session.choices(for: [identity])
+    clock.time = 60
+    await #expect(throws: AutoFillSessionError.expired) { try await session.password(identity) }
+    #expect(service.state.withLock { $0.reads == 0 && !$0.authenticated })
+    let dismissed = AutoFillRequestSession(service: service)
+    _ = try await dismissed.choices(for: [identity]); dismissed.end()
+    await #expect(throws: AutoFillSessionError.ended) { try await dismissed.password(identity) }
+    #expect(service.state.withLock { $0.reads == 0 })
+}
+
+@Test func autoFillIndexFailureIsNotHiddenByAnotherVaultPublication() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let publisher = AutoFillPublisher(directory: root, publish: { _ in })
+    let first = UUID().uuidString, second = UUID().uuidString
+    let catalog = ItemCatalog(vault: "personal", revision: "r", items: [login()])
+    try await publisher.publish(catalog: catalog, vaultID: first)
+    let index = root.appendingPathComponent("identities.json")
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: index.path)
+    await #expect(throws: MopError.filePermissions) { try await publisher.publish(catalog: catalog, vaultID: first) }
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: index.path)
+    try await publisher.publish(catalog: catalog, vaultID: second)
+    #expect(await publisher.status().phase == .failed)
+    #expect(await publisher.status().catalogsNeedingRefresh == [first])
+    try await publisher.publish(catalog: catalog, vaultID: first)
+    #expect(await publisher.status().phase == .current)
+    #expect(await publisher.status().catalogsNeedingRefresh?.isEmpty == true)
 }
