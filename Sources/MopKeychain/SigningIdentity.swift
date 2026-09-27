@@ -5,6 +5,28 @@ import LocalAuthentication
 import MopCore
 
 public enum SigningIdentity {
+    /// Resolve the shared container from the signed enclosing app, including when
+    /// the CLI is launched through a symlink outside the app bundle.
+    public static var appGroupIdentifier: String? {
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        var information: CFDictionary?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any],
+              let executable = info[kSecCodeInfoMainExecutable as String] as? URL,
+              let bundle = applicationBundle(for: executable),
+              let data = try? Data(contentsOf: bundle.bundleURL.appendingPathComponent("Contents/Info.plist")),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let group = plist["MopAppGroup"] as? String,
+              let entitlements = info[kSecCodeInfoEntitlementsDict as String] as? [String: Any],
+              let groups = entitlements["com.apple.security.application-groups"] as? [String],
+              groups.contains(group) else { return nil }
+        return group
+    }
+
     public static func accessGroup() throws -> String {
         var code: SecCode?
         var staticCode: SecStaticCode?

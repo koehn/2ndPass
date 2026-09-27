@@ -38,6 +38,8 @@ public enum VaultManagement: Sendable {
     case importCheckpoint(document: Data, fingerprint: String, sharedOwner: String?)
 }
 public enum VaultOperation: Sendable {
+    case previewImport(ImportDocument, selected: Set<Int>?)
+    case commitImport(ImportDocument, selected: Set<Int>, vault: UUID, revision: String)
     case discover, catalog, passwordQuality(item: String), read(SecretReference), save(ItemEdit)
     case write(SecretReference, SecretBytes, replace: Bool), delete(SecretReference)
     case recentlyDeleted, trashItem(name: String, revision: String), restoreItem(id: UUID, revision: String)
@@ -54,6 +56,8 @@ extension VaultOperation {
     }
 }
 public struct VaultResult: Sendable {
+    public var importPreview: ImportPreview?
+    public var importReport: ImportReport?
     public var vaults: [VaultDescriptor] = []
     public var defaultVault: String?
     public var autoFillStatus: AutoFillPublicationStatus?

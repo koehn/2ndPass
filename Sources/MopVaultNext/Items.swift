@@ -13,7 +13,7 @@ public extension VaultEngine {
         } }
         payload.items.removeAll { $0.deletion?.isExpired(at: date) == true }
         return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
-            records: records, items: payload.items, signer: device).encoded())
+            records: records, items: payload.items, signer: device))
     }
     static func catalog(in vault: VerifiedVault, device: any DeviceOperations, deleted: Bool = false) throws -> ItemCatalog {
         let payload = try vault.revision.payload(device: device)
@@ -26,9 +26,12 @@ public extension VaultEngine {
                 if !items[index].fields.contains(where: { $0.path == field }) { items[index].fields.append(ItemField(path: field)) }
             } else { items.append(VaultItem(name: reference.item, fields: [ItemField(path: field)])) }
         }
-        return ItemCatalog(vault: vault.name, revision: vault.digest, items: items.filter {
+        var result = ItemCatalog(vault: vault.name, revision: vault.digest, items: items.filter {
             deleted ? ($0.deletion != nil && !$0.deletion!.isExpired(at: Date())) : $0.deletion == nil
         }.sorted { $0.name < $1.name })
+        let role = vault.membership.role(of: device.identity)
+        result.canEdit = role == .owner || role == .editor
+        return result
     }
 
     static func saveItem(_ edit: ItemEdit, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
@@ -37,10 +40,29 @@ public extension VaultEngine {
         guard role == .owner || role == .editor else { throw MopError.cloudPermission }
         var payload = try vault.revision.payload(device: device)
         var records = vault.revision.records
-        let current = try catalog(in: vault, device: device).items
+        try apply(edit, payload: &payload, records: &records, vault: vault, device: device)
+        do {
+            return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
+                records: records, items: payload.items, signer: device))
+        } catch MopError.invalidVault where edit.item.fields.contains(where: { $0.type == .attachment }) {
+            throw AttachmentFailure.capacity
+        }
+    }
+
+    private static func apply(_ edit: ItemEdit, payload: inout CatalogPayload, records: inout [String: SealedObject], vault: VerifiedVault, device: any DeviceOperations) throws {
+        var current = payload.items.filter { $0.deletion == nil }
+        for path in payload.references.keys.sorted() {
+            let ref = try SecretReference(vault: vault.name, relativePath: path)
+            let field = [ref.section, ref.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
+            if let index = current.firstIndex(where: { $0.name == ref.item }) {
+                if !current[index].fields.contains(where: { $0.path == field }) { current[index].fields.append(ItemField(path: field)) }
+            } else if !payload.items.contains(where: { $0.name == ref.item }) {
+                current.append(VaultItem(name: ref.item, fields: [ItemField(path: field)]))
+            }
+        }
         let original = edit.originalName ?? edit.item.name
         let old = current.first { $0.name == original }
-        guard edit.create ? old == nil : old != nil else { throw MopError.duplicate }
+        guard edit.create ? old == nil && !payload.items.contains(where: { $0.name == original }) : old != nil else { throw MopError.duplicate }
         guard original == edit.item.name || !current.contains(where: { $0.name == edit.item.name }),
               edit.item.deletion == nil, !edit.item.fields.isEmpty,
               Set(edit.item.fields.map(\.path)).count == edit.item.fields.count else { throw MopError.invalidVault }
@@ -55,6 +77,8 @@ public extension VaultEngine {
             kept.insert(previousPath)
             let recordID: String
             if let value = field.value {
+                if field.type == .attachment { _ = try Attachment.decode(value) }
+                if field.type.isCompound { _ = try CompoundField(value) }
                 recordID = UUID().uuidString
                 var bytes = Data(value.utf8)
                 defer { SecretBytes.wipe(&bytes) }
@@ -62,6 +86,8 @@ public extension VaultEngine {
                     membership: vault.membership, authenticating: Codec.encode(ObjectContext(vault: vault.id, object: recordID)))
                 if let previous = payload.references[previousPath] { records.removeValue(forKey: previous) }
             } else {
+                if field.type.isCompound, old?.fields.first(where: { $0.path == field.path })?.type != field.type { throw CompoundFieldFailure.invalid }
+                if field.type == .attachment, old?.fields.first(where: { $0.path == field.path })?.type != .attachment { throw AttachmentFailure.invalid }
                 guard let previous = payload.references[previousPath] else { throw MopError.notFound }
                 recordID = previous
                 if !field.type.concealed {
@@ -83,8 +109,35 @@ public extension VaultEngine {
         }
         payload.items.removeAll { $0.name == original }
         payload.items.append(item)
-        return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
-            records: records, items: payload.items, signer: device).encoded())
+    }
+
+    /// Prepares a single revision; callers publish it once through PublicationCoordinator.
+    static func importItems(_ items: [VaultItem], revision: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
+        guard revision == vault.digest else { throw MopError.vaultConflict }
+        guard let role = vault.membership.role(of: device.identity), role == .owner || role == .editor else { throw MopError.cloudPermission }
+        var payload = try vault.revision.payload(device: device), records = vault.revision.records
+        for item in items {
+            try Task.checkCancellation()
+            try apply(ItemEdit(revision: revision, item: item, create: true), payload: &payload, records: &records, vault: vault, device: device)
+        }
+        do {
+            return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
+                records: records, items: payload.items, signer: device))
+        } catch MopError.invalidVault { throw ImportFailure.capacity }
+    }
+    static func previewImport(_ document: ImportDocument, selected: Set<Int>? = nil, in vault: VerifiedVault, device: any DeviceOperations) throws -> (items: [VaultItem], preview: ImportPreview) {
+        guard let role = vault.membership.role(of: device.identity), role == .owner || role == .editor else { throw MopError.cloudPermission }
+        var existing = try catalog(in: vault, device: device).items
+        for i in existing.indices {
+            for j in existing[i].fields.indices where existing[i].fields[j].value == nil {
+                try Task.checkCancellation()
+                let path = SecretReference.encode(existing[i].name) + "/" + existing[i].fields[j].path
+                existing[i].fields[j].value = String(decoding: try read(path, in: vault, device: device), as: UTF8.self)
+            }
+        }
+        existing += try vault.revision.payload(device: device).items.filter { $0.deletion != nil }
+        let plan = try ImportPlanner.prepare(document, existing: existing, selected: selected)
+        return (plan.items, ImportPreview(vault: vault.id, revision: vault.digest, report: plan.report))
     }
 
     static func trashItem(name: String, revision: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
@@ -117,15 +170,15 @@ public extension VaultEngine {
         let role = vault.membership.role(of: device.identity)
         guard role == .owner || role == .editor else { throw MopError.cloudPermission }
         return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
-            records: vault.revision.records, items: payload.items, signer: device).encoded())
+            records: vault.revision.records, items: payload.items, signer: device))
     }
     static func rename(_ name: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
         guard vault.membership.role(of: device.identity) == .owner else { throw MopError.cloudPermission }
         try VaultName.validate(name)
         let old = try header(vault, operation: .content)
-        let next = Revision.Header(format: old.format, vault: old.vault, name: name, generation: old.generation, parent: old.parent,
+        let next = Revision.Header(requiredFeatures: old.requiredFeatures, format: old.format, vault: old.vault, name: name, generation: old.generation, parent: old.parent,
             epoch: old.epoch, membership: old.membership, operation: old.operation, acceptedInvitations: old.acceptedInvitations)
         let payload = try vault.revision.payload(device: device)
-        return try vault.applying(Revision.seal(header: next, references: payload.references, records: vault.revision.records, items: payload.items, signer: device).encoded())
+        return try vault.applying(Revision.seal(header: next, references: payload.references, records: vault.revision.records, items: payload.items, signer: device))
     }
 }

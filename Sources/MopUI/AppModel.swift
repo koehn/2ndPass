@@ -4,7 +4,7 @@ import MopAppSupport
 import MopVaultNext
 
 enum AppPage: String, CaseIterable { case secrets = "Secrets", recentlyDeleted = "Recently Deleted" }
-enum AppSheet: String, Identifiable { case createVault, enrollDevice, addDevice, shareAccount, setupRecovery, renameVault, deleteVault, recover
+enum AppSheet: String, Identifiable { case createVault, enrollDevice, addDevice, shareAccount, setupRecovery, renameVault, deleteVault, recover, importItems
     var id: String { rawValue }
 }
 
@@ -31,6 +31,10 @@ final class AppModel {
     var catalog: ItemCatalog?
     var references: [SecretReference] = []
     var selected: SecretReference?
+    var importAfterCreation = false
+    var showArchived = false
+    var favoritesOnly = false
+    var tagFilter = ""
     var search = ""
     var searchIsFocused = false
     var searchHighlighted: ItemRow.ID?
@@ -214,7 +218,7 @@ final class AppModel {
     var unfilteredItems: [ItemRow] {
         let included = allVaults ? catalogs : catalog.map { [vault: $0] } ?? [:]
         return included.flatMap { id, catalog in
-            catalog.items.map { item in
+            catalog.items.filter { $0.isArchived == showArchived && (!favoritesOnly || $0.isFavorite) && (tagFilter.isEmpty || ($0.metadata?.tags.contains(tagFilter) == true)) }.map { item in
                 ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item)
             }
         }.sorted { ($0.item.name, $0.vaultName, $0.id.vault) < ($1.item.name, $1.vaultName, $1.id.vault) }
@@ -391,7 +395,7 @@ final class AppModel {
         passwordQualities = [:]
     }
     var itemCreationVaults: [VaultDescriptor] {
-        vaults.filter { $0.supported && $0.enrolled && catalogs[$0.id] != nil }
+        vaults.filter { $0.supported && $0.enrolled && catalogs[$0.id] != nil && catalogs[$0.id]?.canEdit != false }
             .sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
     }
     var preferredCreationVault: String {
@@ -472,11 +476,11 @@ final class AppModel {
         itemDraft = ItemDraft(vault: vault, revision: catalog.revision, item: item,
                               mode: path.map { .value($0) } ?? .item)
         if addField { itemDraft?.fields.append(ItemDraft.Field(ItemField(path: "", value: ""), existing: false)) }
-        let passwords = item.fields.filter { $0.type == .password && $0.value == nil && (path == nil || $0.path == path) }
-        guard !passwords.isEmpty, let draft = itemDraft else { return }
+        let protectedFields = item.fields.filter { ($0.type == .password || $0.type.isCompound) && $0.value == nil && (path == nil || $0.path == path) }
+        guard !protectedFields.isEmpty, let draft = itemDraft else { return }
         perform { token in
             do {
-                for field in passwords {
+                for field in protectedFields {
                     let reference = try SecretReference(vault: catalog.vault,
                         relativePath: SecretReference.encode(item.name) + "/" + field.path)
                     let result = try await self.service.execute(.read(reference), vault: draft.vault, offline: false)
@@ -486,9 +490,12 @@ final class AppModel {
                     guard let index = self.itemDraft?.fields.firstIndex(where: { $0.path == field.path }) else { continue }
                     // Preserve input if an edit was made while this read was pending.
                     guard self.itemDraft?.fields[index].value == draft.fields.first(where: { $0.path == field.path })?.value else { continue }
-                    let password = String(decoding: value, as: UTF8.self)
-                    self.itemDraft?.fields[index].loadedPassword = password
-                    self.itemDraft?.fields[index].value = password
+                    let plaintext = String(decoding: value, as: UTF8.self)
+                    if field.type.isCompound {
+                        _ = try CompoundField(plaintext)
+                        self.itemDraft?.fields[index].loadedCompound = plaintext
+                    } else { self.itemDraft?.fields[index].loadedPassword = plaintext }
+                    self.itemDraft?.fields[index].value = plaintext
                 }
             } catch {
                 // Keep the draft on recoverable read failures; nil still means unchanged.
@@ -606,6 +613,12 @@ final class AppModel {
         return authenticated ? "Unlocked" : "Locked"
     }
 
+    func beginImport() {
+        importAfterCreation = itemCreationVaults.isEmpty
+        presentSheet(importAfterCreation ? .createVault : .importItems)
+    }
+    func cancelImportOperation() { operationTask?.cancel() }
+
     func perform(_ action: @escaping @MainActor (Int) async throws -> Void) {
         checkExpiration()
         guard !busy else { return }
@@ -623,7 +636,7 @@ final class AppModel {
             guard self.current(token) else { return }
             do { try await action(token) }
             catch {
-                if token == generation {
+                if token == generation && !Task.isCancelled {
                     if error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
                         self.showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending); return
                     }
@@ -642,7 +655,7 @@ final class AppModel {
                     if error as? MopError == .vaultUntrusted {
                         self.error = "Vault trust could not be verified. Automatic unlocking is paused. Repair access from an authorized owner device or use the separate hardware recovery device. Older vault formats are unsupported."
                     } else {
-                        self.error = (error as? MopError)?.errorDescription ?? "The operation could not be completed."
+                        self.error = (error as? MopError)?.errorDescription ?? (error as? ImportFailure)?.errorDescription ?? (error as? AttachmentFailure)?.errorDescription ?? (error as? CompoundFieldFailure)?.errorDescription ?? "The operation could not be completed."
                     }
                 }
             }
@@ -773,6 +786,16 @@ final class AppModel {
               vault == id, selectedItem == item, let value = result.value else { throw MopError.authentication }
         guard let expires = result.otpExpiresAt, let period = result.otpPeriod else { throw MopError.invalidOTP }
         return (String(decoding: value, as: UTF8.self), expires, period)
+    }
+
+    func loadAttachment(_ reference: SecretReference, completion: @escaping @MainActor (Attachment) -> Void) {
+        let visibility = visibilityGeneration, id = selectedVault, item = selectedItem
+        perform { token in
+            let result = try await self.service.execute(.read(reference), vault: id, offline: self.offline)
+            guard self.current(token), self.isActive, self.visibilityGeneration == visibility,
+                  self.selectedVault == id, self.selectedItem == item, let value = result.value else { return }
+            completion(try Attachment.decode(String(decoding: value, as: UTF8.self)))
+        }
     }
 
     func read(copy: Bool) {
@@ -1207,7 +1230,7 @@ final class AppModel {
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
             try await self.unlockContents(token, refresh: false)
-            self.selected = nil; self.sheet = nil; self.showsSetupChecklist = true
+            self.selected = nil; self.sheet = self.importAfterCreation ? .importItems : nil; self.importAfterCreation = false; self.showsSetupChecklist = true
             self.notice = result.message; self.status = "Vault created · add devices or optional recovery in settings"
         }
     }

@@ -56,6 +56,20 @@ struct ItemDetailView: View {
                 Text("Drag the handles to reorder fields. Changes are saved together when you choose Save.")
                     .font(.caption).foregroundStyle(.secondary)
             } else { Text(model.selectedTypedItem?.type.label ?? "Custom").foregroundStyle(.secondary) }
+            if editingItem {
+                TextField("Tags (comma-separated)", text: Binding(get: { model.itemDraft?.metadata?.tags.joined(separator: ", ") ?? "" }, set: { value in
+                    if model.itemDraft?.metadata == nil { model.itemDraft?.metadata = ItemMetadata() }
+                    model.itemDraft?.metadata?.tags = Array(Set(value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })).sorted()
+                }))
+                Toggle("Favorite", isOn: Binding(get: { model.itemDraft?.metadata?.favorite ?? false }, set: { value in
+                    if model.itemDraft?.metadata == nil { model.itemDraft?.metadata = ItemMetadata() }; model.itemDraft?.metadata?.favorite = value
+                }))
+                Toggle("Archived", isOn: Binding(get: { model.itemDraft?.metadata?.archived ?? false }, set: { value in
+                    if model.itemDraft?.metadata == nil { model.itemDraft?.metadata = ItemMetadata() }; model.itemDraft?.metadata?.archived = value
+                }))
+            } else if let metadata = model.selectedTypedItem?.metadata {
+                Text(([metadata.favorite ? "Favorite" : "", metadata.archived ? "Archived" : ""] + metadata.tags).filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption)
+            }
             if editingItem, model.itemDraft?.type == .login { autoFillMappingEditor }
             if let item = model.itemDraft?.item ?? model.selectedTypedItem, item.type == .login {
                 ForEach(AutoFillKind.allCases.filter { $0 == .password || item.fields.contains { $0.type == .otp } || item.autoFill?.oneTimeCode != nil }, id: \.self) { kind in
@@ -231,10 +245,15 @@ struct ItemDetailView: View {
                         ForEach(FieldType.allCases, id: \.self) { Text($0.label).tag($0) }
                     }.frame(maxWidth: 280)
                 } else {
-                    Text(field.path.split(separator: "/").map { String($0).removingPercentEncoding ?? String($0) }.joined(separator: " / ").capitalized)
+                    Text(field.label ?? field.path.split(separator: "/").map { String($0).removingPercentEncoding ?? String($0) }.joined(separator: " / ").capitalized)
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if edits(field) {
+                if field.type == .attachment {
+                    AttachmentFieldView(model: model, editing: edits(field), existing: field.existing,
+                        reference: reference(field), value: binding(field, \.value, fallback: field.value))
+                        .id((model.itemDraft?.id.uuidString ?? "") + ":" + (reference(field)?.description ?? field.id))
+                    if edits(field), !editingItem { HStack { Spacer(); saveControls }.font(.callout) }
+                } else if edits(field) {
                     valueInput(field)
                     if let error = field.validationError {
                         Text(error).font(.caption).foregroundStyle(.red)
@@ -348,7 +367,20 @@ struct ItemDetailView: View {
     @ViewBuilder private func valueInput(_ field: ItemDraft.Field) -> some View {
         let placeholder = field.value == nil ? "Unchanged — enter replacement" : "Value (empty allowed)"
         Group {
-            if field.type == .password {
+            if field.type.isCompound {
+                VStack(alignment: .leading, spacing: 8) {
+                    if field.existing && field.value == nil {
+                        Text("Stored details are unchanged. Reopen the editor to retry loading them.").font(.caption)
+                    } else {
+                        if revealedEditor == field.id && model.isActive && model.authenticated {
+                            CompoundFieldEditor(type: field.type, value: valueBinding(field))
+                        }
+                        Button(revealedEditor == field.id ? "Conceal details" : "Edit " + field.type.label.lowercased() + " details") {
+                            revealedEditor = revealedEditor == field.id ? nil : field.id
+                        }
+                    }
+                }
+            } else if field.type == .password {
                 HStack {
                     Group {
                         if revealedEditor == field.id && model.isActive && model.authenticated {
@@ -366,9 +398,21 @@ struct ItemDetailView: View {
                     .accessibilityLabel(revealedEditor == field.id ? "Conceal password input" : "Reveal password input")
                     .disabled(!model.isActive || !model.authenticated)
                 }
+            } else if [.privateKey, .recoveryCodes].contains(field.type) {
+                VStack(alignment: .leading) {
+                    if revealedEditor == field.id && model.isActive && model.authenticated {
+                        TextEditor(text: valueBinding(field)).frame(minHeight: 120).accessibilityLabel("\(field.path) value")
+                    } else { SecureField(placeholder, text: valueBinding(field)) }
+                    Button(revealedEditor == field.id ? "Conceal input" : "Edit multiline value") {
+                        revealedEditor = revealedEditor == field.id ? nil : field.id
+                    }
+                }
             } else if field.type.concealed {
                 SecureField(field.type == .otp ? "OTP seed or otpauth URL" : placeholder, text: valueBinding(field))
                     .accessibilityLabel("\(field.path) value")
+            } else if field.type == .expirationMonthYear {
+                TextField("MM/YYYY", text: valueBinding(field))
+                    .accessibilityLabel("\(field.path) month/year, MM/YYYY")
             } else if field.type == .notes {
                 TextEditor(text: valueBinding(field)).frame(minHeight: 100).accessibilityLabel("\(field.path) value")
             } else { TextField(placeholder, text: valueBinding(field)).accessibilityLabel("\(field.path) value") }
@@ -382,6 +426,10 @@ struct ItemDetailView: View {
         Group {
             if field.type == .otp {
                 OTPCodeView(model: model, reference: ref)
+            } else if field.type.isCompound {
+                let raw = (model.selected == ref ? model.revealed : nil).map { String(decoding: $0, as: UTF8.self) }
+                Text(raw.flatMap { try? CompoundField($0).displayText(for: field.type) } ?? "••••••••")
+                    .font(.system(.body, design: .monospaced)).textSelection(.disabled).privacySensitive()
             } else if field.type.concealed {
                 Text((model.selected == ref ? model.revealed : nil).map { String(decoding: $0, as: UTF8.self) } ?? "••••••••")
                     .font(.system(.body, design: .monospaced)).textSelection(.disabled)

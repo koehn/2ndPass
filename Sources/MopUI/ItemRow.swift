@@ -19,6 +19,10 @@ extension ItemType {
         case .apiCredential: "terminal"
         case .secureNote: "note.text"
         case .database: "externaldrive"
+        case .sshKey: "terminal"
+        case .paymentCard: "creditcard"
+        case .identity: "person.text.rectangle"
+        case .document: "doc"
         case .custom: "square.grid.2x2"
         }
     }

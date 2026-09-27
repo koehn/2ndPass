@@ -17,7 +17,12 @@ public enum CloudBackgroundRefresh {
             let root = try VerifiedVault(checkpoint: entry.checkpoint, independentlyVerifiedDigest: entry.digest)
             let coordinator = try PublicationCoordinator(address: entry.address, checkpoint: root, transport: transport, storage: storage)
             _ = try await coordinator.refresh()
-            entry.name = await coordinator.offlineSnapshot().0.name; try registry.put(entry)
+            let current = await coordinator.offlineSnapshot().0
+            if AttachmentDownloadSettings.duringSync {
+                _ = try await AttachmentDownloads(state: configuration.stateDirectory, address: entry.address)
+                    .load(current, digests: current.attachmentDigests, transport: transport, offline: false)
+            }
+            entry.name = current.name; try registry.put(entry)
         }
     }
 }

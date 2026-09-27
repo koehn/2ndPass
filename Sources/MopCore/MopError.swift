@@ -87,7 +87,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .ambiguousVault: "Multiple vaults have this name. Select a UUID and rename the conflicting vault."
         case .vaultSelectionMismatch: "The reference does not match the selected vault or its authenticated name."
         case .legacyVault: "Legacy vault format is unsupported. Use an older Mop client to access it; no migration is provided."
-        case .cloudInvalidRequest: "CloudKit rejected the request configuration. Verify the MopV6Revision, MopV6Head and MopV6Enrollment record types in the signed CloudKit environment."
+        case .cloudInvalidRequest: "CloudKit rejected the request configuration. Verify the MopV6Revision, MopV6Attachment, MopV6Head and MopV6Enrollment record types in the signed CloudKit environment."
         case .cloudUnavailable: "CloudKit is unavailable. Retry online or explicitly select --offline for cached reads."
         case .cloudAccount: "An available iCloud account matching this local binding is required."
         case .cloudQuota: "The iCloud storage quota is exceeded."

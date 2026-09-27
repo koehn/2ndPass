@@ -40,7 +40,7 @@ struct MacWindowLifecycle: NSViewRepresentable {
         let original: (any NSWindowDelegate)?
         let model: AppModel
         private var closing = false
-        init(model: AppModel, window: NSWindow) {
+        @MainActor init(model: AppModel, window: NSWindow) {
             self.model = model; self.window = window; original = window.delegate
         }
         override func responds(to selector: Selector!) -> Bool {

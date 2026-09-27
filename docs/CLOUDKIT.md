@@ -6,6 +6,7 @@ Each vault uses a custom zone `mop-v6-UUID`. Old zones are never discovered, mig
 
 | Type | Record name | Fields |
 | --- | --- | --- |
+| `MopV6Attachment` | `attachment-` + SHA-256 of encrypted attachment bytes | `payload`: Asset (application encrypted) |
 | `MopV6Revision` | SHA-256 of exact canonical revision bytes | `payload`: Asset (already application encrypted/signed) |
 | `MopV6Enrollment` | `enrollment` | `payload`: Asset (bounded public enrollment mailbox) |
 | `MopV6Head` | `head` | `digest`: String; `operation`: String (fresh UUID, also for a same-digest fence) |
@@ -61,3 +62,16 @@ Deploy `MopV6Enrollment.payload` (Asset) along with the existing types for
 Production. There are no query-index requirements: the mailbox has a fixed record
 ID. Existing database subscriptions cover mailbox changes. Live multi-device
 CloudKit mailbox/notification behavior remains unverified in this session.
+
+## External attachment assets
+
+`attachment-blobs-1` revisions authenticate ciphertext digests/sizes and key
+envelopes. Upload all new immutable blobs before uploading the signed revision
+and conditionally publishing its head. Fetching/verifying revisions never fetches
+attachment assets. Device Settings controls eager caching; AutoFill opts out.
+Ciphertext caches are scoped by account and complete vault address and are not
+synced or exported implicitly. Backups explicitly bundle all referenced blobs.
+
+Deploy `MopV6Attachment.payload` (Asset) to Production as part of the release.
+This code change does not deploy the CloudKit schema. Orphan/history blobs remain
+until a future reachability-aware collector or complete zone deletion.

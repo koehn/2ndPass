@@ -34,7 +34,7 @@ public enum VaultEngine {
                                invitations: [UUID]? = nil) throws -> Revision.Header {
         let old = vault.revision.header
         guard old.generation < UInt64.max, membership == nil || old.epoch < UInt64.max else { throw MopError.invalidVault }
-        return Revision.Header(format: "mop-vault-v6", vault: vault.id, name: vault.name,
+        return Revision.Header(requiredFeatures: old.requiredFeatures, format: "mop-vault-v6", vault: vault.id, name: vault.name,
             generation: old.generation + 1, parent: vault.digest,
             epoch: membership == nil ? old.epoch : old.epoch + 1,
             membership: membership ?? vault.membership, operation: operation,
@@ -62,6 +62,8 @@ public enum VaultEngine {
             let path = [parsed.section, parsed.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
             if let field = items[item].fields.firstIndex(where: { $0.path == path }) {
                 if let value {
+                    if items[item].fields[field].type == .attachment { _ = try Attachment.decode(String(decoding: value, as: UTF8.self)) }
+                    if items[item].fields[field].type.isCompound { _ = try CompoundField(String(decoding: value, as: UTF8.self)) }
                     items[item].fields[field].value = items[item].fields[field].type.concealed ? nil : String(decoding: value, as: UTF8.self)
                     items[item].fields[field].passwordQuality = items[item].fields[field].type == .password ? PasswordEstimator.estimate(String(decoding: value, as: UTF8.self), userInputs: [parsed.item]) : nil
                 } else { items[item].fields.remove(at: field) }
@@ -69,7 +71,7 @@ public enum VaultEngine {
             if items[item].fields.isEmpty { items.remove(at: item) }
         }
         let revision = try Revision.seal(header: header(vault, operation: .content), references: references, records: records, items: items, signer: device)
-        return try vault.applying(revision.encoded())
+        return try vault.applying(revision)
     }
     public static func invite(member: UUID, role: MemberRole, to vault: VerifiedVault, owner: any DeviceOperations,
                               now: Date = Date(), expires: Date) throws -> Invitation {
@@ -182,12 +184,12 @@ public enum VaultEngine {
                 references[reference] = id
             } else {
                 let key = try old.key(vault: vault.id, epoch: vault.revision.header.epoch, object: oldID, device: signer)
-                records[oldID] = try SealedObject(ciphertext: old.ciphertext,
+                records[oldID] = try SealedObject(ciphertext: old.ciphertext, attachmentDigest: old.attachmentDigest, attachmentSize: old.attachmentSize, loadedCiphertext: old.loadedCiphertext,
                     envelopes: SealedObject.envelopes(key: key, vault: vault.id, epoch: header.epoch, object: oldID, membership: membership))
                 references[reference] = oldID
             }
         }
         let revision = try Revision.seal(header: header, references: references, records: records, items: vault.revision.payload(device: signer).items, signer: signer)
-        return try vault.applying(revision.encoded())
+        return try vault.applying(revision)
     }
 }

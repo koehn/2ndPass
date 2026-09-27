@@ -48,6 +48,8 @@ struct NextRegistry {
                 where name.hasPrefix("enrollment-") && name.hasSuffix(".json") {
                 try FileManager.default.removeItem(at: cache.directory.appendingPathComponent(name))
             }
+            let attachments = cache.directory.appendingPathComponent("attachments")
+            if FileManager.default.fileExists(atPath: attachments.path) { try FileManager.default.removeItem(at: attachments) }
             try write([NextEntry](), "vaults.json")
         }
     }

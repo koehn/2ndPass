@@ -43,8 +43,9 @@ export path suitable for moving to another tool. Document the vault format and
 recovery process so data access does not depend solely on the official app.
 Handle plaintext interchange files explicitly and explain their exposure.
 
-Current import/export supports encrypted v6 Mop backups only; general migration
-support is planned. For future format changes, prioritize preserving access to
+Import now supports common CSV exports, Bitwarden JSON, and 1Password 1PUX; see
+[Importing password-manager data](IMPORT.md). Portable third-party export remains
+planned; encrypted v6 Mop backup export remains available. For future format changes, prioritize preserving access to
 existing user data and provide an explicit compatibility or migration path.
 This does not change the current rejection of pre-v6 formats.
 

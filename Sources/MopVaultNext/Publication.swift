@@ -43,6 +43,8 @@ public struct RevisionHead: Sendable {
 /// outstanding old-version request). The native private-database probe verifies
 /// this for CKModifyRecordsOperation; adapters must preserve that behavior.
 public protocol RevisionTransport: Sendable {
+    func attachment(_ digest: String, at address: VaultAddress) async throws -> Data
+    func uploadAttachment(_ bytes: Data, digest: String, at address: VaultAddress) async throws
     func head(at address: VaultAddress) async throws -> RevisionHead
     func revision(_ digest: String, at address: VaultAddress) async throws -> Data
     func upload(_ bytes: Data, digest: String, at address: VaultAddress) async throws
@@ -176,7 +178,14 @@ public actor PublicationCoordinator {
         guard head.digest == current.digest else { throw MopError.vaultConflict }
         let journal = PendingPublication(operation: UUID(), parent: current.digest, candidate: proposal.digest)
         try save(current, pending: journal, at: state.verifiedAt)
-        do { try await transport.upload(proposal.bytes, digest: proposal.digest, at: address) }
+        do {
+            for (digest, bytes) in proposal.loadedAttachments where !current.attachmentDigests.contains(digest) {
+                try await transport.uploadAttachment(bytes, digest: digest, at: address)
+            }
+            // New references must be uploaded before publishing the revision.
+            guard proposal.attachmentDigests.subtracting(current.attachmentDigests).isSubset(of: Set(proposal.loadedAttachments.keys)) else { throw AttachmentFailure.unavailable }
+            try await transport.upload(proposal.bytes, digest: proposal.digest, at: address)
+        }
         catch {
             // No head call was submitted; unreachable immutable data is harmless.
             try save(current, pending: nil, at: state.verifiedAt)

@@ -1475,3 +1475,43 @@ extension AppModelTests {
         #expect(app.sheetRequest?.inSettings == true)
     }
 }
+
+@Test @MainActor func importDestinationAndMetadataFilters() {
+    let defaults = UserDefaults(suiteName: "mop-import-ui-" + UUID().uuidString)!
+    let model = AppModel(service: FakeService(), defaults: defaults, automaticTimer: false)
+    model.authenticated = true; model.vault = "v"
+    model.vaults = [VaultDescriptor(id: "v", name: "personal", format: "mop-vault-v6", enrolled: true)]
+    var active = VaultItem(name: "Active", type: .password, fields: [ItemField(path: "password", type: .password)])
+    active.metadata = ItemMetadata(tags: ["work"], favorite: true)
+    var archived = active; archived.name = "Archived"; archived.metadata?.archived = true
+    var catalog = ItemCatalog(vault: "personal", revision: "r", items: [active, archived]); catalog.canEdit = true
+    model.catalog = catalog; model.catalogs["v"] = catalog
+    #expect(model.displayedItems.map { $0.item.name } == ["Active"])
+    model.showArchived = true
+    #expect(model.displayedItems.map { $0.item.name } == ["Archived"])
+    model.tagFilter = "missing"
+    #expect(model.displayedItems.isEmpty)
+    model.beginImport(); #expect(model.sheet == .importItems)
+    catalog.canEdit = false; model.catalogs["v"] = catalog
+    #expect(model.itemCreationVaults.isEmpty)
+}
+
+extension AppModelTests {
+    @Test(arguments: [false, true]) func pendingAttachmentExportIsDiscardedOnSecurityTransition(lock: Bool) async throws {
+        let barrier = Barrier()
+        let encoded = try Attachment(fileName: "proof.bin", data: Data([0, 255])).encodedValue()
+        let service = FakeService { _, _, _ in
+            await barrier.wait()
+            var result = VaultResult(); result.value = SecretBytes(utf8: encoded); return result
+        }
+        service.authenticate()
+        let app = model(service)
+        let reference = try SecretReference("mop://personal/github/token")
+        var delivered = false
+        app.loadAttachment(reference) { _ in delivered = true }
+        try await entered(barrier)
+        if lock { app.lock() } else { app.deactivate(); app.activate() }
+        await barrier.release(); try await finish(app)
+        #expect(!delivered)
+    }
+}

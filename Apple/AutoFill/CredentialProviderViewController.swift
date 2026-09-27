@@ -14,7 +14,7 @@ import MopCore
     private var retryIdentity: AutoFillIdentity?
     private var retryField: CredentialField?
     #if os(macOS)
-    private var hostProcess: pid_t?
+    private var focus = AutoFillFocus()
     #endif
     private var generation = 0
     private let model = CredentialListModel()
@@ -57,13 +57,12 @@ import MopCore
         }
         observations.append(AccountObservation(center: center, token: center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
             let application = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            let bundle = application?.bundleIdentifier
             let process = application?.processIdentifier
-            // Apple's authentication panel can temporarily take focus without leaving the request.
-            guard bundle != "com.apple.SecurityAgent", bundle != "com.apple.CoreAuthUI" else { return }
             Task { @MainActor in
-                guard let self, self.session != nil, process != self.hostProcess else { return }
-                self.interrupt()
+                guard let self, self.session != nil else { return }
+                let foreground = Self.userApplication(NSWorkspace.shared.frontmostApplication)
+                guard self.focus.shouldInterrupt(activated: process, foreground: foreground) else { return }
+                self.interrupt("The active application changed. Retry to authenticate again.")
             }
         }))
         #endif
@@ -125,7 +124,7 @@ import MopCore
     private func beginSession() -> AutoFillRequestSession {
         session?.end(); expiryTask?.cancel()
         #if os(macOS)
-        hostProcess = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        focus.begin(application: Self.userApplication(NSWorkspace.shared.frontmostApplication))
         #endif
         let value = AutoFillRequestSession(); session = value
         let token = generation
@@ -241,8 +240,18 @@ import MopCore
     private func stop() {
         generation += 1; task?.cancel(); task = nil; pendingIdentity = nil; pendingList = false; finish()
     }
-    private func interrupt() {
-        stop(); model.message = "AutoFill was interrupted. Retry to authenticate again."; updatePreferredContentSize()
+    #if os(macOS)
+    private static func userApplication(_ application: NSRunningApplication?) -> pid_t? {
+        guard let application, application.activationPolicy == .regular,
+              application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              application.bundleIdentifier != "com.apple.SecurityAgent",
+              application.bundleIdentifier != "com.apple.CoreAuthUI" else { return nil }
+        return application.processIdentifier
+    }
+    #endif
+    private func interrupt(_ reason: String = "AutoFill paused because the device locked, slept, or the request entered the background. Retry to authenticate again.") {
+        guard session != nil else { return }
+        stop(); model.message = reason; updatePreferredContentSize()
     }
     private func identityNotFound() {
         stop(); model.message = "This suggestion is no longer available. Choose another account."; updatePreferredContentSize()

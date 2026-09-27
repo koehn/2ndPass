@@ -19,6 +19,8 @@ struct AppSheetView: View {
     var body: some View {
         VStack(spacing: 0) { ScrollView { VStack(alignment: .leading, spacing: 18) {
             switch kind {
+            case .importItems:
+                PasswordImportView(model: model)
             case .createVault:
                 Text(model.vaults.isEmpty ? "Create Your First Vault" : "Create a Vault").font(.title2)
                 TextField("Vault name", text: $name)
@@ -126,6 +128,7 @@ struct AppSheetView: View {
     }
     private var dirty: Bool { name != initialName || !confirmation.isEmpty || controls.dirty }
     private func dismissOrConfirm(next: AppSheet? = nil) {
+        if kind == .createVault { model.importAfterCreation = false }
         nextSheet = next
         if dirty && !submitted { confirmDiscard = true } else { finishDismissal() }
     }

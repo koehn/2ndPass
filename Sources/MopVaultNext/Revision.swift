@@ -4,6 +4,10 @@ import MopCore
 
 struct SealedObject: Codable, Equatable, Sendable {
     let ciphertext: Data
+    var attachmentDigest: String? = nil
+    var attachmentSize: Int? = nil
+    var loadedCiphertext: Data? = nil
+    enum CodingKeys: String, CodingKey { case ciphertext, envelopes, attachmentDigest, attachmentSize }
     let envelopes: [String: KeyEnvelope]
     func key(vault: UUID, epoch: UInt64, object: String, device: any DeviceOperations) throws -> SymmetricKey {
         let fingerprint = device.identity.fingerprint
@@ -25,7 +29,13 @@ struct SealedObject: Codable, Equatable, Sendable {
     }
     func open(vault: UUID, epoch: UInt64, object: String, device: any DeviceOperations, authenticating aad: Data) throws -> Data {
         let key = try key(vault: vault, epoch: epoch, object: object, device: device)
-        return try AES.GCM.open(AES.GCM.SealedBox(combined: ciphertext), using: key, authenticating: aad)
+        let bytes: Data
+        if let digest = attachmentDigest {
+            guard let loaded = loadedCiphertext else { throw AttachmentFailure.unavailable }
+            guard loaded.count == attachmentSize, Codec.digest(loaded) == digest else { throw MopError.invalidVault }
+            bytes = loaded
+        } else { bytes = ciphertext }
+        return try AES.GCM.open(AES.GCM.SealedBox(combined: bytes), using: key, authenticating: aad)
     }
 }
 
@@ -38,6 +48,7 @@ struct CatalogPayload: Codable {
 
 struct Revision: Codable, Sendable {
     struct Header: Codable, Equatable, Sendable {
+        var requiredFeatures: [String]? = nil
         let format: String
         let vault: UUID
         let name: String
@@ -51,7 +62,7 @@ struct Revision: Codable, Sendable {
     }
     let header: Header
     let catalog: SealedObject
-    let records: [String: SealedObject]
+    var records: [String: SealedObject]
     let author: String
     let signature: Data
 
@@ -73,6 +84,23 @@ struct Revision: Codable, Sendable {
         return bytes
     }
     static func seal(header: Header, references: [String: String], records: [String: SealedObject], items: [VaultItem] = [], signer: any DeviceOperations) throws -> Self {
+        var header = header
+        var records = records
+        for item in items {
+            for field in item.fields where field.type == .attachment {
+                guard let id = references[SecretReference.encode(item.name) + "/" + field.path], let record = records[id] else { throw MopError.invalidVault }
+                if record.attachmentDigest == nil {
+                    records[id] = SealedObject(ciphertext: Data(), attachmentDigest: Codec.digest(record.ciphertext),
+                        attachmentSize: record.ciphertext.count, loadedCiphertext: record.ciphertext, envelopes: record.envelopes)
+                }
+            }
+        }
+        var features = Set(header.requiredFeatures ?? [])
+        if records.count > 4096 || items.contains(where: \.requiresExtendedModel) { features.insert("item-model-1") }
+        if items.contains(where: { $0.type == .document || $0.fields.contains(where: { $0.type == .attachment }) }) { features.insert("attachments-1") }
+        if items.contains(where: { $0.fields.contains(where: { $0.type.isCompound }) }) { features.insert("compound-fields-1") }
+        if records.values.contains(where: { $0.attachmentDigest != nil }) { features.insert("attachment-blobs-1") }
+        header.requiredFeatures = features.isEmpty ? nil : features.sorted()
         var plaintext = try Codec.encode(CatalogPayload(references: references, items: items))
         defer { SecretBytes.wipe(&plaintext) }
         let catalog = try SealedObject.seal(plaintext, vault: header.vault, epoch: header.epoch, object: "catalog",
@@ -96,12 +124,17 @@ struct Revision: Codable, Sendable {
         } catch { throw MopError.invalidVault }
     }
     func validateStructure() throws {
+        if let features = header.requiredFeatures {
+            guard !features.isEmpty, features == Set(features).sorted(),
+                  Set(features).isSubset(of: ["item-model-1", "attachments-1", "compound-fields-1", "attachment-blobs-1"]),
+                  (!(features.contains("attachments-1") || features.contains("compound-fields-1")) || features.contains("item-model-1")) else { throw MopError.invalidVault }
+        }
         guard header.format == "mop-vault-v6", header.generation > 0, header.epoch > 0,
               (header.generation == 1) == (header.parent == nil),
               (header.generation == 1) == (header.operation == .create),
               header.epoch <= header.generation,
               header.parent.map(Codec.hash) ?? true,
-              records.count <= 4096, signature.count == 64, Codec.hash(author),
+              signature.count == 64, Codec.hash(author),
               header.acceptedInvitations.count <= 4096,
               Set(header.acceptedInvitations).count == header.acceptedInvitations.count,
               header.acceptedInvitations == header.acceptedInvitations.sorted(by: { $0.uuidString < $1.uuidString }) else { throw MopError.invalidVault }
@@ -109,9 +142,17 @@ struct Revision: Codable, Sendable {
         try header.membership.validate()
         let recipients = Set(header.membership.recipients.map(\.fingerprint))
         for object in [catalog] + Array(records.values) {
-            guard object.ciphertext.count >= 28, Set(object.envelopes.keys) == recipients,
+            if let digest = object.attachmentDigest {
+                guard header.requiredFeatures?.contains("attachment-blobs-1") == true, Codec.hash(digest),
+                      object.ciphertext.isEmpty, let size = object.attachmentSize, size >= 28,
+                      size <= Codec.maximumSize else { throw MopError.invalidVault }
+            } else {
+                guard object.ciphertext.count >= 28, object.attachmentSize == nil else { throw MopError.invalidVault }
+            }
+            guard Set(object.envelopes.keys) == recipients,
                   object.envelopes.values.allSatisfy({ $0.encapsulatedKey.count == 65 && $0.ciphertext.count == 48 }) else { throw MopError.invalidVault }
         }
+        guard catalog.attachmentDigest == nil else { throw MopError.invalidVault }
         guard records.keys.allSatisfy({ UUID(uuidString: $0)?.uuidString == $0 }) else { throw MopError.invalidVault }
     }
     func verifyGenesis() throws {
@@ -126,6 +167,7 @@ struct Revision: Codable, Sendable {
               header.parent == Codec.digest(try parent.encoded()),
               let signer = parent.header.membership.key(author),
               signer.verifies(signature, message: try message()) else { throw MopError.vaultUntrusted }
+        guard Set(header.requiredFeatures ?? []).isSuperset(of: parent.header.requiredFeatures ?? []) else { throw MopError.invalidVault }
         let role = parent.header.membership.role(of: signer)
         switch header.operation {
         case .create: throw MopError.vaultUntrusted
@@ -178,7 +220,7 @@ struct Revision: Codable, Sendable {
 /// Callers persist a verified checkpoint atomically, separate from downloaded data.
 public struct VerifiedVault: Sendable {
     public func acceptedEnrollment(_ nonce: UUID) -> Bool { revision.header.acceptedInvitations.contains(nonce) }
-    let revision: Revision
+    var revision: Revision
     public let bytes: Data
     public var digest: String { Codec.digest(bytes) }
     public var id: UUID { revision.header.vault }
@@ -198,6 +240,11 @@ public struct VerifiedVault: Sendable {
     public func applying(_ bytes: Data) throws -> Self {
         let next = try Revision.decode(bytes)
         try next.verify(after: revision)
+        return Self(revision: next, bytes: bytes)
+    }
+    func applying(_ next: Revision) throws -> Self {
+        let bytes = try next.encoded()
+        _ = try applying(bytes)
         return Self(revision: next, bytes: bytes)
     }
     init(revision: Revision, bytes: Data) { self.revision = revision; self.bytes = bytes }

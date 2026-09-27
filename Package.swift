@@ -15,12 +15,13 @@ let package = Package(
         .executable(name: "mop-keychain-check", targets: ["MopKeychainCheck"]),
     ],
     dependencies: [
+        .package(url: "https://github.com/weichsel/ZIPFoundation.git", exact: "0.9.20"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.8.2"),
         .package(url: "https://github.com/DeVitoC/zxcvbn-swift.git", revision: "2d0c1137bab12e2c1dc13f167c650256bf60d0b8"),
     ],
     targets: [
         .target(name: "MopCore", dependencies: [.product(name: "zxcvbn", package: "zxcvbn-swift")]),
-        .target(name: "MopAppSupport", dependencies: ["MopCore", "MopAuth", "MopKeychain", "MopVaultNext"]),
+        .target(name: "MopAppSupport", dependencies: ["ZIPFoundation", "MopCore", "MopAuth", "MopKeychain", "MopVaultNext"]),
         .target(name: "MopUI", dependencies: ["MopAppSupport", "MopCore", "MopVaultNext"]),
         .executableTarget(name: "MopApp", dependencies: ["MopUI"]),
         .testTarget(name: "MopAppSupportTests", dependencies: ["MopAppSupport", "MopCore", "MopVaultNext"]),

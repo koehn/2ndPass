@@ -19,7 +19,7 @@ public enum AppStorageLocation {
         #if os(macOS)
         if let override = ProcessInfo.processInfo.environment["MOP_STATE_DIRECTORY"] { return URL(fileURLWithPath: override, isDirectory: true) }
         #endif
-        if let group = Bundle.main.object(forInfoDictionaryKey: "MopAppGroup") as? String,
+        if let group = SigningIdentity.appGroupIdentifier,
            let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) {
             return root.appendingPathComponent("MopV6", isDirectory: true)
         }

@@ -65,3 +65,10 @@ import MopCore
     #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "enrollment", "approve", "--request-id", UUID().uuidString]) }
     #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "enrollment", "confirm"]) }
 }
+
+@Test func importCLIRequiresExplicitVaultAndSupportsFormats() throws {
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["item", "import", "export.csv"]) }
+    #expect(try Mop.parseAsRoot(["item", "import", "export.csv", "--vault", "personal", "--dry-run", "--format", "apple-csv", "--json"]) is Item.Import)
+    #expect(try Mop.parseAsRoot(["item", "import", "export.1pux", "--vault", "personal", "--yes"]) is Item.Import)
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["item", "import", "export.csv", "--vault", "personal", "--offline"]) }
+}

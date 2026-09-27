@@ -1,17 +1,30 @@
 import Foundation
 
 public enum FieldType: String, Codable, CaseIterable, Sendable {
-    case text, username, website, email, password, otp, concealed, notes
-    public var concealed: Bool { [.password, .otp, .concealed].contains(self) }
-    public var label: String { self == .otp ? "OTP" : rawValue.capitalized }
+    case text, username, website, email, password, otp, concealed, notes, recoveryCodes, privateKey, cardNumber, expirationMonthYear, date, phone, attachment, bankAccount, address
+    public var concealed: Bool { [.password, .otp, .concealed, .recoveryCodes, .privateKey, .cardNumber, .attachment, .bankAccount, .address].contains(self) }
+    public var isCompound: Bool { self == .bankAccount || self == .address }
+    public var label: String {
+        switch self {
+        case .otp: "OTP"
+        case .privateKey: "Private key"
+        case .recoveryCodes: "Recovery codes"
+        case .cardNumber: "Card number"
+        case .bankAccount: "Bank account"
+        case .expirationMonthYear: "Month/year"
+        default: rawValue.capitalized
+        }
+    }
 }
 
 public enum ItemType: String, Codable, CaseIterable, Sendable {
-    case login, password, apiCredential, secureNote, database, custom
+    case login, password, apiCredential, secureNote, database, sshKey, paymentCard, identity, document, custom
     public var label: String {
         switch self {
         case .apiCredential: "API credential"
         case .secureNote: "Secure note"
+        case .sshKey: "SSH key"
+        case .paymentCard: "Payment card"
         default: rawValue.capitalized
         }
     }
@@ -25,6 +38,10 @@ public enum ItemType: String, Codable, CaseIterable, Sendable {
         case .apiCredential: fields = [("token", .concealed), ("endpoint", .website)]
         case .secureNote: fields = [("note", .concealed)]
         case .database: fields = [("server", .text), ("username", .username), ("password", .password), ("database", .text)]
+        case .sshKey: fields = [("privateKey", .privateKey), ("publicKey", .text), ("passphrase", .password), ("fingerprint", .text)]
+        case .paymentCard: fields = [("cardholder", .text), ("number", .cardNumber), ("brand", .text), ("expiration", .expirationMonthYear), ("securityCode", .concealed), ("pin", .concealed)]
+        case .identity: fields = [("firstName", .text), ("middleName", .text), ("lastName", .text), ("company", .text), ("birthDate", .date), ("email", .email), ("phone", .phone), ("address1", .text), ("address2", .text), ("city", .text), ("state", .text), ("postalCode", .text), ("country", .text), ("username", .username), ("governmentID", .concealed)]
+        case .document: fields = [("attachment", .attachment)]
         case .custom: return []
         }
         return (fields + (self == .secureNote ? [] : [("notes", .notes)])).map { ItemField(path: $0.0, type: $0.1, value: "", isTemplate: true) }
@@ -38,6 +55,7 @@ public struct ItemField: Codable, Equatable, Sendable {
     public var value: String?
     public var passwordQuality: PasswordQuality?
     public var isTemplate: Bool?
+    public var label: String?
     public init(path: String, type: FieldType = .concealed, value: String? = nil, isTemplate: Bool? = nil) {
         self.path = path; self.type = type; self.value = value; self.isTemplate = isTemplate
     }
@@ -70,6 +88,14 @@ public struct VaultItem: Codable, Equatable, Sendable {
     public var fields: [ItemField]
     public var deletion: ItemDeletion?
     public var autoFill: AutoFillMapping?
+    public var metadata: ItemMetadata?
+    public var isArchived: Bool { metadata?.archived == true }
+    public var isFavorite: Bool { metadata?.favorite == true }
+    public var requiresExtendedModel: Bool {
+        metadata != nil || [.sshKey, .paymentCard, .identity, .document].contains(type) || fields.contains {
+            $0.label != nil || [.recoveryCodes, .privateKey, .cardNumber, .expirationMonthYear, .date, .phone, .attachment, .bankAccount, .address].contains($0.type)
+        }
+    }
     public func isTemplateField(_ field: ItemField) -> Bool {
         field.isTemplate == true || type.template.contains { $0.path == field.path }
     }
@@ -82,6 +108,7 @@ public struct ItemCatalog: Codable, Sendable {
     public var vault: String
     public var revision: String
     public var items: [VaultItem]
+    public var canEdit: Bool?
     public init(vault: String, revision: String, items: [VaultItem]) { self.vault = vault; self.revision = revision; self.items = items }
 }
 
@@ -92,5 +119,23 @@ public struct ItemEdit: Codable, Sendable {
     public var originalName: String?
     public init(revision: String, item: VaultItem, create: Bool, originalName: String? = nil) {
         self.revision = revision; self.item = item; self.create = create; self.originalName = originalName
+    }
+}
+
+public struct ImportSourceIdentity: Codable, Equatable, Sendable {
+    public var provider: String
+    public var container: String
+    public var item: String
+    public init(provider: String, container: String, item: String) {
+        self.provider = provider; self.container = container; self.item = item
+    }
+}
+public struct ItemMetadata: Codable, Equatable, Sendable {
+    public var tags: [String]
+    public var favorite: Bool
+    public var archived: Bool
+    public var source: ImportSourceIdentity?
+    public init(tags: [String] = [], favorite: Bool = false, archived: Bool = false, source: ImportSourceIdentity? = nil) {
+        self.tags = tags; self.favorite = favorite; self.archived = archived; self.source = source
     }
 }

@@ -411,3 +411,27 @@ private final class PickerService: VaultService, Sendable {
     #expect(await publisher.status().phase == .current)
     #expect(await publisher.status().catalogsNeedingRefresh?.isEmpty == true)
 }
+
+@Test func archivedLoginsAreNeverPublishedToAutoFill() {
+    var item = VaultItem(name: "Archived", type: .login, fields: [ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "password", type: .password), ItemField(path: "website", type: .website, value: "https://example.test")])
+    item.metadata = ItemMetadata(archived: true)
+    #expect(AutoFillEntry.entries(catalog: ItemCatalog(vault: "personal", revision: "r", items: [item]), vaultID: UUID().uuidString).isEmpty)
+}
+
+
+@Test func autoFillFocusIgnoresSystemPanelsAndStaleActivationEvents() {
+    var focus = AutoFillFocus()
+    focus.begin(application: 100)
+    // Authentication/accessory UI is represented as no foreground user app.
+    #expect(!({ focus.shouldInterrupt(activated: 200, foreground: nil) }()))
+    #expect(!({ focus.shouldInterrupt(activated: 100, foreground: 100) }()))
+    // A queued switch notification must not cancel a request in the current app.
+    #expect(!({ focus.shouldInterrupt(activated: 300, foreground: 100) }()))
+    #expect(({ focus.shouldInterrupt(activated: 300, foreground: 300) }()))
+    // Starting/retrying while an authentication panel is foreground must not
+    // mistake the subsequent return to the browser for switching applications.
+    focus.begin(application: nil)
+    #expect(!({ focus.shouldInterrupt(activated: 200, foreground: nil) }()))
+    #expect(!({ focus.shouldInterrupt(activated: 100, foreground: 100) }()))
+    #expect(({ focus.shouldInterrupt(activated: 300, foreground: 300) }()))
+}

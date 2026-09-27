@@ -24,6 +24,17 @@ struct Mop: AsyncParsableCommand {
             var command = try parseAsRoot()
             if var asyncCommand = command as? any AsyncParsableCommand { try await asyncCommand.run() }
             else { try command.run() }
+        } catch let code as ExitCode {
+            exit(withError: code)
+        } catch let error as CompoundFieldFailure {
+            IO.diagnostic("mop: \(error.errorDescription ?? "Invalid structured field.")\n")
+            exit(withError: ExitCode(1))
+        } catch let error as AttachmentFailure {
+            IO.diagnostic("mop: \(error.errorDescription ?? "Attachment operation failed.")\n")
+            exit(withError: ExitCode(1))
+        } catch let error as ImportFailure {
+            IO.diagnostic("mop: \(error.errorDescription ?? "Import failed.")\n")
+            exit(withError: ExitCode(1))
         } catch let error as MopError {
             IO.diagnostic("mop: \(error.errorDescription ?? "Operation failed.")\n")
             exit(withError: ExitCode(error.exitCode))
@@ -132,7 +143,7 @@ struct Inject: AsyncParsableCommand {
 }
 
 struct Item: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "List typed items or atomically save an item from JSON stdin.", subcommands: [Catalog.self, Save.self])
+    static let configuration = CommandConfiguration(abstract: "List typed items or atomically save an item from JSON stdin.", subcommands: [Catalog.self, Save.self, Import.self, Attachments.self])
     struct Catalog: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         func run() async throws {

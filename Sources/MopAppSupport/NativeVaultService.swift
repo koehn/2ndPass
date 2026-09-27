@@ -20,10 +20,13 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     private let openDevice: (String, UUID, LAContext, Bool) throws -> any DeviceOperations
     private let authenticate: (@escaping (LAContext) throws -> Void) async throws -> LAContext
     private var authorization: (token: Int, context: LAContext)?
+    private var allowsAttachments = true
+    private var attachmentSyncOverride: Bool?
     private let publishesAutoFill: Bool
     private var accountObserver: NSObjectProtocol?
     public var authenticatedAt: TimeInterval? { control.authenticatedAt }
-    public init(state: URL? = nil, configuration: any VaultPlatformConfiguration = DefaultVaultPlatformConfiguration(), documents: any DocumentAccessing = SystemDocumentAccess()) {
+    public init(state: URL? = nil, allowsAttachments: Bool = true, configuration: any VaultPlatformConfiguration = DefaultVaultPlatformConfiguration(), documents: any DocumentAccessing = SystemDocumentAccess()) {
+        self.allowsAttachments = allowsAttachments
         makeTransport = { try CloudRevisionTransport(container: $0, environment: $1) }
         deleteDevice = { try DeviceKeychain.remove(scope: $0, member: $1) }
         openDevice = { try DeviceKeychain.open(scope: $0, member: $1, context: $2, create: $3) }
@@ -37,10 +40,11 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     }
     // Test-only injection is internal. Public app/CLI construction always uses
     // Apple's hardware provider, account checks and user-presence authentication.
-    init(state: URL, configuration: any VaultPlatformConfiguration, transport: any VaultTransport,
+    init(state: URL, configuration: any VaultPlatformConfiguration, transport: any VaultTransport, allowsAttachments: Bool = true, attachmentSyncOverride: Bool? = nil,
          openDevice: @escaping (String, UUID, LAContext, Bool) throws -> any DeviceOperations,
          deleteDevice: @escaping (String, UUID) throws -> Void = { _, _ in },
          authenticate: @escaping (@escaping (LAContext) throws -> Void) async throws -> LAContext) {
+        self.allowsAttachments = allowsAttachments; self.attachmentSyncOverride = attachmentSyncOverride
         self.state = state; self.configuration = configuration; documents = SystemDocumentAccess()
         publishesAutoFill = false; makeTransport = { _, _ in transport }
         self.openDevice = openDevice; self.deleteDevice = deleteDevice; self.authenticate = authenticate
@@ -125,7 +129,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     let listing = try await run(.members, selection: entry.address.vault.uuidString, offline: false, token: token)
                     for device in listing.devices {
                         var combined = devices[device.id] ?? device
-                        combined.vaultNames[entry.address.vault.uuidString] = entry.name ?? "Unnamed vault"
+                        combined.vaultNames[entry.address.vault.uuidString] = entry.name
                         devices[device.id] = combined
                     }
                     if case .removeAccountDevice(let id) = action,
@@ -141,7 +145,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     for entry in affected {
                         do {
                             _ = try await run(.manage(.removeDevice(id)), selection: entry.address.vault.uuidString, offline: false, token: token)
-                            completed.append(entry.name ?? "Unnamed vault")
+                            completed.append(entry.name)
                             devices[id]?.vaultNames.removeValue(forKey: entry.address.vault.uuidString)
                         } catch {
                             try control.check(token)
@@ -150,7 +154,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                             result.deviceRemovalIncomplete = true
                             result.devices = devices.values.sorted { $0.name < $1.name }
                             let done = completed.isEmpty ? "No removals were confirmed." : "Removed from: " + completed.joined(separator: ", ") + "."
-                            result.message = done + " Removal from " + (entry.name ?? "Unnamed vault") + " was not confirmed; remaining vaults were not changed. Refresh Devices before retrying."
+                            result.message = done + " Removal from " + entry.name + " was not confirmed; remaining vaults were not changed. Refresh Devices before retrying."
                             return result
                         }
                     }
@@ -360,11 +364,12 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             }
         }
         if case .manage(.importCheckpoint(let document, let fingerprint, let sharedOwner)) = operation {
-            let root = try VerifiedVault(checkpoint: document, independentlyVerifiedDigest: fingerprint)
+            let root = try VerifiedVault.restoreBackup(document, independentlyVerifiedDigest: fingerprint)
             let key = try device(); defer { close(key) }
             guard root.membership.role(of: key.identity) != nil else { throw MopError.notVaultMember }
             let address = try VaultAddress(container: config.container, environment: config.environment, account: account,
                 database: sharedOwner == nil ? .private : .shared, owner: sharedOwner ?? CKCurrentUserDefaultName, vault: root.id)
+            try AttachmentDownloads(state: state, address: address).cache(root)
             let entry = NextEntry(address: address, checkpoint: root.bytes, digest: root.digest, name: root.name, submitted: true, ready: true)
             let storage = try registry.storage(entry)
             let coordinator = try PublicationCoordinator(address: address, checkpoint: root, transport: transport, storage: storage)
@@ -443,7 +448,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             return result
         }
         if case .manage(.recoverHardware(let backup, let checkpoint, let ownerBytes, let recoveryBytes, let copy)) = operation {
-            let source = try VerifiedVault(checkpoint: backup, independentlyVerifiedDigest: checkpoint)
+            let source = try VerifiedVault.restoreBackup(backup, independentlyVerifiedDigest: checkpoint)
             let ownerRequest = try ExchangeFile.decode(DeviceRequest.self, from: ownerBytes); try ownerRequest.validate()
             let nextRecovery = try ExchangeFile.decode(DeviceRequest.self, from: recoveryBytes); try nextRecovery.validate()
             guard !ownerRequest.recovery, nextRecovery.recovery,
@@ -460,7 +465,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 try registry.put(entry); try control.check(token)
                 try await transport.initialize(root, at: address)
                 entry.ready = true; try registry.put(entry)
-                result.document = root.bytes
+                try AttachmentDownloads(state: state, address: address).cache(root)
+                result.document = try root.backup()
                 result.message = "Recovered into new vault \(root.id). Source retained. Checkpoint: \(root.digest)"
             } else {
                 guard source.membership.accounts.first(where: { $0.role == .owner })?.id == registry.member else { throw MopError.cloudAccount }
@@ -470,11 +476,15 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 let storage = try registry.storage(entry)
                 let coordinator = try PublicationCoordinator(address: address, checkpoint: source, transport: transport, storage: storage)
                 _ = try await coordinator.refresh()
-                let current = await coordinator.offlineSnapshot().0
+                var current = await coordinator.offlineSnapshot().0
+                let downloads = AttachmentDownloads(state: state, address: address)
+                try downloads.cache(source)
+                current = try await downloads.load(current, digests: current.attachmentDigests, transport: transport, offline: false)
                 let next = try VaultEngine.recover(current, using: recovery, owner: ownerRequest.device, replacementRecovery: nextRecovery.device)
                 try control.check(token); try await coordinator.publish(next)
                 try await transport.reconcileShare(next.membership, at: address)
-                result.document = next.bytes
+                try downloads.cache(next)
+                result.document = try next.backup()
                 result.message = "Recovered owner device; old devices and members removed. Checkpoint: \(next.digest)"
             }
             return result
@@ -497,6 +507,21 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             try registry.setRemoved(true)
             removedRegistry = registry
             throw MopError.deviceRemoved
+        }
+        let attachments = AttachmentDownloads(state: state, address: entry.address)
+        if allowsAttachments {
+            var needed: Set<String> = []
+            switch operation {
+            case .read(let reference):
+                if let digest = try current.attachmentDigest(for: reference.relativePath, device: key) { needed.insert(digest) }
+            case .export, .previewImport, .commitImport: needed = current.attachmentDigests
+            case .manage(.removeMember), .manage(.removeDevice), .manage(.replaceRecovery): needed = current.attachmentDigests
+            case .sync, .catalog:
+                if !offline && (attachmentSyncOverride ?? AttachmentDownloadSettings.duringSync) { needed = current.attachmentDigests }
+            default: break
+            }
+            current = try await attachments.load(current, digests: needed, transport: transport, offline: offline)
+            try control.check(token)
         }
         if case .sync = operation { result.message = "Verified checkpoint: \(current.digest)"; return result }
         if case .manage(let action) = operation {
@@ -587,6 +612,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             let catalog = try VaultEngine.catalog(in: current, device: key)
             let path = [reference.section, reference.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
             guard let field = catalog.items.first(where: { $0.name == reference.item })?.fields.first(where: { $0.path == path }) else { throw MopError.notFound }
+            guard allowsAttachments || field.type != .attachment else { throw MopError.notFound }
             let value = try VaultEngine.read(reference.relativePath, in: current, device: key)
             if field.type == .otp {
                 let otp = try TimeBasedOTP(String(decoding: value, as: UTF8.self)), now = Date()
@@ -594,6 +620,16 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             } else { result.value = value }
             result.valueIsConcealed = field.type.concealed
             return result
+        case .previewImport(let document, let selected):
+            let plan = try VaultEngine.previewImport(document, selected: selected, in: current, device: key)
+            result.importPreview = plan.preview
+            return result
+        case .commitImport(let document, let selected, let vaultID, let revision):
+            guard vaultID == current.id, revision == current.digest else { throw MopError.vaultConflict }
+            let plan = try VaultEngine.previewImport(document, selected: selected, in: current, device: key)
+            if !plan.items.isEmpty { proposal = try VaultEngine.importItems(plan.items, revision: revision, in: current, device: key) }
+            var report = plan.preview.report; report.imported = plan.items.count; report.committed = true
+            result.importReport = report
         case .save(let edit): proposal = try VaultEngine.saveItem(edit, in: current, device: key)
         case .write(let reference, let value, let replace):
             guard reference.vault == current.name else { throw MopError.vaultSelectionMismatch }
@@ -625,7 +661,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             proposal = try VaultEngine.rename(name, in: current, device: key)
         case .export(let url):
             try documents.write(to: url) { target in
-                try OutputFile(url: target, force: false, mode: 0o600, protectedFiles: [], protectedDirectories: [state]).write(current.bytes)
+                try OutputFile(url: target, force: false, mode: 0o600, protectedFiles: [], protectedDirectories: [state]).write(try current.backup())
             }
             result.message = "Encrypted backup exported. Checkpoint: \(current.digest)"
         case .deleteVault:
@@ -676,6 +712,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         default: throw MopError.invalidProcess
         }
         if let proposal {
+            try attachments.cache(proposal)
             try control.check(token); try await coordinator.publish(proposal)
             try control.check(token)
             entry.name = proposal.name; entry.ready = true; try registry.put(entry)

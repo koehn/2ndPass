@@ -18,6 +18,18 @@ actor MemoryRevisionTransport: RevisionTransport {
     private var version = 1
     private var blobs: [String: Data]
     private var fault = Fault.none
+    private var attachments: [String: Data] = [:]
+    private(set) var attachmentReads = 0
+    func attachment(_ digest: String, at address: VaultAddress) async throws -> Data {
+        attachmentReads += 1
+        guard address.vault == vault, let bytes = attachments[digest] else { throw AttachmentFailure.unavailable }
+        return bytes
+    }
+    func uploadAttachment(_ bytes: Data, digest: String, at address: VaultAddress) async throws {
+        if fault == .upload { fault = .none; throw MopError.cloudUnavailable }
+        guard address.vault == vault, Codec.digest(bytes) == digest else { throw MopError.invalidVault }
+        attachments[digest] = bytes
+    }
     private(set) var publications = 0
     init(_ root: VerifiedVault) { vault = root.id; headDigest = root.digest; blobs = [root.digest: root.bytes] }
     func setFault(_ value: Fault) { fault = value }
@@ -32,6 +44,10 @@ actor MemoryRevisionTransport: RevisionTransport {
         if fault == .upload { fault = .none; throw MopError.cloudUnavailable }
         guard address.vault == vault, Codec.digest(bytes) == digest,
               blobs[digest] == nil || blobs[digest] == bytes else { throw MopError.invalidVault }
+        let revision = try Revision.decode(bytes)
+        for record in revision.records.values {
+            if let digest = record.attachmentDigest { guard attachments[digest] != nil else { throw AttachmentFailure.unavailable } }
+        }
         blobs[digest] = bytes
     }
     func publish(_ digest: String, expectedVersion: Data, at address: VaultAddress) throws {
@@ -158,4 +174,34 @@ private func address(_ vault: VerifiedVault, account: String = "account-a", shar
     #expect(await coordinator.offlineSnapshot().0.digest == root.digest)
     try await coordinator.publish(proposal) // Explicit new user attempt, now safe.
     #expect(await coordinator.offlineSnapshot().0.digest == proposal.digest)
+}
+
+@Test func attachmentPublicationUploadsBeforeHeadAndRefreshDoesNotDownload() async throws {
+    let owner = try TestDevice()
+    let root = try VaultEngine.create(name: "files", owner: owner)
+    let file = try Attachment(fileName: "file.dat", data: Data([1, 2, 3]))
+    let item = VaultItem(name: "File", type: .document, fields: [.init(path: "file", type: .attachment, value: try file.encodedValue())])
+    let proposal = try VaultEngine.saveItem(.init(revision: root.digest, item: item, create: true), in: root, device: owner)
+    let transport = MemoryRevisionTransport(root)
+    let coordinator = try PublicationCoordinator(address: address(root), checkpoint: root, transport: transport, storage: MemoryVerifiedState())
+    await transport.setFault(.upload)
+    await #expect(throws: MopError.cloudUnavailable) { try await coordinator.publish(proposal) }
+    #expect(await transport.publications == 0)
+    #expect(await coordinator.offlineSnapshot().0.digest == root.digest)
+    try await coordinator.publish(proposal)
+    let reader = try PublicationCoordinator(address: address(root), checkpoint: root, transport: transport, storage: MemoryVerifiedState())
+    try await reader.refresh()
+    let remote = await reader.offlineSnapshot().0
+    #expect(remote.loadedAttachments.isEmpty)
+    #expect(await transport.attachmentReads == 0)
+    #expect(try VaultEngine.catalog(in: remote, device: owner).items.count == 1)
+    #expect(throws: AttachmentFailure.unavailable) { try VaultEngine.read("File/file", in: remote, device: owner) }
+    let digest = try #require(remote.attachmentDigests.first)
+    let bytes = try await transport.attachment(digest, at: address(root))
+    #expect(throws: MopError.invalidVault) { try remote.loadingAttachment(Data([9]), digest: digest) }
+    let hydrated = try remote.loadingAttachment(bytes, digest: digest)
+    #expect(try Attachment.decode(String(decoding: VaultEngine.read("File/file", in: hydrated, device: owner), as: UTF8.self)) == file)
+    #expect(throws: AttachmentFailure.unavailable) { try remote.backup() }
+    let restored = try VerifiedVault.restoreBackup(hydrated.backup(), independentlyVerifiedDigest: hydrated.digest)
+    #expect(restored.loadedAttachments == hydrated.loadedAttachments)
 }

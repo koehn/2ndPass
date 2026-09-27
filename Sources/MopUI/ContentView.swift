@@ -61,6 +61,12 @@ struct ContentView: View {
                 if model.page == .secrets {
                 VStack(spacing: 0) {
                     SearchSummary(model: model)
+                    HStack {
+                        Toggle("Archived", isOn: $model.showArchived)
+                        Toggle("Favorites", isOn: $model.favoritesOnly)
+                        TextField("Filter tag", text: $model.tagFilter)
+                    }.font(.caption).padding(.horizontal)
+
                     if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
                         ContentUnavailableView {
                             Label("Connect this device", systemImage: model.vaultIcon(descriptor))
@@ -97,7 +103,10 @@ struct ContentView: View {
                                 Label(model.search.isEmpty ? "No items" : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")
                             } actions: {
                                 if !model.search.isEmpty { Button("Clear Search") { model.search = "" } }
-                                else { Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy) }
+                                else {
+                                    Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy)
+                                    Button("Import…") { model.beginImport() }.disabled(model.offline || model.busy)
+                                }
                             }
                         }
                     } else {

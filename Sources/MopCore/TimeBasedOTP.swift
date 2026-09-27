@@ -13,7 +13,7 @@ public struct TimeBasedOTP {
         var secret = input, algorithm = "SHA1", digits = 6, period = 30
         if input.lowercased().hasPrefix("otpauth:") {
             guard let url = URLComponents(string: input), url.scheme?.lowercased() == "otpauth",
-                  url.host?.lowercased() == "totp", !url.path.dropFirst().isEmpty,
+                  url.host?.lowercased() == "totp",
                   url.user == nil, url.password == nil, url.port == nil, url.fragment == nil else { throw MopError.invalidOTP }
             var values: [String: String] = [:]
             for query in url.queryItems ?? [] {

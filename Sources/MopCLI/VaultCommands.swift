@@ -235,7 +235,7 @@ struct Vault: AsyncParsableCommand {
             let owner = try readFile(ownerRequest), recovery = try readFile(recoveryRequest)
             guard try ExchangeFile.decode(DeviceRequest.self, from: owner).fingerprint == ownerFingerprint,
                   try ExchangeFile.decode(DeviceRequest.self, from: recovery).fingerprint == recoveryFingerprint else { throw MopError.invalidIdentity }
-            try emit(await storage.execute(.manage(.recoverHardware(backup: readFile(backup), checkpoint: checkpoint, owner: owner, recovery: recovery, copy: copy))))
+            try emit(await storage.execute(.manage(.recoverHardware(backup: LocalFile.read(URL(fileURLWithPath: backup), limit: VerifiedVault.maximumBackupSize), checkpoint: checkpoint, owner: owner, recovery: recovery, copy: copy))))
         }
     }
     struct ReconcileShare: AsyncParsableCommand {
@@ -249,7 +249,7 @@ struct Vault: AsyncParsableCommand {
         @Argument(completion: .file()) var file: String
         @Option var checkpoint: String
         @Option(help: "Actual zone owner record name for a shared database vault; omit for your own private vault.") var sharedOwner: String?
-        func run() async throws { try emit(await storage.execute(.manage(.importCheckpoint(document: readFile(file), fingerprint: checkpoint, sharedOwner: sharedOwner)))) }
+        func run() async throws { try emit(await storage.execute(.manage(.importCheckpoint(document: LocalFile.read(URL(fileURLWithPath: file), limit: VerifiedVault.maximumBackupSize), fingerprint: checkpoint, sharedOwner: sharedOwner)))) }
     }
     struct DeleteVault: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "delete", abstract: "Delete the selected cloud vault. Backups and local ciphertext remain.")

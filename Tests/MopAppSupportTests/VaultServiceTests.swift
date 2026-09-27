@@ -43,6 +43,14 @@ private final class TestHardware: @unchecked Sendable {
 private actor Server {
     struct State { var head: String; var version: Int; var revisions: [String: Data] }
     var vaults: [UUID: State] = [:]
+    var attachments: [UUID: [String: Data]] = [:]
+    var attachmentReads = 0
+    func attachment(_ digest: String, _ id: UUID) throws -> Data {
+        attachmentReads += 1
+        guard let bytes = attachments[id]?[digest] else { throw AttachmentFailure.unavailable }
+        return bytes
+    }
+    func uploadAttachment(_ bytes: Data, _ digest: String, _ id: UUID) { attachments[id, default: [:]][digest] = bytes }
     var inboxes: [String: (EnrollmentMailbox, Int)] = [:]
     func enrollment(_ address: VaultAddress) -> EnrollmentInbox {
         let saved = inboxes[address.binding]
@@ -80,6 +88,8 @@ private actor Server {
 }
 private struct Transport: VaultTransport {
     let server: Server, accountID: String
+    func attachment(_ digest: String, at address: VaultAddress) async throws -> Data { try await server.attachment(digest, address.vault) }
+    func uploadAttachment(_ bytes: Data, digest: String, at address: VaultAddress) async throws { await server.uploadAttachment(bytes, digest, address.vault) }
     func enrollment(at address: VaultAddress) async throws -> EnrollmentInbox { await server.enrollment(address) }
     func saveEnrollment(_ mailbox: EnrollmentMailbox, version: Data?, at address: VaultAddress) async throws { try await server.saveEnrollment(mailbox, version, address) }
     func discover() async throws -> [VaultAddress] { await server.discover(accountID) }
@@ -114,9 +124,9 @@ private final class Client {
         self.server = server; self.account = account
         reopen()
     }
-    func reopen() {
+    func reopen(allowsAttachments: Bool = true, duringSync: Bool = false) {
         let hardware = hardware, calls = calls
-        service = NativeVaultService(state: state, configuration: Configuration(stateDirectory: state), transport: Transport(server: server, accountID: account),
+        service = NativeVaultService(state: state, configuration: Configuration(stateDirectory: state), transport: Transport(server: server, accountID: account), allowsAttachments: allowsAttachments, attachmentSyncOverride: duringSync,
             openDevice: { try hardware.open($0, $1, $2, $3) }, deleteDevice: { try hardware.remove($0, $1) }, authenticate: { callback in
                 calls.withLock { $0 += 1 }; let context = LAContext(); try callback(context); return context
             })
@@ -547,4 +557,80 @@ private actor AuthenticationGate {
     // A retry reconciles the pending publication and safely completes the remaining scope.
     _ = try await owner.service.execute(.manage(.removeAccountDevice(device.device)), vault: first)
     for id in [first, second] { #expect(try await owner.service.execute(.members, vault: id).devices.count == 1) }
+}
+
+@Test func importServicePublishesOnceAndRejectsStalePreview() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), viewer = Client(cloud, "b")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let bytes = Data("Title,URL,Username,Password\nA,https://a.test,u,p\nB,https://b.test,u,q\n".utf8)
+    let document = try PasswordImport.parse(bytes)
+    let preview = try #require(try await owner.service.execute(.previewImport(document, selected: nil), vault: id).importPreview)
+    let before = try await cloud.head(preview.vault)
+    let result = try await owner.service.execute(.commitImport(document, selected: [1, 2], vault: preview.vault, revision: preview.revision), vault: id)
+    #expect(result.importReport?.imported == 2)
+    #expect(try await cloud.head(preview.vault).version == Data("2".utf8))
+    #expect(before.version == Data("1".utf8))
+    await #expect(throws: MopError.vaultConflict) {
+        try await owner.service.execute(.commitImport(document, selected: [1, 2], vault: preview.vault, revision: preview.revision), vault: id)
+    }
+    let again = try #require(try await owner.service.execute(.previewImport(document, selected: nil), vault: id).importPreview)
+    #expect(again.report.rows.allSatisfy { $0.disposition == .duplicate })
+    await #expect(throws: MopError.offlineWrite) { try await owner.service.execute(.previewImport(document, selected: nil), vault: id, offline: true) }
+    try await enroll(viewer, owner: owner, vault: id, role: .viewer)
+    await #expect(throws: MopError.cloudPermission) { try await viewer.service.execute(.previewImport(document, selected: nil), vault: id) }
+}
+
+@Test func uncertainImportReconcilesWithoutDuplicatingItems() async throws {
+    let cloud = Server(), owner = Client(cloud, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let document = try PasswordImport.parse(Data("url,username,password\nhttps://a.test,u,p\n".utf8))
+    let preview = try #require(try await owner.service.execute(.previewImport(document, selected: nil), vault: id).importPreview)
+    await cloud.dropNext()
+    await #expect(throws: MopError.cloudUncertain) {
+        try await owner.service.execute(.commitImport(document, selected: [1], vault: preview.vault, revision: preview.revision), vault: id)
+    }
+    owner.reopen()
+    let recovered = try #require(try await owner.service.execute(.previewImport(document, selected: nil), vault: id).importPreview)
+    #expect(recovered.report.rows[0].disposition == .duplicate)
+    #expect(try await owner.service.execute(.catalog, vault: id).catalog?.items.count == 1)
+}
+
+@Test func attachmentDownloadsAreOnDemandCachedAndExcludedFromAutoFill() async throws {
+    let cloud = Server()
+    let writer = Client(cloud, "a"), reader = Client(cloud, "a"), recovery = Client(cloud, "a")
+    let id = try await create(writer, recovery: recovery)
+    let catalog = try #require(try await writer.service.execute(.catalog, vault: id).catalog)
+    let file = try Attachment(fileName: "proof.dat", data: Data([0, 128, 255]))
+    let item = VaultItem(name: "Proof", type: .document, fields: [.init(path: "file", type: .attachment, value: try file.encodedValue())])
+    _ = try await writer.service.execute(.save(.init(revision: catalog.revision, item: item, create: true)), vault: id)
+    try await enroll(reader, owner: writer, vault: id, role: .owner)
+    let reference = try SecretReference("mop://personal/Proof/file")
+    reader.reopen(allowsAttachments: false, duringSync: true)
+    _ = try await reader.service.execute(.catalog, vault: id)
+    await #expect(throws: MopError.notFound) { try await reader.service.execute(.read(reference), vault: id) }
+    #expect(await cloud.attachmentReads == 0)
+    reader.reopen()
+    _ = try await reader.service.execute(.sync, vault: id)
+    #expect(await cloud.attachmentReads == 0)
+    await #expect(throws: AttachmentFailure.unavailable) { try await reader.service.execute(.read(reference), vault: id, offline: true) }
+    let value = try #require(try await reader.service.execute(.read(reference), vault: id).value)
+    #expect(try Attachment.decode(String(decoding: value, as: UTF8.self)) == file)
+    #expect(await cloud.attachmentReads == 1)
+    _ = try await reader.service.execute(.read(reference), vault: id, offline: true)
+    #expect(await cloud.attachmentReads == 1)
+    let syncReader = Client(cloud, "a")
+    try await enroll(syncReader, owner: writer, vault: id, role: .owner)
+    syncReader.reopen(duringSync: true)
+    _ = try await syncReader.service.execute(.sync, vault: id)
+    #expect(await cloud.attachmentReads == 2)
+    _ = try await syncReader.service.execute(.read(reference), vault: id, offline: true)
+    #expect(await cloud.attachmentReads == 2)
+    let (_, readerIdentity) = try await reader.request()
+    _ = try await writer.service.execute(.manage(.removeDevice(readerIdentity.device.device)), vault: id)
+    await #expect(throws: MopError.deviceRemoved) { try await reader.service.execute(.read(reference), vault: id) }
+    let rotated = try #require(try await syncReader.service.execute(.read(reference), vault: id).value)
+    #expect(try Attachment.decode(String(decoding: rotated, as: UTF8.self)) == file)
+    #expect(await cloud.attachmentReads == 3)
 }

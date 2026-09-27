@@ -189,6 +189,32 @@ public final class CloudRevisionTransport: VaultTransport, @unchecked Sendable {
         }
         try await check(address)
     }
+    public func attachment(_ digest: String, at address: VaultAddress) async throws -> Data {
+        guard Codec.hash(digest) else { throw MopError.invalidVault }
+        try await check(address)
+        let record = try await fetch("attachment-" + digest, address)
+        guard record.recordType == "MopV6Attachment", let asset = record["payload"] as? CKAsset, let url = asset.fileURL else { throw MopError.invalidVault }
+        let bytes = try LocalFile.read(url, limit: Codec.maximumSize)
+        guard Codec.digest(bytes) == digest else { throw MopError.invalidVault }
+        try await check(address)
+        return bytes
+    }
+    public func uploadAttachment(_ bytes: Data, digest: String, at address: VaultAddress) async throws {
+        guard bytes.count <= Codec.maximumSize, Codec.hash(digest), Codec.digest(bytes) == digest else { throw MopError.invalidVault }
+        try await check(address)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("mop-attachment-" + UUID().uuidString)
+        try LocalFile.privateDirectory(folder)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let url = folder.appendingPathComponent("ciphertext")
+        try LocalFile.write(bytes, to: url)
+        let record = CKRecord(recordType: "MopV6Attachment", recordID: id("attachment-" + digest, address))
+        record["payload"] = CKAsset(fileURL: url)
+        do { try await save(record, address) }
+        catch MopError.vaultConflict {
+            guard try await attachment(digest, at: address) == bytes else { throw MopError.invalidVault }
+        }
+        try await check(address)
+    }
     public func publish(_ digest: String, expectedVersion: Data, at address: VaultAddress) async throws {
         guard Codec.hash(digest), expectedVersion.count <= 65536 else { throw MopError.invalidVault }
         try await check(address)
@@ -212,6 +238,7 @@ public final class CloudRevisionTransport: VaultTransport, @unchecked Sendable {
         guard address.database == .private, address.owner == CKCurrentUserDefaultName,
               genesis.id == address.vault, genesis.generation == 1 else { throw MopError.cloudInvalidRequest }
         try genesis.revision.verifyGenesis()
+        guard genesis.attachmentDigests.isSubset(of: Set(genesis.loadedAttachments.keys)) else { throw AttachmentFailure.unavailable }
         try await check(address)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let operation = CKModifyRecordZonesOperation(recordZonesToSave: [CKRecordZone(zoneID: zone(address))])
@@ -219,6 +246,7 @@ public final class CloudRevisionTransport: VaultTransport, @unchecked Sendable {
             operation.modifyRecordZonesResultBlock = { result in continuation.resume(with: result.mapError(Self.map)) }
             database(address).add(operation)
         }
+        for (digest, bytes) in genesis.loadedAttachments { try await uploadAttachment(bytes, digest: digest, at: address) }
         try await upload(genesis.bytes, digest: genesis.digest, at: address)
         let record = CKRecord(recordType: "MopV6Head", recordID: id("head", address))
         record["digest"] = genesis.digest; record["operation"] = UUID().uuidString

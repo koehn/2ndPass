@@ -169,7 +169,7 @@ struct SharingView: View {
             do {
                 let url = try result.get(), access = url.startAccessingSecurityScopedResource()
                 defer { if access { url.stopAccessingSecurityScopedResource() } }
-                let bytes = try LocalFile.read(url, limit: 24 * 1024 * 1024)
+                let bytes = try LocalFile.read(url, limit: VerifiedVault.maximumBackupSize)
                 _ = try JSONSerialization.jsonObject(with: bytes)
                 switch action {
                 case "invite", "replaceRecovery": _ = try ExchangeFile.decode(DeviceRequest.self, from: bytes)
@@ -186,8 +186,8 @@ struct SharingView: View {
                 let url = try result.get(), access = url.startAccessingSecurityScopedResource()
                 defer { if access { url.stopAccessingSecurityScopedResource() } }
                 let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
-                let bytes = try handle.read(upToCount: 16 * 1024 * 1024 + 1) ?? Data()
-                guard !bytes.isEmpty, bytes.count <= 16 * 1024 * 1024 else { throw MopError.invalidVault }
+                let bytes = try handle.read(upToCount: VerifiedVault.maximumBackupSize + 1) ?? Data()
+                guard !bytes.isEmpty, bytes.count <= VerifiedVault.maximumBackupSize else { throw MopError.invalidVault }
                 _ = try JSONSerialization.jsonObject(with: bytes)
                 backup = bytes
                 importedName = url.lastPathComponent

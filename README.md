@@ -275,3 +275,9 @@ mop vault enrollment request --vault VAULT_UUID --name "Test iPad"
 ```
 
 Keep another enrolled device unlocked to complete the new request.
+
+## Import from another password manager
+
+Use **Import…** in the app, or `mop item import FILE --vault personal --dry-run`
+to preview a supported export. See [Importing password-manager data](docs/IMPORT.md)
+for supported formats, conflict handling, and migration limits.

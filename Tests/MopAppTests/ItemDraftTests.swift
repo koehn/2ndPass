@@ -165,3 +165,42 @@ extension ItemDraftTests {
         #expect(!draft.isModified)
     }
 }
+
+@Test func editingImportedItemsPreservesMetadataAndFieldLabels() {
+    var item = VaultItem(name: "SSH", type: .sshKey, fields: [ItemField(path: "privateKey", type: .privateKey)])
+    item.fields[0].label = "Private key"
+    item.metadata = ItemMetadata(tags: ["work"], favorite: true, archived: true, source: .init(provider: "test", container: "v", item: "i"))
+    var draft = ItemDraft(vault: "v", revision: "r", item: item)
+    #expect(!draft.isModified)
+    draft.name = "Renamed"
+    #expect(draft.item.metadata == item.metadata)
+    #expect(draft.item.fields[0].label == "Private key")
+    #expect(draft.item.fields[0].value == nil)
+}
+
+@Test func attachmentDraftPreservesStoredValueAndValidatesReplacement() throws {
+    let stored = VaultItem(name: "Document", type: .document, fields: [.init(path: "file", type: .attachment)])
+    var draft = ItemDraft(vault: "personal", revision: "revision", item: stored, mode: .value("file"))
+    #expect(draft.fields[0].value == nil)
+    #expect(!draft.isModified)
+    #expect(draft.valid(vaultName: "personal"))
+    draft.fields[0].value = ""
+    #expect(!draft.valid(vaultName: "personal"))
+    draft.fields[0].value = try Attachment(fileName: "file.bin", data: Data([0, 255])).encodedValue()
+    #expect(draft.valid(vaultName: "personal") && draft.isModified)
+    #expect(draft.item.fields[0].type == .attachment)
+}
+
+@Test func compoundDraftLoadDoesNotMarkUnchangedValuesModified() throws {
+    let item = VaultItem(name: "Bank", fields: [.init(path: "bank", type: .bankAccount)])
+    var draft = ItemDraft(vault: "personal", revision: "revision", item: item, mode: .value("bank"))
+    #expect(draft.fields[0].value == nil && !draft.isModified)
+    let original = try CompoundField(#"{"accountNo":"000123","extra":{"code":"preserved"}}"#)
+    draft.fields[0].loadedCompound = original.encodedValue
+    draft.fields[0].value = original.encodedValue
+    #expect(!draft.isModified && draft.item.fields[0].value == nil)
+    draft.fields[0].value = try original.replacing("owner", with: "New owner").encodedValue
+    #expect(draft.isModified && draft.valid(vaultName: "personal"))
+    draft.fields[0].value = "invalid"
+    #expect(!draft.valid(vaultName: "personal"))
+}

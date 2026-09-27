@@ -2,6 +2,7 @@
 import Foundation
 import CryptoKit
 import MopCore
+import MopKeychain
 
 public enum AutoFillKind: String, Codable, Sendable, CaseIterable {
     case password, oneTimeCode
@@ -18,7 +19,7 @@ public struct AutoFillEntry: Equatable, Sendable {
 
     public static func entries(catalog: ItemCatalog, vaultID: String) -> [Self] {
         guard let id = UUID(uuidString: vaultID) else { return [] }
-        return catalog.items.filter { $0.type == .login && $0.deletion == nil }.flatMap { item -> [Self] in
+        return catalog.items.filter { $0.type == .login && $0.deletion == nil && !$0.isArchived }.flatMap { item -> [Self] in
             AutoFillKind.allCases.flatMap { kind -> [Self] in
                 guard exclusionReason(for: item, kind: kind) == nil,
                       let username = usernameField(in: item)?.value,
@@ -58,6 +59,7 @@ public struct AutoFillEntry: Equatable, Sendable {
     }
     /// Nil means the field layout is eligible, not that system publication succeeded.
     public static func exclusionReason(for item: VaultItem, kind: AutoFillKind = .password) -> String? {
+        if item.isArchived { return "Archived items are excluded." }
         guard item.type == .login else { return "Set the item type to Login." }
         guard item.deletion == nil else { return "Restore this deleted login first." }
         if let mapping = item.autoFill {
@@ -183,7 +185,7 @@ public enum AutoFillStorage {
     }
 
     public static func directory() throws -> URL {
-        guard let group = Bundle.main.object(forInfoDictionaryKey: "MopAppGroup") as? String,
+        guard let group = SigningIdentity.appGroupIdentifier,
               !group.contains("$"), let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else { throw MopError.signing }
         return root.appendingPathComponent("AutoFill", isDirectory: true)
     }

@@ -43,6 +43,7 @@ private struct MopCommands: Commands {
             CommandGroup(after: .newItem) {
                 Button("New Item") { model.beginCreatingItem() }
                     .keyboardShortcut("n").disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil || model.page != .secrets)
+                Button("Import…") { model.beginImport() }.disabled(model.busy || model.offline || !model.authenticated)
                 Button("New Vault…") { model.presentSheet(.createVault) }.disabled(model.busy || model.offline)
             }
             CommandGroup(after: .textEditing) {
@@ -81,6 +82,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
 struct SessionSettings: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var model: AppModel
+    @AppStorage(AttachmentDownloadSettings.key, store: AttachmentDownloadSettings.defaults) private var downloadAttachmentsDuringSync = false
     @AppStorage("developerToolsEnabled") private var developerTools = false
     @State private var vaultID = ""
     @State private var removal: VaultDeviceRecord?
@@ -177,6 +179,14 @@ struct SessionSettings: View {
             }
 
             case .advanced:
+                Section("Attachments on this device") {
+                    Picker("Download attachments", selection: $downloadAttachmentsDuringSync) {
+                        Text("On demand").tag(false)
+                        Text("During sync").tag(true)
+                    }
+                    Text("On demand downloads files when you open or export them. During sync keeps encrypted files available offline. AutoFill never downloads attachments. Changing this setting keeps files already downloaded.")
+                        .font(.callout)
+                }
             Section("Developer") {
                 Toggle("Show developer tools", isOn: Binding(get: { developerTools }, set: { DeveloperPreferences.shared.set($0) }))
                 Text("Include Copy Reference in field menus for scripts and configuration. Syncs across devices using your Apple Account.")

@@ -7,6 +7,10 @@ import MopCore
 /// iOS validates the signed application's entitlements when accessing Keychain
 /// and CloudKit. Do not use macOS SecCode APIs or parse provisioning profiles.
 public enum SigningIdentity {
+    public static var appGroupIdentifier: String? {
+        Bundle.main.object(forInfoDictionaryKey: "MopAppGroup") as? String
+    }
+
     public static func accessGroup() throws -> String {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "MopKeychainAccessGroup") as? String,
               let identifier = Bundle.main.bundleIdentifier,

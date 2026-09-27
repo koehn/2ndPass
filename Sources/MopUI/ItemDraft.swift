@@ -9,17 +9,21 @@ struct ItemDraft: Identifiable {
         let dragID = UUID()
         let existing: Bool
         let isTemplate: Bool
+        var label: String?
         var path: String
         var type: FieldType
         let storedPasswordQuality: PasswordQuality?
         var loadedPassword: String?
+        var loadedCompound: String?
         var value: String?
         init(_ field: ItemField, existing: Bool = true) {
             id = existing ? "existing:" + field.path : "new:" + UUID().uuidString
             isTemplate = field.isTemplate == true
+            label = field.label
             self.existing = existing; path = field.path; type = field.type
             value = existing && field.type == .otp ? nil : field.value
             storedPasswordQuality = existing ? field.passwordQuality : nil
+            loadedCompound = existing && field.type.isCompound ? field.value : nil
             loadedPassword = existing && field.type == .password ? field.value : nil
         }
         /// Only changed or new input is sent to the live estimator.
@@ -36,14 +40,25 @@ struct ItemDraft: Identifiable {
             return type
         }
         var validationError: String? {
+            if effectiveType.isCompound {
+                guard let value else { return existing ? nil : CompoundFieldFailure.invalid.errorDescription }
+                return (try? CompoundField(value)) == nil ? CompoundFieldFailure.invalid.errorDescription : nil
+            }
+            if effectiveType == .attachment {
+                guard let value else { return existing ? nil : "Choose a file to attach." }
+                do { _ = try Attachment.decode(value); return nil }
+                catch { return (error as? AttachmentFailure)?.errorDescription ?? "Invalid attachment." }
+            }
             guard effectiveType == .otp else { return nil }
             guard let value else { return existing ? nil : MopError.invalidOTP.errorDescription }
             return (try? TimeBasedOTP(value)) == nil ? MopError.invalidOTP.errorDescription : nil
         }
         var field: ItemField {
-            ItemField(path: encodedPath, type: effectiveType,
-                      value: existing && loadedPassword != nil && value == loadedPassword ? nil : value,
+            var result = ItemField(path: encodedPath, type: effectiveType,
+                      value: existing && ((loadedPassword != nil && value == loadedPassword) || (loadedCompound != nil && value == loadedCompound)) ? nil : value,
                       isTemplate: isTemplate ? true : nil)
+            result.label = label
+            return result
         }
     }
     enum Mode: Equatable { case item, value(String) }
@@ -55,6 +70,7 @@ struct ItemDraft: Identifiable {
     var name: String
     var type: ItemType
     var fields: [Field]
+    var metadata: ItemMetadata?
     var autoFill: AutoFillMapping
     var mode: Mode
     private let initialVault: String
@@ -64,6 +80,7 @@ struct ItemDraft: Identifiable {
     var isModified: Bool { vault != initialVault || item != initialItem }
 
     init(vault: String, revision: String, item: VaultItem, mode: Mode = .item, isNew: Bool = false) {
+        metadata = item.metadata
         autoFill = item.autoFill ?? AutoFillMapping()
         initialVault = vault
         self.isNew = isNew
@@ -73,15 +90,17 @@ struct ItemDraft: Identifiable {
             if item.isTemplateField(field) { field.isTemplate = true }
             return Field(field, existing: !isNew)
         }; self.mode = mode
-        if case .value(let path) = mode, let index = fields.firstIndex(where: { $0.path == path }), fields[index].type != .password && fields[index].type != .otp {
+        if case .value(let path) = mode, let index = fields.firstIndex(where: { $0.path == path }), fields[index].type != .password && fields[index].type != .otp && fields[index].type != .attachment && !fields[index].type.isCompound {
             fields[index].value = fields[index].value ?? ""
         }
         var baseline = VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field))
+        baseline.metadata = metadata
         baseline.autoFill = autoFill.isAutomatic ? nil : autoFill
         initialItem = baseline
     }
     var item: VaultItem {
         var result = VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field))
+        result.metadata = metadata
         result.autoFill = autoFill.isAutomatic ? nil : autoFill
         return result
     }
