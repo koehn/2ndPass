@@ -1,41 +1,138 @@
 # How Mop protects your secrets
 
-**Onboarding update:** Recovery is optional. A vault starts with one owner device
-and no recovery recipient. An authorized owner can add hardware recovery later,
-including access to existing secrets. Without a surviving authorized device or
-configured recovery device, access is lost. iCloud discovery is an untrusted
-enrollment hint, never device approval. No format compatibility layer is used.
+Mop protects your passwords with encryption, security hardware built into your
+Apple devices, and checks that detect unauthorized changes. Your vault is
+encrypted before it reaches iCloud. Each enrolled device has its own protected
+keys, so a copy of your encrypted vault is not enough to read your passwords.
 
+These protections work together. Hardware protects the device keys, encryption
+protects stored passwords, and signed updates help Mop check who is allowed to
+change the vault. Your device security and Apple Account security are important
+parts of that protection too.
 
-Mop gives each approved device its own private keys, generated inside Apple's Secure Enclave. Those private values do not leave the hardware. Your Apple Account helps deliver encrypted data; a new device on that account is enrolled automatically while an existing owner device is unlocked.
+## Your device keys are protected by hardware
 
-Each password has a separate random encryption key. Mop encrypts a copy of that small key for every approved device and any configured recovery device. The item catalog has its own key. Browsing the catalog does not open all password keys; revealing one password opens that password's key only.
+Apple devices supported by Mop have a **Secure Enclave**: an isolated security
+component that can use a private key without handing that key to the app.
+Think of it as a locked key cabinet that can perform a task for Mop without
+letting Mop take the key away.
 
-The password and its temporary encryption key **do reach Mop's memory**. Commands, clipboard destinations and websites receiving the password also receive plaintext. Apple's APIs protect the device private key operations, not every byte inside the application. Mop releases keys after operations and wipes buffers it owns where practical, but cannot guarantee erasure of every framework or string copy. Compromised authorized code may still ask the hardware to decrypt.
+Mop creates its device keys there and does not fall back to ordinary software
+keys. The saved information needed to use them is tied to that device; copying
+it to another computer does not copy a working set of keys. Apple checks local
+authentication before Mop can use the protected keys. While Mop is unlocked, it
+can reuse that authorization so you do not need a prompt for every action.
 
-## Approving and removing access
+When you reveal or fill a password, Mop decrypts it for that task. This is how a
+password manager puts your saved passwords to use. The device's private keys
+remain protected by the Secure Enclave throughout the process.
 
-A personal vault is a shared vault with one member account. An owner account controls membership. Editors can change contents; viewers can read. Own-account devices negotiate enrollment automatically through the private iCloud mailbox. Sharing with another account requires explicit invitation and approval. An iCloud share invitation alone cannot decrypt the vault.
+## Your passwords are encrypted separately
 
-Removing a member or device gives current records fresh encryption keys and protects later revisions. It cannot erase a password somebody copied or an old backup they could already decrypt. Change the real password at its website if it must stop working for that person.
+Each secret has its own randomly generated encryption key. Mop encrypts a copy
+of that small key for each enrolled device. Your list of items has a separate
+key, so browsing the list does not require opening every password.
 
-Mop checks signed changes against the previous trusted membership. Two concurrent edits cannot silently overwrite each other: one wins and the other must be reviewed against the new revision. Interrupted uploads retain a journal so retrying does not blindly repeat a secret change. Offline browsing is read-only and cannot know about a recent removal.
+When you ask for one password, Mop uses your device's protected key to unlock
+that password's encryption key, then reads the password. It checks the encrypted
+data for tampering along the way. Someone who merely obtains your encrypted
+cloud data or an encrypted backup does not get the device keys needed to read it.
 
-## Recovery
+Mop also signs vault updates. A signature lets other devices check that a change
+came from a device with the right permissions and follows the history they
+already trust. Mop rejects unauthorized changes and conflicting edits rather
+than silently accepting them. These checks cannot stop a cloud outage or ensure
+that a server always delivers the newest update.
 
-You can optionally add a separate hardware recovery device and retain encrypted backups. Its public request may be copied; its private keys stay on that device. It can replace lost ordinary devices. If account access is lost, it can recreate a verified backup as a new vault under another account without deleting the source.
+## Adding your devices and sharing with other people
 
-If every authorized device and any configured recovery device are lost, your data is unrecoverable. Restoring an Apple Account or possessing an encrypted backup does not recreate those hardware private keys. There is no portable recovery seed or software private-key file.
+A new device on your Apple Account connects automatically when an existing
+owner device has Mop unlocked and can process its request. This makes setup
+convenient: you do not need to transfer key files or compare a code.
 
-## What has actually been checked
+**Your Apple Account is part of this security boundary.** Someone who gains
+control of the account's private iCloud mailbox could enroll their own device
+while your existing Mop session is unlocked and gain access to your vault.
+A compromised mailbox could also mislead a new device about which vault to trust
+when it first connects. Protect your Apple Account with a strong password and
+two-factor authentication, and investigate unfamiliar devices.
 
-The implementation has real Secure Enclave, Keychain reload and private-database CloudKit evidence on one Mac, plus automated multi-member/device models. A simulator build or software test cannot prove hardware behavior. Actual second-account sharing, separate physical recovery devices and signed iPhone/iPad/AutoFill behavior still need the checks listed in [validation](VAULT-NEXT-VALIDATION.md).
+Sharing with another person's account requires an explicit invitation,
+verification and approval. The owner controls membership. Editors can change
+contents; viewers can read them. Accepting an iCloud sharing invitation alone
+does not give a device the keys to your passwords.
 
-See [the technical security explanation](SECURITY.md) for API boundaries, memory limits and synchronization details, and [the usage guide](../README.md) for enrollment and recovery commands.
+## Removing a device or person's access
 
-You can remove devices in Settings → devices on Mac, iPhone, or iPad. Mop removes
-their wrapped encryption keys and rotates the vault's encryption material.
-When a removed device next connects and verifies the removal, it deletes its
-local device identity and account caches. It asks whether you want to reconnect;
-it does not quietly join again. Reconnect creates fresh device keys. Removal
-cannot erase previously copied passwords or notify a device that is offline.
+When removal completes, Mop gives the current secrets fresh encryption keys and
+leaves the removed recipient out. Their old keys cannot open later protected
+versions. Manage enrolled devices in **Settings → devices**. Device removal
+covers personal vaults enrolled on the managing device; it is not a universal
+revocation across every vault that device may have used.
+
+When an honest removed device reconnects and verifies its removal, Mop clears
+its ordinary local identity and account caches. It requires an explicit
+**Reconnect** to create fresh keys instead of quietly joining again. A device
+that is offline cannot learn about removal immediately.
+
+Removal cannot erase passwords someone already copied or old backups they could
+already read. If a password must stop working for that person, change it at the
+website or service too. If your Apple Account was compromised, secure the account
+as well: an attacker who retains access could request enrollment with a new
+identity.
+
+## What these protections mean in everyday situations
+
+| Situation | How Mop helps |
+| --- | --- |
+| Someone obtains a copy of your encrypted vault | They still need an authorized device's protected keys to read it. |
+| Your locked device is stolen | Device-bound keys and local authentication help prevent access. Someone who can unlock and use your authorized Mop session has a different level of access. |
+| Someone alters your stored vault data | Encryption checks and signed updates let Mop reject unauthorized changes against its trusted history. |
+| A device or person loses access | Fresh encryption keys protect later versions, while previously copied passwords remain outside Mop's control. |
+| You lose your internet connection | You can read a previously trusted local vault after authentication. Offline access cannot learn about a recent removal. |
+
+These protections rely on a trustworthy device, as all password managers do.
+Keep your operating system updated and protect your device's unlock credentials;
+malware controlling your device can capture passwords when you use them.
+
+## What iCloud and AutoFill can see
+
+Mop encrypts passwords, item names and field details. Some information remains
+visible to the cloud service, including the vault name, enrolled public
+identities, encrypted data sizes and update timing. Choose a vault name you are
+comfortable exposing as metadata.
+
+For AutoFill to suggest the right login, Mop supplies Apple’s credential system
+with website and username information. That listing does not contain the
+password. Mop checks the authenticated vault again before filling it.
+
+## Plan for a lost or broken device
+
+You can add a separate hardware recovery device and keep encrypted backups.
+Recovery is optional; a new vault starts without it. A configured recovery device
+can help restore access, including moving a verified backup to a new account if
+necessary. Because it can unlock your secrets, keep it secure and separate from
+your everyday device.
+
+**If you lose every enrolled device and every configured recovery device, your
+vault cannot be recovered.** Restoring your Apple Account or finding an encrypted
+backup does not recreate the hardware keys. There is no recovery seed or hidden
+master key that bypasses this protection.
+
+## How these protections have been checked
+
+Mop's security design uses Apple's hardware key protection and established
+cryptographic algorithms. The implementation has been exercised with real
+Secure Enclave keys, saved-key reloads and private iCloud storage on a Mac, along
+with automated tests for access, tampering, enrollment, removal and recovery.
+
+Validation is still in progress. Sharing between two real Apple Accounts,
+recovery on separate physical devices, and signed iPhone/iPad and AutoFill
+workflows still need the physical-device checks recorded in the
+[validation report](VAULT-NEXT-VALIDATION.md). Automated tests and simulator builds
+are useful evidence, but do not replace those checks or an independent security
+review.
+
+For implementation details and the full threat model, read
+[Security and key management](SECURITY.md). The [usage guide](../README.md)
+explains setup and recovery commands.
