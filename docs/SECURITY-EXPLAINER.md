@@ -50,6 +50,13 @@ A new device on your Apple Account connects automatically when an existing
 owner device has 2ndPass unlocked and can process its request. This makes setup
 convenient: you do not need to transfer key files or compare a code.
 
+Apple's [two-factor authentication](https://support.apple.com/en-us/102660) helps
+protect new-device sign-ins even when someone knows your account password.
+Optional [Apple Account security keys](https://support.apple.com/en-us/102637)
+provide extra phishing protection. 2ndPass relies on the system's authenticated
+iCloud session; it never collects your Apple Account password or verification
+code. These protections help secure automatic enrollment.
+
 **Your Apple Account is part of this security boundary.** Someone who gains
 control of the account's private iCloud mailbox could enroll their own device
 while your existing 2ndPass session is unlocked and gain access to your vault.

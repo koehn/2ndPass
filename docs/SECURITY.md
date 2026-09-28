@@ -208,6 +208,18 @@ Owners control ordinary membership; editors can write contents; viewers can
 read. A personal vault uses these same rules with one member account. Recovery
 has separate, explicitly configured authority described below.
 
+### Apple Account authentication
+
+Apple's [two-factor authentication](https://support.apple.com/en-us/102660) protects
+new-device sign-ins with an account password and verification through a trusted
+device or phone number. It is the default for most accounts. Optional
+[account security keys](https://support.apple.com/en-us/102637) add phishing
+protection. 2ndPass uses the OS-authenticated iCloud session, without collecting
+Apple Account credentials. These controls protect the enrollment channel; they
+are separate from vault unlock and the optional hardware recovery device.
+A compromised authenticated session or trusted device can still undermine that
+channel, so account recovery and trusted-device security matter too.
+
 ### Automatic same-account enrollment
 
 A new device authenticates locally and submits a signed request through the
@@ -412,6 +424,5 @@ The principal implementation entry points are:
   and [CloudRevisionTransport.swift](../Sources/MopVaultNext/CloudRevisionTransport.swift):
   ancestry, journals, local state and conditional cloud publication.
 
-The [architecture proposal](VAULT-NEXT.md) explains design alternatives. Historical
-entries in that proposal and the validation log may describe earlier enrollment
-policies; the automatic same-account policy above is the current behavior.
+The [vault architecture](VAULT-NEXT.md) describes enrollment, membership, recovery,
+and publication. [Vault v7](VAULT-V7.md) specifies the wire format.

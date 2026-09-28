@@ -1,57 +1,19 @@
-> Superseded for format and storage by [Vault v7](VAULT-V7.md). The material below records the v6 design and validation history.
+# 2ndPass vault architecture
 
-> Current policy (2026-09-26): same-account device enrollment is automatic while
-> an owner device is unlocked. This supersedes the manual comparison requirements
-> below for own-account enrollment only. The private CloudKit mailbox is trusted
-> for bootstrap identity: account/mailbox compromise can admit an attacker while
-> an owner is unlocked, and a malicious mailbox can substitute an initial root.
-> Signed ancestry remains enforced after pinning. Cross-account sharing retains
-> explicit verification and approval. Hardware private keys remain nonexportable.
-> Retired device UUIDs are blocked, and honest removed clients require explicit
-> Reconnect with fresh keys. An attacker retaining iCloud access could still
-> request admission under a new identity; revoke account access to prevent that.
-
-# 2ndPass next vault architecture
-
-**Onboarding update:** Recovery is optional. A vault starts with one owner device
-and no recovery recipient. An authorized owner can add hardware recovery later,
-including access to existing secrets. Without a surviving authorized device or
-configured recovery device, access is lost. iCloud discovery is an untrusted
-enrollment hint, never device approval. No format compatibility layer is used.
-
-
-Proposal written before production changes, 2026-09-25. This is the intended
-replacement for v5, not a description of shipped behavior. Existing v5 data,
-Keychain items, backups, and cloud zones must remain untouched. No migration,
-dual reader, or sharing on v5 is planned. Implementation and acceptance status
-belong in `VAULT-NEXT-VALIDATION.md`; incomplete gates must remain visible.
-
-**Confirmed product decision (2026-09-25): hardware-only recovery.** No portable
-software recovery private key, private-key export/import, or software fallback is
-part of v6. The initial portable-recovery alternative was rejected by the user;
-the experimental implementation was removed before application integration.
-
-## Recommendation and alternatives
-
-Use device-generated Secure Enclave P-256 encryption and signing keys, CryptoKit
-HPKE for individual key envelopes, AES-256-GCM for the catalog and records, and
+2ndPass uses device-generated Secure Enclave P-256 encryption and signing keys,
+CryptoKit HPKE for item-key envelopes, AES-256-GCM for the catalog and fields, and
 signed, parent-linked revisions published by a conditional CloudKit head update.
-Use one CloudKit zone per vault, privately owned until shared through CKShare.
+Each vault occupies a CloudKit zone, privately owned until shared through CKShare.
 One owner account administers the vault; other accounts are editors or viewers.
-A personal vault is precisely a vault with one account member. Device approval
-is explicit, even for another device on the same Apple Account.
 
-| Design | Benefit | Reason to choose/reject |
-| --- | --- | --- |
-| Synchronized account software private key | Easy enrollment | Reject: long-lived private key reaches every application process and prevents individual device revocation. |
-| Enclave-wrapped software account private key | Smaller storage change | Reject: the account private key still enters application memory on unlock. |
-| Enclave devices wrapping a shared vault master key | Few envelopes | Reject: retaining the master key enables bulk decryption without further hardware operations. |
-| Enclave devices with a wrap per catalog/secret key | Established constructions, bounded key exposure | Choose; storage grows with secrets × devices and enrollment requires an online authorized device. |
-| MLS or custom group ratchet | Efficient large dynamic groups | Defer: substantially more state and recovery complexity than a small password vault needs. |
+A vault starts with one owner device. Hardware recovery is optional and can be
+configured later. There is no portable recovery private key or software device-key
+fallback. Without a surviving authorized device or configured recovery device,
+access is lost.
 
-No custom ECDH/HKDF encryption protocol is needed: CryptoKit's HPKE suite
-`P256_SHA256_AES_GCM_256` already supports Secure Enclave recipient keys.
-Use independent encryption and signing keys rather than sharing a P-256 scalar.
+See [Vault v7](VAULT-V7.md) for the wire format, [security and key management](SECURITY.md)
+for the trust boundaries, and the [validation record](V7-VALIDATION-2026-09-27.md)
+for measured results and remaining acceptance work.
 
 ## Verified platform boundary
 
@@ -121,20 +83,35 @@ the key belongs to the intended person. Ordinary Enclave keys offer no remote
 attestation through this API; a malicious participant may submit software keys.
 
 The first owner device signs genesis, which the creating device pins locally.
-Subsequent devices and invited accounts exchange a full fingerprint/QR over an
-independent authenticated channel. Owner approval signs the exact device request
-and vault checkpoint. The recipient verifies the owner's fingerprint/checkpoint
-independently before pinning. Never trust a public key simply because CloudKit
-returned it. New devices require an owner device or recovery, not just account
-login. Keep private local trust separate from cloud discovery metadata.
+For another device on the same Apple Account, an unlocked owner automatically
+processes enrollment through the private CloudKit mailbox. This channel establishes
+initial trust; subsequent revisions must follow the pinned signed history.
+Cross-account sharing requires independent fingerprint verification and owner
+approval. Account login alone does not decrypt a vault: an enrolled owner must
+publish key envelopes for the joining device.
+
+### Apple Account authentication
+
+Apple's [two-factor authentication](https://support.apple.com/en-us/102660), the
+default for most accounts, protects a new-device sign-in with the account password
+and verification through a trusted device or phone number. Optional
+[Security Keys for Apple Account](https://support.apple.com/en-us/102637) strengthen
+this against phishing. 2ndPass uses the operating system's authenticated iCloud
+session; it does not collect the Apple Account password or verification code.
+
+These protections support trust in the same-account enrollment mailbox. They do
+not turn it into an independent identity check: an attacker controlling an
+account session can request enrollment while an owner is unlocked. Protect trusted
+devices and recovery channels as well as the account password. Apple account
+security keys are distinct from 2ndPass's hardware vault recovery device.
 
 ## Membership and invitation state machine
 
 There is exactly one owner account. Owner devices can invite, grant/revoke
 devices, change roles, rotate recovery, and remove accounts. Editors can change
 contents; viewers can decrypt. Neither can change membership. An account role
-applies to its explicitly approved device list. No implicit delegation from a
-member's newly discovered device. Owner transfer is a separate recovery/export
+applies to its enrolled device list. A discovered device gains access only after
+an owner publishes its cryptographic grant. Owner transfer is a separate recovery/export
 operation into a new owner zone, since CloudKit zone ownership is not assumed
 transferable.
 
@@ -160,7 +137,7 @@ than granting temporary CloudKit write permission.
 
 ## Device addition and removal
 
-For an approved device, an owner opens each current catalog/secret key once and
+For an approved device, an owner opens each current catalog/item key once and
 creates an HPKE envelope for the new device. No existing plaintext value needs to
 be decrypted merely to add a recipient. Publish all envelopes and the owner-signed
 membership in one revision. Enrollment grants current contents, not arbitrary
@@ -168,9 +145,9 @@ historical revisions. An offline owner cannot approve a device. New owner device
 are enrolled per vault; account login does not imply access to every vault.
 
 Removing an account removes all its devices. Removing a device removes only its
-key pair. Removal rotates the catalog key and **all current secret keys**, reseals
-each current record, and omits removed recipients. Recovery recipient changes
-require the same rotation. New values always receive fresh IDs/keys. The new
+key pair. Removal rotates the catalog key and **all retained item keys**, reseals
+each retained record, including recently deleted items, and omits removed recipients. Recovery recipient changes
+require the same rotation. Field edits receive fresh record IDs and nonces while preserving the item key. The new
 membership epoch and all rotated ciphertext publish together at the head CAS.
 Staging is not a committed removal. After CAS, revoke CloudKit transport access
 where applicable; if that fails, report crypto removal complete/transport cleanup
@@ -192,11 +169,11 @@ keys. Enroll it with the same independent fingerprint verification as a normal
 device, but give it explicit recovery authority instead of ordinary member roles.
 Keep that device secure and available offline. Private key representations are
 not portable backups. There is no recovery seed/private-key file and no software
-private-key provider in the v6 module.
+private-key provider in the shipping vault module.
 
 A hardware recovery device can decrypt an accessible snapshot and sign a recovery
 transition, enrolling a replacement owner device and replacing the recovery
-recipient. Rotate every current secret/catalog key and remove all old devices.
+recipient. Rotate every retained item/catalog key and remove all old devices.
 Proof of possession establishes the signing key, not hardware attestation or
 physical separation. 2ndPass cannot cryptographically prove that the recovery key
 was generated on a different physical device through these APIs; the operator
@@ -221,25 +198,23 @@ Losing **every authorized and recovery device** makes decryption impossible,
 even with the encrypted backup, Apple Account access, or support intervention.
 This is the user-selected security tradeoff. Without an accessible snapshot,
 hardware keys alone cannot recreate data. There is no support backdoor or
-portable recovery exception. Existing v5 recovery files are preserved but are
-not accepted by the v6 implementation.
+portable recovery exception.
 
 ## Format, signatures, and publication
 
-Use an incompatible `mop-vault-v6` namespace, new domain strings and state
-namespace. Encrypted backups contain only v6 documents and public trust evidence.
-Header contains vault UUID, format, generation, parent digest, membership epoch,
-member/device roster, recovery public keys, and encrypted-key envelopes. Metadata
-exposure includes vault name, public membership graph, device keys, size/timing.
-Catalog contains item metadata/references; each concealed value has an independent
-record. Limit document size, members, devices, record count, and ancestry work.
+The format is `mop-vault-v7`. The header identifies the vault, generation, parent
+revision, membership epoch, members, devices, and recovery public keys. The
+revision includes an encrypted catalog, field-record table, and item-key table.
+Each item has a random AES-256-GCM key shared by its separately encrypted fields;
+the catalog has a separate key. Each authorized recipient has an HPKE envelope
+for every item key and the catalog key.
 
-HPKE context binds format, vault, epoch, recipient fingerprint, purpose, and
-record UUID. AES-GCM associated data binds equivalent object identity; catalog
-AAD additionally binds header and complete record-table digest. Signatures cover
-the entire canonical revision (excluding signature) with a format-specific domain.
-Sort dictionary keys and set-valued arrays and reject duplicates before signing.
-Use SHA-256 content hashes and raw P-256 ECDSA signatures. No unsigned role fields.
+Field authenticated data binds the vault, item, item-key generation, and field
+record. Item HPKE contexts bind the vault, item, generation, and recipient
+fingerprint. Catalog authentication binds the header and record/key tables.
+Signatures cover the canonical revision with a format-specific domain. SHA-256
+content hashes and P-256 ECDSA signatures protect revision identity and authorship.
+[Vault v7](VAULT-V7.md) specifies the format and storage namespaces.
 
 Validate an ordinary revision's signer and authorization against its validated
 **parent**, not just its self-declared roster. Contents-only revisions must retain
@@ -266,71 +241,24 @@ refresh/reapply. Writes and membership operations require online authorization.
 Offline reads use only previously verified snapshots, clearly showing staleness;
 no offline enrollment or revocation guarantee. Notifications are refresh hints.
 
-## Memory and existing bypass paths
+## Memory and client access
 
-Use short synchronous unwrap/consume scopes. Wipe owned HPKE-returned Data after
-constructing the transient SymmetricKey; release each key before the next record.
-Do not cache secret keys. Decrypt catalog on demand and discard its key; retaining
-decrypted catalog for an unlocked UI is distinct from retaining a master key.
-Swift/CryptoKit copies, strings, framework buffers and subprocess environments
-cannot be comprehensively erased. Memory wiping is best effort, not a guarantee.
+Item keys exist only in operation-local scopes. Owned temporary secret buffers
+are wiped where practical; Swift strings and framework copies prevent a complete
+erasure guarantee. The unlocked UI retains its decoded catalog and verified
+encrypted records, not unwrapped item keys or a cache of concealed passwords.
+All clients use the same hardware-backed authorization and membership checks.
+Test-only software keys are not a runtime fallback.
 
-Replace these paths as one coordinated release:
+## Validation
 
-- `UserIdentity.AccountIdentity`, `CloudIdentity.accountIdentity`, and
-  `SynchronizedIdentityStore`: remove software account-key loading/creation from
-  production; leave existing Keychain items untouched.
-- `VaultSession` owner casts, `adoptOwner`, creation, trust bootstrap, restore,
-  and cached catalog key: use device authorization and parent-verified membership.
-- `CommandVaultAuthorization`, CLI init/import/recovery, `VaultService.Worker`,
-  AutoFill extension/service and any noninteractive retrieval: same hardware key
-  provider and OS ACL; no separate synchronized-key shortcut.
-- `VaultDocument`, CloudManifest, CloudVault trust/history, CloudRepository
-  discovery/cache, AppleCloudTransport: strict v6 validation and full shared-zone
-  address. Restoring contents never restores old grants.
-- Test-only software keys belong in test/prototype code and must not be a runtime
-  feature flag, unavailable-hardware fallback, or shipping UI fixture.
+Automated tests cover membership transitions, key rotation, malformed records,
+publication conflicts, and cancellation. Hardware authorization, signed Keychain
+access, CloudKit permissions, and cross-account behavior also require physical
+acceptance checks. See the [validation record](V7-VALIDATION-2026-09-27.md);
+software fixtures do not substitute for platform evidence.
 
-Copied plaintext and previously unwrapped keys cannot be revoked. An authorized
-compromised process may ask the Enclave to decrypt while the OS permits it and
-may exfiltrate results. Hardware protection prevents exporting the device private
-scalar, not misuse of its authorized operations. Neither signatures nor CloudKit
-permissions prevent an authorized reader sharing passwords outside 2ndPass.
-
-## Staged implementation and release gates
-
-1. Standalone prototype: compile HPKE with Enclave recipients; exercise creation,
-   representation reload, signing, wrong context, lock/cancel, and no-interaction
-   access. Probe real CKShare owner/participant addresses and CAS behavior using
-   disposable explicitly named test zones. Never silently touch existing zones.
-2. Implement strict format, hardware provider, membership/transition validator,
-   scoped cache and shared transport. Switch app/CLI/AutoFill together; no v5
-   sharing interim and no migration layer.
-3. Automated two-account/four-device model exercises enrollment, roles, removals,
-   recovery, malicious transitions, conflicts and dropped acknowledgements.
-   Separately run signed physical Mac/iOS and two actual Apple Accounts.
-4. Shared service-backed CLI/UI for requests, approval, invitations, acceptance,
-   member/device lists, removal progress, recovery, and conflict resolution.
-5. Replace current security/user docs only when implementation warrants their
-   claims. Record exact commands/results and outstanding physical acceptance.
-
-Do not count software fixtures as Secure Enclave, biometric, Keychain sync,
-CloudKit permission, delivery, or multi-account evidence. A prototype failure is
-a platform/integration finding to resolve, not permission to ship software keys.
-
-## Automatic own-account device enrollment implementation
-
-Same-account requests, invitations, acceptance and approved encrypted checkpoints
-now travel through a bounded private-zone iCloud mailbox. An enrolled owner
-compares the 96-bit SHA-256 transcript code with the new device and approves.
-The new device explicitly confirms that match locally before pinning a root;
-a server-provided approval or confirmation field cannot establish bootstrap
-trust. This reuses signed invitation/acceptance and conditional membership
-publication, with no private-key transport or automatic approval on account login.
-Other-account sharing remains a separate permission/invitation flow.
-See CLOUDKIT.md for schema, bounds, concurrency and metadata exposure.
-
-### Device removal lifecycle (2026-09-26)
+## Device removal lifecycle
 
 Settings on all Apple platforms and `2ndpass vault devices` share account-device
 management. Removal spans the private vaults locally enrolled on the managing
@@ -345,5 +273,4 @@ the ordinary device Keychain record or caches. Cleanup is retryable; app/extensi
 operations and registry writes refuse the removed account. Checkpoint cleanup takes
 per-vault leases and preserves lock inodes. Exported backups and separately scoped
 hardware recovery keys are outside this cleanup. The marker remains until an explicit
-Reconnect action. This supersedes the prior honest-client auto-readmission behavior;
-account compromise can still enroll an attacker with fresh keys.
+Reconnect action. Account compromise can still enroll an attacker with fresh keys.

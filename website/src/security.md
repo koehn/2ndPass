@@ -52,6 +52,8 @@ Passwords are concealed until requested, revealed values hide again after a time
 
 CloudKit provides transport and storage through your Apple Account. There is no separate 2ndPass-hosted vault service. Secret contents are encrypted by 2ndPass before upload; iCloud carries the ciphertext and encrypted key material.
 
+Apple protects account sign-in with [two-factor authentication](https://support.apple.com/en-us/102660), enabled by default for most accounts: a new device requires the account password and verification through a trusted device or phone number. Optional [Security Keys for Apple Account](https://support.apple.com/en-us/102637) add protection against phishing. 2ndPass uses the system's authenticated iCloud session and never asks for your Apple Account password or verification code. These account security keys are separate from 2ndPass's vault recovery hardware.
+
 **Your Apple Account is part of the trust boundary.** For your own devices, an enrolled owner device can automatically approve a new device through the account’s private iCloud mailbox while the owner app is unlocked. Someone who compromises that account may be able to enroll an attacker-controlled device during that window. Protect the account and its trusted devices accordingly.
 
 Encryption does not conceal all metadata. Cloud records can expose vault names, public identities, record sizes, and timing. The local AutoFill index and Apple’s suggestion system receive website, username, and opaque identifier metadata. Passwords and OTP seeds are not placed in that index.
