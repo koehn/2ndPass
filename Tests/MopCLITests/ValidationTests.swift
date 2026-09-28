@@ -11,7 +11,7 @@ import MopCore
 
     @Test func removedFileOptionIsAnUnknownArgument() throws {
         do {
-            _ = try Mop.parseAsRoot(["read", "mop://personal/mycloud/sshd", "--vault-file", "/sensitive-path"])
+            _ = try Mop.parseAsRoot(["read", "secondpass://personal/mycloud/sshd", "--vault-file", "/sensitive-path"])
             Issue.record("Legacy file configuration was accepted")
         } catch {
             #expect(Mop.knownValidationError(error) == nil)

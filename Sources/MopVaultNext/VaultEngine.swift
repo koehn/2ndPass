@@ -8,7 +8,7 @@ import MopCore
 public enum VaultEngine {
     public static func create(name: String, owner: any DeviceOperations, recovery: DevicePublicKey? = nil, id: UUID = UUID()) throws -> VerifiedVault {
         let membership = try Membership(accounts: [AccountMember(id: owner.identity.member, role: .owner, devices: [owner.identity])], recovery: recovery)
-        let header = Revision.Header(format: "mop-vault-v6", vault: id, name: name, generation: 1, parent: nil,
+        let header = Revision.Header(format: "mop-vault-v7", vault: id, name: name, generation: 1, parent: nil,
                                      epoch: 1, membership: membership, operation: .create, acceptedInvitations: [])
         let revision = try Revision.seal(header: header, references: [:], records: [:], signer: owner)
         try revision.verifyGenesis()
@@ -24,9 +24,8 @@ public enum VaultEngine {
     public static func read(_ reference: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> SecretBytes {
         try authorizeRead(vault, device)
         let references = try vault.revision.references(device: device)
-        guard let id = references[reference], let record = vault.revision.records[id] else { throw MopError.notFound }
-        var bytes = try record.open(vault: vault.id, epoch: vault.revision.header.epoch, object: id, device: device,
-                                    authenticating: Codec.encode(ObjectContext(vault: vault.id, object: id)))
+        guard let id = references[reference], vault.revision.records[id] != nil else { throw MopError.notFound }
+        var bytes = try openRecord(id, in: vault, device: device)
         defer { SecretBytes.wipe(&bytes) }
         return SecretBytes(copying: bytes)
     }
@@ -34,7 +33,7 @@ public enum VaultEngine {
                                invitations: [UUID]? = nil) throws -> Revision.Header {
         let old = vault.revision.header
         guard old.generation < UInt64.max, membership == nil || old.epoch < UInt64.max else { throw MopError.invalidVault }
-        return Revision.Header(requiredFeatures: old.requiredFeatures, format: "mop-vault-v6", vault: vault.id, name: vault.name,
+        return Revision.Header(requiredFeatures: old.requiredFeatures, format: "mop-vault-v7", vault: vault.id, name: vault.name,
             generation: old.generation + 1, parent: vault.digest,
             epoch: membership == nil ? old.epoch : old.epoch + 1,
             membership: membership ?? vault.membership, operation: operation,
@@ -44,7 +43,11 @@ public enum VaultEngine {
         guard !reference.isEmpty, reference.utf8.count <= 4096 else { throw MopError.invalidReference }
         let role = vault.membership.role(of: device.identity)
         guard role == .owner || role == .editor else { throw MopError.cloudPermission }
-        var references = try vault.revision.references(device: device)
+        let payload = try vault.revision.payload(device: device)
+        var references = payload.references
+        var keys = vault.revision.itemKeys
+        let name = try SecretReference(vault: vault.name, relativePath: reference).item
+        let itemID = try references.first { try SecretReference(vault: vault.name, relativePath: $0.key).item == name }.flatMap { vault.revision.records[$0.value]?.itemID } ?? UUID().uuidString
         var records = vault.revision.records
         if let old = references.removeValue(forKey: reference) { records.removeValue(forKey: old) }
         else if value == nil { throw MopError.notFound }
@@ -52,11 +55,16 @@ public enum VaultEngine {
             let id = UUID().uuidString
             var bytes = Data(value)
             defer { SecretBytes.wipe(&bytes) }
-            records[id] = try SealedObject.seal(bytes, vault: vault.id, epoch: vault.revision.header.epoch, object: id,
-                membership: vault.membership, authenticating: Codec.encode(ObjectContext(vault: vault.id, object: id)))
+            let key: SymmetricKey
+            if let old = keys[itemID] { key = try old.unwrap(vault: vault.id, item: itemID, device: device) }
+            else {
+                key = SymmetricKey(size: .bits256)
+                keys[itemID] = try ItemKey.wrap(key, vault: vault.id, item: itemID, generation: 1, recipients: vault.membership.recipients)
+            }
+            records[id] = try SealedObject.field(bytes, key: key, vault: vault.id, item: itemID, generation: keys[itemID]!.generation, id: id)
             references[reference] = id
         }
-        var items = try vault.revision.payload(device: device).items
+        var items = payload.items
         if let parsed = try? SecretReference(vault: vault.name, relativePath: reference),
            let item = items.firstIndex(where: { $0.name == parsed.item }) {
             let path = [parsed.section, parsed.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
@@ -70,7 +78,7 @@ public enum VaultEngine {
             }
             if items[item].fields.isEmpty { items.remove(at: item) }
         }
-        let revision = try Revision.seal(header: header(vault, operation: .content), references: references, records: records, items: items, signer: device)
+        let revision = try Revision.seal(header: header(vault, operation: .content), references: references, records: records, itemKeys: keys, items: items, signer: device)
         return try vault.applying(revision)
     }
     public static func invite(member: UUID, role: MemberRole, to vault: VerifiedVault, owner: any DeviceOperations,
@@ -103,14 +111,15 @@ public enum VaultEngine {
         return try change(membership, in: vault, signer: owner, operation: .membership,
                           invitations: vault.revision.header.acceptedInvitations + [invitation.nonce])
     }
-    public static func remove(device id: UUID, from vault: VerifiedVault, owner: any DeviceOperations) throws -> VerifiedVault {
+    public static func remove(device id: UUID, from vault: VerifiedVault, owner: any DeviceOperations,
+                              progress: ((Int, Int) throws -> Void)? = nil) throws -> VerifiedVault {
         guard vault.membership.role(of: owner.identity) == .owner,
               vault.membership.devices.contains(where: { $0.device == id }) else { throw MopError.cloudPermission }
         let accounts = vault.membership.accounts.compactMap { account -> AccountMember? in
             let remaining = account.devices.filter { $0.device != id }
             return remaining.isEmpty ? nil : AccountMember(id: account.id, role: account.role, devices: remaining)
         }
-        return try change(Membership(accounts: accounts, recovery: vault.membership.recovery, removedDevices: Array(Set((vault.membership.removedDevices ?? []) + [id])).sorted { $0.uuidString < $1.uuidString }), in: vault, signer: owner, operation: .membership)
+        return try change(Membership(accounts: accounts, recovery: vault.membership.recovery, removedDevices: Array(Set((vault.membership.removedDevices ?? []) + [id])).sorted { $0.uuidString < $1.uuidString }), in: vault, signer: owner, operation: .membership, progress: progress)
     }
     public static func remove(member id: UUID, from vault: VerifiedVault, owner: any DeviceOperations) throws -> VerifiedVault {
         guard vault.membership.role(of: owner.identity) == .owner, id != vault.membership.owner,
@@ -143,53 +152,72 @@ public enum VaultEngine {
     /// Recreates contents in another account without modifying/deleting the source.
     public static func recoverCopy(_ vault: VerifiedVault, using recovery: any DeviceOperations, name: String,
                                    owner: any DeviceOperations, replacementRecovery: DevicePublicKey) throws -> VerifiedVault {
-        guard recovery.identity == vault.membership.recovery, replacementRecovery.encryption != recovery.identity.encryption, replacementRecovery.signing != recovery.identity.signing else { throw MopError.invalidRecovery }
-        let membership = try Membership(accounts: [AccountMember(id: owner.identity.member, role: .owner, devices: [owner.identity])], recovery: replacementRecovery)
-        let destination = UUID()
-        var references: [String: String] = [:], records: [String: SealedObject] = [:]
-        for (reference, sourceID) in try vault.revision.references(device: recovery) {
-            guard let source = vault.revision.records[sourceID] else { throw MopError.invalidVault }
-            let id = UUID().uuidString
-            var plaintext = try source.open(vault: vault.id, epoch: vault.revision.header.epoch, object: sourceID,
-                device: recovery, authenticating: Codec.encode(ObjectContext(vault: vault.id, object: sourceID)))
-            defer { SecretBytes.wipe(&plaintext) }
-            records[id] = try SealedObject.seal(plaintext, vault: destination, epoch: 1, object: id,
-                membership: membership, authenticating: Codec.encode(ObjectContext(vault: destination, object: id)))
-            references[reference] = id
-        }
-        // One new genesis, one plaintext at a time, and no intermediate snapshots.
-        let header = Revision.Header(format: "mop-vault-v6", vault: destination, name: name, generation: 1,
-                                     parent: nil, epoch: 1, membership: membership, operation: .create, acceptedInvitations: [])
-        let root = try Revision.seal(header: header, references: references, records: records, items: vault.revision.payload(device: recovery).items, signer: owner)
-        try root.verifyGenesis()
-        return try VerifiedVault(revision: root, bytes: root.encoded())
-    }
-    private static func change(_ membership: Membership, in vault: VerifiedVault, signer: any DeviceOperations,
-                               operation: RevisionOperation, invitations: [UUID]? = nil) throws -> VerifiedVault {
-        let header = try header(vault, operation: operation, membership: membership, invitations: invitations)
-        let previous = try vault.revision.references(device: signer)
-        let removed = Set(vault.membership.recipients.map(\.fingerprint)).subtracting(membership.recipients.map(\.fingerprint))
-        let rotate = !removed.isEmpty || operation == .recovery
-        var references: [String: String] = [:], records: [String: SealedObject] = [:]
-        for (reference, oldID) in previous {
-            guard let old = vault.revision.records[oldID] else { throw MopError.invalidVault }
-            if rotate {
-                // One plaintext and key at a time; no bulk-decrypted vault buffer.
-                let id = UUID().uuidString
-                var bytes = try old.open(vault: vault.id, epoch: vault.revision.header.epoch, object: oldID, device: signer,
-                                         authenticating: Codec.encode(ObjectContext(vault: vault.id, object: oldID)))
+        guard recovery.identity == vault.membership.recovery, replacementRecovery.encryption != recovery.identity.encryption,
+              replacementRecovery.signing != recovery.identity.signing else { throw MopError.invalidRecovery }
+        let root = try create(name: name, owner: owner, recovery: replacementRecovery)
+        let payload = try vault.revision.payload(device: recovery)
+        var references: [String: String] = [:], records: [String: SealedObject] = [:], keys: [String: ItemKey] = [:]
+        let paths = Dictionary(uniqueKeysWithValues: payload.references.map { ($0.value, $0.key) })
+        for (oldItem, oldKey) in vault.revision.itemKeys {
+            try Task.checkCancellation()
+            let sourceKey = try oldKey.unwrap(vault: vault.id, item: oldItem, device: recovery)
+            let item = UUID().uuidString, key = SymmetricKey(size: .bits256)
+            keys[item] = try ItemKey.wrap(key, vault: root.id, item: item, generation: 1, recipients: root.membership.recipients)
+            for (oldID, record) in vault.revision.records where record.itemID == oldItem {
+                var bytes = try record.open(using: sourceKey, authenticating: Codec.encode(FieldContext(vault: vault.id, item: oldItem, generation: oldKey.generation, field: oldID)))
                 defer { SecretBytes.wipe(&bytes) }
-                records[id] = try SealedObject.seal(bytes, vault: vault.id, epoch: header.epoch, object: id,
-                    membership: membership, authenticating: Codec.encode(ObjectContext(vault: vault.id, object: id)))
-                references[reference] = id
-            } else {
-                let key = try old.key(vault: vault.id, epoch: vault.revision.header.epoch, object: oldID, device: signer)
-                records[oldID] = try SealedObject(ciphertext: old.ciphertext, attachmentDigest: old.attachmentDigest, attachmentSize: old.attachmentSize, loadedCiphertext: old.loadedCiphertext,
-                    envelopes: SealedObject.envelopes(key: key, vault: vault.id, epoch: header.epoch, object: oldID, membership: membership))
-                references[reference] = oldID
+                let id = UUID().uuidString
+                records[id] = try SealedObject.field(bytes, key: key, vault: root.id, item: item, generation: 1, id: id)
+                references[paths[oldID]!] = id
             }
         }
-        let revision = try Revision.seal(header: header, references: references, records: records, items: vault.revision.payload(device: signer).items, signer: signer)
+        let revision = try Revision.seal(header: root.revision.header, references: references, records: records, itemKeys: keys, items: payload.items, signer: owner)
+        try revision.verifyGenesis()
+        return try VerifiedVault(revision: revision, bytes: revision.encoded())
+    }
+    private static func change(_ membership: Membership, in vault: VerifiedVault, signer: any DeviceOperations,
+                               operation: RevisionOperation, invitations: [UUID]? = nil,
+                               progress: ((Int, Int) throws -> Void)? = nil) throws -> VerifiedVault {
+        let header = try header(vault, operation: operation, membership: membership, invitations: invitations)
+        let payload = try vault.revision.payload(device: signer)
+        let removed = Set(vault.membership.recipients.map(\.fingerprint)).subtracting(membership.recipients.map(\.fingerprint))
+        let added = membership.recipients.filter { recipient in !vault.membership.recipients.contains { $0.fingerprint == recipient.fingerprint } }
+        let rotate = !removed.isEmpty || operation == .recovery
+        var references = payload.references, records = vault.revision.records, keys = vault.revision.itemKeys
+        let paths = Dictionary(uniqueKeysWithValues: payload.references.map { ($0.value, $0.key) })
+        let grouped = Dictionary(grouping: records.keys, by: { records[$0]!.itemID! })
+        try progress?(0, keys.count)
+        var completed = 0
+        for (item, old) in vault.revision.itemKeys {
+            try Task.checkCancellation()
+            if rotate {
+                guard old.generation < UInt64.max else { throw MopError.invalidVault }
+                let source = try old.unwrap(vault: vault.id, item: item, device: signer)
+                let key = SymmetricKey(size: .bits256), generation = old.generation + 1
+                keys[item] = try ItemKey.wrap(key, vault: vault.id, item: item, generation: generation, recipients: membership.recipients)
+                for oldID in grouped[item] ?? [] {
+                    let record = records.removeValue(forKey: oldID)!
+                    var bytes = try record.open(using: source, authenticating: Codec.encode(FieldContext(vault: vault.id, item: item, generation: old.generation, field: oldID)))
+                    defer { SecretBytes.wipe(&bytes) }
+                    let id = UUID().uuidString
+                    records[id] = try SealedObject.field(bytes, key: key, vault: vault.id, item: item, generation: generation, id: id)
+                    references[paths[oldID]!] = id
+                }
+            } else if !added.isEmpty {
+                let key = try old.unwrap(vault: vault.id, item: item, device: signer)
+                let additions = try ItemKey.wrap(key, vault: vault.id, item: item, generation: old.generation, recipients: added)
+                keys[item]!.envelopes.merge(additions.envelopes) { _, new in new }
+            }
+            completed += 1
+            try progress?(completed, keys.count)
+        }
+        let revision = try Revision.seal(header: header, references: references, records: records, itemKeys: keys, items: payload.items, signer: signer)
         return try vault.applying(revision)
+    }
+
+    static func openRecord(_ id: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> Data {
+        guard let record = vault.revision.records[id], let item = record.itemID, let wrapped = vault.revision.itemKeys[item] else { throw MopError.invalidVault }
+        let key = try wrapped.unwrap(vault: vault.id, item: item, device: device)
+        return try record.open(using: key, authenticating: Codec.encode(FieldContext(vault: vault.id, item: item, generation: wrapped.generation, field: id)))
     }
 }

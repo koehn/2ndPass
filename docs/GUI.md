@@ -6,7 +6,7 @@ device-local identity. Old-format vaults are not displayed or converted.
 ## Guided setup
 
 Successful iCloud discovery with no v6 vaults opens **Create a vault**. Enter a
-name (the displayed Personal default creates `personal`) and authenticate; Mop generates the device’s hardware keys and opens the
+name (the displayed Personal default creates `personal`) and authenticate; 2ndPass generates the device’s hardware keys and opens the
 vault immediately. Recovery is optional and does not block creation. A notice
 explains the risk of losing the only authorized device.
 
@@ -15,9 +15,9 @@ device** opens instead. Selecting an unenrolled vault also opens that flow.
 Discovery does not authenticate cloud data or create a local trust pin. Failed
 CloudKit discovery reports an error rather than claiming the account is empty.
 
-On your own new device, select the desired vaults and choose **Connect**. Mop generates keys and submits signed requests through
+On your own new device, select the desired vaults and choose **Connect**. 2ndPass generates keys and submits signed requests through
 iCloud. An unlocked owner device processes it automatically without a dialog.
-The new device shows progress and asks you to unlock Mop elsewhere if waiting.
+The new device shows progress and asks you to unlock 2ndPass elsewhere if waiting.
 Each vault reports its own result when the signed grant arrives. Completion does not replace your current selection or discard an item draft. Existing owner devices show an
 in-app notice once per added device, based on signed membership, including after
 the enrollment mailbox expires.
@@ -42,10 +42,10 @@ checkpoint import and cloud permission reconciliation.
 
 ## Items and sessions
 
-The existing item editor supports typed fields, renaming, password-strength metadata, concealed values, TOTP, trash/restore and encrypted backup export. Catalog browsing opens its own key; revealing a password opens that record's key. Values passed to an edit are plaintext inside Mop. The catalog stores concealed fields without values.
+The existing item editor supports typed fields, renaming, password-strength metadata, concealed values, TOTP, trash/restore and encrypted backup export. Catalog browsing opens its own key; revealing a password opens that record's key. Values passed to an edit are plaintext inside 2ndPass. The catalog stores concealed fields without values.
 
-Mop attempts authentication once at launch while active. After cancelling, locking,
-inactivity expiry, or waking from system lock, choose **Unlock Mop** to authenticate.
+2ndPass attempts authentication once at launch while active. After cancelling, locking,
+inactivity expiry, or waking from system lock, choose **Unlock 2ndPass** to authenticate.
 Pointer movement, typing, returning to the app, and Refresh do not unlock a locked
 session. Refresh discovers vaults while locked and updates catalogs while unlocked.
 Settings can be opened without authenticating; protected device details offer Unlock.
@@ -61,7 +61,7 @@ or quitting the Mac app offers **Save Changes**, **Discard Changes**, or **Cance
 Saving completes the requested action only after the save succeeds. Invalid or offline
 drafts can be retained or discarded. Recoverable failures preserve edits. Concurrent
 changes retain the draft and block further saves until you explicitly discard it and
-refresh; Mop never silently overwrites another revision.
+refresh; 2ndPass never silently overwrites another revision.
 
 Explicit lock, inactivity expiry, system lock/sleep, account loss, device revocation,
 and termination clear drafts and reject late results immediately. Security locking
@@ -128,8 +128,8 @@ revocation until it reconnects; previously copied plaintext cannot be revoked.
 
 ## Settings and Vault Details
 
-Open **Mop → Settings…** (Command-comma) on Mac, or the Settings gear on iPhone
-and iPad. Security, AutoFill, Devices, and Advanced are separate categories. Mop
+Open **2ndPass → Settings…** (Command-comma) on Mac, or the Settings gear on iPhone
+and iPad. Security, AutoFill, Devices, and Advanced are separate categories. 2ndPass
 remembers the last category. Security offers inactivity presets and a custom
 minute value. Opening Settings neither selects a vault nor authenticates.
 Devices loads protected information only while unlocked.
@@ -161,3 +161,17 @@ a value does not copy it. Website fields offer Open Website. Passwords retain
 explicit reveal/conceal and protected clipboard behavior. Mobile controls retain
 44-point targets and adapt for accessibility text sizes. The app respects the
 user’s split-view column visibility rather than resetting it as windows resize.
+
+### Password import progress
+
+The import preview scrolls independently of its footer. **Refresh Preview**,
+**Cancel**, and **Import N Items** remain visible; changing the selection replaces
+Import with **Review Selection** until the updated preview is ready.
+
+Starting an import dismisses the dialog and transfers the operation to the app
+model. A persistent banner at the bottom of the main window shows a horizontal
+progress bar: actual completed-item counts during encryption and indeterminate
+activity during checking and cloud publication. Once the service confirms the
+result, the banner shows the import summary until dismissed. An uncertain cloud
+commit is shown as pending confirmation, with guidance to refresh before retrying.
+Locking clears the retained report and prevents a late result from repopulating it.

@@ -1,0 +1,13 @@
+{
+  "name": "secondpass-website",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "eleventy && python3 check.py",
+    "dev": "eleventy --serve --port=8080",
+    "check": "python3 check.py"
+  },
+  "devDependencies": { "@11ty/eleventy": "3.1.6" }
+}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  {% if baseHref %}<base href="{{ baseHref }}">{% endif %}
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} — 2ndPass</title>
+  <meta name="description" content="{{ description }}">
+  <meta name="theme-color" content="#252c64">
+  <meta property="og:title" content="{{ title }} — 2ndPass">
+  <meta property="og:description" content="{{ description }}">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="{{ site.url }}{{ page.url }}">
+  <meta property="og:image" content="https://2ndpass.app/assets/logo.png">
+  <meta property="og:image:alt" content="The 2ndPass titanium vault on an indigo app icon">
+  <link rel="canonical" href="{{ site.url }}{{ page.url }}">
+  <link rel="icon" type="image/png" href="assets/logo.png">
+  <link rel="apple-touch-icon" href="assets/logo.png">
+  <link rel="stylesheet" href="assets/site.css">
+  <script src="assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header wrap">
+  <a class="brand" href="index.html" aria-label="2ndPass home"><img src="assets/logo.png" width="46" height="46" alt=""><span>2nd<span class="brand-pass">Pass</span></span></a>
+  <nav aria-label="Main navigation">{% for item in site.navigation %}<a href="{{ item.href }}"{% if page.url == "/" + item.href %} aria-current="page"{% endif %}>{{ item.label }}</a>{% endfor %}</nav>
+  <a class="source-link" href="https://github.com/koehn/2ndPass">Source <span aria-hidden="true">↗</span></a>
+</header>
+<main id="main">{{ content | safe }}</main>
+<footer class="site-footer wrap">
+  <div><a class="brand" href="index.html"><img src="assets/logo.png" width="36" height="36" alt=""><span>2ndPass</span></a><p>Your passwords. Your devices. Your choice.</p></div>
+  <div class="footer-links"><a href="docs.html">Documentation</a><a href="security.html">Security &amp; limits</a><a href="faq.html">Project FAQ</a><a href="https://github.com/koehn/2ndPass/blob/main/LICENSE">Copyright notice ↗</a></div>
+  <p class="footer-note">Copyright © 2026 Koehn Consulting, Inc. All rights reserved. Not affiliated with Apple or 1Password.<br>This site uses no analytics, cookies, or third-party scripts.</p>
+</footer>
+</body>
+</html>

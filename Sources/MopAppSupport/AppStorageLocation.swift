@@ -21,8 +21,8 @@ public enum AppStorageLocation {
         #endif
         if let group = SigningIdentity.appGroupIdentifier,
            let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) {
-            return root.appendingPathComponent("MopV6", isDirectory: true)
+            return root.appendingPathComponent("MopV7", isDirectory: true)
         }
-        return URL.applicationSupportDirectory.appendingPathComponent("Mop", isDirectory: true)
+        return URL.applicationSupportDirectory.appendingPathComponent("MopV7", isDirectory: true)
     }
 }

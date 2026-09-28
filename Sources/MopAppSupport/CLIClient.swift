@@ -13,7 +13,7 @@ public struct CLIResult: Sendable {
         catch { throw CLIError.malformedResponse }
     }
     public var offlineDate: String? {
-        let prefix = "mop: offline cache from "
+        let prefix = "2ndpass: offline cache from "
         guard let line = diagnostic.split(separator: 10).first(where: { $0.starts(with: prefix.utf8) }) else { return nil }
         let date = String(decoding: line.dropFirst(prefix.utf8.count).prefix(20), as: UTF8.self)
         return ISO8601DateFormatter().date(from: date) == nil ? nil : date
@@ -24,7 +24,7 @@ public enum CLIError: LocalizedError, Sendable {
     case missingExecutable, malformedResponse, failed(Int32), launch
     public var errorDescription: String? {
         switch self {
-        case .missingExecutable: return "Open the packaged Mop.app. Its bundled command-line executable is missing."
+        case .missingExecutable: return "Open the packaged 2ndPass.app. Its bundled command-line executable is missing."
         case .malformedResponse: return "The command returned an unreadable response."
         case .launch: return "The bundled command could not be started."
         case .failed(let code):

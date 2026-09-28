@@ -21,7 +21,7 @@ struct NextRegistry {
     init(state: URL, container: String, environment: String, account: String) throws {
         self.account = account; self.container = container; self.environment = environment
         member = AccountScope.member(container: container, environment: environment, account: account)
-        cache = try LocalDirectory(directory: state.appendingPathComponent("v6").appendingPathComponent(member.uuidString))
+        cache = try LocalDirectory(directory: state.appendingPathComponent("v7").appendingPathComponent(member.uuidString))
     }
     private func read<T: Decodable>(_ name: String, as type: T.Type) throws -> T? {
         let url = cache.directory.appendingPathComponent(name)
@@ -101,7 +101,7 @@ struct NextAccountBinding: Codable {
     let environment: String
     let account: String
     var valid: Bool
-    static func cache(_ state: URL) throws -> LocalDirectory { try LocalDirectory(directory: state.appendingPathComponent("v6-account-bindings")) }
+    static func cache(_ state: URL) throws -> LocalDirectory { try LocalDirectory(directory: state.appendingPathComponent("v7-account-bindings")) }
     static func name(_ container: String, _ environment: String) -> String {
         AccountScope.member(container: container, environment: environment, account: "local-binding").uuidString + ".json"
     }

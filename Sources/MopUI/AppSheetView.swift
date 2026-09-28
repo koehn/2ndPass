@@ -20,14 +20,14 @@ struct AppSheetView: View {
         VStack(spacing: 0) { ScrollView { VStack(alignment: .leading, spacing: 18) {
             switch kind {
             case .importItems:
-                PasswordImportView(model: model)
+                PasswordImportView(model: model, controls: controls)
             case .createVault:
                 Text(model.vaults.isEmpty ? "Create Your First Vault" : "Create a Vault").font(.title2)
                 TextField("Vault name", text: $name)
                 if (try? VaultName.validate(creationName)) == nil {
                     Text("Use letters, numbers, and hyphens for the vault name.").font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Mop will create this device’s protected keys automatically. You can start saving passwords immediately and add other devices or hardware recovery later.")
+                Text("2ndPass will create this device’s protected keys automatically. You can start saving passwords immediately and add other devices or hardware recovery later.")
                 Text("Until you add another device or recovery, losing this device means losing access to your vault.").font(.caption)
                 Divider()
                 DisclosureGroup("More Options") {
@@ -42,7 +42,7 @@ struct AppSheetView: View {
                     Button("Reconnect") { model.reconnectDevice() }
                 } else {
                 Text(connectTitle).font(.title2)
-                Text("Mop connects automatically through your Apple Account. Keep Mop unlocked on another device until setup finishes.")
+                Text("2ndPass connects automatically through your Apple Account. Keep 2ndPass unlocked on another device until setup finishes.")
                 CloudEnrollmentView(model: model, owner: false)
                 DisclosureGroup("More Options") {
                 DisclosureGroup("Join another person’s shared vault") { SharingView(model: model, setup: true, flow: .connect, target: request.target, controls: controls) }
@@ -53,11 +53,11 @@ struct AppSheetView: View {
                 }
             case .addDevice:
                 Text("Connect Another Device").font(.title2)
-                Text("Open Mop on your new device using the same Apple Account. Keep this device unlocked; Mop will connect the new device automatically and notify you when it joins.")
+                Text("Open 2ndPass on your new device using the same Apple Account. Keep this device unlocked; 2ndPass will connect the new device automatically and notify you when it joins.")
                 CloudEnrollmentView(model: model, owner: true)
             case .shareAccount:
                 Text("Share with another person").font(.title2)
-                Text("Ask the other person to open Mop and choose Connect to an existing vault. Choose what they may do, exchange the invitation, then approve their response.")
+                Text("Ask the other person to open 2ndPass and choose Connect to an existing vault. Choose what they may do, exchange the invitation, then approve their response.")
                 SharingView(model: model, setup: false, flow: .share, target: request.target, controls: controls)
             case .setupRecovery:
                 Text("Optional hardware recovery").font(.title2)
@@ -85,6 +85,9 @@ struct AppSheetView: View {
         }.padding(24).disabled(model.busy) }
             Divider()
             HStack {
+                if let title = controls.secondaryTitle {
+                    Button(title) { controls.secondarySubmit?() }.disabled(model.busy)
+                }
                 Spacer()
                 Button(submitted || [.enrollDevice, .addDevice].contains(kind) ? "Close" : "Cancel") { dismissOrConfirm() }
                     .keyboardShortcut(.cancelAction)
@@ -154,9 +157,31 @@ private struct CloudEnrollmentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if owner {
-                Text("Connections are checked automatically while Mop is unlocked.")
-                if !model.enrollmentSessionActive { Button("Unlock Mop") { model.unlock() }.disabled(!model.canUnlock) }
+                Text("Connections are checked automatically while 2ndPass is unlocked.")
+                if !model.enrollmentSessionActive { Button("Unlock 2ndPass") { model.unlock() }.disabled(!model.canUnlock) }
                 if model.enrollmentWorking { ProgressView("Checking connections…") }
+                ForEach(model.vaults.filter { $0.enrolled }) { vault in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(model.vaultLabel(vault)).font(.headline)
+                        if let progress = model.ownerEnrollmentProgress[vault.id] {
+                            switch progress.phase {
+                            case .connected:
+                                Text("Connection check completed.")
+                            case .waiting:
+                                Text("Connection changed during the check. Retrying automatically…")
+                            default:
+                                Text(progress.phase.message).textSelection(.enabled)
+                            }
+                            if let date = progress.lastContact {
+                                Text("Last checked \(date, style: .relative) ago").font(.caption)
+                            } else if let date = progress.lastAttempt {
+                                Text("Last attempted \(date, style: .relative) ago").font(.caption)
+                            }
+                        } else {
+                            Text("Waiting for the first connection check.")
+                        }
+                    }
+                }
             } else {
                 ForEach(model.vaults.filter { !$0.enrolled || model.enrollmentSelection.contains($0.id) }) { vault in
                     VStack(alignment: .leading, spacing: 8) {
@@ -187,7 +212,7 @@ private struct CloudEnrollmentView: View {
                         }
                     }.padding(.vertical, 6)
                 }
-                Text("Closing this window keeps submitted requests active. Mop checks while unlocked; iPhone and iPad resume checks when you return to Mop. Use Cancel Request to stop a connection.")
+                Text("Closing this window keeps submitted requests active. 2ndPass checks while unlocked; iPhone and iPad resume checks when you return to 2ndPass. Use Cancel Request to stop a connection.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

@@ -70,11 +70,11 @@ import Testing
     var masker = SecretMasker(patterns: patterns)
     #expect(masker.consume(SecretBytes(copying: [0xFF])).isEmpty)
     var other = masker
-    #expect(masker.consume(SecretBytes(copying: [0x42, 0x43]), final: true) == "[concealed by mop]")
+    #expect(masker.consume(SecretBytes(copying: [0x42, 0x43]), final: true) == "[concealed by 2ndpass]")
     #expect(other.consume("", final: true) == SecretBytes(copying: [0xFF]))
     for secret in secrets {
         var filter = SecretMasker(patterns: patterns)
-        #expect(filter.consume(secret, final: true) == "[concealed by mop]")
+        #expect(filter.consume(secret, final: true) == "[concealed by 2ndpass]")
     }
 }
 
@@ -102,10 +102,10 @@ private final class EphemeralStore: SecretStore, AsyncSecretStore {
 @Test func resolutionReleasesFetchedValuesOnErrorAndAfterRendering() throws {
     let store = EphemeralStore()
     let service = SecretService { store }
-    #expect(throws: MopError.notFound) { try service.inject("{{mop://v/i/token}}{{mop://v/i/missing}}") }
+    #expect(throws: MopError.notFound) { try service.inject("{{secondpass://v/i/token}}{{secondpass://v/i/missing}}") }
     #expect(store.value == nil)
     #expect(store.closes == 1)
-    let result = try service.inject("prefix {{mop://v/i/token}} {{mop://v/i/token}} suffix")
+    let result = try service.inject("prefix {{secondpass://v/i/token}} {{secondpass://v/i/token}} suffix")
     #expect(result == "prefix owned\n秘密 owned\n秘密 suffix")
     #expect(store.reads == 2)
     #expect(store.value == nil)
@@ -117,12 +117,12 @@ private final class EphemeralStore: SecretStore, AsyncSecretStore {
     let service = AsyncSecretService { store }
     store.cancel = true
     do {
-        _ = try await service.inject("{{mop://v/i/token}}{{mop://v/i/missing}}")
+        _ = try await service.inject("{{secondpass://v/i/token}}{{secondpass://v/i/missing}}")
         Issue.record("Expected cancellation")
     } catch is CancellationError {} catch { Issue.record("Unexpected error type") }
     #expect(store.value == nil)
     #expect(store.closes == 1)
-    #expect(try await service.inject("{{mop://v/i/token}}") == "owned\n秘密")
+    #expect(try await service.inject("{{secondpass://v/i/token}}") == "owned\n秘密")
     #expect(store.value == nil)
     #expect(store.closes == 2)
 }

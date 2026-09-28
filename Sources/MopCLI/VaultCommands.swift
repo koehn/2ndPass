@@ -122,7 +122,7 @@ struct Vault: AsyncParsableCommand {
                 guard request.recovery, request.fingerprint == fingerprint else { throw MopError.invalidRecovery }
             }
             let id = storage.vault ?? UUID().uuidString
-            IO.diagnostic("mop: creation UUID \(id); retain it to reconcile an interrupted submission.\n")
+            IO.diagnostic("2ndpass: creation UUID \(id); retain it to reconcile an interrupted submission.\n")
             try emit(await storage.execute(.create(name: name, recovery: recoveryRequest.map { URL(fileURLWithPath: $0) }, fingerprint: fingerprint), selection: id))
         }
     }
@@ -132,7 +132,7 @@ struct Vault: AsyncParsableCommand {
         @Flag var json = false
         func run() async throws {
             let result = try await storage.execute(.discover)
-            if result.deviceRemoved { IO.diagnostic("This device was removed. Run mop vault enrollment reconnect to opt in before requesting enrollment again.\n") }
+            if result.deviceRemoved { IO.diagnostic("This device was removed. Run 2ndpass vault enrollment reconnect to opt in before requesting enrollment again.\n") }
             let rows = result.vaults
             if json { try IO.output(String(decoding: JSONEncoder().encode(rows), as: UTF8.self) + "\n") }
             else { for row in rows { try IO.output("\(row.name ?? "")\t\(row.id)\t\(row.format)\n") } }
@@ -244,7 +244,7 @@ struct Vault: AsyncParsableCommand {
         func run() async throws { try emit(await storage.execute(.manage(.reconcileShare))) }
     }
     struct Import: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Trust an independently verified v6 checkpoint for an already enrolled device; never converts old formats.")
+        static let configuration = CommandConfiguration(abstract: "Trust an independently verified v7 checkpoint for an already enrolled device; never converts old formats.")
         @OptionGroup var storage: VaultOptions
         @Argument(completion: .file()) var file: String
         @Option var checkpoint: String

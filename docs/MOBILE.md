@@ -2,11 +2,11 @@
 
 **V6 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](VAULT-NEXT-VALIDATION.md); remaining physical acceptance is not implied by historical build notes below.
 
-Mop uses the same SwiftUI views and application model on macOS, iPhone, and iPad.
+2ndPass uses the same SwiftUI views and application model on macOS, iPhone, and iPad.
 `Sources/MopUI` owns the interface; `MopApp` is a thin entry point. The existing
 Mac CLI, packaging, signing checks, and installer remain supported.
 
-Open `Apple/Mop.xcodeproj` and select the Mop scheme. The deployment minimums are
+Open `Apple/Mop.xcodeproj` and select the `Mop` scheme. The deployment minimums are
 iOS/iPadOS 18 and macOS 15. iPhone and narrow iPad windows use the collapsed
 navigation split view; larger windows show columns. Settings, item editors,
 password generation, Recently Deleted, account membership, and vault administration
@@ -48,7 +48,7 @@ replace the CLI packaging workflow.
 Recovery-key and backup export use a native folder picker followed by an exclusive
 write with a unique filename. Existing files are never overwritten. A provider
 that cannot support the required safe file operations returns an error; choose a
-different writable folder. Mop does not fall back to an overwrite-capable export.
+different writable folder. 2ndPass does not fall back to an overwrite-capable export.
 Recovery imports use coordinated, security-scoped access and a bounded private
 copy, which is removed when the recovery form closes.
 
@@ -73,7 +73,7 @@ not transfer the account private keys.
 Temporary inactivity immediately covers the entire window, including sheets, and
 conceals revealed values. An authentication prompt does not cancel its own session.
 Both apps attempt authentication once at launch while active. After cancellation,
-manual lock, timeout, or system lock, choose Unlock Mop to try again. Activity,
+manual lock, timeout, or system lock, choose Unlock 2ndPass to try again. Activity,
 foregrounding, and Refresh do not start authentication. Vaults open together;
 any opening failure clears the entire session. Unconnected vaults are excluded.
 Entering the background conceals the interface and retains unsaved drafts and
@@ -84,7 +84,7 @@ immediately. Ordinary navigation offers Save Changes, Discard Changes, or Cancel
 failed saves keep edits unless access is invalidated.
 
 Copied concealed values remain available during ordinary app switching for their
-original 30-second lifetime. The iOS pasteboard enforces expiration even while Mop
+original 30-second lifetime. The iOS pasteboard enforces expiration even while 2ndPass
 is suspended. Explicit lock clears owned concealed content; newer clipboard
 content from another application is preserved. Visible values and references do
 not expire. Copies are device-local. Account changes and protected-data loss
@@ -113,7 +113,7 @@ non-exempt encryption; complete the applicable App Store Connect encryption revi
 for the vault cryptography before distributing the beta. Supply the beta description,
 contact information, privacy policy, and review instructions in App Store Connect.
 
-The mobile icon is derived from the existing Mop artwork at 1024×1024 with an opaque
+The mobile icon is derived from the existing 2ndPass artwork at 1024×1024 with an opaque
 background. Xcode packages the password estimator's dictionary resources through
 SwiftPM.
 
@@ -186,7 +186,7 @@ remains locally usable while offline.
 ## AutoFill setup and repair
 
 Settings → AutoFill shows provider state and suggestion publication health. Enable
-Mop using the native system prompt, or open password/code provider settings. Refresh
+2ndPass using the native system prompt, or open password/code provider settings. Refresh
 Suggestions requires an unlocked session. Publication failures do not undo a saved
 vault edit. Edit Item → Use for AutoFill chooses the username, password, or optional
 verification-code field without renaming existing fields. Mappings stay encrypted.

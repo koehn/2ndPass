@@ -98,7 +98,7 @@ public final class KeychainStore: SecretStore {
             guard let service = row[kSecAttrService as String] as? String,
                   service.hasPrefix(Self.servicePrefix),
                   let field = row[kSecAttrAccount as String] as? String,
-                  let reference = try? SecretReference("mop://" + service.dropFirst(Self.servicePrefix.count) + "/" + SecretReference.encode(field)),
+                  let reference = try? SecretReference("secondpass://" + service.dropFirst(Self.servicePrefix.count) + "/" + SecretReference.encode(field)),
                   vault == nil || reference.vault == vault else { return nil }
             return reference
         }.sorted()

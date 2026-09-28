@@ -9,7 +9,7 @@ require `compound-fields-1`; update all clients before using them.
 
 ## Implemented compound-field mappings
 
-| Source | Mop field | Components |
+| Source | 2ndPass field | Components |
 | --- | --- | --- |
 | 1PUX `value.address`, on any category | Address | `street`, `city`, `state`, `zip`, `country`, plus every other property |
 | 1PUX Bank Account category `101` | Bank Account, one per source section containing banking details | `bankName`, `owner`, `accountType`, `accountNo`, `routingNo`, `iban`, `swift`, `telephonePin`, `branchPhone` |
@@ -28,9 +28,9 @@ These are recommendations for a later import/migration change, not additional
 automatic conversions in this update. Prefer the explicit source category and
 source identity over guessing from an item's title.
 
-| Source category | Existing Mop item type | Conditions and retained details |
+| Source category | Existing 2ndPass item type | Conditions and retained details |
 | --- | --- | --- |
-| Login, Password, Secure Note, Card, Identity, Database, SSH Key, API Credential, Document | Corresponding Mop type | Already mapped directly |
+| Login, Password, Secure Note, Card, Identity, Database, SSH Key, API Credential, Document | Corresponding 2ndPass type | Already mapped directly |
 | Bank Account (`101`) | Custom + Bank Account field | Keep banking data together; a bank account is not a payment card |
 | Passport (`106`), Driver License (`103`), Outdoor License (`104`), Social Security Number (`108`) | Identity | Preserve original category in encrypted metadata; identifiers stay concealed with their original labels |
 | Membership (`105`), Rewards Program (`107`) | Identity | Retain organization, member name, number, dates, and category; do not reinterpret every number as a government ID |
@@ -43,7 +43,7 @@ source identity over guessing from an item's title.
 
 ## Recommended remaining field mappings for review
 
-| Imported field | Mop field type | Rule |
+| Imported field | 2ndPass field type | Rule |
 | --- | --- | --- |
 | Explicit username/password designation | Username / Password | Prefer designation over translated labels |
 | `string`, `menu`, `gender` | Text | Preserve the original string; concealed/guarded input stays Concealed |
@@ -55,7 +55,7 @@ source identity over guessing from an item's title.
 | TOTP | OTP | Only supported configurations generate codes; retain other configurations concealed with a specific warning |
 | SSH key | Private key plus public key/fingerprint | Existing mapping; keep every additional source property |
 | File reference | Attachment | Resolve bytes from 1PUX; report named failures |
-| Item reference | Text containing a clearly labeled source reference, pending a link feature | Do not turn an opaque source ID into a functioning Mop reference |
+| Item reference | Text containing a clearly labeled source reference, pending a link feature | Do not turn an opaque source ID into a functioning 2ndPass reference |
 | Unknown structured value | Concealed JSON | Preserve it and report field/section/type structure, without scalar secret values |
 
 Scope template IDs by category: for example, `type` can mean card brand, passport

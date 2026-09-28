@@ -7,9 +7,9 @@ import MopCore
 public struct VaultAddress: Codable, Equatable, Sendable {
     public enum Namespace: String, Codable, Sendable { case user, probe }
     public let namespace: Namespace
-    public var zoneName: String { (namespace == .user ? "mop-v6-" : "mop-v6-probe-") + vault.uuidString }
+    public var zoneName: String { (namespace == .user ? "mop-v7-" : "mop-v7-probe-") + vault.uuidString }
     static func discoveredVault(in zoneName: String) -> UUID? {
-        guard zoneName.hasPrefix("mop-v6-") else { return nil }
+        guard zoneName.hasPrefix("mop-v7-") else { return nil }
         return UUID(uuidString: String(zoneName.dropFirst(7)))
     }
     public enum Database: String, Codable, Sendable { case `private`, shared }
@@ -169,7 +169,7 @@ public actor PublicationCoordinator {
         try save(verified, pending: nil)
         return outcome
     }
-    public func publish(_ proposal: VerifiedVault, offline: Bool = false) async throws {
+    public func publish(_ proposal: VerifiedVault, offline: Bool = false, progress: (@Sendable (String) -> Void)? = nil) async throws {
         guard !offline else { throw MopError.offlineWrite }
         try enter(); defer { busy = false }
         guard state.pending == nil else { throw MopError.cloudUncertain }
@@ -179,12 +179,12 @@ public actor PublicationCoordinator {
         let journal = PendingPublication(operation: UUID(), parent: current.digest, candidate: proposal.digest)
         try save(current, pending: journal, at: state.verifiedAt)
         do {
-            for (digest, bytes) in proposal.loadedAttachments where !current.attachmentDigests.contains(digest) {
-                try await transport.uploadAttachment(bytes, digest: digest, at: address)
+            try await AttachmentUploads.upload(proposal, excluding: current.attachmentDigests, transport: transport, address: address) { completed, total in
+                if total > 0 { progress?("Uploading encrypted files: \(completed) of \(total)") }
             }
-            // New references must be uploaded before publishing the revision.
-            guard proposal.attachmentDigests.subtracting(current.attachmentDigests).isSubset(of: Set(proposal.loadedAttachments.keys)) else { throw AttachmentFailure.unavailable }
+            progress?("Publishing vault revision…")
             try await transport.upload(proposal.bytes, digest: proposal.digest, at: address)
+            try Task.checkCancellation()
         }
         catch {
             // No head call was submitted; unreachable immutable data is harmless.

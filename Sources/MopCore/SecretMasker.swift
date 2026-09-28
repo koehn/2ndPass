@@ -74,7 +74,7 @@ public struct SecretMasker: Sendable {
             }
             if cursor == input.count && !final && patterns.hasChildren(node) { break }
             if let end = matchEnd {
-                output.append("[concealed by mop]".utf8); start = end
+                output.append("[concealed by 2ndpass]".utf8); start = end
             } else { output.append(input[start]); start += 1 }
         }
         pending = SecretBytes(copying: input[start...])

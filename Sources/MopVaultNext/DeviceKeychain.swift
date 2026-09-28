@@ -12,7 +12,7 @@ public enum DeviceKeychain {
             kSecUseDataProtectionKeychain as String: true,
             kSecAttrSynchronizable as String: false,
             kSecAttrAccessGroup as String: try SigningIdentity.accessGroup(),
-            kSecAttrService as String: "mop.device-identity.v6." + Codec.digest(Data(scope.utf8)),
+            kSecAttrService as String: "mop.device-identity.v7." + Codec.digest(Data(scope.utf8)),
             kSecAttrAccount as String: member.uuidString
         ]
         let status = SecItemDelete(query as CFDictionary)
@@ -24,7 +24,7 @@ public enum DeviceKeychain {
             kSecUseDataProtectionKeychain as String: true,
             kSecAttrSynchronizable as String: false,
             kSecAttrAccessGroup as String: try SigningIdentity.accessGroup(),
-            kSecAttrService as String: "mop.device-identity.v6." + Codec.digest(Data(scope.utf8)),
+            kSecAttrService as String: "mop.device-identity.v7." + Codec.digest(Data(scope.utf8)),
             kSecAttrAccount as String: member.uuidString
         ]
         func read() throws -> EnclaveDevice? {

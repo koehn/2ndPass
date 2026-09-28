@@ -31,13 +31,15 @@ public extension VerifiedVault {
     func backup() throws -> Data {
         guard attachmentDigests == Set(loadedAttachments.keys) else { throw AttachmentFailure.unavailable }
         if attachmentDigests.isEmpty { return bytes }
-        let data = try Codec.encode(AttachmentBackup(format: "mop-attachment-backup-1", revision: bytes, attachments: loadedAttachments))
+        let data = try Codec.encode(AttachmentBackup(format: "mop-attachment-backup-7", revision: bytes, attachments: loadedAttachments))
         guard data.count <= Self.maximumBackupSize else { throw MopError.invalidVault }
         return data
     }
     static func restoreBackup(_ data: Data, independentlyVerifiedDigest: String) throws -> Self {
         guard data.count <= Self.maximumBackupSize else { throw MopError.invalidVault }
-        if let backup = try? JSONDecoder().decode(AttachmentBackup.self, from: data), backup.format == "mop-attachment-backup-1" {
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let format = object["format"] as? String, format != "mop-attachment-backup-7" { throw MopError.legacyVault }
+        if let backup = try? JSONDecoder().decode(AttachmentBackup.self, from: data), backup.format == "mop-attachment-backup-7" {
             var vault = try Self(checkpoint: backup.revision, independentlyVerifiedDigest: independentlyVerifiedDigest)
             guard Set(backup.attachments.keys) == vault.attachmentDigests else { throw MopError.invalidVault }
             for (digest, bytes) in backup.attachments { vault = try vault.loadingAttachment(bytes, digest: digest) }

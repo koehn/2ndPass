@@ -1,15 +1,15 @@
 .Dd September 25, 2026
-.Dt MOP 1
+.Dt 2NDPASS 1
 .Os
 .Sh NAME
-.Nm mop
+.Nm 2ndpass
 .Nd use hardware-protected personal and shared CloudKit vaults
 .Sh SYNOPSIS
 .Nm
 .Ar command
 .Op Ar options
 .Sh DESCRIPTION
-Mop v6 generates device private keys in Secure Enclave. Personal vaults are the
+2ndPass v6 generates device private keys in Secure Enclave. Personal vaults are the
 one-member case of shared vaults. Every additional device requires explicit
 owner approval. The application, AutoFill and CLI share device-local encrypted
 checkpoints and device-only Keychain representations. There is no software-key
@@ -23,7 +23,7 @@ Use
 .Nm command --help
 for complete arguments. Secret commands are read, write, list, delete, run,
 inject and item. Values are supplied by hidden prompt or stdin, never positional
-password arguments. References use mop://vault/item/[section/]field.
+password arguments. References use secondpass://vault/item/[section/]field.
 .Pp
 Device request creates a public enrollment document; --recovery selects this
 device's separate hardware recovery identity. Vault init creates a vault on this
@@ -84,12 +84,12 @@ replacing its hardware keys. Enrollment cancel stops the pending request.
 Neither command deletes vault contents or revokes access already granted.
 The app displays request status, expiry and the last successful iCloud check.
 .SH DEVICE REMOVAL
-.B mop vault devices
+.B 2ndpass vault devices
 lists own-account devices across enrolled personal vaults.
-.B mop vault devices --remove UUID
+.B 2ndpass vault devices --remove UUID
 revokes a device across those vaults. The last owner device cannot be removed.
 The removed device clears its local access after observing the signed revocation.
-.B mop vault enrollment reconnect
+.B 2ndpass vault enrollment reconnect
 explicitly permits fresh-key enrollment after removal; follow it with
-.B mop vault enrollment request --vault UUID
+.B 2ndpass vault enrollment request --vault UUID
 while another owner device is unlocked.

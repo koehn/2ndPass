@@ -35,15 +35,16 @@ jobs:
           set -euo pipefail
           brew tap-new --no-git koehn/mop-ci
           tap="$(brew --repository)/Library/Taps/koehn/homebrew-mop-ci"
-          cp Formula/mop.rb "$tap/Formula/mop.rb"
+          cp Formula/secondpass.rb "$tap/Formula/secondpass.rb"
           # Test PR code without fetching main or requiring a published release.
           git archive --format=tar.gz --output="$RUNNER_TEMP/mop-source.tar.gz" HEAD
-          export MOP_CI_FORMULA="$tap/Formula/mop.rb"
+          export MOP_CI_FORMULA="$tap/Formula/secondpass.rb"
           python3 - <<'PY'
           import hashlib, os, pathlib, re
           archive = pathlib.Path(os.environ["RUNNER_TEMP"]) / "mop-source.tar.gz"
           formula = pathlib.Path(os.environ["MOP_CI_FORMULA"])
           text = formula.read_text()
+          text = text.replace('  head ', '  url PLACEHOLDER\n  sha256 PLACEHOLDER\n  head ', 1)
           text = re.sub(r'^  url .*$', f'  url "{archive.as_uri()}"', text, flags=re.M)
           text = re.sub(r'^  sha256 .*$', f'  sha256 "{hashlib.sha256(archive.read_bytes()).hexdigest()}"', text, flags=re.M)
           if not re.search(r'^  version ', text, re.M):
@@ -51,13 +52,13 @@ jobs:
           formula.write_text(text)
           PY
       - name: Check formula style
-        run: brew style koehn/mop-ci/mop
+        run: brew style koehn/mop-ci/secondpass
       - name: Build and test the installed formula
         run: |
-          brew install --build-from-source koehn/mop-ci/mop
-          brew test koehn/mop-ci/mop
-          brew linkage --test koehn/mop-ci/mop
+          brew install --build-from-source koehn/mop-ci/secondpass
+          brew test koehn/mop-ci/secondpass
+          brew linkage --test koehn/mop-ci/secondpass
       - name: Exercise the installed CLI without authentication
         run: |
-          python3 scripts/smoke-test.py "$(brew --prefix mop)/bin/mop"
-          python3 scripts/test-shell-support.py "$(brew --prefix mop)/bin/mop" "$(brew --prefix mop)"
+          python3 scripts/smoke-test.py "$(brew --prefix secondpass)/bin/2ndpass"
+          python3 scripts/test-shell-support.py "$(brew --prefix secondpass)/bin/2ndpass" "$(brew --prefix secondpass)"

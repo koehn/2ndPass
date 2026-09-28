@@ -127,7 +127,7 @@ private struct ActivityBridge: UIViewRepresentable {
             cover.backgroundColor = .systemBackground
             cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             cover.isAccessibilityElement = true
-            cover.accessibilityLabel = "Mop is concealed"
+            cover.accessibilityLabel = "2ndPass is concealed"
             cover.accessibilityViewIsModal = true
             window.addSubview(cover)
             shield = cover

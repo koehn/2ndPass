@@ -1,8 +1,8 @@
 # Security and key management
 
-This document describes Mop v6's implemented security model, reviewed against the
+This document describes 2ndPass v7's implemented security model, reviewed against the
 source on 2026-09-26. For a user-oriented overview, see
-[How Mop protects your secrets](SECURITY-EXPLAINER.md). The
+[How 2ndPass protects your secrets](SECURITY-EXPLAINER.md). The
 [validation record](VAULT-NEXT-VALIDATION.md) distinguishes implementation and
 model tests from physical-device evidence. This document is not a claim of an
 independent security audit or completed release acceptance.
@@ -14,30 +14,30 @@ old-format reader, or automatic migration in this implementation.
 
 ## Trust boundaries and threat model
 
-Mop encrypts vault contents before uploading them, grants access to specific
+2ndPass encrypts vault contents before uploading them, grants access to specific
 device public keys, and verifies signed revisions against previously trusted
 state. Its protections have distinct dependencies:
 
 - **Device hardware and Apple platform security:** Secure Enclave protects device
   private-key operations; Keychain and code-signing access controls protect the
-  stored device identity. Mop relies on these implementations and local
+  stored device identity. 2ndPass relies on these implementations and local
   authentication, rather than implementing its own hardware security boundary.
-- **Authorized Mop code:** plaintext and temporary record keys enter the app's
+- **Authorized 2ndPass code:** plaintext and temporary record keys enter the app's
   process. Code able to act as an authorized client can request permitted
   hardware operations and retain their results.
 - **Apple Account and private CloudKit mailbox during same-account enrollment:**
   automatic enrollment trusts this channel for initial identity. An attacker
-  controlling it can request admission while an existing owner's Mop session is
+  controlling it can request admission while an existing owner's 2ndPass session is
   unlocked. A malicious mailbox can substitute a joining device's initial root.
 - **Locally pinned state after enrollment:** signed ancestry and local checkpoints
   constrain later updates. They do not establish the authenticity of an initial
   root independently of its bootstrap channel, or prove that the server has
   supplied the newest revision.
 
-CloudKit is Apple's application data service. Its transport permissions and Mop's
+CloudKit is Apple's application data service. Its transport permissions and 2ndPass's
 cryptographic membership are separate controls. A stolen ciphertext copy alone
 is insufficient to decrypt secrets; active account/mailbox control has the
-additional enrollment consequences above. Mop does not promise availability
+additional enrollment consequences above. 2ndPass does not promise availability
 against a malicious server, secrecy from an authorized recipient, or protection
 of plaintext on a compromised endpoint.
 
@@ -45,25 +45,25 @@ of plaintext on a compromised endpoint.
 
 ### What the Secure Enclave does
 
-The Secure Enclave is an isolated hardware security subsystem. Mop creates two
+The Secure Enclave is an isolated hardware security subsystem. 2ndPass creates two
 separate P-256 private keys per device: a key-agreement key used to open encrypted
-record-key envelopes, and a signing key used to authenticate requests and vault
-revisions. Private scalar values are not exported to Mop. The shipping
+item-key envelopes, and a signing key used to authenticate requests and vault
+revisions. Private scalar values are not exported to 2ndPass. The shipping
 `EnclaveDevice` provider requires `SecureEnclave.isAvailable` and has no software
 fallback. Software key providers used in tests do not establish hardware behavior.
 
 Apple's [Secure Enclave overview](https://support.apple.com/guide/security/sec59b0b31ff/web)
 and [key protection documentation](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave)
-describe the platform boundary. Mop uses its P-256 operations; it does not run the
+describe the platform boundary. 2ndPass uses its P-256 operations; it does not run the
 whole vault engine, AES record decryption, or the UI inside the Enclave.
 
 ### What is stored on the device
 
 The Keychain is Apple's OS-managed credential store, distinct from the Enclave.
-Mop persists opaque, device-bound representations of the two hardware keys in
+2ndPass persists opaque, device-bound representations of the two hardware keys in
 the Data Protection Keychain. These are not portable private scalars or a
 recoverable backup of the device identity. The items are non-synchronizable,
-scoped to Mop's signing access group, and use `WhenUnlockedThisDeviceOnly`.
+scoped to 2ndPass's signing access group, and use `WhenUnlockedThisDeviceOnly`.
 Copying their bytes to another device does not provide portable device keys.
 
 Keychain access groups, provisioning and hardened-runtime validation constrain
@@ -74,7 +74,7 @@ of physical zeroization of every hardware or storage location.
 
 ### What unlocking authorizes
 
-Key access controls use `privateKeyUsage` and `userPresence`. Mop preauthorizes an
+Key access controls use `privateKeyUsage` and `userPresence`. 2ndPass preauthorizes an
 `LAContext` (Apple's local-authentication context) using device-owner
 authentication, then disables unexpected interactive prompts during key
 operations. This is the platform's authentication policy, not a promise that
@@ -88,22 +88,22 @@ context and session generation, cancels work, and rejects late results.
 
 Invalidating an `LAContext` is **not established as revoking an already-used
 signing handle**: a real-host probe found signing still succeeded through such a
-handle. Mop consequently clears handles and independently guards operation and
+handle. 2ndPass consequently clears handles and independently guards operation and
 session state. In-flight hardware operations or submitted cloud mutations may
 finish after cancellation; journals reconcile cloud outcomes.
 
 ## Encryption and plaintext lifetime
 
-Each secret record has a distinct random 256-bit AES-GCM key. The catalog has a
+Each item has a distinct random 256-bit AES-GCM key shared by its fields. Fields use independent random nonces and remain separately encrypted. The catalog has a
 separate key and contains item names, field descriptions, references, visible
 field values and deletion metadata. Concealed field values are stored in their
 separate records. Each authorized ordinary device and any configured recovery
-device receives an encrypted copy, or *envelope*, of each object's key.
+device receives an encrypted copy, or *envelope*, of each item's key and the catalog key.
 
 Envelopes use CryptoKit HPKE with `P256_SHA256_AES_GCM_256`. HPKE combines public-key
 agreement and symmetric encryption so an object key can be encrypted to a
 recipient's public key and opened using its private key. There is no retained
-vault-wide symmetric master key. Per-record keys reduce unnecessary decryption;
+vault-wide symmetric master key. Per-item keys bound key exposure to one item;
 they do not prevent an authorized device from deliberately reading every record.
 
 For a normal password read:
@@ -112,15 +112,13 @@ For a normal password read:
    revision, from online validation or an eligible local offline checkpoint.
 2. The device opens its catalog-key envelope and authenticates/decrypts the catalog
    to locate the requested record.
-3. It opens its envelope for that record's key using the hardware agreement key.
+3. It opens its envelope for that item's key using the hardware agreement key.
 4. AES-GCM authenticates and decrypts the record in application memory. The result
    goes to the requested UI, AutoFill, clipboard or command destination.
 5. Providers release their key handles; owned temporary buffers are wiped where
    practical. The engine retains no private or symmetric key between operations.
 
-Adding a recipient unwraps and re-wraps existing record keys without decrypting
-record values. Removing a recipient creates fresh keys and ciphertext for current
-records, processing plaintext one record at a time. Catalog operations decrypt
+Adding a recipient unwraps each item key once and adds only the new recipient envelope, preserving existing envelopes and ciphertext. Role-only changes preserve item keys and envelopes. Removing a recipient creates fresh item keys and ciphertext for all retained records, including recently deleted items, processing plaintext one field at a time. Catalog operations decrypt
 catalog data, including visible field values, even when no password is revealed.
 
 AES keys, HPKE-derived state, passwords, edited values and command inputs can
@@ -150,7 +148,7 @@ has separate, explicitly configured authority described below.
 ### Automatic same-account enrollment
 
 A new device authenticates locally and submits a signed request through the
-private CloudKit enrollment mailbox. An existing owner's unlocked Mop session
+private CloudKit enrollment mailbox. An existing owner's unlocked 2ndPass session
 processes it, supplies an invitation, checks the acceptance and publishes a
 signed membership grant with key envelopes for the new device. Automatic
 processing refuses a locked service without initiating authentication. It needs
@@ -188,7 +186,7 @@ owner approval adds device envelopes for existing records. Accepting an Apple
 CloudKit share (`CKShare`) alone does not grant cryptographic vault membership.
 
 Nonpublic, zone-wide shares separately grant read-only or read-write transport
-permissions. Mop checks participant/account bindings, actual shared-zone owner,
+permissions. 2ndPass checks participant/account bindings, actual shared-zone owner,
 container and environment. The default-owner alias is not accepted as a shared
 address; unexpected mappings fail closed. Real participant-side behavior remains
 a second-account validation requirement.
@@ -196,7 +194,7 @@ a second-account validation requirement.
 ## Authenticity, tampering and synchronization
 
 AES-GCM detects changes to protected ciphertext or its authenticated context.
-HPKE contexts bind vault, object, recipient fingerprint and membership epoch.
+Item HPKE contexts bind vault, item UUID, recipient fingerprint and item-key generation, independently of membership epoch. Field AES-GCM contexts bind vault, item UUID, key generation and field-record UUID. Catalog envelopes retain membership-epoch binding.
 Record authenticated data binds vault and object; catalog authenticated data
 binds the header and digest of the record table. These bindings prevent valid
 pieces being silently substituted into a different context.
@@ -216,7 +214,7 @@ also removes the basis for its previous observations.
 
 Content-addressed CloudKit assets are treated as immutable by the client. Head
 updates use `ifServerRecordUnchanged` and actual server change tags, so competing
-writes conflict instead of silently overwriting each other. Mop does not
+writes conflict instead of silently overwriting each other. 2ndPass does not
 resolve conflicts by blindly replaying secret changes.
 
 A private atomic journal is persisted before submission. When an acknowledgement
@@ -307,20 +305,20 @@ AutoFill intentionally publishes website, username and credential-kind locators
 to Apple's credential identity store. It re-resolves them from an authenticated
 catalog before filling. This metadata is a privacy tradeoff for credential
 discovery, not publication of the password itself. Clipboard, subprocess and
-website destinations receive plaintext by design; Mop cannot control how they
+website destinations receive plaintext by design; 2ndPass cannot control how they
 retain or disclose it afterward.
 
 ## Attacks and practical limits
 
 | Scenario | Protection | Boundary or remaining risk |
 | --- | --- | --- |
-| Someone copies cloud ciphertext or an encrypted backup | Per-record encryption and device-specific key envelopes | Active mailbox control can additionally enable automatic enrollment; old authorized recipients may retain decryptable copies. |
+| Someone copies cloud ciphertext or an encrypted backup | Per-item keys with separate field encryption and device-specific key envelopes | Active mailbox control can additionally enable automatic enrollment; old authorized recipients may retain decryptable copies. |
 | Someone steals a locked device | Hardware-bound keys, Keychain accessibility and local authentication | Depends on platform security and authentication credentials; an unlocked authorized session has broader access. |
 | Someone tampers with records or grants themselves a role | Authenticated encryption, complete revision signatures and parent-authority checks | Initial same-account bootstrap trusts the mailbox; authorized writers can still make valid harmful edits. |
 | A server replays or forks history | Pinned checkpoints, ancestry verification and local watermarks | Withheld updates cannot be detected as globally stale; availability is not guaranteed. |
 | An attacker replays an enrollment request | Scope, expiry, acceptance checks, consumed nonces and retired UUIDs | A fresh identity can be admitted if the attacker still controls the account mailbox. |
 | A removed person keeps old data | Rotation excludes them from current and later encrypted revisions | Copies and unchanged external passwords remain usable; offline clients learn revocation later. |
-| Malware compromises an authorized Mop process | Private scalars remain behind the hardware boundary | Malware may request operations, read plaintext and copy results. Hardware protection is not endpoint immunity. |
+| Malware compromises an authorized 2ndPass process | Private scalars remain behind the hardware boundary | Malware may request operations, read plaintext and copy results. Hardware protection is not endpoint immunity. |
 | Every enrolled device is lost | Optional separate hardware recovery plus verified backups | Without surviving ordinary or recovery keys there is no decryption backdoor. |
 
 ## Evidence and source map

@@ -162,7 +162,7 @@ struct SharingView: View {
             else { input = ""; fingerprint = ""; shareURL = ""; member = ""; importedName = "" }
             model.exchangeOutput = ""; model.notice = nil; error = nil; updateControls()
         }
-        .fileExporter(isPresented: $exportingExchange, document: ExchangeDocument(Data(model.exchangeOutput.utf8)), contentType: .json, defaultFilename: "mop-" + action) { result in
+        .fileExporter(isPresented: $exportingExchange, document: ExchangeDocument(Data(model.exchangeOutput.utf8)), contentType: .json, defaultFilename: "2ndpass-" + action) { result in
             if case .failure(let failure) = result, (failure as NSError).code != NSUserCancelledError { error = "Could not save the exchange file." }
         }
         .fileImporter(isPresented: $importingExchange, allowedContentTypes: [.json, .data]) { result in

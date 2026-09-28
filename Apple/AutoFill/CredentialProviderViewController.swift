@@ -104,7 +104,7 @@ import MopCore
                 guard token == generation, !Task.isCancelled else { return }
                 guard !identities.isEmpty else {
                     model.loading = false
-                    model.message = "No suggestions are available. Open Mop, unlock it, then choose Settings → AutoFill → Refresh Suggestions."
+                    model.message = "No suggestions are available. Open 2ndPass, unlock it, then choose Settings → AutoFill → Refresh Suggestions."
                     updatePreferredContentSize(); return
                 }
                 let session = beginSession()
@@ -112,8 +112,8 @@ import MopCore
                 guard token == generation, !Task.isCancelled else { return }
                 model.entries = choices.sorted { ($0.identity.website, $0.identity.username, $0.vaultName, $0.itemName, $0.id) < ($1.identity.website, $1.identity.username, $1.vaultName, $1.itemName, $1.id) }
                 model.loading = false
-                if session.unavailableVaults > 0 { model.message = "Some vaults are unavailable. Open and unlock Mop to refresh them. Available accounts are listed below." }
-                else if choices.isEmpty { model.message = "These suggestions are no longer available. Refresh Suggestions in Mop’s AutoFill settings." }
+                if session.unavailableVaults > 0 { model.message = "Some vaults are unavailable. Open and unlock 2ndPass to refresh them. Available accounts are listed below." }
+                else if choices.isEmpty { model.message = "These suggestions are no longer available. Refresh Suggestions in 2ndPass’s AutoFill settings." }
                 updatePreferredContentSize()
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
@@ -224,12 +224,12 @@ import MopCore
         finish(); model.loading = false
         switch error as? MopError {
         case .authentication: model.message = "Authentication was cancelled. Retry when you are ready."
-        case .notFound, .vaultMissing: model.message = "This account was changed or removed. Choose another account, or refresh suggestions in Mop."
-        case .deviceRemoved, .deviceRemovalPending, .notVaultMember: model.message = "This device is no longer connected to the vault. Open Mop and reconnect before trying again."
-        case .invalidIdentity, .signing: model.message = "AutoFill needs setup. Open Mop, connect this device, then enable Mop in Settings → AutoFill."
+        case .notFound, .vaultMissing: model.message = "This account was changed or removed. Choose another account, or refresh suggestions in 2ndPass."
+        case .deviceRemoved, .deviceRemovalPending, .notVaultMember: model.message = "This device is no longer connected to the vault. Open 2ndPass and reconnect before trying again."
+        case .invalidIdentity, .signing: model.message = "AutoFill needs setup. Open 2ndPass, connect this device, then enable 2ndPass in Settings → AutoFill."
         case .invalidOTP: model.message = "The verification code expired or is unavailable. Retry to generate a fresh code."
         default:
-            model.message = error is AutoFillSessionError ? "AutoFill timed out. Retry to authenticate again." : "This vault is unavailable. Retry, choose another account, or open and unlock Mop to refresh it."
+            model.message = error is AutoFillSessionError ? "AutoFill timed out. Retry to authenticate again." : "This vault is unavailable. Retry, choose another account, or open and unlock 2ndPass to refresh it."
         }
         updatePreferredContentSize()
     }
@@ -294,7 +294,7 @@ private struct CredentialListView: View {
     private var other: [AutoFillChoice] { filtered.filter { !model.hosts.contains($0.identity.website) } }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Text("Mop AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel).keyboardShortcut(.cancelAction) }
+            HStack { Text("2ndPass AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel).keyboardShortcut(.cancelAction) }
             if !model.hosts.isEmpty { Text("Filling for " + model.hosts.sorted().joined(separator: ", ")).font(.callout) }
             if model.loading { ProgressView("Authenticating for AutoFill…") }
             if let message = model.message {

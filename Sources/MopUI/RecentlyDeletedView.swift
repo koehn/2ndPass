@@ -20,8 +20,8 @@ struct RecentlyDeletedList: View {
             } else {
                 ContentUnavailableView {
                     Label("Recently Deleted is locked", systemImage: "lock")
-                } description: { Text("Unlock Mop to view recently deleted items.") }
-                actions: { Button("Unlock Mop") { model.unlock() }.disabled(!model.canUnlock) }
+                } description: { Text("Unlock 2ndPass to view recently deleted items.") }
+                actions: { Button("Unlock 2ndPass") { model.unlock() }.disabled(!model.canUnlock) }
             }
         }
     }
@@ -52,7 +52,7 @@ struct RecentlyDeletedDetail: View {
             }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
         } else {
             ContentUnavailableView("Recently Deleted", systemImage: "trash",
-                description: Text("Deleted items can be restored for 30 days. Expired items are removed when Mop is unlocked and online."))
+                description: Text("Deleted items can be restored for 30 days. Expired items are removed when 2ndPass is unlocked and online."))
                 .padding(.top, 60)
         }
     }

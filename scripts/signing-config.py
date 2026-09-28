@@ -32,7 +32,7 @@ if not any(fnmatch.fnmatchcase(shared_group, group) for group in entitlements.ge
 output = {'com.apple.application-identifier': app_id,
           'com.apple.developer.team-identifier': team,
           'keychain-access-groups': [shared_group]}
-if executable == 'mop' or is_extension:
+if executable == '2ndpass' or is_extension:
     container = 'iCloud.' + parent_bundle
     environment = os.environ.get('MOP_CLOUD_ENVIRONMENT', 'Production')
     if environment not in ('Development', 'Production'):
@@ -83,14 +83,14 @@ if is_extension:
     output['com.apple.security.app-sandbox'] = True
     output['com.apple.security.network.client'] = True
 # Carry the profile's APNs environment into native macOS app signatures.
-if executable == 'mop' and entitlements.get('com.apple.developer.aps-environment'):
+if executable == '2ndpass' and entitlements.get('com.apple.developer.aps-environment'):
     output['com.apple.developer.aps-environment'] = entitlements['com.apple.developer.aps-environment']
 with open(entitlements_path, 'wb') as f:
     plistlib.dump(output, f)
 with open(info_path, 'wb') as f:
     plistlib.dump({'CFBundleIdentifier': bundle_id, 'CFBundleExecutable': executable,
-                  'CFBundleName': 'mop', 'CFBundlePackageType': 'APPL',
-                  'CFBundleVersion': '0.6.0', 'CFBundleShortVersionString': '0.6.0',
+                  'CFBundleName': '2ndPass', 'CFBundleDisplayName': '2ndPass', 'CFBundlePackageType': 'APPL',
+                  'CFBundleVersion': '0.7.0', 'CFBundleShortVersionString': '0.7.0',
                   'LSMinimumSystemVersion': '15.0'}, f)
 
 if autofill:

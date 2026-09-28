@@ -46,7 +46,7 @@ private final class CountingOpener: VaultSigningOpener {
 @Test func snapshotCRUDAndTamperDetection() throws {
     let (directory, trust, initial, device, _) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let ref = try SecretReference("mop://v/github/token")
+    let ref = try SecretReference("secondpass://v/github/token")
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
     try store.write(ref, value: "VERY_SECRET\n多行", replace: false)
@@ -111,7 +111,7 @@ private final class CountingOpener: VaultSigningOpener {
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
-    let ref = try SecretReference("mop://v/i/f")
+    let ref = try SecretReference("secondpass://v/i/f")
     try store.write(ref, value: "same", replace: false)
     let first = store.snapshot
     #expect(throws: MopError.duplicate) { try store.write(ref, value: "other", replace: false) }
@@ -167,8 +167,8 @@ private final class CountingOpener: VaultSigningOpener {
     let spy = CountingOpener(device)
     let store = try VaultSession(snapshot: initial, trust: trust, opener: spy)
     defer { store.close() }
-    let first = try SecretReference("mop://v/i/first")
-    let second = try SecretReference("mop://v/i/section/second")
+    let first = try SecretReference("secondpass://v/i/first")
+    let second = try SecretReference("secondpass://v/i/section/second")
     try store.write(first, value: "one", replace: false)
     try store.write(second, value: "two", replace: false)
     #expect(spy.purposes == ["index"])
@@ -195,8 +195,8 @@ private final class CountingOpener: VaultSigningOpener {
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
-    try store.write(SecretReference("mop://v/i/a"), value: "alpha", replace: false)
-    try store.write(SecretReference("mop://v/i/b"), value: "beta", replace: false)
+    try store.write(SecretReference("secondpass://v/i/a"), value: "alpha", replace: false)
+    try store.write(SecretReference("secondpass://v/i/b"), value: "beta", replace: false)
     let original = try VaultDocument.decode(store.snapshot)
     let ids = original.records.keys.sorted()
     var changed = original
@@ -221,7 +221,7 @@ private final class CountingOpener: VaultSigningOpener {
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
-    let ref = try SecretReference("mop://v/my%2Fcloud/section/sshd")
+    let ref = try SecretReference("secondpass://v/my%2Fcloud/section/sshd")
     try store.write(ref, value: "original", replace: false)
     let before = store.snapshot
     let document = try VaultDocument.decode(before)
@@ -271,7 +271,7 @@ private final class CountingOpener: VaultSigningOpener {
     }
     let store = try VaultSession(snapshot: original, trust: trust, opener: device)
     defer { store.close() }
-    try store.write(SecretReference("mop://v/i/new"), value: "protected-future-secret", replace: false)
+    try store.write(SecretReference("secondpass://v/i/new"), value: "protected-future-secret", replace: false)
     #expect(throws: MopError.notVaultMember) { try VaultSession(snapshot: store.snapshot, trust: trust, opener: attacker) }
 
 }
@@ -309,16 +309,16 @@ private final class CountingOpener: VaultSigningOpener {
     try reopened.saveItem(ItemEdit(revision: reopened.catalog().revision, item: listed, create: false))
     #expect(try reopened.catalog().items[0].fields.map(\.path) == ["otp", "password", "username"])
     opener.allowRecords = true
-    #expect(try reopened.read(SecretReference("mop://v/login/password")) == "HIDDEN_PASSWORD")
-    #expect(try reopened.read(SecretReference("mop://v/login/otp")) == "JBSWY3DPEHPK3PXP")
+    #expect(try reopened.read(SecretReference("secondpass://v/login/password")) == "HIDDEN_PASSWORD")
+    #expect(try reopened.read(SecretReference("secondpass://v/login/otp")) == "JBSWY3DPEHPK3PXP")
     // CLI replacements and deletions keep visible metadata consistent.
-    try reopened.write(SecretReference("mop://v/login/username"), value: "new-user", replace: true)
+    try reopened.write(SecretReference("secondpass://v/login/username"), value: "new-user", replace: true)
     #expect(try reopened.catalog().items[0].fields.last?.value == "new-user")
-    try reopened.delete(SecretReference("mop://v/login/username"))
+    try reopened.delete(SecretReference("secondpass://v/login/username"))
     #expect(try reopened.catalog().items[0].fields.map(\.path) == ["otp", "password"])
-    try reopened.write(SecretReference("mop://v/login/new"), value: "new-secret", replace: false)
-    try reopened.delete(SecretReference("mop://v/login/otp"))
-    try reopened.delete(SecretReference("mop://v/login/password"))
+    try reopened.write(SecretReference("secondpass://v/login/new"), value: "new-secret", replace: false)
+    try reopened.delete(SecretReference("secondpass://v/login/otp"))
+    try reopened.delete(SecretReference("secondpass://v/login/password"))
     #expect(try reopened.catalog().items[0].type == .login)
     #expect(try reopened.catalog().items[0].fields == [ItemField(path: "new")])
     reopened.close()
@@ -329,7 +329,7 @@ private final class CountingOpener: VaultSigningOpener {
     let (directory, trust, initial, device, _) = try fixture()
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
-    let ref = try SecretReference("mop://v/legacy/secret")
+    let ref = try SecretReference("secondpass://v/legacy/secret")
     try store.write(ref, value: "keep-me", replace: false)
     var item = try #require(store.catalog().items.first)
     #expect(item.type == .custom && item.fields[0].type == .concealed)
@@ -419,7 +419,7 @@ private final class CountingOpener: VaultSigningOpener {
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
-    try store.write(SecretReference("mop://v/old/field"), value: "kept", replace: false)
+    try store.write(SecretReference("secondpass://v/old/field"), value: "kept", replace: false)
     var item = try store.catalog().items[0]; item.name = "new"; item.fields[0].type = .text
     try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false, originalName: "old"))
     #expect(try store.catalog().items[0].fields[0].value == "kept")
@@ -455,7 +455,7 @@ private final class CountingOpener: VaultSigningOpener {
     let opener = CountingOpener(device)
     let store = try VaultSession(snapshot: initial, trust: trust, opener: opener)
     defer { store.close() }
-    let ref = try SecretReference("mop://v/login/password")
+    let ref = try SecretReference("secondpass://v/login/password")
     try store.write(ref, value: "secret", replace: false)
     let before = try VaultDocument.decode(store.snapshot)
     opener.allowRecords = false
@@ -483,8 +483,8 @@ private final class CountingOpener: VaultSigningOpener {
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
     let date = Date(timeIntervalSince1970: 1_000_000)
-    try store.write(SecretReference("mop://v/old/password"), value: "old", replace: false)
-    try store.write(SecretReference("mop://v/keep/password"), value: "keep", replace: false)
+    try store.write(SecretReference("secondpass://v/old/password"), value: "old", replace: false)
+    try store.write(SecretReference("secondpass://v/keep/password"), value: "keep", replace: false)
     try store.trashItem(name: "old", revision: store.catalog().revision, at: date)
     let deleted = try #require(store.recentlyDeleted(at: date).items.first?.deletion)
     let snapshot = store.snapshot
@@ -494,7 +494,7 @@ private final class CountingOpener: VaultSigningOpener {
     #expect(throws: MopError.notFound) { try store.restoreItem(id: deleted.id, revision: store.catalog().revision, at: deleted.expiresAt) }
     #expect(try store.purgeExpiredItems(at: deleted.expiresAt))
     #expect(try VaultDocument.decode(store.snapshot).records.count == 1)
-    #expect(try store.read(SecretReference("mop://v/keep/password")) == "keep")
+    #expect(try store.read(SecretReference("secondpass://v/keep/password")) == "keep")
     #expect(try store.recentlyDeleted(at: .distantPast).items.isEmpty)
 }
 
@@ -503,7 +503,7 @@ private final class CountingOpener: VaultSigningOpener {
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
-    let ref = try SecretReference("mop://v/login/password"), date = Date()
+    let ref = try SecretReference("secondpass://v/login/password"), date = Date()
     try store.write(ref, value: "old", replace: false)
     let snapshot = store.snapshot
     #expect(throws: MopError.vaultConflict) { try store.trashItem(name: "login", revision: "stale", at: date) }
@@ -574,7 +574,7 @@ private final class CountingOpener: VaultSigningOpener {
     #expect(store.snapshot == initialSnapshot)
     item.fields[0].value = "JBSWY3DPEHPK3PXP"
     try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: true))
-    let ref = try SecretReference("mop://v/otp-login/otp"), saved = store.snapshot
+    let ref = try SecretReference("secondpass://v/otp-login/otp"), saved = store.snapshot
     #expect(throws: MopError.invalidOTP) { try store.write(ref, value: "invalid", replace: true) }
     #expect(store.snapshot == saved)
     let unchanged = try #require(store.catalog().items.first { $0.name == "otp-login" })
@@ -587,14 +587,14 @@ private final class CountingOpener: VaultSigningOpener {
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try VaultSession(snapshot: initial, trust: trust, opener: device)
     defer { store.close() }
-    try store.write(SecretReference("mop://v/login/otp"), value: "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP", replace: false)
+    try store.write(SecretReference("secondpass://v/login/otp"), value: "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP", replace: false)
     var item = try #require(store.catalog().items.first { $0.name == "login" })
     #expect(item.fields[0].type == .concealed && item.fields[0].value == nil)
     item.fields[0].type = .otp
     try store.saveItem(ItemEdit(revision: store.catalog().revision, item: item, create: false))
     let converted = try #require(store.catalog().items.first { $0.name == "login" })
     #expect(converted.fields[0].type == .otp && converted.fields[0].value == nil)
-    try store.write(SecretReference("mop://v/login/other"), value: "not-an-otp", replace: false)
+    try store.write(SecretReference("secondpass://v/login/other"), value: "not-an-otp", replace: false)
     var invalid = try #require(store.catalog().items.first { $0.name == "login" })
     invalid.fields[1].type = .otp
     let previous = store.snapshot

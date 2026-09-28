@@ -63,7 +63,7 @@ public enum PasswordImport {
             return quoted(field.label ?? field.path.removingPercentEncoding ?? field.path) + " (" + structure + ")"
         }
         if !retained.isEmpty {
-            warnings.append("Source fields kept as hidden reference data: " + retained.joined(separator: ", ") + ". Mop does not interpret these fields.")
+            warnings.append("Source fields kept as hidden reference data: " + retained.joined(separator: ", ") + ". 2ndPass does not interpret these fields.")
         }
         if item.fields.isEmpty { return ImportRecord(id: id, item: item, warnings: warnings + ["No importable fields or attachments remain in this item."]) }
         return ImportRecord(id: id, item: item, warnings: warnings)
@@ -124,7 +124,7 @@ public enum PasswordImport {
         let exact = prefixes.map { $0 + exportedName }.filter { matches.contains($0) }
         let path = exact.count == 1 ? exact[0] : exact.isEmpty && matches.count == 1 ? matches[0] : nil
         guard let path, let entry = archive[path], entry.type == .file else {
-            warnings.append("Attachment \(display) skipped: \(matches.isEmpty ? "Mop could not locate an archive file matching its documentId (checked double- and triple-underscore filenames)" : "multiple archive files match its documentId")."); return
+            warnings.append("Attachment \(display) skipped: \(matches.isEmpty ? "2ndPass could not locate an archive file matching its documentId (checked double- and triple-underscore filenames)" : "multiple archive files match its documentId")."); return
         }
         guard entry.uncompressedSize <= Attachment.maximumBytes else {
             warnings.append("Attachment \(display) skipped: \(entry.uncompressedSize) bytes exceeds the 8 MiB attachment limit."); return
@@ -238,7 +238,7 @@ public enum PasswordImport {
             let known: Set<String> = ["title", "name", "url", "website", "username", "password", "notes", "extra", "otpauth", "one-time password", "login_uri", "login_username", "login_password", "login_totp", "type", "folder", "grouping", "tags", "favorite", "favorite status", "fav", "archived", "archived status", "passwordhistory"]
             preserve(values, excluding: known, to: &item)
             var warnings: [String] = []
-            if type == .custom { warnings.append("Source category \(quoted(values["type"] ?? "missing")) has no Mop template; imported as Custom with \(item.fields.count) fields.") }
+            if type == .custom { warnings.append("Source category \(quoted(values["type"] ?? "missing")) has no 2ndPass template; imported as Custom with \(item.fields.count) fields.") }
             return finish(item, id: id, warnings: warnings)
         }
         return ImportDocument(format: format, records: records)
@@ -326,12 +326,12 @@ public enum PasswordImport {
                 let info = rawAttachment as? [String: Any] ?? [:]
                 warnings.append("Attachment \(quoted(text(info["fileName"]).isEmpty ? "unnamed" : text(info["fileName"]))) is listed in Bitwarden JSON, but the export contains no file bytes. Add the original file separately.")
             }
-            if flag(entry["reprompt"]) { warnings.append("Bitwarden reprompt is enabled for this item. Mop uses its own unlock policy; it cannot request the source master password.") }
+            if flag(entry["reprompt"]) { warnings.append("Bitwarden reprompt is enabled for this item. 2ndPass uses its own unlock policy; it cannot request the source master password.") }
             if entry["deletedDate"] != nil && !(entry["deletedDate"] is NSNull) {
                 return ImportRecord(id: offset + 1, item: nil, warnings: ["Bitwarden deletedDate is set; this item is in the source trash and was skipped."])
             }
             preserve(entry, excluding: ["id", "organizationId", "folderId", "collectionIds", "type", "name", "notes", "favorite", "archived", "archivedDate", "login", "card", "identity", "bankAccount", "sshKey", "secureNote", "fields", "attachments", "reprompt", "deletedDate", "revisionDate", "creationDate", "passwordHistory"], to: &item)
-            if type == .custom { warnings.append("Bitwarden item type \(quoted(text(entry["type"]))) has no Mop template; imported as Custom with \(item.fields.count) fields.") }
+            if type == .custom { warnings.append("Bitwarden item type \(quoted(text(entry["type"]))) has no 2ndPass template; imported as Custom with \(item.fields.count) fields.") }
             return finish(item, id: offset + 1, warnings: warnings)
         }
         return ImportDocument(format: .bitwardenJSON, records: records)
@@ -442,7 +442,7 @@ public enum PasswordImport {
                                 try importAttachment(file, label: label, archive: archive, paths: paths, contents: &contents, total: &total, item: &item, warnings: &warnings)
                                 continue
                             }
-                            if value["passkey"] != nil { warnings.append("Field \(quoted(label.isEmpty ? fieldID : label)) (source type passkey) was skipped; Mop cannot import passkeys. Re-enroll it before removing the source item."); continue }
+                            if value["passkey"] != nil { warnings.append("Field \(quoted(label.isEmpty ? fieldID : label)) (source type passkey) was skipped; 2ndPass cannot import passkeys. Re-enroll it before removing the source item."); continue }
                             if let ssh = value["sshKey"] as? [String: Any] {
                                 let metadata = ssh["metadata"] as? [String: Any] ?? [:]
                                 add("privateKey", .privateKey, metadata["privateKey"] ?? ssh["privateKey"], to: &item)
@@ -511,7 +511,7 @@ public enum PasswordImport {
                         try importAttachment(file, label: "", archive: archive, paths: paths, contents: &contents, total: &total, item: &item, warnings: &warnings)
                     }
                     preserve(details, excluding: ["notesPlain", "password", "loginFields", "sections", "documentAttributes", "files", "passwordHistory", "htmlForm"], to: &item)
-                    if type == .custom { warnings.append("1Password \(categoryDescription(text(source["categoryUuid"]))) has no Mop template; imported as Custom with \(item.fields.count) fields. Source section titles: \((details["sections"] as? [[String: Any]] ?? []).map { quoted(text($0["title"])) }.joined(separator: ", ")).") }
+                    if type == .custom { warnings.append("1Password \(categoryDescription(text(source["categoryUuid"]))) has no 2ndPass template; imported as Custom with \(item.fields.count) fields. Source section titles: \((details["sections"] as? [[String: Any]] ?? []).map { quoted(text($0["title"])) }.joined(separator: ", ")).") }
                     records.append(finish(item, id: records.count + 1, warnings: warnings))
                 }
             }

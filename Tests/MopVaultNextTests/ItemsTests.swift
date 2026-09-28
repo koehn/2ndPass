@@ -3,6 +3,28 @@ import Testing
 import MopCore
 @testable import MopVaultNext
 
+@Test func removalReportsFieldProgressAndCanStopBeforePublication() throws {
+    let owner = try TestDevice(), other = try TestDevice(member: owner.identity.member)
+    var vault = try VaultEngine.create(name: "personal", owner: owner)
+    vault = try VaultEngine.write("login/password", value: SecretBytes(utf8: "secret"), in: vault, device: owner)
+    let invitation = try VaultEngine.invite(member: other.identity.member, role: .owner, to: vault, owner: owner, expires: Date().addingTimeInterval(60))
+    let acceptance = try Acceptance(invitation: invitation, expectedCheckpoint: vault.digest, device: other)
+    vault = try VaultEngine.approve(acceptance, expectedDeviceFingerprint: other.identity.fingerprint, in: vault, owner: owner)
+    #expect(throws: MopError.operationCancelled) {
+        try VaultEngine.remove(device: other.identity.device, from: vault, owner: owner) { completed, _ in
+            if completed == 1 { throw MopError.operationCancelled }
+        }
+    }
+    var counts: [Int] = []
+    let removed = try VaultEngine.remove(device: other.identity.device, from: vault, owner: owner) { completed, total in
+        #expect(total == 1)
+        counts.append(completed)
+    }
+    #expect(counts == [0, 1])
+    #expect(try VaultEngine.read("login/password", in: removed, device: owner) == SecretBytes(utf8: "secret"))
+    #expect(throws: MopError.notVaultMember) { try VaultEngine.read("login/password", in: removed, device: other) }
+}
+
 @Test func typedItemEditsAndRemovalPreserveOnlyCurrentEncryptedFields() throws {
     let owner = try TestDevice(), recovery = try TestDevice()
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
@@ -77,6 +99,11 @@ import MopCore
     exchange.invitation = InvitationPacket(request: device, invitation: invitation, address: address, checkpoint: vault.bytes)
     _ = try exchange.verifiedInvitation(at: address)
     #expect(exchange.verificationCode?.count == 29)
+    exchange.invitation = InvitationPacket(request: device, invitation: invitation, address: address, checkpoint: Data())
+    #expect(try exchange.verifiedInvitation(at: address, referencedCheckpoint: vault.bytes).digest == vault.digest)
+    #expect(throws: MopError.vaultUntrusted) { try exchange.verifiedInvitation(at: address) }
+    let other = try VaultEngine.create(name: "other", owner: owner)
+    #expect(throws: MopError.vaultUntrusted) { try exchange.verifiedInvitation(at: address, referencedCheckpoint: other.bytes) }
     var box = EnrollmentMailbox(); box.exchanges = [exchange, exchange]
     #expect(throws: MopError.invalidVault) { try box.encoded() }
 }
@@ -144,14 +171,14 @@ import MopCore
     var oldHeader = extended.revision.header
     oldHeader.requiredFeatures = nil
     // An older decoder discards the unknown header key; canonical re-encoding therefore differs.
-    let oldEncoding = Revision(header: oldHeader, catalog: extended.revision.catalog, records: extended.revision.records,
+    let oldEncoding = Revision(header: oldHeader, catalog: extended.revision.catalog, records: extended.revision.records, itemKeys: extended.revision.itemKeys,
                                author: extended.revision.author, signature: extended.revision.signature)
     #expect(try oldEncoding.encoded() != extended.bytes)
     var stripped = try VaultEngine.header(extended, operation: .content)
     stripped.requiredFeatures = nil
     let payload = try extended.revision.payload(device: owner)
     var legacyItem = payload.items[0]; legacyItem.metadata = nil
-    let downgrade = try Revision.seal(header: stripped, references: payload.references, records: extended.revision.records, items: [legacyItem], signer: owner)
+    let downgrade = try Revision.seal(header: stripped, references: payload.references, records: extended.revision.records, itemKeys: extended.revision.itemKeys, items: [legacyItem], signer: owner)
     #expect(throws: MopError.invalidVault) { try extended.applying(downgrade.encoded()) }
 }
 
@@ -169,7 +196,7 @@ import MopCore
     var downgradedHeader = try VaultEngine.header(vault, operation: .content)
     downgradedHeader.requiredFeatures = ["item-model-1"]
     let downgrade = try Revision.seal(header: downgradedHeader,
-        references: vault.revision.references(device: owner), records: vault.revision.records, signer: owner)
+        references: vault.revision.references(device: owner), records: vault.revision.records, itemKeys: vault.revision.itemKeys, signer: owner)
     #expect(throws: MopError.invalidVault) { try vault.applying(downgrade.encoded()) }
     var stored = try #require(VaultEngine.catalog(in: vault, device: owner).items.first { $0.name == "File" })
     #expect(stored.fields[0].value == nil)
@@ -220,4 +247,20 @@ import MopCore
     let bytes = try vault.revision.encoded()
     let reloaded = try VerifiedVault(checkpoint: bytes, independentlyVerifiedDigest: Codec.digest(bytes))
     #expect(try VaultEngine.read("Address/address", in: reloaded, device: owner) == read)
+}
+
+@Test func importProgressCountsCompletedItemsAndCanCancel() throws {
+    let owner = try TestDevice(), root = try VaultEngine.create(name: "personal", owner: owner)
+    let items = (0..<3).map { VaultItem(name: "item-\($0)", fields: [.init(path: "password", type: .password, value: "synthetic")]) }
+    var counts: [Int] = []
+    _ = try VaultEngine.importItems(items, revision: root.digest, in: root, device: owner) { completed, total in
+        #expect(total == 3); counts.append(completed)
+    }
+    #expect(counts == [0, 1, 2, 3])
+    #expect(throws: CancellationError.self) {
+        try VaultEngine.importItems(items, revision: root.digest, in: root, device: owner) { completed, _ in
+            if completed == 1 { throw CancellationError() }
+        }
+    }
+    #expect(try VaultEngine.catalog(in: root, device: owner).items.isEmpty)
 }

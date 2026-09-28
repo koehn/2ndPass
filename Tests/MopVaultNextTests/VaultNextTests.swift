@@ -130,7 +130,7 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     vault = try add(editor, role: .editor, to: vault, owner: owner)
     let malicious = try Membership(accounts: [AccountMember(id: editor.identity.member, role: .owner, devices: [editor.identity])], recovery: recovery.identity)
-    let header = Revision.Header(format: "mop-vault-v6", vault: vault.id, name: vault.name, generation: vault.generation + 1,
+    let header = Revision.Header(format: "mop-vault-v7", vault: vault.id, name: vault.name, generation: vault.generation + 1,
         parent: vault.digest, epoch: vault.revision.header.epoch + 1, membership: malicious, operation: .membership,
         acceptedInvitations: vault.revision.header.acceptedInvitations)
     let forged = try Revision.seal(header: header, references: [:], records: [:], signer: editor)

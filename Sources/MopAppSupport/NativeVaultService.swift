@@ -1,6 +1,8 @@
 import Foundation
 import CloudKit
 import LocalAuthentication
+import OSLog
+import Synchronization
 import MopCore
 import MopAuth
 import MopVaultNext
@@ -11,6 +13,10 @@ import MopVaultNext
 public final class NativeVaultService: VaultService, @unchecked Sendable {
     private let control = SessionControl()
     private let gate = OperationGate()
+    private let progressState = Mutex<(String, Double?)?>(nil)
+    public var operationProgress: String? { progressState.withLock { $0?.0 } }
+    public var operationFraction: Double? { progressState.withLock { $0?.1 } }
+    private func reportProgress(_ message: String, fraction: Double? = nil) { progressState.withLock { $0 = (message, fraction) } }
     private let state: URL
     private let configuration: any VaultPlatformConfiguration
     private let documents: any DocumentAccessing
@@ -30,9 +36,10 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         makeTransport = { try CloudRevisionTransport(container: $0, environment: $1) }
         deleteDevice = { try DeviceKeychain.remove(scope: $0, member: $1) }
         openDevice = { try DeviceKeychain.open(scope: $0, member: $1, context: $2, create: $3) }
-        authenticate = { try await Authentication.authorizeAsync(reason: "use your Mop device keys", contextCreated: $0) }
+        authenticate = { try await Authentication.authorizeAsync(reason: "use your 2ndPass device keys", contextCreated: $0) }
         self.state = state ?? configuration.stateDirectory; self.configuration = configuration; self.documents = documents
         publishesAutoFill = state == nil && Bundle.main.object(forInfoDictionaryKey: "MopPublishesAutoFill") as? Bool == true
+        if publishesAutoFill { Task { try? await AutoFillPublisher.shared.refresh() } }
         let directory = self.state, control = self.control
         accountObserver = NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: nil) { _ in
             control.lock(); try? NextAccountBinding.invalidate(state: directory)
@@ -56,6 +63,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         let token = control.generation
         let task = Task.detached { [self] in
             await gate.enter()
+            progressState.withLock { $0 = nil }
             do {
                 try control.check(token)
                 var result = try await run(operation, selection: vault, offline: offline, token: token)
@@ -64,8 +72,10 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     do { try await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault) }
                     catch { result.autoFillStatus = await AutoFillPublisher.shared.status() }
                 }
+                progressState.withLock { $0 = nil }
                 await gate.leave(); return result
             } catch {
+                progressState.withLock { $0 = nil }
                 if let registry = removedRegistry {
                     do { control.lock(); try await clearRemovedAccount(registry); removedRegistry = nil }
                     catch { await gate.leave(); throw error }
@@ -109,7 +119,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             try await clearRemovedAccount(registry)
             if case .manage(.reconnect) = operation {
                 try registry.setRemoved(false)
-                result.message = "Ready to reconnect. Open and unlock Mop on another device."
+                result.message = "Ready to reconnect. Open and unlock 2ndPass on another device."
                 return result
             }
             if case .discover = operation { result.deviceRemoved = true; return result }
@@ -141,6 +151,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     }
                 }
                 if case .removeAccountDevice(let id) = action {
+                    reportProgress("Checking device access…")
                     var completed: [String] = []
                     for entry in affected {
                         do {
@@ -175,7 +186,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         }
         if case .discover = operation {
             let entries = try registry.entries()
-            result.vaults = entries.map { VaultDescriptor(id: $0.address.vault.uuidString, name: $0.name, format: "mop-vault-v6", enrolled: $0.ready) }
+            result.vaults = entries.map { VaultDescriptor(id: $0.address.vault.uuidString, name: $0.name, format: "mop-vault-v7", enrolled: $0.ready) }
             if !offline {
                 let discovered = try await transport.discover()
                 try control.check(token)
@@ -183,7 +194,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 for address in discovered where !entries.contains(where: { $0.address == address }) {
                     // No registry pin and no key access: cloud visibility is not trust.
                     if !result.vaults.contains(where: { $0.id == address.vault.uuidString }) {
-                        result.vaults.append(VaultDescriptor(id: address.vault.uuidString, name: "iCloud vault · " + String(address.vault.uuidString.prefix(8)), format: "mop-vault-v6", enrolled: false))
+                        result.vaults.append(VaultDescriptor(id: address.vault.uuidString, name: "iCloud vault · " + String(address.vault.uuidString.prefix(8)), format: "mop-vault-v7", enrolled: false))
                     }
                 }
             }
@@ -308,8 +319,10 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                         result.message = "Request declined. Choose Restart connection to try again."
                         return result
                     }
-                    if remote.invitation != nil {
-                        let root = try remote.verifiedInvitation(at: address)
+                    if let packet = remote.invitation {
+                        let referenced = packet.checkpoint.isEmpty
+                            ? try await transport.revision(packet.invitation.checkpoint, at: address) : nil
+                        let root = try remote.verifiedInvitation(at: address, referencedCheckpoint: referenced)
                         if case .confirmEnrollment(let code) = action {
                             guard local.verificationCode == code, remote.verificationCode == code,
                                   local.acceptance != nil else { throw MopError.vaultUntrusted }
@@ -350,14 +363,14 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                         // A missing server invitation invalidates the displayed code.
                         local.invitation = nil; local.acceptance = nil; local.confirmedCode = nil; local.approved = nil
                         try registry.saveEnrollment(local)
-                        result.enrollments = [local]; result.message = "Waiting for another device. Open and unlock Mop there to connect automatically."
+                        result.enrollments = [local]; result.message = "Waiting for another device. Open and unlock 2ndPass there to connect automatically."
                     }
                 } else {
                     local.invitation = nil; local.acceptance = nil; local.confirmedCode = nil; local.approved = nil
                     try registry.saveEnrollment(local)
                     mailbox.exchanges.append(local)
                     try control.check(token); try await transport.saveEnrollment(mailbox, version: inbox.version, at: address)
-                    result.enrollments = [local]; result.message = "Waiting for another device. Open and unlock Mop there to connect automatically."
+                    result.enrollments = [local]; result.message = "Waiting for another device. Open and unlock 2ndPass there to connect automatically."
                 }
                 return result
             default: break
@@ -515,7 +528,14 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             case .read(let reference):
                 if let digest = try current.attachmentDigest(for: reference.relativePath, device: key) { needed.insert(digest) }
             case .export, .previewImport, .commitImport: needed = current.attachmentDigests
-            case .manage(.removeMember), .manage(.removeDevice), .manage(.replaceRecovery): needed = current.attachmentDigests
+            case .manage(.removeMember), .manage(.removeDevice):
+                reportProgress("Preparing encrypted files…")
+                needed = current.attachmentDigests
+            case .manage(.replaceRecovery):
+                if current.membership.recovery != nil {
+                    reportProgress("Preparing encrypted files…")
+                    needed = current.attachmentDigests
+                }
             case .sync, .catalog:
                 if !offline && (attachmentSyncOverride ?? AttachmentDownloadSettings.duringSync) { needed = current.attachmentDigests }
             default: break
@@ -530,12 +550,19 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 guard current.membership.role(of: key.identity) == .owner, entry.address.database == .private else { throw MopError.cloudPermission }
                 let inbox = try await transport.enrollment(at: entry.address)
                 var mailbox = inbox.mailbox
+                let enrollmentLogger = Logger(subsystem: "com.koehn.mop", category: "Enrollment")
+                enrollmentLogger.notice("Owner check: \(mailbox.exchanges.count) requests")
                 mailbox.exchanges.removeAll { $0.request.expires <= Date() }
                 var changed = mailbox.exchanges.count != inbox.mailbox.exchanges.count
                 for index in mailbox.exchanges.indices {
                     var exchange = mailbox.exchanges[index]
                     // Never display malformed requests as actionable approval prompts.
-                    guard (try? exchange.request.validate(at: entry.address)) != nil else { continue }
+                    do { try exchange.request.validate(at: entry.address) }
+                    catch {
+                        enrollmentLogger.error("Skipping invalid enrollment request: \(String(describing: error), privacy: .public)")
+                        continue
+                    }
+                    enrollmentLogger.notice("Request state: invited=\(exchange.invitation != nil) accepted=\(exchange.acceptance != nil) approved=\(exchange.approved != nil) rejected=\(exchange.rejected)")
                     if (current.membership.removedDevices ?? []).contains(exchange.request.request.device.device) {
                         exchange.rejected = true; mailbox.exchanges[index] = exchange; changed = true
                         continue
@@ -543,7 +570,9 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     if exchange.rejected || exchange.approved != nil || exchange.invitation.map({ current.acceptedEnrollment($0.invitation.nonce) }) == true { continue }
                     if exchange.invitation?.invitation.checkpoint != current.digest {
                         let invitation = try VaultEngine.invite(member: exchange.request.request.device.member, role: .owner, to: current, owner: key, expires: exchange.request.expires)
-                        exchange.invitation = InvitationPacket(request: exchange.request.request, invitation: invitation, address: entry.address, checkpoint: current.bytes)
+                        // The signed invitation pins a revision already in CloudKit.
+                        // Repeating its bytes per device can overflow the mailbox.
+                        exchange.invitation = InvitationPacket(request: exchange.request.request, invitation: invitation, address: entry.address, checkpoint: Data())
                         exchange.acceptance = nil; exchange.approved = nil
                         mailbox.exchanges[index] = exchange; changed = true
                     }
@@ -566,16 +595,23 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     guard let index = mailbox.exchanges.firstIndex(where: { $0.id == id }) else { throw MopError.invalidIdentity }
                     var exchange = mailbox.exchanges[index]
                     guard !exchange.rejected else { throw MopError.invalidIdentity }
-                    _ = try exchange.verifiedInvitation(at: entry.address)
+                    var referenced: Data?
+                    if let packet = exchange.invitation, packet.checkpoint.isEmpty {
+                        // An uncertain publication may already have advanced the head.
+                        // Verify against the invitation's pinned revision, not that head.
+                        referenced = packet.invitation.checkpoint == current.digest ? current.bytes
+                            : try await transport.revision(packet.invitation.checkpoint, at: entry.address)
+                    }
+                    _ = try exchange.verifiedInvitation(at: entry.address, referencedCheckpoint: referenced)
                     guard exchange.verificationCode == code, let acceptance = exchange.acceptance,
                           acceptance.device == exchange.request.request.device,
                           acceptance.invitation.nonce == exchange.invitation?.invitation.nonce else { throw MopError.vaultConflict }
                     if !current.acceptedEnrollment(acceptance.invitation.nonce) {
                         let proposal = try VaultEngine.approve(acceptance, expectedDeviceFingerprint: acceptance.device.fingerprint, in: current, owner: key)
-                        try control.check(token); try await coordinator.publish(proposal)
+                        try control.check(token); try await coordinator.publish(proposal) { self.reportProgress($0) }
                         current = proposal
                     }
-                    exchange.approved = current.bytes; mailbox.exchanges[index] = exchange; changed = true
+                    exchange.approved = Data(); mailbox.exchanges[index] = exchange; changed = true
                     result.message = "Device approved. It will open the vault automatically."
                 }
                 if changed { try control.check(token); try await transport.saveEnrollment(mailbox, version: inbox.version, at: entry.address) }
@@ -625,9 +661,15 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             result.importPreview = plan.preview
             return result
         case .commitImport(let document, let selected, let vaultID, let revision):
+            reportProgress("Checking selected items…")
             guard vaultID == current.id, revision == current.digest else { throw MopError.vaultConflict }
             let plan = try VaultEngine.previewImport(document, selected: selected, in: current, device: key)
-            if !plan.items.isEmpty { proposal = try VaultEngine.importItems(plan.items, revision: revision, in: current, device: key) }
+            if !plan.items.isEmpty {
+                proposal = try VaultEngine.importItems(plan.items, revision: revision, in: current, device: key) { completed, total in
+                    try self.control.check(token)
+                    self.reportProgress("Encrypting items: \(completed) of \(total)", fraction: total > 0 ? Double(completed) / Double(total) : nil)
+                }
+            }
             var report = plan.preview.report; report.imported = plan.items.count; report.committed = true
             result.importReport = report
         case .save(let edit): proposal = try VaultEngine.saveItem(edit, in: current, device: key)
@@ -698,7 +740,12 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 proposal = try VaultEngine.approve(packet.acceptance, expectedDeviceFingerprint: request.device.fingerprint, in: current, owner: key)
                 reconcile = true
             case .removeMember(let id): proposal = try VaultEngine.remove(member: id, from: current, owner: key); reconcile = true
-            case .removeDevice(let id): proposal = try VaultEngine.remove(device: id, from: current, owner: key); reconcile = true
+            case .removeDevice(let id):
+                proposal = try VaultEngine.remove(device: id, from: current, owner: key) { completed, total in
+                    try self.control.check(token)
+                    self.reportProgress("Updating encryption: \(completed) of \(total) items")
+                }
+                reconcile = true
             case .role(let id, let role): proposal = try VaultEngine.setRole(role, member: id, in: current, owner: key); reconcile = true
             case .replaceRecovery(let bytes, let fingerprint):
                 let request = try checkedRequest(bytes, fingerprint: fingerprint, recovery: true)
@@ -712,11 +759,15 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         default: throw MopError.invalidProcess
         }
         if let proposal {
+            if operationProgress != nil { reportProgress("Saving the updated vault to iCloud…") }
             try attachments.cache(proposal)
-            try control.check(token); try await coordinator.publish(proposal)
+            try control.check(token); try await coordinator.publish(proposal) { self.reportProgress($0) }
             try control.check(token)
             entry.name = proposal.name; entry.ready = true; try registry.put(entry)
-            if reconcile { try await transport.reconcileShare(proposal.membership, at: entry.address) }
+            if reconcile {
+                if operationProgress != nil { reportProgress("Confirming cloud access…") }
+                try await transport.reconcileShare(proposal.membership, at: entry.address)
+            }
             result.message = "Published checkpoint: \(proposal.digest)"
         }
         let verified = proposal ?? current

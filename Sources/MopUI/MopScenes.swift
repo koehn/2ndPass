@@ -18,7 +18,7 @@ public struct MopScenes: Scene {
     }
     public var body: some Scene {
         #if os(macOS)
-        Window("mop", id: "main") {
+        Window("2ndPass", id: "main") {
             MopRootView(model: model)
                 .frame(minWidth: 820, minHeight: 540)
         }
@@ -65,7 +65,7 @@ private struct MopCommands: Commands {
                 if model.authenticated {
                     Button("Lock") { model.lock() }.keyboardShortcut("l", modifiers: [.command, .shift])
                 } else {
-                    Button("Unlock Mop") { model.unlock() }.disabled(!model.canUnlock)
+                    Button("Unlock 2ndPass") { model.unlock() }.disabled(!model.canUnlock)
                 }
             }
     }
@@ -149,11 +149,16 @@ struct SessionSettings: View {
                     if customTimeout || !durations.contains(model.autoLockMinutes) {
                         Stepper("\(model.autoLockMinutes) minutes", value: $model.autoLockMinutes, in: 1...60)
                     }
-                    Text("Activity in Mop keeps your session open. Switching apps conceals secrets. Security locking clears unsaved edits immediately.").font(.callout)
+                    Text("Activity in 2ndPass keeps your session open. Switching apps conceals secrets. Security locking clears unsaved edits immediately.").font(.callout)
                 }
             case .autoFill: AutoFillSettingsView(model: model)
             case .devices:
             Section("Devices") {
+                if model.removingDevice {
+                    ProgressView(model.removalProgress ?? "Removing device…")
+                    Text("Keep 2ndPass open while encryption is updated and the change is saved to iCloud.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Text("Devices connected to your enrolled personal vaults.").font(.caption).foregroundStyle(.secondary)
                 ForEach(model.devices) { device in
                     HStack {
@@ -169,7 +174,7 @@ struct SessionSettings: View {
                             .disabled(model.busy || model.offline || model.devices.count < 2)
                     }
                 }
-                if model.devices.isEmpty { Text(model.authenticated ? "Refresh to load enrolled devices." : "Unlock Mop to view connected devices.").foregroundStyle(.secondary) }
+                if model.devices.isEmpty { Text(model.authenticated ? "Refresh to load enrolled devices." : "Unlock 2ndPass to view connected devices.").foregroundStyle(.secondary) }
                 if model.authenticated {
                     Button("Refresh devices") { model.loadDevices() }.disabled(model.busy || model.offline)
                 } else {

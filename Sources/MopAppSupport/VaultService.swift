@@ -86,11 +86,15 @@ public struct VaultResult: Sendable {
 }
 public protocol VaultService: Sendable {
     var authenticatedAt: TimeInterval? { get }
+    var operationProgress: String? { get }
+    var operationFraction: Double? { get }
     func lock()
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult
 }
 
 public extension VaultService {
+    var operationProgress: String? { nil }
+    var operationFraction: Double? { nil }
     var isAuthenticated: Bool { authenticatedAt != nil }
 }
 

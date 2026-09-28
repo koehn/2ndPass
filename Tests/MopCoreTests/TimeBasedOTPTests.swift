@@ -18,7 +18,7 @@ struct TimeBasedOTPTests {
     }
     @Test func rawSecretURLEquivalenceAndRollover() throws {
         let raw = try TimeBasedOTP("jbsw y3dp ehpk 3pxp")
-        let url = try TimeBasedOTP("otpauth://totp/Mop:test@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Mop&algorithm=SHA1&digits=6&period=30")
+        let url = try TimeBasedOTP("otpauth://totp/2ndPass:test@example.com?secret=JBSWY3DPEHPK3PXP&issuer=2ndPass&algorithm=SHA1&digits=6&period=30")
         for time: TimeInterval in [0, 29, 30, 59, 60] {
             #expect(try raw.code(at: Date(timeIntervalSince1970: time)) == url.code(at: Date(timeIntervalSince1970: time)))
         }

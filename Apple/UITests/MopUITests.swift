@@ -20,7 +20,7 @@ import XCTest
         app.launch()
         XCTAssertTrue(app.buttons["Connect"].waitForExistence(timeout: 10))
         app.buttons["Connect"].tap()
-        let waiting = app.staticTexts["Open and unlock Mop on another connected device."]
+        let waiting = app.staticTexts["Open and unlock 2ndPass on another connected device."]
         XCTAssertTrue(waiting.waitForExistence(timeout: 5))
         XCTAssertFalse(app.activityIndicators.firstMatch.exists)
         app.buttons["Close"].tap()
@@ -96,8 +96,8 @@ import XCTest
         app.launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        let seed = app.descendants(matching: .any)["otp-code-mop://personal/Example%20Login/otp"].firstMatch
-        let url = app.descendants(matching: .any)["otp-code-mop://personal/Example%20Login/otp-url"].firstMatch
+        let seed = app.descendants(matching: .any)["otp-code-secondpass://personal/Example%20Login/otp"].firstMatch
+        let url = app.descendants(matching: .any)["otp-code-secondpass://personal/Example%20Login/otp-url"].firstMatch
         XCTAssertTrue(seed.waitForExistence(timeout: 5))
         XCTAssertTrue(url.waitForExistence(timeout: 5))
         let numeric = NSPredicate(format: "label MATCHES '[0-9]{6}'")
@@ -105,7 +105,7 @@ import XCTest
         expectation(for: numeric, evaluatedWith: url)
         waitForExpectations(timeout: 5)
         XCTAssertEqual(seed.label, url.label)
-        let timer = app.descendants(matching: .any)["otp-countdown-mop://personal/Example%20Login/otp-url"].firstMatch
+        let timer = app.descendants(matching: .any)["otp-countdown-secondpass://personal/Example%20Login/otp-url"].firstMatch
         XCTAssertTrue(timer.waitForExistence(timeout: 5))
         XCTAssertTrue(timer.label.hasPrefix("Code expires in "))
         let legacyActions = app.buttons["Actions for otp-legacy"]
@@ -404,7 +404,7 @@ extension MopUITests {
         app.launch()
         XCTAssertTrue(app.buttons["Connect"].waitForExistence(timeout: 10))
         app.buttons["Connect"].click()
-        let waiting = app.staticTexts["Open and unlock Mop on another connected device."]
+        let waiting = app.staticTexts["Open and unlock 2ndPass on another connected device."]
         XCTAssertTrue(waiting.waitForExistence(timeout: 5))
         XCTAssertFalse(app.progressIndicators.firstMatch.exists)
         app.buttons["Close"].click()
@@ -423,7 +423,7 @@ extension MopUITests {
     func testLockRequiresExplicitUnlock() {
         let app = launch()
         app.buttons["Lock"].click()
-        let unlock = app.buttons["Unlock Mop"]
+        let unlock = app.buttons["Unlock 2ndPass"]
         XCTAssertTrue(unlock.waitForExistence(timeout: 5))
         app.buttons["All Items"].click()
         app.typeKey("r", modifierFlags: .command)

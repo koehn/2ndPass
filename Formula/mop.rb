@@ -5,7 +5,6 @@ class Mop < Formula
   version "0.3.0"
   sha256 "e921fd4dee0da4e8372f55d32f2f0df508eb7fc65f3a01364d34ab108805151d"
   license "MIT"
-  head "https://github.com/koehn/mop.git", branch: "main"
 
   depends_on xcode: ["16.0", :build]
   depends_on macos: :sequoia

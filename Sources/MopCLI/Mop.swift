@@ -5,9 +5,9 @@ import MopCore
 @main
 struct Mop: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "mop",
+        commandName: "2ndpass",
         abstract: "Read and manage an encrypted vault using your Mac's Secure Enclave.",
-        version: "0.6.0",
+        version: "0.7.0",
         subcommands: [Item.self, Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Completion.self, Device.self]
     )
 
@@ -27,26 +27,26 @@ struct Mop: AsyncParsableCommand {
         } catch let code as ExitCode {
             exit(withError: code)
         } catch let error as CompoundFieldFailure {
-            IO.diagnostic("mop: \(error.errorDescription ?? "Invalid structured field.")\n")
+            IO.diagnostic("2ndpass: \(error.errorDescription ?? "Invalid structured field.")\n")
             exit(withError: ExitCode(1))
         } catch let error as AttachmentFailure {
-            IO.diagnostic("mop: \(error.errorDescription ?? "Attachment operation failed.")\n")
+            IO.diagnostic("2ndpass: \(error.errorDescription ?? "Attachment operation failed.")\n")
             exit(withError: ExitCode(1))
         } catch let error as ImportFailure {
-            IO.diagnostic("mop: \(error.errorDescription ?? "Import failed.")\n")
+            IO.diagnostic("2ndpass: \(error.errorDescription ?? "Import failed.")\n")
             exit(withError: ExitCode(1))
         } catch let error as MopError {
-            IO.diagnostic("mop: \(error.errorDescription ?? "Operation failed.")\n")
+            IO.diagnostic("2ndpass: \(error.errorDescription ?? "Operation failed.")\n")
             exit(withError: ExitCode(error.exitCode))
         } catch {
             if exitCode(for: error) == .success { exit(withError: error) }
             if let known = knownValidationError(error) {
-                IO.diagnostic("mop: \(known.errorDescription!)\n")
+                IO.diagnostic("2ndpass: \(known.errorDescription!)\n")
                 exit(withError: ExitCode(known.exitCode))
             }
             // Parser diagnostics can echo unexpected arguments. Do not accidentally
             // reveal a secret supplied as an unsupported positional argument.
-            IO.diagnostic("mop: Invalid command arguments. Use 'mop --help' or 'mop <command> --help'.\n")
+            IO.diagnostic("2ndpass: Invalid command arguments. Use '2ndpass --help' or '2ndpass <command> --help'.\n")
             exit(withError: ExitCode(2))
         }
     }
@@ -56,7 +56,7 @@ struct Mop: AsyncParsableCommand {
 struct Read: AsyncParsableCommand {
     @OptionGroup var storage: VaultOptions
     static let configuration = CommandConfiguration(abstract: "Read one secret field.")
-    @Argument(help: "A mop://vault/item/[section/]field reference.") var reference: String
+    @Argument(help: "A secondpass://vault/item/[section/]field reference.") var reference: String
     @OptionGroup var output: OutputOptions
     @Flag(name: [.short, .long], help: "Do not append a newline.") var noNewline = false
 
@@ -109,7 +109,7 @@ struct Run: AsyncParsableCommand {
     @OptionGroup var storage: VaultOptions
     static let configuration = CommandConfiguration(
         abstract: "Resolve environment references and execute a command. Resolved secrets are masked on stdout and stderr by default.",
-        discussion: "Usage: mop run [--env-file FILE] -- COMMAND [ARGS...]. Later dotenv files override earlier files and inherited variables."
+        discussion: "Usage: 2ndpass run [--env-file FILE] -- COMMAND [ARGS...]. Later dotenv files override earlier files and inherited variables."
     )
     @Option(help: "Literal dotenv file. May be repeated.", completion: .file()) var envFile: [String] = []
     @Flag(help: "Disable output masking and preserve direct execution and terminal behavior.") var noMasking = false
@@ -131,7 +131,7 @@ struct Run: AsyncParsableCommand {
 
 struct Inject: AsyncParsableCommand {
     @OptionGroup var storage: VaultOptions
-    static let configuration = CommandConfiguration(abstract: "Resolve {{ mop://vault/item/[section/]field }} placeholders.")
+    static let configuration = CommandConfiguration(abstract: "Resolve {{ secondpass://vault/item/[section/]field }} placeholders.")
     @OptionGroup var output: OutputOptions
     @Option(name: [.short, .long], help: "Read a UTF-8 template file instead of stdin.", completion: .file()) var inFile: String?
 

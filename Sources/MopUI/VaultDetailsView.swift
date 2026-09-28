@@ -60,4 +60,6 @@ struct VaultDetailsView: View {
     var dirty = false
     var error: String?
     var submit: (() -> Void)?
+    var secondaryTitle: String?
+    var secondarySubmit: (() -> Void)?
 }

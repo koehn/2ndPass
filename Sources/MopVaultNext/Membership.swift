@@ -64,7 +64,7 @@ public struct Invitation: Codable, Sendable {
     public let issuer: DevicePublicKey
     public let signature: Data
     private struct Statement: Encodable {
-        let domain = "mop-v6-invitation"
+        let domain = "mop-v7-invitation"
         let vault: UUID; let checkpoint: String; let nonce: UUID; let member: UUID
         let role: MemberRole; let expires: Date; let issuer: DevicePublicKey
     }
@@ -88,7 +88,7 @@ public struct Acceptance: Codable, Sendable {
     public let device: DevicePublicKey
     public let signature: Data
     private struct Statement: Encodable {
-        let domain = "mop-v6-acceptance"
+        let domain = "mop-v7-acceptance"
         let invitation: String
         let device: DevicePublicKey
     }

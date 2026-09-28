@@ -27,8 +27,8 @@ Keep the existing macOS application and CLI working throughout the project.
 - Reuse the existing CloudKit container, vault format, encrypted item schema,
   enrollment protocol, recovery credentials, fingerprints, and backup format.
   Each physical phone or tablet enrolls as its own device with its own key.
-- Support one Mop window per mobile app initially, including iPad resizing and
-  multitasking. Multiple simultaneous Mop windows are a separate enhancement;
+- Support one 2ndPass window per mobile app initially, including iPad resizing and
+  multitasking. Multiple simultaneous 2ndPass windows are a separate enhancement;
   the Mac currently also uses a single main window.
 - Treat Password AutoFill, passkeys, OTP code generation, widgets, share extensions,
   and Shortcuts as follow-up work. They are not present in the Mac GUI and are
@@ -138,7 +138,7 @@ Never infer a security decision from a device's display name or icon.
 | Existing area | Planned change |
 | --- | --- |
 | `Package.swift` | Add mobile platform support and library products for app support/shared UI. Ensure mobile targets do not build CLI executables or desktop-only helpers. Verify the pinned zxcvbn dependency and dictionary resources in an installed mobile bundle. |
-| `MopAppSupport/VaultService.swift` | Keep typed operations, serialization, revision checks, and cancellation generations shared. Inject state location and platform identity configuration instead of mobile use of `~/.mop` or environment overrides. |
+| `MopAppSupport/VaultService.swift` | Keep typed operations, serialization, revision checks, and cancellation generations shared. Inject state location and platform identity configuration instead of mobile use of `~/.2ndpass` or environment overrides. |
 | `MopAppSupport/CLIClient.swift` | Move the subprocess adapter to a macOS-only target or conditionally compile it out of mobile builds. Mobile uses `NativeVaultService` directly. |
 | `MopApp/AppModel.swift` | Extract shared observable state and workflows into a library. Inject clipboard, lifecycle/activity, and file-presentation services; remove direct AppKit dependencies from shared state. Preserve separate operation and visibility generations. |
 | `MopApp` views | Move the root split view, item lists/cards, drafts, generator, strength, recently-deleted, settings, and management forms into one shared UI library. Thin build entry points and conditional scene modifiers must host the same root view. |
@@ -203,7 +203,7 @@ Proposed mobile lifecycle policy:
 3. Preserve an intentionally copied concealed value through ordinary app switching
    until its original 30-second expiry so copy/paste remains useful. Use a distinct
    background-lock path. Manual lock, observed device locking/protected-data loss,
-   account changes, and timeout clear Mop's owned concealed entry when executable.
+   account changes, and timeout clear 2ndPass's owned concealed entry when executable.
 4. Enforce deadlines on foreground entry; never depend on a suspended timer or
    termination callback for security. Do not save plaintext drafts for restoration.
 5. Count user touch, keyboard, pointer, and accessibility interaction toward
@@ -222,7 +222,7 @@ Implement the mobile adapter with `UIPasteboard`, `localOnly: true`, and a syste
 expiration date for concealed values. Track ownership/change count before clearing
 to avoid removing another app's newer content. Visible values and references retain
 the Mac's non-expiring behavior. Use system expiry as well as an in-process timer
-because iOS may suspend Mop. Verify replacement of a concealed copy with a visible
+because iOS may suspend 2ndPass. Verify replacement of a concealed copy with a visible
 copy cancels old ownership. See Apple's
 [pasteboard write options](https://developer.apple.com/documentation/uikit/uipasteboard/setitemproviders(_:localonly:expirationdate:)).
 
@@ -314,5 +314,5 @@ signing, SDK, and document-provider uncertainties.
 Proceed with the defaults above; none requires blocking this planning task.
 Before the release configuration is finalized, record the mobile bundle identifier,
 supported OS minimum, signing/provisioning ownership, distribution channel, and
-approved document-provider guarantees. Treat AutoFill and multiple Mop windows as
+approved document-provider guarantees. Treat AutoFill and multiple 2ndPass windows as
 separately scoped additions, not implicit requirements for the parity release.

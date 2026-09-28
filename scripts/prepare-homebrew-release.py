@@ -36,11 +36,13 @@ def main():
         if not re.search(r'version:\s*"' + re.escape(version) + r'"', read("Sources/MopCLI/Mop.swift")):
             raise ValueError("tag and CLI version do not match")
         read("Package.resolved")
-    formula = pathlib.Path(__file__).resolve().parents[1] / "Formula/mop.rb"
+    formula = pathlib.Path(__file__).resolve().parents[1] / "Formula/secondpass.rb"
     current = formula.read_text()
     metadata = (f'  url "{url}"\n'
                 f'  sha256 "{hashlib.sha256(archive).hexdigest()}"\n'
                 f'  license "{args.license}"\n')
+    if not re.search(r"^  url ", current, re.M):
+        current = current.replace('  license "MIT"\n', '  url PLACEHOLDER\n  license "MIT"\n', 1)
     updated, count = re.subn(r'  url .*?\n(?=  head )', lambda _: metadata, current, count=1, flags=re.S)
     if count != 1:
         raise ValueError("could not locate formula metadata; no changes made")

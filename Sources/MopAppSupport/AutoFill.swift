@@ -6,7 +6,7 @@ import MopKeychain
 
 public enum AutoFillKind: String, Codable, Sendable, CaseIterable {
     case password, oneTimeCode
-    var prefix: String { self == .password ? "mop-autofill-v6" : "mop-autofill-otp-v6" }
+    var prefix: String { self == .password ? "mop-autofill-v7" : "mop-autofill-otp-v7" }
 }
 
 /// Only websites, usernames, credential kinds and opaque locators leave the encrypted catalog.
@@ -187,7 +187,7 @@ public enum AutoFillStorage {
     public static func directory() throws -> URL {
         guard let group = SigningIdentity.appGroupIdentifier,
               !group.contains("$"), let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else { throw MopError.signing }
-        return root.appendingPathComponent("AutoFill", isDirectory: true)
+        return root.appendingPathComponent("AutoFillV7", isDirectory: true)
     }
 }
 

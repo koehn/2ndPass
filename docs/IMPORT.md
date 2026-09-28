@@ -17,14 +17,14 @@ Supported sources:
 | LastPass | Generic password/secure-note CSV |
 
 Use the source selector if detection fails. CSV must have a header and use UTF-8.
-Mop handles quoted commas, quotes, and multiline values. It preserves password
+2ndPass handles quoted commas, quotes, and multiline values. It preserves password
 whitespace. Password-manager export formats vary; unknown columns and structured
 values are retained as concealed source data where possible. Invalid records
 and unsupported features are reported. Passkeys and password history are not migrated. 1PUX file attachments and Document items are imported when the referenced file bytes are present.
 Keep access to the source manager until every warning has been resolved.
 
 Logins, passwords, secure notes, API credentials, databases, SSH keys, cards,
-identities, and documents use Mop's item templates. Source folders/collections become tags in
+identities, and documents use 2ndPass's item templates. Source folders/collections become tags in
 the selected vault. Favorites and archive state are retained when exported.
 Archived entries do not appear in normal lists or AutoFill; use the Archived
 filter and edit an item to unarchive it. Cards and identities have no system
@@ -38,7 +38,7 @@ If the selected batch exceeds vault capacity, choose fewer items or another
 vault. A failure before publication leaves the vault unchanged. If the server
 may have committed despite a lost response, refresh to reconcile before retrying.
 
-Update Mop on every connected device before using the new item types or metadata.
+Update 2ndPass on every connected device before using the new item types or metadata.
 Affected revisions contain a signed capability marker. Older clients reject
 those revisions rather than silently discarding metadata. Existing v6 vaults
 remain readable by the updated app, and encrypted backups/recovery retain the
@@ -47,9 +47,9 @@ new fields. This does not add support for pre-v6 vaults.
 ## Command line
 
 ```sh
-mop item import export.csv --vault personal --dry-run
-mop item import export.1pux --vault personal --yes
-mop item import export.json --vault personal --format bitwarden-json --dry-run --json
+2ndpass item import export.csv --vault personal --dry-run
+2ndpass item import export.1pux --vault personal --yes
+2ndpass item import export.json --vault personal --format bitwarden-json --dry-run --json
 ```
 
 Formats: `auto`, `apple-csv`, `chrome-csv`, `bitwarden-csv`, `1password-csv`,
@@ -58,17 +58,17 @@ noninteractive import requires `--yes`. Reports include titles, record numbers,
 status, and warnings, but no field values. Warnings identify source field names, category names/IDs, structural property types, and attachment failures. Treat titles, filenames, and field names as personal information.
 Exit status 0 means success (including duplicates), 2 means records need attention,
 and 1 means import failed or its publication outcome is uncertain.
-`mop vault import` still imports trusted encrypted Mop checkpoints.
+`2ndpass vault import` still imports trusted encrypted 2ndPass checkpoints.
 
 ## Handling export files
 
-Source exports contain unencrypted secrets. Mop reads them using coordinated,
+Source exports contain unencrypted secrets. 2ndPass reads them using coordinated,
 security-scoped access and does not stage plaintext copies. Import review state
 is not persisted and is cleared on lock, backgrounding, cancellation, or completion.
 Swift/Foundation text parsing creates memory copies that cannot be reliably wiped;
-Mop drops references when the operation ends and wipes owned byte buffers where
-possible. Mop never deletes the source file: check the results, then delete it
-manually, including copies made outside Mop.
+2ndPass drops references when the operation ends and wipes owned byte buffers where
+possible. 2ndPass never deletes the source file: check the results, then delete it
+manually, including copies made outside 2ndPass.
 
 Source-specific matching first uses exported stable item identity when available.
 When both records have source identities, different identities mean different
@@ -139,8 +139,8 @@ contains attachment metadata but no file bytes, so those files must be added
 separately. Exporting a file writes an unencrypted copy to the chosen destination.
 
 ```sh
-mop item attachment add proof.pdf --vault personal --item "Account" --field proof
-mop item attachment export mop://personal/Account/proof --output ./proof.pdf
+2ndpass item attachment add proof.pdf --vault personal --item "Account" --field proof
+2ndpass item attachment export secondpass://personal/Account/proof --output ./proof.pdf
 ```
 
 The CLI export refuses to overwrite an existing file and creates the destination

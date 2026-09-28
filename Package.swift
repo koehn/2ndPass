@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "mop",
+    name: "2ndpass",
     platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "MopUI", targets: ["MopUI"]),
@@ -10,9 +10,9 @@ let package = Package(
         .library(name: "MopAppSupport", targets: ["MopAppSupport"]),
         .library(name: "MopVaultNext", targets: ["MopVaultNext"]),
         .library(name: "MopKeychain", targets: ["MopKeychain"]),
-        .executable(name: "mop", targets: ["MopCLI"]),
+        .executable(name: "2ndpass", targets: ["MopCLI"]),
         .executable(name: "MopApp", targets: ["MopApp"]),
-        .executable(name: "mop-keychain-check", targets: ["MopKeychainCheck"]),
+        .executable(name: "2ndpass-keychain-check", targets: ["MopKeychainCheck"]),
     ],
     dependencies: [
         .package(url: "https://github.com/weichsel/ZIPFoundation.git", exact: "0.9.20"),

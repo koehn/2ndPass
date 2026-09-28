@@ -95,7 +95,7 @@ struct ItemDetailView: View {
                 }.disabled(model.busy)
             }
             if model.itemDraft != nil {
-                Text("Changes stay in this session until saved. Locking Mop discards unsaved changes.")
+                Text("Changes stay in this session until saved. Locking 2ndPass discards unsaved changes.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if model.itemDraft != nil, let reason = model.draftSaveUnavailableReason {
@@ -127,35 +127,65 @@ struct ItemDetailView: View {
 
     private var autoFillMappingEditor: some View {
         GroupBox("Use for AutoFill") {
-            VStack(alignment: .leading, spacing: 10) {
-                mappingPicker("Username", key: \.username, types: [.username, .email, .text])
-                mappingPicker("Password", key: \.password, types: [.password, .concealed])
-                mappingPicker("Verification code", key: \.oneTimeCode, types: [.otp])
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Choose which fields 2ndPass fills when you sign in. Leave Automatic selected to use this login’s standard fields.")
+                    .font(.callout).foregroundStyle(.secondary)
+                mappingPicker("Username", key: \.username, types: [.username, .email, .text],
+                              help: "Automatic uses the standard username, or an email field if no username is filled in.")
+                mappingPicker("Password", key: \.password, types: [.password, .concealed],
+                              help: "Automatic uses the standard password field.")
+                mappingPicker("Verification code", key: \.oneTimeCode, types: [.otp],
+                              help: "Optional. Automatic uses an existing verification-code field; you don’t need to add one.")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Websites").font(.callout.weight(.semibold))
+                    Text("Enter a domain or URL in the Website fields below. This login will be suggested on those sites.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if let error = model.itemDraft?.autoFill.validationError(in: fields.map(\.field)) {
                     Text(error).font(.callout).foregroundStyle(.red)
                 }
-                Menu("Add AutoFill field") {
-                    ForEach([FieldType.username, .password, .otp, .website], id: \.self) { type in
-                        Button(type.label) { addAutoFillField(type) }
-                    }
+                DisclosureGroup("Add a missing field") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Adds an empty field below for you to fill in. New username, password, and verification-code fields are selected for AutoFill.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach([FieldType.username, .password, .otp, .website], id: \.self) { type in
+                            Button("Add " + (type == .otp ? "verification code" : type.label.lowercased()), systemImage: "plus") {
+                                addAutoFillField(type)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }.padding(.top, 8)
                 }
-                Text("Automatic uses the standard login fields. Verification codes are optional. Website fields determine where suggestions appear.")
-                    .font(.caption).foregroundStyle(.secondary)
+                if model.busy {
+                    Label("Please wait for the current operation to finish before changing AutoFill fields.", systemImage: "hourglass")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }.frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 6)
         }.disabled(model.busy)
     }
-    private func mappingPicker(_ title: String, key: WritableKeyPath<AutoFillMapping, String?>, types: [FieldType]) -> some View {
-        Picker(title, selection: Binding(get: { model.itemDraft?.autoFill[keyPath: key] ?? "" }, set: {
-            model.activity(); model.itemDraft?.autoFill[keyPath: key] = $0.isEmpty ? nil : $0
-        })) {
-            Text("Automatic").tag("")
-            ForEach(fields.filter { types.contains($0.effectiveType) && !$0.encodedPath.isEmpty }) { field in
-                Text(field.path.removingPercentEncoding ?? field.path).tag(field.encodedPath)
+    private func mappingPicker(_ title: String, key: WritableKeyPath<AutoFillMapping, String?>, types: [FieldType], help: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Explicit text keeps the purpose visible even when the platform's menu picker hides its label.
+            Text(title == "Verification code" ? "Verification code (optional)" : title)
+                .font(.callout.weight(.semibold))
+            Picker(title, selection: Binding(get: { model.itemDraft?.autoFill[keyPath: key] ?? "" }, set: {
+                model.activity(); model.itemDraft?.autoFill[keyPath: key] = $0.isEmpty ? nil : $0
+            })) {
+                Text("Automatic").tag("")
+                ForEach(fields.filter { types.contains($0.effectiveType) && !$0.encodedPath.isEmpty }) { field in
+                    Text(field.path.removingPercentEncoding ?? field.path).tag(field.encodedPath)
+                }
+                if let path = model.itemDraft?.autoFill[keyPath: key], !fields.contains(where: { $0.encodedPath == path && types.contains($0.effectiveType) }) {
+                    Text("Missing or incompatible field: " + path).tag(path)
+                }
             }
-            if let path = model.itemDraft?.autoFill[keyPath: key], !fields.contains(where: { $0.encodedPath == path && types.contains($0.effectiveType) }) {
-                Text("Missing or incompatible field: " + path).tag(path)
-            }
-        }.accessibilityIdentifier("autofill-mapping-" + title)
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .accessibilityLabel(title)
+            .accessibilityIdentifier("autofill-mapping-" + title)
+            Text(help).font(.caption).foregroundStyle(.secondary)
+        }
     }
     private func addAutoFillField(_ type: FieldType) {
         var name = type.rawValue

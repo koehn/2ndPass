@@ -2,20 +2,20 @@
 set -euo pipefail
 umask 022
 cd "$(dirname "$0")/.."
-[[ $# -le 1 ]] || { echo 'Usage: scripts/install.sh [signed-Mop.app]' >&2; exit 2; }
-source_app=${1:-"$PWD/dist/Mop.app"}
+[[ $# -le 1 ]] || { echo 'Usage: scripts/install.sh [signed-2ndPass.app]' >&2; exit 2; }
+source_app=${1:-"$PWD/dist/2ndPass.app"}
 prefix=${MOP_INSTALL_ROOT:-/usr/local}
 applications=${MOP_APPLICATIONS_DIR:-/Applications}
-app="$applications/Mop.app"
+app="$applications/2ndPass.app"
 bin_dir="$prefix/bin"
-lib_dir="$prefix/lib/mop"
-target="$app/Contents/MacOS/mop"
-link="$bin_dir/mop"
-[[ -d "$source_app" && -f "$source_app/Contents/embedded.provisionprofile" && -f "$source_app/Contents/MacOS/mop" ]] || { echo 'Run scripts/package.sh first.' >&2; exit 7; }
+lib_dir="$prefix/lib/2ndpass"
+target="$app/Contents/MacOS/2ndpass"
+link="$bin_dir/2ndpass"
+[[ -d "$source_app" && -f "$source_app/Contents/embedded.provisionprofile" && -f "$source_app/Contents/MacOS/2ndpass" ]] || { echo 'Run scripts/package.sh first.' >&2; exit 7; }
 codesign --verify --strict "$source_app"
-identity=$("$source_app/Contents/MacOS/mop" device identity)
+identity=$("$source_app/Contents/MacOS/2ndpass" device identity)
 source_share="$(dirname "$source_app")/share"
-resources=(man/man1/mop.1 bash-completion/completions/mop zsh/site-functions/_mop fish/vendor_completions.d/mop.fish)
+resources=(man/man1/2ndpass.1 bash-completion/completions/2ndpass zsh/site-functions/_2ndpass fish/vendor_completions.d/2ndpass.fish)
 # Refuse collisions before changing any installed file or requesting privileges.
 if [[ -e "$app" || -L "$app" ]]; then
     [[ -d "$app" && ! -L "$app" && -x "$target" ]] || { echo 'Refusing to replace an unrelated application.' >&2; exit 7; }
@@ -39,7 +39,7 @@ done
 if [[ -e "$link" || -L "$link" ]]; then
     [[ -L "$link" ]] || { echo 'Refusing to replace an unrelated executable.' >&2; exit 7; }
     previous=$(readlink "$link")
-    [[ "$previous" == "$target" || "$previous" == "$lib_dir/Mop.app/Contents/MacOS/mop" || "$previous" == "$lib_dir/mop" || "$previous" == "$HOME/Applications/Mop.app/Contents/MacOS/mop" ]] || exit 7
+    [[ "$previous" == "$target" || "$previous" == "$lib_dir/2ndPass.app/Contents/MacOS/2ndpass" || "$previous" == "$lib_dir/2ndpass" || "$previous" == "$HOME/Applications/2ndPass.app/Contents/MacOS/2ndpass" ]] || exit 7
 fi
 if [[ -e "$lib_dir" || -L "$lib_dir" ]]; then
     [[ ! -L "$lib_dir" && -f "$lib_dir/.mop-install" ]] || exit 7
@@ -75,16 +75,16 @@ cleanup() {
 }
 trap cleanup EXIT
 install_command chmod 755 "$stage"
-install_command cp -R "$source_app" "$stage/Mop.app"
+install_command cp -R "$source_app" "$stage/2ndPass.app"
 # Packaging uses a private umask; the installed app must be readable by all users.
-install_command chmod -R a+rX "$stage/Mop.app"
-codesign --verify --strict "$stage/Mop.app"
+install_command chmod -R a+rX "$stage/2ndPass.app"
+codesign --verify --strict "$stage/2ndPass.app"
 for resource in "${resources[@]}"; do
     install_command mkdir -p "$prefix/share/$(dirname "$resource")" "$lib_dir/share/$(dirname "$resource")"
     install_command install -m 644 "$source_share/$resource" "$lib_dir/share/$resource"
 done
 if [[ -e "$app" ]]; then install_command mv "$app" "$stage/previous.app"; fi
-install_command mv "$stage/Mop.app" "$app"
+install_command mv "$stage/2ndPass.app" "$app"
 published=true
 codesign --verify --strict "$app"
 [[ $("$target" device identity) == "$identity" ]]
@@ -97,6 +97,6 @@ install_command ln -sfn "$target" "$link"
 installed=true
 echo "Installed application: $app"
 echo "Installed CLI: $link"
-echo "Manpage: $prefix/share/man/man1/mop.1"
+echo "Manpage: $prefix/share/man/man1/2ndpass.1"
 echo "Completions: $prefix/share/{bash-completion/completions,zsh/site-functions,fish/vendor_completions.d}"
 echo 'No shell startup files were modified. Ensure the CLI directory is on PATH.'

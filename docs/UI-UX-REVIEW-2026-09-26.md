@@ -1,8 +1,8 @@
-# Mop macOS UI/UX review — September 26, 2026
+# 2ndPass macOS UI/UX review — September 26, 2026
 
 Reviewed source at `9ce147d`, the preceding UI revision, UI tests, and the running Mac app's locked window. The live window confirmed the contradictory locked/busy presentation described below. Enrollment, editing, recovery, and AutoFill findings are based on source inspection; real-device end-to-end behavior, VoiceOver, and visual layouts in those states still need acceptance testing. No credentials or access settings were changed. This is a product review, not a cryptographic audit.
 
-Mop has a useful native foundation: NavigationSplitView, a real Settings scene, LocalAuthentication, native credential-provider integration, Recently Deleted, local password generation, and field-specific copy feedback. The largest problems are inconsistent state presentation and workflows that expose internal protocols. The latest architecture is substantially simpler than parts of its interface suggest.
+2ndPass has a useful native foundation: NavigationSplitView, a real Settings scene, LocalAuthentication, native credential-provider integration, Recently Deleted, local password generation, and field-specific copy feedback. The largest problems are inconsistent state presentation and workflows that expose internal protocols. The latest architecture is substantially simpler than parts of its interface suggest.
 
 Priority meanings: P1 = fix before considering the experience polished or dependable; P2 = important usability/platform improvement; P3 = refinement. Source references below use paths relative to the repository and line numbers from the reviewed revision.
 
@@ -12,7 +12,7 @@ Priority meanings: P1 = fix before considering the experience polished or depend
 
 The toolbar and Vault menu always offer Lock. The locked detail tells people to use Refresh, and the item list independently says it is locked. In the observed live state Refresh was disabled, the status read “Vaults available,” and a spinner appeared. A person cannot tell whether to wait, authenticate, or repair a connection.
 
-Use one coherent locked presentation, preferably across the content/detail area: “Mop is locked,” a primary Unlock button, and a short explanation. Return activates Unlock; show Touch ID-specific wording only when that capability is available. Swap toolbar Lock for Unlock or disable Lock while already locked. Keep Refresh for fetching current cloud data. Distinguish waiting for system authentication from fetching vault contents and from idle locked state.
+Use one coherent locked presentation, preferably across the content/detail area: “2ndPass is locked,” a primary Unlock button, and a short explanation. Return activates Unlock; show Touch ID-specific wording only when that capability is available. Swap toolbar Lock for Unlock or disable Lock while already locked. Keep Refresh for fetching current cloud data. Distinguish waiting for system authentication from fetching vault contents and from idle locked state.
 
 Evidence: `Sources/MopUI/PlatformViews.swift:33`, `MopScenes.swift:43`, `ContentView.swift:122`, `ContentView.swift:142`, `AppModel.swift:584`.
 
@@ -62,7 +62,7 @@ Evidence: `AppSheetView.swift:91–122`, `AppModel.swift:819–923`.
 
 An unenrolled vault is labeled “Not owned by this account,” although same-account discovery is exactly how automatic enrollment starts. The main pane says an owner must approve the device; the connection sheet says no approval is needed. Completion still says “Approved.” These are different mental models for the same path.
 
-Use “Not connected to this Mac,” “Open and unlock Mop on another connected device,” and “Connected. Opening your vault…”. Reserve explicit approval language for sharing across accounts. Replace “Tap” with “Choose” or platform-specific “Click” in Mac-facing instructions.
+Use “Not connected to this Mac,” “Open and unlock 2ndPass on another connected device,” and “Connected. Opening your vault…”. Reserve explicit approval language for sharing across accounts. Replace “Tap” with “Choose” or platform-specific “Click” in Mac-facing instructions.
 
 Evidence: `AppModel.swift:540`, `ContentView.swift:96`, `AppSheetView.swift:99`, `AppModel.swift:837–886`.
 
@@ -80,7 +80,7 @@ Evidence: `AppSheetView.swift:45`, `MopScenes.swift:65–81`, `MopScenes.swift:1
 
 The 260–340-point sidebar has a large branded header, a custom disclosure header, a plus button, and an ellipsis per vault. Items has a separate in-content title and plus button. The detail repeats vault context. At smaller widths these consume substantial space before the actual password fields.
 
-Use native sidebar sections and a compact vault list. Remove the redundant Mop wordmark inside the sidebar; the app/window already identifies itself. Put New Item in the toolbar and File menu, keep vault actions in a contextual menu, and use a clear Vault Details destination. Avoid forcing all columns visible whenever width crosses 950; respect a user's chosen collapsed state. Treat exact widths as visual-validation decisions, not hard-coded design rules.
+Use native sidebar sections and a compact vault list. Remove the redundant 2ndPass wordmark inside the sidebar; the app/window already identifies itself. Put New Item in the toolbar and File menu, keep vault actions in a contextual menu, and use a clear Vault Details destination. Avoid forcing all columns visible whenever width crosses 950; respect a user's chosen collapsed state. Treat exact widths as visual-validation decisions, not hard-coded design rules.
 
 Evidence: `ContentView.swift:33–89`, `ContentView.swift:176–180`. The live locked window confirms the duplicated chrome and empty columns.
 
@@ -110,7 +110,7 @@ Evidence: `MopScenes.swift:43–53`, `ItemSearchView.swift:14–29`, `ItemDetail
 
 ### 13. P1 — Protect edits during navigation
 
-Changing selected rows calls `cancelItemEditing`; switching sections or vaults also clears the draft. A caption advertises this loss rather than preventing it. This is particularly painful when changing a password in a browser and returning to Mop.
+Changing selected rows calls `cancelItemEditing`; switching sections or vaults also clears the draft. A caption advertises this loss rather than preventing it. This is particularly painful when changing a password in a browser and returning to 2ndPass.
 
 On ordinary navigation, offer Save Changes, Discard Changes, or Cancel, or retain an in-memory draft with explicit lifecycle rules. Mask rather than discard on ordinary Mac app switching. Security lock must still clear sensitive UI immediately. Preserve unsaved values through recoverable save/conflict errors and provide a review/retry path.
 
@@ -176,9 +176,9 @@ Evidence: `CredentialProviderViewController.swift:84–90`, `CredentialProviderV
 
 ### 21. P1 — Provide actionable AutoFill failure recovery
 
-A selected-credential failure can leave a small 360×140 presentation with a message and Cancel, without Retry or Choose Another Account. Picker errors and empty states repeatedly direct the user to open/unlock Mop. That route itself lacks a clear Unlock button. Different failures collapse to “credential unavailable.”
+A selected-credential failure can leave a small 360×140 presentation with a message and Cancel, without Retry or Choose Another Account. Picker errors and empty states repeatedly direct the user to open/unlock 2ndPass. That route itself lacks a clear Unlock button. Different failures collapse to “credential unavailable.”
 
-Keep fresh authentication for each fill; that is the current security policy. Improve surrounding UX with distinct cancelled, removed/stale, unconfigured, and unavailable states, a safe Retry, and Choose Another Account where supported. Use an Open Mop route only where the extension platform supports it; otherwise give precise instructions. Let error content expand beyond the compact progress size. Keep code generation after authentication and reject expired results; offer retry rather than filling stale codes.
+Keep fresh authentication for each fill; that is the current security policy. Improve surrounding UX with distinct cancelled, removed/stale, unconfigured, and unavailable states, a safe Retry, and Choose Another Account where supported. Use an Open 2ndPass route only where the extension platform supports it; otherwise give precise instructions. Let error content expand beyond the compact progress size. Keep code generation after authentication and reject expired results; offer retry rather than filling stale codes.
 
 Evidence: `CredentialProviderViewController.swift:175–180`, `CredentialProviderViewController.swift:222–233`, `docs/AUTOFILL.md`.
 
@@ -216,7 +216,7 @@ Evidence: `DocumentTransfers.swift:28–39`, `AppModel.swift:1075–1090`, `AppS
 | Same-account confirmation/approval/rejection view-model methods | Remove after caller check | `AppModel.swift:925–950`; no current UI/test callers found. Preserve protocol/CLI functionality where still required. |
 | `EnrollmentFlow.addDevice` manual exchange branch | Remove unused UI branch | `SharingView.swift:16,59,106,145`; actual Add My Device uses CloudEnrollmentView, no `flow: .addDevice` caller found. |
 | Unreachable `.trust` sheet | Retire from the normal UI enum/view unless a deliberate diagnostic entry point is added | `AppSheetView.swift:60`; no route sets this sheet. Do not remove checkpoint validation from recovery. |
-| Old “Waiting for your Mop identity” UI-test expectation | Update | `Apple/UITests/MopUITests.swift:340` contradicts the current device-local enrollment error text in `MopError.swift:81`. |
+| Old “Waiting for your 2ndPass identity” UI-test expectation | Update | `Apple/UITests/MopUITests.swift:340` contradicts the current device-local enrollment error text in `MopError.swift:81`. |
 | Manual same-account enrollment request/accept entries in Advanced | Move out of ordinary settings; retain only if a supported diagnostic workflow needs them | `SharingView.swift:65–68`; overlap with automatic connection and cross-account joining. |
 | Top-level Show Checkpoint and Verify Members buttons | Move into Security Details/Advanced | `MopScenes.swift:91–98`; raw hashes/IDs should not be normal housekeeping. |
 | Duplicate Remove Device path accepting a UUID | Consolidate around the device list; retain explicit per-vault administration if needed | `SharingView.swift:69–72,88`; account-wide and per-vault scopes must remain clear. |
@@ -236,4 +236,4 @@ Acceptance should cover launch/cancel/retry, explicit lock followed by pointer m
 
 The current UI automation fixture is enabled only under `DEBUG && targetEnvironment(simulator)` and the UI suite uses iOS-specific APIs. Add a Mac-capable fixture and Mac UI coverage before relying on those tests for desktop interaction correctness. No tests were run for this review; implementation was not changed.
 
-Apple's current guidance supports the native split-view foundation, window toolbars, menu-bar access to commands, and respecting user window/toolbar configuration. The specific restructuring recommendations here are design judgments applied to Mop, not claims that Apple mandates a particular layout. References: [Designing for macOS](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos/), [Toolbars](https://developer.apple.com/design/human-interface-guidelines/toolbars?changes=la), [Sidebars](https://developer.apple.com/design/human-interface-guidelines/sidebars?changes=_11).
+Apple's current guidance supports the native split-view foundation, window toolbars, menu-bar access to commands, and respecting user window/toolbar configuration. The specific restructuring recommendations here are design judgments applied to 2ndPass, not claims that Apple mandates a particular layout. References: [Designing for macOS](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos/), [Toolbars](https://developer.apple.com/design/human-interface-guidelines/toolbars?changes=la), [Sidebars](https://developer.apple.com/design/human-interface-guidelines/sidebars?changes=_11).

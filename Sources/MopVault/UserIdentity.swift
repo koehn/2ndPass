@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import MopCore
 
-/// The public portion of a user's synchronized Mop identity. No Apple Account
+/// The public portion of a user's synchronized 2ndPass identity. No Apple Account
 /// identifier or private key appears in vault membership metadata.
 public struct UserIdentity: Codable, Equatable, Sendable {
     public let encryptionKey: Data
@@ -37,7 +37,7 @@ public final class AccountIdentity: VaultSigningOpener {
     public let identity: UserIdentity
     public var publicKey: Data { identity.encryptionKey }
     public var signingPublicKey: Data { identity.signingKey }
-    public var request: RecipientKey { try! RecipientKey(name: "Mop account", publicKey: publicKey) }
+    public var request: RecipientKey { try! RecipientKey(name: "2ndPass account", publicKey: publicKey) }
     public init() {
         let encryption = P256.KeyAgreement.PrivateKey(), signing = P256.Signing.PrivateKey()
         self.encryption = encryption; self.signing = signing

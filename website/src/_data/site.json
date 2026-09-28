@@ -1,0 +1,9 @@
+{
+  "url": "https://2ndpass.app",
+  "navigation": [
+    {"href":"index.html","label":"Overview"},
+    {"href":"docs.html","label":"Docs"},
+    {"href":"security.html","label":"Security"},
+    {"href":"faq.html","label":"Our story"}
+  ]
+}

@@ -1,14 +1,16 @@
 import Foundation
 
 public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConvertible {
+    static let prefixes = ["secondpass://", "mop://"]
+
     public let vault: String
     public let item: String
     public let section: String?
     public let field: String
 
     public init(_ token: String) throws {
-        guard token.hasPrefix("mop://") else { throw MopError.invalidReference }
-        let parts = token.dropFirst(6).split(separator: "/", omittingEmptySubsequences: false)
+        guard let prefix = Self.prefixes.first(where: { token.hasPrefix($0) }) else { throw MopError.invalidReference }
+        let parts = token.dropFirst(prefix.count).split(separator: "/", omittingEmptySubsequences: false)
         guard [3, 4].contains(parts.count) else { throw MopError.invalidReference }
         let decoded = try parts.map { try Self.decode(String($0)) }
         try VaultName.validate(decoded[0])
@@ -64,12 +66,12 @@ public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConve
     }
 
     public init(vault: String, relativePath: String) throws {
-        try self.init("mop://" + vault + "/" + relativePath)
+        try self.init("secondpass://" + vault + "/" + relativePath)
         guard self.relativePath == relativePath else { throw MopError.invalidReference }
     }
 
     public var description: String {
-        "mop://" + ([vault, item] + (section.map { [$0] } ?? []) + [field]).map(Self.encode).joined(separator: "/")
+        "secondpass://" + ([vault, item] + (section.map { [$0] } ?? []) + [field]).map(Self.encode).joined(separator: "/")
     }
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.description < rhs.description }

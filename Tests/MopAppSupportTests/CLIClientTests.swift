@@ -32,10 +32,10 @@ struct CLIClientTests {
         let executable = try fixture("printf '%s\\n' \"$@\" >&2\ncat\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let secret = "first line\n$(do-not-execute) ' \"\nlast line\n"
-        let result = try await CLIClient(executable: executable).run(["write", "mop://personal/item/token"], input: SecretBytes(utf8: secret))
+        let result = try await CLIClient(executable: executable).run(["write", "secondpass://personal/item/token"], input: SecretBytes(utf8: secret))
         #expect(result.text == secret)
         #expect(!String(decoding: result.diagnostic, as: UTF8.self).contains(secret))
-        #expect(result.diagnostic == "write\nmop://personal/item/token\n")
+        #expect(result.diagnostic == "write\nsecondpass://personal/item/token\n")
     }
     @Test func drainsBothPipesWhileWritingLargeInput() async throws {
         let executable = try fixture("head -c 262144 /dev/zero >&2\ncat\n")
@@ -57,10 +57,10 @@ struct CLIClientTests {
         }
     }
     @Test func parsesOnlyValidOfflineTimestamp() throws {
-        let result = CLIResult(output: "[]", diagnostic: "mop: offline cache from 2026-09-22T09:41:00Z; remote revocation cannot be checked.\n")
+        let result = CLIResult(output: "[]", diagnostic: "2ndpass: offline cache from 2026-09-22T09:41:00Z; remote revocation cannot be checked.\n")
         #expect(result.offlineDate == "2026-09-22T09:41:00Z")
         #expect(try result.decode([String].self) == [])
-        #expect(CLIResult(output: "", diagnostic: "mop: offline cache from untrusted text").offlineDate == nil)
+        #expect(CLIResult(output: "", diagnostic: "2ndpass: offline cache from untrusted text").offlineDate == nil)
     }
     @Test func malformedJSONFailsClosed() {
         #expect(throws: (any Error).self) { try CLIResult(output: "invalid", diagnostic: "").decode([String].self) }

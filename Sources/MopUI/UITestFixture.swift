@@ -27,7 +27,7 @@ final class UITestVaultService: VaultService, Sendable {
             var result = VaultResult()
             switch operation {
             case .discover:
-                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-vault-v6", enrolled: ProcessInfo.processInfo.environment["MOP_UI_ENROLLMENT"] != "1")]
+                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-vault-v7", enrolled: ProcessInfo.processInfo.environment["MOP_UI_ENROLLMENT"] != "1")]
                 result.defaultVault = Self.vaultID
                 return result
             case .catalog:
@@ -46,7 +46,7 @@ final class UITestVaultService: VaultService, Sendable {
             case .read(let reference):
                 guard state.authenticatedAt != nil else { throw MopError.authentication }
                 if reference.field == "otp" || reference.field == "otp-url" || reference.field == "otp-legacy" {
-                    let input = reference.field == "otp" ? "JBSWY3DPEHPK3PXP" : "otpauth://totp/Mop:test@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Mop"
+                    let input = reference.field == "otp" ? "JBSWY3DPEHPK3PXP" : "otpauth://totp/2ndPass:test@example.com?secret=JBSWY3DPEHPK3PXP&issuer=2ndPass"
                     let otp = try TimeBasedOTP(input), date = Date()
                     result.value = SecretBytes(utf8: try otp.code(at: date))
                     result.otpExpiresAt = otp.expires(at: date); result.otpPeriod = otp.period

@@ -24,21 +24,21 @@ private final class MemoryStore: SecretStore {
 }
 
 @Test func referenceItemsAreCaseSensitiveAndUnambiguous() throws {
-    let ref = try SecretReference("mop://personal/an%2Fitem/%E2%9C%93%20token")
+    let ref = try SecretReference("secondpass://personal/an%2Fitem/%E2%9C%93%20token")
     #expect(ref.vault == "personal")
     #expect(ref.item == "an/item")
     #expect(ref.field == "✓ token")
-    #expect(ref.description == "mop://personal/an%2Fitem/%E2%9C%93%20token")
-    #expect(try SecretReference("mop://v/i/%74oken") == SecretReference("mop://v/i/token"))
-    #expect(try SecretReference("mop://v/i/token") != SecretReference("mop://v/I/token"))
-    #expect(try SecretReference("mop://v/i/%252F").field == "%2F")
-    let composed = try SecretReference("mop://v/%C3%A9/f")
-    let decomposed = try SecretReference("mop://v/e%CC%81/f")
+    #expect(ref.description == "secondpass://personal/an%2Fitem/%E2%9C%93%20token")
+    #expect(try SecretReference("secondpass://v/i/%74oken") == SecretReference("secondpass://v/i/token"))
+    #expect(try SecretReference("secondpass://v/i/token") != SecretReference("secondpass://v/I/token"))
+    #expect(try SecretReference("secondpass://v/i/%252F").field == "%2F")
+    let composed = try SecretReference("secondpass://v/%C3%A9/f")
+    let decomposed = try SecretReference("secondpass://v/e%CC%81/f")
     #expect(composed == decomposed)
     #expect(composed.description == decomposed.description)
 }
 
-@Test(arguments: ["op://v/i/f", "MOP://v/i/f", "mop://v/i", "mop://v/i/s/f/x", "mop:///i/f", "mop://v//f", "mop://v/i/", "mop://v/i/f?q", "mop://v/i/f#x", "mop://v/i/a b", "mop://v/i/%", "mop://v/i/%XZ", "mop://v/i/%FF", "mop://v/i/%00", "mop://v/i/é", "mop://user@v/i/f"])
+@Test(arguments: ["op://v/i/f", "MOP://v/i/f", "secondpass://v/i", "secondpass://v/i/s/f/x", "secondpass:///i/f", "secondpass://v//f", "secondpass://v/i/", "secondpass://v/i/f?q", "secondpass://v/i/f#x", "secondpass://v/i/a b", "secondpass://v/i/%", "secondpass://v/i/%XZ", "secondpass://v/i/%FF", "secondpass://v/i/%00", "secondpass://v/i/é", "secondpass://user@v/i/f"])
 func invalidReferences(_ token: String) {
     #expect(throws: MopError.invalidReference) { try SecretReference(token) }
 }
@@ -66,7 +66,7 @@ func rejectsInvalidDotenv(_ input: String) {
     let store = MemoryStore()
     var opens = 0
     let service = SecretService { opens += 1; return store }
-    let ref = try SecretReference("mop://v/i/f")
+    let ref = try SecretReference("secondpass://v/i/f")
     try service.write(ref, value: "one\ntwo\n", replace: false)
     #expect(try service.read(ref) == "one\ntwo\n")
     #expect(throws: MopError.duplicate) { try service.write(ref, value: "wrong", replace: false) }
@@ -83,14 +83,14 @@ func rejectsInvalidDotenv(_ input: String) {
 
 @Test func environmentPrecedenceAndDeduplication() throws {
     let store = MemoryStore()
-    let ref = try SecretReference("mop://v/i/f")
+    let ref = try SecretReference("secondpass://v/i/f")
     store.values[ref] = "secret\nvalue"
     var opens = 0
     let service = SecretService { opens += 1; return store }
     let result = try service.environment(inherited: ["A": "old", "UNCHANGED": "keep"], files: [
-        "A=first\nB=mop://v/i/f", "A=mop://v/i/%66\nC=prefix mop://v/i/f"
+        "A=first\nB=secondpass://v/i/f", "A=secondpass://v/i/%66\nC=prefix secondpass://v/i/f"
     ])
-    #expect(result == ["A": "secret\nvalue", "B": "secret\nvalue", "C": "prefix mop://v/i/f", "UNCHANGED": "keep"])
+    #expect(result == ["A": "secret\nvalue", "B": "secret\nvalue", "C": "prefix secondpass://v/i/f", "UNCHANGED": "keep"])
     #expect(opens == 1)
     #expect(store.reads == [ref])
     #expect(store.closes == 1)
@@ -98,26 +98,26 @@ func rejectsInvalidDotenv(_ input: String) {
 
 @Test func templatesPreserveUnicodeAndDoNotRecursivelyExpand() throws {
     let store = MemoryStore()
-    let ref = try SecretReference("mop://v/i/f")
-    store.values[ref] = "{{ mop://not/another/lookup }}\n🔒"
+    let ref = try SecretReference("secondpass://v/i/f")
+    store.values[ref] = "{{ secondpass://not/another/lookup }}\n🔒"
     let service = SecretService { store }
-    let output = try service.inject("前 {{ mop://v/i/f }} {{mop://v/i/%66}} {{ unrelated }} 後")
-    #expect(output == "前 {{ mop://not/another/lookup }}\n🔒 {{ mop://not/another/lookup }}\n🔒 {{ unrelated }} 後")
+    let output = try service.inject("前 {{ secondpass://v/i/f }} {{secondpass://v/i/%66}} {{ unrelated }} 後")
+    #expect(output == "前 {{ secondpass://not/another/lookup }}\n🔒 {{ secondpass://not/another/lookup }}\n🔒 {{ unrelated }} 後")
     #expect(store.reads == [ref])
     #expect(store.closes == 1)
 }
 
 @Test func missingSecretsProduceNoResultAndCloseSession() throws {
     let store = MemoryStore()
-    store.values[try SecretReference("mop://v/i/a")] = "must not escape"
+    store.values[try SecretReference("secondpass://v/i/a")] = "must not escape"
     let service = SecretService { store }
     var output: SecretBytes?
-    #expect(throws: MopError.notFound) { output = try service.inject("{{mop://v/i/a}}{{mop://v/i/b}}") }
+    #expect(throws: MopError.notFound) { output = try service.inject("{{secondpass://v/i/a}}{{secondpass://v/i/b}}") }
     #expect(output == nil)
     #expect(store.closes == 1)
     var environment: [String: SecretBytes]?
     #expect(throws: MopError.notFound) {
-        environment = try service.environment(inherited: ["A": "mop://v/i/a", "B": "mop://v/i/b"], files: [])
+        environment = try service.environment(inherited: ["A": "secondpass://v/i/a", "B": "secondpass://v/i/b"], files: [])
     }
     #expect(environment == nil)
     #expect(store.closes == 2)
@@ -128,48 +128,48 @@ func rejectsInvalidDotenv(_ input: String) {
     let service = SecretService { opens += 1; throw MopError.authentication }
     #expect(try service.inject("literal {{ unrelated }}") == "literal {{ unrelated }}")
     #expect(try service.environment(inherited: ["A": "literal"], files: []) == ["A": "literal"])
-    #expect(throws: MopError.invalidReference) { try service.inject("{{ mop://v/i/f }} {{ mop://invalid }}") }
-    #expect(throws: MopError.invalidTemplate) { try service.inject("{{ mop://v/i/f") }
-    #expect(throws: MopError.invalidReference) { try service.environment(inherited: ["A": "mop://invalid"], files: []) }
+    #expect(throws: MopError.invalidReference) { try service.inject("{{ secondpass://v/i/f }} {{ secondpass://invalid }}") }
+    #expect(throws: MopError.invalidTemplate) { try service.inject("{{ secondpass://v/i/f") }
+    #expect(throws: MopError.invalidReference) { try service.environment(inherited: ["A": "secondpass://invalid"], files: []) }
     #expect(opens == 0)
-    #expect(throws: MopError.authentication) { try service.inject("{{mop://v/i/f}}") }
+    #expect(throws: MopError.authentication) { try service.inject("{{secondpass://v/i/f}}") }
     #expect(opens == 1)
 }
 
 @Test func nulInSecretCannotBecomeEnvironment() throws {
     let store = MemoryStore()
-    store.values[try SecretReference("mop://v/i/f")] = "a\0b"
+    store.values[try SecretReference("secondpass://v/i/f")] = "a\0b"
     let service = SecretService { store }
-    #expect(throws: MopError.invalidProcess) { try service.environment(inherited: ["A": "mop://v/i/f"], files: []) }
+    #expect(throws: MopError.invalidProcess) { try service.environment(inherited: ["A": "secondpass://v/i/f"], files: []) }
     #expect(store.closes == 1)
 }
 
 @Test func sectionsAndComponentExpansion() throws {
-    let plain = try SecretReference("mop://v/i/f")
-    let section = try SecretReference("mop://v/i/s/f")
+    let plain = try SecretReference("secondpass://v/i/f")
+    let section = try SecretReference("secondpass://v/i/s/f")
     #expect(plain != section)
     #expect(section.section == "s")
-    #expect(section.description == "mop://v/i/s/f")
-    let expanded = try ReferenceExpansion.resolve("mop://$VAULT/i/${SECTION}/pre-${FIELD}", variables: [
+    #expect(section.description == "secondpass://v/i/s/f")
+    let expanded = try ReferenceExpansion.resolve("secondpass://$VAULT/i/${SECTION}/pre-${FIELD}", variables: [
         "VAULT": "a-b", "SECTION": "多 行", "FIELD": "${LITERAL}?/#"
     ])
     #expect(expanded.vault == "a-b")
     #expect(expanded.section == "多 行")
     #expect(expanded.field == "pre-${LITERAL}?/#")
-    #expect(try ReferenceExpansion.resolve("mop://v/i/%24NAME", variables: [:]).field == "$NAME")
-    for token in ["mop://$MISSING/i/f", "mop://v/i/${}", "mop://v/i/$1", "mop://v/i/$(false)",
-                  "mop://v/i/${A:-x}", "mop://v/i/$", "mop://v/i/${A", "mop://v/i/$EMPTY", "mop://v/i//f"] {
+    #expect(try ReferenceExpansion.resolve("secondpass://v/i/%24NAME", variables: [:]).field == "$NAME")
+    for token in ["secondpass://$MISSING/i/f", "secondpass://v/i/${}", "secondpass://v/i/$1", "secondpass://v/i/$(false)",
+                  "secondpass://v/i/${A:-x}", "secondpass://v/i/$", "secondpass://v/i/${A", "secondpass://v/i/$EMPTY", "secondpass://v/i//f"] {
         #expect(throws: MopError.invalidReference) { try ReferenceExpansion.resolve(token, variables: ["EMPTY": ""]) }
     }
 }
 
 @Test func expansionUsesMergedEnvironmentAndResolvesOnce() throws {
     let store = MemoryStore()
-    let reference = try SecretReference("mop://prod/i/section/token")
+    let reference = try SecretReference("secondpass://prod/i/section/token")
     store.values[reference] = "value"
     let service = SecretService { store }
     let result = try service.resolvedEnvironment(inherited: ["V": "dev"], files: [
-        "V=staging\nTOKEN=mop://$V/i/section/token", "V=prod\nALSO=mop://${V}/i/section/%74oken\nLITERAL=$V"
+        "V=staging\nTOKEN=secondpass://$V/i/section/token", "V=prod\nALSO=secondpass://${V}/i/section/%74oken\nLITERAL=$V"
     ])
     #expect(result.variables["TOKEN"] == "value")
     #expect(result.variables["ALSO"] == "value")
@@ -177,7 +177,7 @@ func rejectsInvalidDotenv(_ input: String) {
     #expect(result.secrets == ["value"])
     #expect(store.reads == [reference])
     #expect(store.closes == 1)
-    #expect(try service.inject("{{mop://prod/i/${S}/${F}}} $F {{ unrelated }}", variables: ["S": "section", "F": "token"])
+    #expect(try service.inject("{{secondpass://prod/i/${S}/${F}}} $F {{ unrelated }}", variables: ["S": "section", "F": "token"])
             == "value $F {{ unrelated }}")
 }
 
@@ -185,25 +185,25 @@ func rejectsInvalidDotenv(_ input: String) {
     var opens = 0
     let service = SecretService { opens += 1; throw MopError.authentication }
     #expect(throws: MopError.invalidReference) {
-        try service.inject("{{mop://v/i/f}} {{mop://$MISSING/i/f}}")
+        try service.inject("{{secondpass://v/i/f}} {{secondpass://$MISSING/i/f}}")
     }
     #expect(throws: MopError.invalidReference) {
-        try service.resolvedEnvironment(inherited: ["A": "mop://v/i/f", "B": "mop://$MISSING/i/f"], files: [])
+        try service.resolvedEnvironment(inherited: ["A": "secondpass://v/i/f", "B": "secondpass://$MISSING/i/f"], files: [])
     }
     #expect(opens == 0)
 }
 
 @Test func environmentMaskingPreservesAllSecretBytes() throws {
     let store = MemoryStore()
-    let first = try SecretReference("mop://v/i/a")
-    let second = try SecretReference("mop://v/i/b")
+    let first = try SecretReference("secondpass://v/i/a")
+    let second = try SecretReference("secondpass://v/i/b")
     store.values[first] = "audit-\u{e9}-token"
     store.values[second] = "audit-e\u{301}-token"
     let result = try SecretService { store }.resolvedEnvironment(inherited: ["A": first.description, "B": second.description], files: [])
     #expect(Set(result.secrets.map { Data($0.utf8) }).count == 2)
     var masker = SecretMasker(patterns: MaskPatterns(secrets: result.secrets))
     let input = Data((result.variables["A"]! + "|" + result.variables["B"]!).utf8)
-    #expect(masker.consume(SecretBytes(copying: input), final: true) == "[concealed by mop]|[concealed by mop]")
+    #expect(masker.consume(SecretBytes(copying: input), final: true) == "[concealed by 2ndpass]|[concealed by 2ndpass]")
 }
 
 @Test func namedVaultValidationAndRelativePaths() throws {
@@ -213,8 +213,28 @@ func rejectsInvalidDotenv(_ input: String) {
     for name in ["", "Personal", "a b", "a/b", "-a", "a-", "a--b", "é", "a\n", String(repeating: "a", count: 64)] {
         #expect(throws: MopError.invalidVaultName) { try VaultName.validate(name) }
     }
-    let ref = try SecretReference("mop://personal/my%2Fcloud/a%20section/%E2%9C%93")
+    let ref = try SecretReference("secondpass://personal/my%2Fcloud/a%20section/%E2%9C%93")
     #expect(ref.relativePath == "my%2Fcloud/a%20section/%E2%9C%93")
     #expect(try SecretReference(vault: "private", relativePath: ref.relativePath).vault == "private")
     #expect(throws: MopError.invalidReference) { try SecretReference(vault: "personal", relativePath: "item/%74oken") }
+}
+
+@Test func legacyReferencesResolveAlongsideSecondPassReferences() throws {
+    let expected = try SecretReference("secondpass://personal/item/token")
+    #expect(try SecretReference("mop://personal/item/token") == expected)
+    #expect(try SecretReference("mop://personal/item/token").description == expected.description)
+    let environment = ["VAULT": SecretBytes(utf8: "personal"),
+                       "OLD": SecretBytes(utf8: "mop://${VAULT}/item/token"),
+                       "NEW": SecretBytes(utf8: "secondpass://${VAULT}/item/token")]
+    let references = try SecretParsing.references(in: environment)
+    #expect(references["OLD"] == expected)
+    #expect(references["NEW"] == expected)
+    let template = SecretBytes(utf8: "{{ mop://${VAULT}/item/token }} {{ secondpass://${VAULT}/item/token }}")
+    let placeholders = try SecretParsing.placeholders(template, variables: ["VAULT": "personal"])
+    #expect(placeholders.count == 2)
+    #expect(placeholders.allSatisfy { $0.1 == expected })
+    #expect(throws: MopError.invalidTemplate) {
+        try SecretParsing.placeholders(SecretBytes(utf8: "{{ mop://personal/item/token"), variables: [:])
+    }
+    #expect(throws: MopError.invalidReference) { try SecretReference("2ndpass://personal/item/token") }
 }

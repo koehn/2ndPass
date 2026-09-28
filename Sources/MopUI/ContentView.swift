@@ -71,7 +71,7 @@ struct ContentView: View {
                         ContentUnavailableView {
                             Label("Connect this device", systemImage: model.vaultIcon(descriptor))
                         } description: {
-                            Text("This vault is not connected to this device. Open and unlock Mop on another connected device to connect automatically.")
+                            Text("This vault is not connected to this device. Open and unlock 2ndPass on another connected device to connect automatically.")
                             Button("Connect this device…") { model.presentSheet(.enrollDevice) }
                         }
                     } else if model.authenticated {
@@ -129,14 +129,14 @@ struct ContentView: View {
                     else if let item = model.selectedItem, model.authenticated { ItemDetailView(model: model, itemName: item).id(model.vault + ":" + item) }
                     else {
                         ContentUnavailableView {
-                            Label(model.vaults.isEmpty ? "Welcome to Mop" : model.authenticated ? "Select an item" : model.unlocking ? "Unlocking Mop" : "Mop is locked", systemImage: "key.horizontal")
+                            Label(model.vaults.isEmpty ? "Welcome to 2ndPass" : model.authenticated ? "Select an item" : model.unlocking ? "Unlocking 2ndPass" : "2ndPass is locked", systemImage: "key.horizontal")
                         } description: {
-                            Text(model.vaults.isEmpty ? "Create a vault, or refresh to find vaults in your iCloud account." : model.authenticated ? "Choose an item to view its details." : "Unlock Mop to access your connected vaults.")
+                            Text(model.vaults.isEmpty ? "Create a vault, or refresh to find vaults in your iCloud account." : model.authenticated ? "Choose an item to view its details." : "Unlock 2ndPass to access your connected vaults.")
                         } actions: {
                             if model.unlocking {
-                                ProgressView("Unlocking Mop…")
+                                ProgressView("Unlocking 2ndPass…")
                             } else if model.hasConnectedVaults && !model.authenticated {
-                                Button("Unlock Mop") { model.unlock() }
+                                Button("Unlock 2ndPass") { model.unlock() }
                                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                                     .disabled(!model.canUnlock)
                             }
@@ -146,7 +146,7 @@ struct ContentView: View {
                         }.padding(.top, 60)
                     }
                     if model.showsSetupChecklist {
-                        GroupBox("Finish setting up Mop") {
+                        GroupBox("Finish setting up 2ndPass") {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("Add another connected device or hardware recovery so losing this device does not mean losing access.")
                                 Button("Connect Another Device…") { model.presentSheet(.addDevice) }
@@ -182,6 +182,25 @@ struct ContentView: View {
                 }.background(.background)
             }.mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout, isDetail: true)
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if let status = model.importStatus {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top) {
+                        Text(status).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                            .foregroundStyle(model.importFailed ? Color.red : Color.primary)
+                        if !model.importing {
+                            Button("Dismiss") { model.importStatus = nil; model.importReport = nil }
+                        }
+                    }
+                    if model.importing {
+                        ProgressView(value: model.importFraction).progressViewStyle(.linear)
+                            .accessibilityLabel("Import progress")
+                    } else if model.importReport?.committed == true {
+                        Text("Check the results before deleting the unencrypted source file manually.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }.padding().background(.regularMaterial).accessibilityIdentifier("Import status")
+            }
+        }
         .navigationSplitViewStyle(.balanced)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
             availableWidth = width
@@ -199,7 +218,7 @@ struct ContentView: View {
         .documentTransfers(model: model)
         .task(id: model.notice) {
             let notice = model.notice
-            let temporary = ["Value copied.", "Value copied. Mop clears its clipboard entry after 30 seconds.",
+            let temporary = ["Value copied.", "Value copied. 2ndPass clears its clipboard entry after 30 seconds.",
                              "Reference copied.", "Item saved to iCloud.", "Secret saved to iCloud."]
             guard let notice, temporary.contains(notice) else { return }
             try? await Task.sleep(for: .seconds(5))

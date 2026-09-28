@@ -33,7 +33,7 @@ func run() throws {
     print("ACL userPresence: \(presence); creating ephemeral hardware keys")
     let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: acl, authenticationContext: context)
     let signing = try SecureEnclave.P256.Signing.PrivateKey(accessControl: acl, authenticationContext: context)
-    let info = Data("mop-v6-prototype:disposable-record:device".utf8)
+    let info = Data("mop-v7-prototype:disposable-record:device".utf8)
     if preauthorize {
         let semaphore = DispatchSemaphore(value: 0)
         context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: context.localizedReason) { _, _ in semaphore.signal() }

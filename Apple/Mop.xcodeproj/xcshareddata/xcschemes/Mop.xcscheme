@@ -15,7 +15,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "000000000000000000000016"
-               BuildableName = "Mop.app"
+               BuildableName = "2ndPass.app"
                BlueprintName = "Mop"
                ReferencedContainer = "container:Mop.xcodeproj">
             </BuildableReference>
@@ -65,7 +65,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000000000016"
-            BuildableName = "Mop.app"
+            BuildableName = "2ndPass.app"
             BlueprintName = "Mop"
             ReferencedContainer = "container:Mop.xcodeproj">
          </BuildableReference>
@@ -82,7 +82,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000000000016"
-            BuildableName = "Mop.app"
+            BuildableName = "2ndPass.app"
             BlueprintName = "Mop"
             ReferencedContainer = "container:Mop.xcodeproj">
          </BuildableReference>

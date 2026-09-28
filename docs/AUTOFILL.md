@@ -1,10 +1,10 @@
 # Password and TOTP AutoFill
 
-Mop includes a native credential provider extension for iOS/iPadOS 18+ and macOS
-15+. Enable Mop in the system AutoFill/password-provider settings, then open and
-unlock Mop. Each authenticated catalog refresh publishes login websites,
-usernames and opaque password/code credential identifiers to Mop's Apple credential identity
-store. Mop also writes the same metadata fields plus credential kind to a shared local index;
+2ndPass includes a native credential provider extension for iOS/iPadOS 18+ and macOS
+15+. Enable 2ndPass in the system AutoFill/password-provider settings, then open and
+unlock 2ndPass. Each authenticated catalog refresh publishes login websites,
+usernames and opaque password/code credential identifiers to 2ndPass's Apple credential identity
+store. 2ndPass also writes the same metadata fields plus credential kind to a shared local index;
 the extension reads that index, then authenticates before showing encrypted account
 labels in its picker. It does not depend on Apple returning its stored suggestions to the extension.
 Only undeleted Login items with a usable username and valid HTTP(S) website are
@@ -32,7 +32,7 @@ whose catalogs still need refreshing. Files use private permissions and iOS data
 
 All no-interaction password and code requests return `userInteractionRequired`
 before opening a vault. A selected suggestion authenticates in the presented
-extension. Opening Mop’s picker also authenticates, then loads item and vault names
+extension. Opening 2ndPass’s picker also authenticates, then loads item and vault names
 from verified encrypted catalogs into memory. One fresh request session authorizes
 one fill for at most 60 seconds. It never reuses the containing app’s authentication
 or a prior fill. Dismissal, cancellation, backgrounding, account changes, failures,
@@ -43,7 +43,7 @@ The picker groups exact normalized-host matches under For This Website, with Oth
 Accounts below. Search includes decrypted item/vault names. Arrow keys select, Return
 fills, and Escape cancels. Choosing an unrelated account requires confirmation that
 names both sites. Empty searches and unavailable vaults have explicit explanations.
-Errors offer Retry and Choose Another Account; setup instructions point to Mop’s
+Errors offer Retry and Choose Another Account; setup instructions point to 2ndPass’s
 AutoFill settings without relying on an unsupported extension-to-app launch route.
 
 Immediately before filling, the extension re-resolves the identifier against the
@@ -55,7 +55,7 @@ before completion; an expired result requires a fresh authenticated Retry.
 
 ## Storage and refresh
 
-The app, CLI, and extension share device-local App Group `MopV6` checkpoints and the
+The app, CLI, and extension share device-local App Group `MopV7` checkpoints and the
 non-synchronizable hardware key namespace. Account changes invalidate offline access
 and clear suggestions. Removed/stale suggestions cannot bypass catalog resolution.
 Offline filling uses the last verified catalog and cannot establish remote freshness.
@@ -64,7 +64,7 @@ item/vault names are visible only inside the authenticated picker.
 
 This version fills existing passwords and verification codes. Passkeys, saving new
 credentials, and generating passwords inside AutoFill are not implemented. Disabling
-the provider clears Apple’s store; enable it again and refresh suggestions in Mop.
+the provider clears Apple’s store; enable it again and refresh suggestions in 2ndPass.
 An invalid derived metadata cache is rebuilt from authenticated catalogs. Filesystem
 permission failures remain errors and are never bypassed during repair.
 
@@ -77,7 +77,7 @@ same CloudKit container (`iCloud.com.koehn.mop`) and existing Keychain group
 capabilities. Keep the app's existing identifier/group so existing keys remain
 accessible. The Mac extension is sandboxed and uses the hardened runtime.
 
-The Mop Xcode scheme builds and embeds MopAutoFill on both platforms. The separate
+The `Mop` Xcode scheme builds and embeds MopAutoFill on both platforms. The separate
 MopAutoFill scheme supports the Mac packaging script. For that script, supply
 `MOP_AUTOFILL_PROVISION_PROFILE` as well as `MOP_PROVISION_PROFILE` and
 `MOP_SIGN_IDENTITY`. Packaging validates the required capabilities, signs the
@@ -91,26 +91,26 @@ Unsigned builds and unit tests cannot validate system registration, provisioning
 Keychain sharing or biometric presentation. Before release, use signed builds on
 an iPhone/iPad and Mac to check:
 
-- Enable provider, unlock Mop, and see website/username suggestions in Safari.
+- Enable provider, unlock 2ndPass, and see website/username suggestions in Safari.
 - Verify TOTP suggestions in a code field, including a login without a password.
-  Selecting a code must present Mop authentication before filling, even after
+  Selecting a code must present 2ndPass authentication before filling, even after
   a recent app unlock or code fill. Cancel the prompt and verify nothing fills.
 - Open the code picker and verify only code accounts appear, with working search.
-- Fill codes before and after a TOTP rollover and compare with Mop’s current code.
-- Open the picker with Mop locked or terminated; authenticate before names appear. Verify identical website/username accounts are distinguishable by item and vault.
-- Select a password suggestion and verify Mop requires authentication before filling.
+- Fill codes before and after a TOTP rollover and compare with 2ndPass’s current code.
+- Open the picker with 2ndPass locked or terminated; authenticate before names appear. Verify identical website/username accounts are distinguishable by item and vault.
+- Select a password suggestion and verify 2ndPass requires authentication before filling.
   Repeat immediately after an app unlock and after a successful fill. Cancel and
-  confirm neither username nor password is filled. Choose “Mop…” and verify its
+  confirm neither username nor password is filled. Choose “2ndPass…” and verify its
   picker authenticates once, then fills without a second prompt within that request.
 - Cancel system authentication and confirm no fields are filled; then retry.
-- On iOS, long-press a text field and choose AutoFill → Passwords. Verify Mop
+- On iOS, long-press a text field and choose AutoFill → Passwords. Verify 2ndPass
   appears, its list can be searched, and Username/Password/Code inserts only the
   chosen value after authentication. Cancelling must leave the field unchanged.
 - Cancel authentication and retry; dismiss the extension during authentication.
 - Fill offline, update a password/username, rename/trash/delete items and vaults,
-  refresh Mop, and confirm old suggestions cannot fill removed credentials.
+  refresh 2ndPass, and confirm old suggestions cannot fill removed credentials.
 - Switch/sign out of the Apple Account and verify suggestions/offline access clear.
-- Disable/re-enable the provider and repopulate by unlocking Mop.
+- Disable/re-enable the provider and repopulate by unlocking 2ndPass.
 - Upgrade an existing installation and verify its app and CLI identities still work.
 
 An invalid local AutoFill metadata index is rebuilt on the next successful

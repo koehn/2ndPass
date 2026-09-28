@@ -30,8 +30,8 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "Formula").mkdir()
-            formula = root / "Formula/mop.rb"
-            original = (ROOT / "Formula/mop.rb").read_text()
+            formula = root / "Formula/secondpass.rb"
+            original = (ROOT / "Formula/secondpass.rb").read_text()
             formula.write_text(original)
             with patch.object(prepare, "__file__", str(root / "scripts/prepare-homebrew-release.py")), \
                  patch.object(sys, "argv", ["prepare", "v0.3.1", "--license", "MIT"]), \

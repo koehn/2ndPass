@@ -8,16 +8,16 @@ import subprocess
 import sys
 import tempfile
 
-binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/Mop.app/Contents/MacOS/mop').resolve()
+binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/2ndPass.app/Contents/MacOS/2ndpass').resolve()
 brew_prefix = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
 share = brew_prefix / 'share' if brew_prefix else (binary.parents[3] / 'share' if binary.parent.name == 'MacOS' else binary.parent / 'share')
-bash_script = (brew_prefix / 'etc/bash_completion.d/mop' if brew_prefix
-               else share / 'bash-completion/completions/mop')
+bash_script = (brew_prefix / 'etc/bash_completion.d/2ndpass' if brew_prefix
+               else share / 'bash-completion/completions/2ndpass')
 scripts = {'bash': bash_script,
-           'zsh': share / 'zsh/site-functions/_mop',
-           'fish': share / 'fish/vendor_completions.d/mop.fish'}
+           'zsh': share / 'zsh/site-functions/_2ndpass',
+           'fish': share / 'fish/vendor_completions.d/2ndpass.fish'}
 env = os.environ | {'MOP_CLOUD_VAULT': '00000000-0000-0000-0000-000000000000',
-                    'MOP_STATE_DIRECTORY': '/nonexistent/mop-completion-state'}
+                    'MOP_STATE_DIRECTORY': '/nonexistent/2ndpass-completion-state'}
 for shell, path in scripts.items():
     generated = subprocess.check_output([str(binary), 'completion', shell], env=env)
     assert generated == path.read_bytes()
@@ -37,7 +37,7 @@ COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
 COMP_LINE="${COMP_WORDS[*]}"
 COMP_POINT=${#COMP_LINE}
 COMPREPLY=()
-_mop mop "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}"
+_2ndpass 2ndpass "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}"
 printf '%s\\n' "${COMPREPLY[@]}"
 '''
     result = subprocess.run(['/bin/bash', '-c', code, 'test', str(scripts['bash']), *words],
@@ -45,35 +45,35 @@ printf '%s\\n' "${COMPREPLY[@]}"
     assert not result.stderr, result.stderr
     return result.stdout.splitlines()
 
-assert 'read' in bash_candidates(['mop', 're'])
-assert 'trust' in bash_candidates(['mop', 'vault', 'tr'])
-assert 'rename' in bash_candidates(['mop', 'vault', 'ren'])
-assert 'delete' in bash_candidates(['mop', 'vault', 'del'])
-assert '--yes' in bash_candidates(['mop', 'vault', 'delete', '--y'])
-assert '--strict-biometrics' not in bash_candidates(['mop', 'vault', 'init', '--strict'])
-assert '--device-name' not in bash_candidates(['mop', 'vault', 'init', '--device'])
-assert '--no-masking' in bash_candidates(['mop', 'run', '--no'])
-assert set(bash_candidates(['mop', 'completion', ''])) == {'bash', 'zsh', 'fish'}
-with tempfile.TemporaryDirectory(prefix='mop-completion-test-') as directory:
+assert 'read' in bash_candidates(['2ndpass', 're'])
+assert 'enrollment' in bash_candidates(['2ndpass', 'vault', 'en'])
+assert 'rename' in bash_candidates(['2ndpass', 'vault', 'ren'])
+assert 'delete' in bash_candidates(['2ndpass', 'vault', 'del'])
+assert '--confirm' in bash_candidates(['2ndpass', 'vault', 'delete', '--con'])
+assert '--strict-biometrics' not in bash_candidates(['2ndpass', 'vault', 'init', '--strict'])
+assert '--device-name' not in bash_candidates(['2ndpass', 'vault', 'init', '--device'])
+assert '--no-masking' in bash_candidates(['2ndpass', 'run', '--no'])
+assert set(bash_candidates(['2ndpass', 'completion', ''])) == {'bash', 'zsh', 'fish'}
+with tempfile.TemporaryDirectory(prefix='2ndpass-completion-test-') as directory:
     root = Path(directory)
     (root / 'input file.env').write_text('literal')
     (root / 'input directory').mkdir()
-    assert 'input file.env' in bash_candidates(['mop', 'run', '--env-file', 'input'], cwd=root)
-    directories = bash_candidates(['mop', 'read', '--state-directory', 'input'], cwd=root)
+    assert 'input file.env' in bash_candidates(['2ndpass', 'run', '--env-file', 'input'], cwd=root)
+    directories = bash_candidates(['2ndpass', 'read', '--state-directory', 'input'], cwd=root)
     assert 'input directory' in directories and 'input file.env' not in directories
     # Register zsh's autoload completion without writing a completion cache.
     subprocess.run(['/bin/zsh', '-f', '-c',
-                    'fpath=("$1" $fpath); autoload -Uz compinit; compinit -D; [[ ${_comps[mop]} == _mop ]]',
+                    'fpath=("$1" $fpath); autoload -Uz compinit; compinit -D; [[ ${_comps[2ndpass]} == _2ndpass ]]',
                     'test', str(scripts['zsh'].parent)], check=True, env=env, cwd=root)
 
 fish = shutil.which('fish')
 if fish:
-    result = subprocess.check_output([fish, '-c', 'source $argv[1]; complete -C "mop completion "', str(scripts['fish'])], env=env, text=True)
+    result = subprocess.check_output([fish, '-c', 'source $argv[1]; complete -C "2ndpass completion "', str(scripts['fish'])], env=env, text=True)
     assert {'bash', 'zsh', 'fish'} <= {line.split('\t')[0] for line in result.splitlines()}
 
-manual = share / 'man/man1/mop.1'
+manual = share / 'man/man1/2ndpass.1'
 result = subprocess.run(['mandoc', '-Tascii', str(manual)], check=True, capture_output=True)
 rendered = re.sub(rb'.\x08', b'', result.stdout)
-assert b'MOP(1)' in rendered and b'EXIT STATUS' in rendered
-assert manual.read_bytes() == (Path(__file__).resolve().parent.parent / 'docs/man/mop.1').read_bytes()
+assert b'2NDPASS(1)' in rendered and b'SECURITY' in rendered
+assert manual.read_bytes() == (Path(__file__).resolve().parent.parent / 'docs/man/2ndpass.1').read_bytes()
 print('PASS: packaged resources, Bash candidates and paths, zsh registration, and manpage rendering.')

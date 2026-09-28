@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory() as tmp:
     def generate(profile, environment="Production"):
         (root / 'profile').write_bytes(plistlib.dumps(profile))
         return subprocess.run([sys.executable, str(script), str(root / 'profile'),
-                               'net.test.mop', 'mop', str(root / 'info'), str(root / 'entitlements')],
+                               'net.test.mop', '2ndpass', str(root / 'info'), str(root / 'entitlements')],
                               capture_output=True, env={**os.environ, "MOP_CLOUD_ENVIRONMENT": environment})
     assert generate(base).returncode == 0
     ent = plistlib.loads((root / 'entitlements').read_bytes())
@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory() as tmp:
                    'com.apple.developer.icloud-services': ['CloudKit'],
                          'com.apple.developer.ubiquity-kvstore-identifier': 'TEAM.net.test.mop',
                    'com.apple.developer.icloud-container-environment': 'Production'}
-    assert plistlib.loads((root / 'info').read_bytes())['CFBundleExecutable'] == 'mop'
+    assert plistlib.loads((root / 'info').read_bytes())['CFBundleExecutable'] == '2ndpass'
     for field, value in [('com.apple.application-identifier', 'TEAM.*'),
                          ('com.apple.application-identifier', 'TEAM.net.other.app'),
                          ('com.apple.developer.team-identifier', ''),

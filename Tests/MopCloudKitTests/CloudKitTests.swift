@@ -122,8 +122,8 @@ private func fixture() async throws -> Fixture {
 @Test func cloudRoundTripAndIncrementalRecords() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
-    let a = try SecretReference("mop://v/github/token")
-    let b = try SecretReference("mop://v/database/password")
+    let a = try SecretReference("secondpass://v/github/token")
+    let b = try SecretReference("secondpass://v/database/password")
     try await store.write(a, value: "UNIQUE-SECRET", replace: false)
     try await store.write(b, value: "second", replace: false)
     await f.cloud.resetCounters()
@@ -151,7 +151,7 @@ private func fixture() async throws -> Fixture {
 @Test func lostCommitResponseReconcilesWithoutReplay() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
-    let ref = try SecretReference("mop://v/i/f")
+    let ref = try SecretReference("secondpass://v/i/f")
     await f.cloud.setLoss()
     await #expect(throws: MopError.cloudUncertain) { try await store.write(ref, value: "committed", replace: false) }
     #expect(try f.vault.status()["pendingCommit"] != "none")
@@ -167,7 +167,7 @@ private func fixture() async throws -> Fixture {
 
 @Test func failedStagingAndUncommittedHeadLeavePreviousSnapshot() async throws {
     let f = try await fixture(); defer { f.cleanup() }
-    let ref = try SecretReference("mop://v/i/f")
+    let ref = try SecretReference("secondpass://v/i/f")
     await f.cloud.failBlobs(.cloudQuota)
     let store = try await f.store(); defer { store.close() }
     await #expect(throws: MopError.cloudQuota) { try await store.write(ref, value: "staged", replace: false) }
@@ -185,7 +185,7 @@ private func fixture() async throws -> Fixture {
 @Test func offlineUsesVerifiedSnapshotAndRejectsWrites() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
-    let ref = try SecretReference("mop://v/i/f")
+    let ref = try SecretReference("secondpass://v/i/f")
     try await store.write(ref, value: "offline", replace: false)
     let repo = try await CloudRepository.open(transport: f.cloud, state: f.directory, offline: true)
     let vault = try repo.selected(nil)
@@ -212,7 +212,7 @@ private func fixture() async throws -> Fixture {
     let f = try await fixture(); defer { f.cleanup() }
     let initialHead = try await f.cloud.fetch("head", vault: f.vault.id)!
     let store = try await f.store(); defer { store.close() }
-    try await store.write(SecretReference("mop://v/i/f"), value: "safe", replace: false)
+    try await store.write(SecretReference("secondpass://v/i/f"), value: "safe", replace: false)
     let last = store.snapshot
     await f.cloud.replace("head", vault: f.vault.id, bytes: initialHead.data)
     await #expect(throws: MopError.vaultUntrusted) { try await f.vault.sync() }
@@ -253,8 +253,8 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     let a = try VaultSession(snapshot: f.initial, trust: f.vault.trust, opener: f.device)
     let b = try VaultSession(snapshot: f.initial, trust: f.vault.trust, opener: f.device)
     defer { a.close(); b.close() }
-    try a.write(SecretReference("mop://v/i/a"), value: "a", replace: false)
-    try b.write(SecretReference("mop://v/i/b"), value: "b", replace: false)
+    try a.write(SecretReference("secondpass://v/i/a"), value: "a", replace: false)
+    try b.write(SecretReference("secondpass://v/i/b"), value: "b", replace: false)
     await f.cloud.synchronizeHeads()
     let first = a.snapshot, second = b.snapshot
     let cloud = f.cloud, directory = f.directory, id = f.vault.id, initial = f.initial
@@ -271,7 +271,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
 @Test func incompleteFetchAndSameGenerationSubstitutionFailClosed() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
-    let ref = try SecretReference("mop://v/i/f")
+    let ref = try SecretReference("secondpass://v/i/f")
     try await store.write(ref, value: "value", replace: false)
     let good = store.snapshot
     let doc = try VaultDocument.decode(good)
@@ -317,7 +317,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
     await f.cloud.failHeads(.cloudQuota)
-    await #expect(throws: MopError.cloudQuota) { try await store.write(SecretReference("mop://v/i/f"), value: "no", replace: false) }
+    await #expect(throws: MopError.cloudQuota) { try await store.write(SecretReference("secondpass://v/i/f"), value: "no", replace: false) }
     #expect(try f.vault.status()["pendingCommit"] == "none")
     #expect(try f.vault.cached().0 == f.initial)
 }
@@ -371,7 +371,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
     let f = try await fixture(); defer { f.cleanup() }
     let session = try VaultSession(snapshot: f.initial, trust: f.vault.trust, opener: f.device)
     defer { session.close() }
-    let ref = try SecretReference("mop://v/item/token")
+    let ref = try SecretReference("secondpass://v/item/token")
     let originalFiles = try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path).sorted()
     for attempt in 0..<8 {
         let before = session.snapshot
@@ -402,7 +402,7 @@ private func attemptCommit(cloud: MemoryCloud, directory: URL, id: UUID, expecte
 @Test func validRecordsInARejectedRevisionDoNotLeaveCacheFiles() async throws {
     let f = try await fixture(); defer { f.cleanup() }
     let store = try await f.store(); defer { store.close() }
-    try await store.write(SecretReference("mop://v/item/token"), value: "fixture-value", replace: false)
+    try await store.write(SecretReference("secondpass://v/item/token"), value: "fixture-value", replace: false)
     let doc = try VaultDocument.decode(store.snapshot)
     let wrongDigest = String(repeating: "a", count: 64)
     await f.cloud.replace("m-" + wrongDigest, vault: f.vault.id, bytes: try VaultCoding.encode(CloudManifest(document: doc)))
@@ -432,7 +432,7 @@ private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
     #expect(try await f.repo.named("v").id == f.vault.id)
     await #expect(throws: MopError.duplicate) { try await f.repo.ensureAvailable("v") }
     let store = try await f.store(); defer { store.close() }
-    try await store.write(SecretReference("mop://v/mycloud/sshd"), value: "secret", replace: false)
+    try await store.write(SecretReference("secondpass://v/mycloud/sshd"), value: "secret", replace: false)
     let before = try VaultDocument.decode(store.snapshot)
     let offline = try await CloudRepository.open(transport: f.cloud, state: f.directory, offline: true)
     await f.cloud.resetCounters()
@@ -453,9 +453,9 @@ private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
     let f = try await fixture(); defer { f.cleanup() }
     let second = try await addVault(f, name: "personal")
     let one = try await f.store()
-    try await one.write(SecretReference("mop://v/item/token"), value: "first", replace: false); one.close()
+    try await one.write(SecretReference("secondpass://v/item/token"), value: "first", replace: false); one.close()
     let two = try CloudSecretStore(vault: second, snapshot: await second.sync(), opener: f.device)
-    try await two.write(SecretReference("mop://personal/item/token"), value: "second", replace: false); two.close()
+    try await two.write(SecretReference("secondpass://personal/item/token"), value: "second", replace: false); two.close()
     try f.repo.use(second.id)
     let rows = try await f.repo.descriptors(identity: f.device.identity.identity)
     var opens = 0, closes = 0
@@ -467,16 +467,16 @@ private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
         }
     }
     let service = AsyncSecretService { router() }
-    #expect(try await service.inject("{{mop://v/item/token}} {{mop://personal/item/token}} {{mop://v/item/token}}") == "first second first")
+    #expect(try await service.inject("{{secondpass://v/item/token}} {{secondpass://personal/item/token}} {{secondpass://v/item/token}}") == "first second first")
     #expect(opens == 2 && closes == 2)
     #expect(try await service.list(vault: nil).map(\.vault) == ["personal", "v"])
     #expect(opens == 4 && closes == 4)
-    await #expect(throws: MopError.notFound) { try await service.inject("{{mop://v/item/token}}{{mop://personal/item/missing}}") }
+    await #expect(throws: MopError.notFound) { try await service.inject("{{secondpass://v/item/token}}{{secondpass://personal/item/missing}}") }
     #expect(opens == 6 && closes == 6)
     let constrained = AsyncSecretService { router(second.id.uuidString) }
-    await #expect(throws: MopError.vaultSelectionMismatch) { try await constrained.read(SecretReference("mop://v/item/token")) }
+    await #expect(throws: MopError.vaultSelectionMismatch) { try await constrained.read(SecretReference("secondpass://v/item/token")) }
     #expect(opens == 6)
-    await #expect(throws: MopError.vaultMissing) { try await service.read(SecretReference("mop://unknown/item/token")) }
+    await #expect(throws: MopError.vaultMissing) { try await service.read(SecretReference("secondpass://unknown/item/token")) }
     #expect(opens == 6)
 }
 
@@ -506,7 +506,7 @@ private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
             return try CloudSecretStore(vault: vault, snapshot: await vault.sync(), opener: f.device)
         }
     }
-    await #expect(throws: (any Error).self) { try await service.read(SecretReference("mop://forged/item/token")) }
+    await #expect(throws: (any Error).self) { try await service.read(SecretReference("secondpass://forged/item/token")) }
     #expect(try f.vault.cached().0 == original)
 }
 
@@ -587,7 +587,7 @@ private func addVault(_ f: Fixture, name: String) async throws -> CloudVault {
     #expect(throws: MopError.vaultMissing) { try f.vault.verified(live) }
     #expect(try FileManager.default.contentsOfDirectory(atPath: f.vault.cache.directory.path).sorted() == ["deleted.json", "lock", "writer.lock"])
     await #expect(throws: MopError.vaultMissing) {
-        try await store.write(SecretReference("mop://v/item/field"), value: "late", replace: false)
+        try await store.write(SecretReference("secondpass://v/item/field"), value: "late", replace: false)
     }
     #expect(try other.cached().0 == otherSnapshot)
 }
@@ -909,15 +909,15 @@ private func identityFixture() async throws -> IdentityFixture {
         }
         for path in ["seed", "url"] {
             let start = Date()
-            let value = try await service.read(SecretReference("mop://v/login/\(path)"))
+            let value = try await service.read(SecretReference("secondpass://v/login/\(path)"))
             let expected = try [SecretBytes(utf8: otp.code(at: start)), SecretBytes(utf8: otp.code())]
             #expect(expected.contains(value))
         }
         let start = Date()
-        let injected = try await service.inject("{{mop://v/login/url}}")
+        let injected = try await service.inject("{{secondpass://v/login/url}}")
         let expected = try [SecretBytes(utf8: otp.code(at: start)), SecretBytes(utf8: otp.code())]
         #expect(expected.contains(injected))
-        #expect(try await service.read(SecretReference("mop://v/login/token")) == "ordinary-secret")
+        #expect(try await service.read(SecretReference("secondpass://v/login/token")) == "ordinary-secret")
     }
 }
 
@@ -945,7 +945,7 @@ private func identityFixture() async throws -> IdentityFixture {
     let store = try await f.store()
     await #expect(throws: MopError.invalidVault) { try await store.restore(oldDigest) }
     #expect(store.snapshot == currentBytes)
-    try await store.write(SecretReference("mop://v/item/value"), value: "current", replace: false)
+    try await store.write(SecretReference("secondpass://v/item/value"), value: "current", replace: false)
     #expect(try await f.vault.revisions() == [VaultCoding.digest(store.snapshot), currentDigest])
     try await store.restore(currentDigest)
     #expect(try store.catalog().items.isEmpty)

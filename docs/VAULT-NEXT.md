@@ -1,3 +1,5 @@
+> Superseded for format and storage by [Vault v7](VAULT-V7.md). The material below records the v6 design and validation history.
+
 > Current policy (2026-09-26): same-account device enrollment is automatic while
 > an owner device is unlocked. This supersedes the manual comparison requirements
 > below for own-account enrollment only. The private CloudKit mailbox is trusted
@@ -9,7 +11,7 @@
 > Reconnect with fresh keys. An attacker retaining iCloud access could still
 > request admission under a new identity; revoke account access to prevent that.
 
-# Mop next vault architecture
+# 2ndPass next vault architecture
 
 **Onboarding update:** Recovery is optional. A vault starts with one owner device
 and no recovery recipient. An authorized owner can add hardware recovery later,
@@ -58,7 +60,7 @@ device, cannot be imported as plaintext, and perform ECDH/signing without giving
 the application the plaintext private scalar. This does **not** mean HPKE, AES,
 derived symmetric keys, or decrypted passwords remain inside the Enclave.
 HPKE's recipient API returns plaintext Data. The application must consume the
-32-byte secret key to perform AES-GCM decryption. Passwords must reach Mop,
+32-byte secret key to perform AES-GCM decryption. Passwords must reach 2ndPass,
 AutoFill, the clipboard when requested, and authorized child commands.
 
 References checked on 2026-09-25:
@@ -75,7 +77,7 @@ References checked on 2026-09-25:
 
 The installed Xcode CryptoKit Swift interface explicitly declares
 `SecureEnclave.P256.KeyAgreement.PrivateKey: HPKEDiffieHellmanPrivateKey`, available
-since macOS 14/iOS 17, below Mop's minimum deployment targets. Compilation proves
+since macOS 14/iOS 17, below 2ndPass's minimum deployment targets. Compilation proves
 API compatibility; hardware execution, OS prompts, context invalidation,
 cross-process Keychain access, and real CloudKit sharing need separate evidence.
 
@@ -98,7 +100,7 @@ is not a portable recovery key and must not be treated as synchronized identity.
 
 ## Accounts, devices, and trust
 
-An account is a stable opaque Mop member UUID plus its authenticated CloudKit
+An account is a stable opaque 2ndPass member UUID plus its authenticated CloudKit
 participant identity in the container/environment. It groups roles and device
 approvals; it has no decryption private key. Do not use names/email addresses as
 cryptographic identity or assume an owner's private-database user ID is identical
@@ -148,8 +150,8 @@ Do not include decryption keys in URLs or send invitations automatically.
 Use CKShare with `publicPermission = .none`. Owner uses privateCloudDatabase;
 participants use sharedCloudDatabase and the **actual ownerName** from accepted
 metadata. Cloud addresses must include database scope and ownerName as well as
-zone UUID; UUID alone is insufficient. Cloud permissions and Mop roles must both
-allow an action. A CKShare acceptance is not a Mop membership grant. CloudKit
+zone UUID; UUID alone is insufficient. Cloud permissions and 2ndPass roles must both
+allow an action. A CKShare acceptance is not a 2ndPass membership grant. CloudKit
 may expose historical ciphertext and metadata to a newly accepted participant.
 Transport invitation and cryptographic membership are not one atomic transaction;
 persist progress and reconcile them explicitly. Never claim completion from one
@@ -196,7 +198,7 @@ A hardware recovery device can decrypt an accessible snapshot and sign a recover
 transition, enrolling a replacement owner device and replacing the recovery
 recipient. Rotate every current secret/catalog key and remove all old devices.
 Proof of possession establishes the signing key, not hardware attestation or
-physical separation. Mop cannot cryptographically prove that the recovery key
+physical separation. 2ndPass cannot cryptographically prove that the recovery key
 was generated on a different physical device through these APIs; the operator
 must keep an independently verified recovery device. Multiple keys on one Mac
 are not protection against losing that Mac.
@@ -293,7 +295,7 @@ Copied plaintext and previously unwrapped keys cannot be revoked. An authorized
 compromised process may ask the Enclave to decrypt while the OS permits it and
 may exfiltrate results. Hardware protection prevents exporting the device private
 scalar, not misuse of its authorized operations. Neither signatures nor CloudKit
-permissions prevent an authorized reader sharing passwords outside Mop.
+permissions prevent an authorized reader sharing passwords outside 2ndPass.
 
 ## Staged implementation and release gates
 
@@ -330,7 +332,7 @@ See CLOUDKIT.md for schema, bounds, concurrency and metadata exposure.
 
 ### Device removal lifecycle (2026-09-26)
 
-Settings on all Apple platforms and `mop vault devices` share account-device
+Settings on all Apple platforms and `2ndpass vault devices` share account-device
 management. Removal spans the private vaults locally enrolled on the managing
 device, with preflight last-owner checks and independently journaled publications.
 It is not an atomic account-wide CloudKit transaction and does not affect unknown

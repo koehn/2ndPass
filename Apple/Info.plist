@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>Mop</string>
+	<string>2ndPass</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleName</key>
-	<string>Mop</string>
+	<string>2ndPass</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -29,7 +29,7 @@
 	<key>MopPublishesAutoFill</key>
 	<true/>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Authenticate to unlock your Mop vaults and access secrets.</string>
+	<string>Authenticate to unlock your 2ndPass vaults and access secrets.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

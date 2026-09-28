@@ -1,0 +1,8 @@
+---
+layout: base.njk
+---
+<div class="page-head wrap"><p class="eyebrow">{{ eyebrow }}</p><h1>{{ heading }}</h1><p>{{ intro }}</p></div>
+<div class="doc-layout wrap">
+  <nav class="toc" aria-label="On this page"><strong>On this page</strong>{% for item in toc %}<a href="#{{ item.id }}">{{ item.label }}</a>{% endfor %}</nav>
+  <article class="prose">{{ content | safe }}</article>
+</div>

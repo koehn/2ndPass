@@ -2,15 +2,15 @@
 
 **V6 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](VAULT-NEXT-VALIDATION.md); remaining physical acceptance is not implied by historical build notes below.
 
-Mop is an open-source, Apple-native password and secrets manager built for the
+2ndPass is an open-source, Apple-native password and secrets manager built for the
 command line. It began with a practical need: keep passwords and other secrets
 in an encrypted vault and make them available to commands at runtime, without
 depending on a separate password-manager vendor.
 
 The motivation included wanting the freedom to leave a vendor whose choices no
-longer aligned with the maintainer's values. Mop should extend that same freedom
+longer aligned with the maintainer's values. 2ndPass should extend that same freedom
 to its own users: they should be able to inspect, modify, continue using, and
-leave Mop. Matching every feature of a competing password manager is not the goal.
+leave 2ndPass. Matching every feature of a competing password manager is not the goal.
 
 This document describes direction, not features already delivered or a release
 schedule. The [README](../README.md) describes current behavior, and
@@ -28,7 +28,7 @@ runtime secrets in one native application. A useful, sustainable project for
 that audience is a successful outcome without becoming a general-purpose
 commercial password-manager business.
 
-Mop still depends on Apple platforms, Secure Enclave, and CloudKit. Independence
+2ndPass still depends on Apple platforms, Secure Enclave, and CloudKit. Independence
 from a separate password-manager service does not mean independence from Apple.
 Portable exports and a documented vault format should preserve users' options.
 Cross-platform clients and alternate synchronization providers are not current
@@ -45,7 +45,7 @@ Handle plaintext interchange files explicitly and explain their exposure.
 
 Import now supports common CSV exports, Bitwarden JSON, and 1Password 1PUX; see
 [Importing password-manager data](IMPORT.md). Portable third-party export remains
-planned; encrypted v6 Mop backup export remains available. For future format changes, prioritize preserving access to
+planned; encrypted v6 2ndPass backup export remains available. For future format changes, prioritize preserving access to
 existing user data and provide an explicit compatibility or migration path.
 This does not change the current rejection of pre-v6 formats.
 
@@ -62,7 +62,7 @@ of how secrets reach child processes.
 Complete the signed physical-device and Production CloudKit acceptance in
 [validation](VALIDATION.md), including recovery, interrupted synchronization,
 account changes, and upgrades. Seek independent security review before promoting
-Mop for broad use as a primary credential store.
+2ndPass for broad use as a primary credential store.
 
 Add offline item creation and editing as the next substantial enhancement.
 Persist encrypted local changes across restarts, make them available locally,
@@ -73,12 +73,12 @@ resolution rather than silently discarding a password. Keep vault deletion and
 ownership/recovery operations online-only initially.
 
 Offline editing requires application-level persistence and conflict handling;
-CloudKit cannot merge Mop's encrypted contents. Current offline access remains
+CloudKit cannot merge 2ndPass's encrypted contents. Current offline access remains
 read-only until that work is implemented and validated.
 
 ### 4. Make distribution accessible
 
-Provide signed builds so using Mop does not require users to provision and build
+Provide signed builds so using 2ndPass does not require users to provision and build
 their own application. Start with a small beta of Apple-using developers and use
 their migration, installation, recovery, and everyday workflow experience to
 guide further work. Observe continued use and concrete blockers before expanding
@@ -94,7 +94,7 @@ paid, maintained distribution can coexist.
 
 ## Features deferred until there is a demonstrated need
 
-- **Passkeys:** Add when the maintainer or users need them to use Mop as their
+- **Passkeys:** Add when the maintainer or users need them to use 2ndPass as their
   primary credential manager. Their hardware and recovery model needs a separate
   design and acceptance effort.
 
@@ -105,4 +105,4 @@ access cannot retract secrets already copied by a recipient.
 Passkeys are not a prerequisite for an initial open-source release. Prioritize
 the original runtime-secrets problem, user control, and reliable operation over
 feature parity. Future expansion should follow the maintainer's needs or evidence
-from people actually using Mop.
+from people actually using 2ndPass.

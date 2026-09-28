@@ -35,13 +35,13 @@ for prefix in ("iPhone", "iPad"):
     [[ "$MOP_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid build number.' >&2; exit 2; }
     mkdir -p dist/mobile
     xcodebuild -project "$project" -scheme Mop -configuration Release -destination 'generic/platform=iOS' \
-      -archivePath "$PWD/dist/mobile/Mop-$MOP_BUILD_NUMBER.xcarchive" \
+      -archivePath "$PWD/dist/mobile/2ndPass-$MOP_BUILD_NUMBER.xcarchive" \
       CURRENT_PROJECT_VERSION="$MOP_BUILD_NUMBER" archive
     ;;
   export)
     : "${MOP_BUILD_NUMBER:?Set MOP_BUILD_NUMBER to the archived build number.}"
     [[ "$MOP_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || exit 2
-    xcodebuild -exportArchive -archivePath "$PWD/dist/mobile/Mop-$MOP_BUILD_NUMBER.xcarchive" \
+    xcodebuild -exportArchive -archivePath "$PWD/dist/mobile/2ndPass-$MOP_BUILD_NUMBER.xcarchive" \
       -exportOptionsPlist Apple/ExportOptions.plist -exportPath "$PWD/dist/mobile/export-$MOP_BUILD_NUMBER"
     ;;
   *) echo 'Usage: scripts/mobile.sh [build|test|archive|export]' >&2; exit 2 ;;

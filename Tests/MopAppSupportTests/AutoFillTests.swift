@@ -286,7 +286,7 @@ func autoFillSuggestionRequiresInteractionBeforeVaultAccess(kind: AutoFillKind) 
     let file = root.appendingPathComponent("identities.json")
     let valid = try JSONEncoder().encode(expected)
     let obsolete = Data(String(decoding: valid, as: UTF8.self)
-        .replacingOccurrences(of: "mop-autofill-v6", with: "mop-autofill-v1").utf8)
+        .replacingOccurrences(of: "mop-autofill-v7", with: "mop-autofill-v1").utf8)
     for invalid in [Data("{broken".utf8), obsolete] {
         try LocalFile.write(invalid, to: file, replace: true)
         #expect(throws: MopError.invalidVault) { try index.load() }

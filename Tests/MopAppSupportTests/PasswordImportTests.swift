@@ -235,7 +235,7 @@ extension PasswordImportTests {
         let bytes = try binaryArchive([("export.attributes", Data("{\"version\":3}".utf8)), ("export.data", Data(root.utf8)), ("files/large___big.bin", Data(repeating: 0, count: Attachment.maximumBytes + 1)), ("files/wrong___wrong.txt", Data([1, 2]))])
         let document = try PasswordImport.parse(bytes)
         let warnings = document.records[0].warnings.joined(separator: " ")
-        #expect(warnings.contains("lost.pdf") && warnings.contains("Mop could not locate an archive file matching its documentId"))
+        #expect(warnings.contains("lost.pdf") && warnings.contains("2ndPass could not locate an archive file matching its documentId"))
         #expect(warnings.contains("big.bin") && warnings.contains("8388609 bytes"))
         #expect(warnings.contains("wrong.txt") && warnings.contains("metadata says 20 bytes; archive contains 2 bytes"))
         #expect(!warnings.contains("private-password"))

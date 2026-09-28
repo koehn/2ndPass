@@ -18,7 +18,7 @@ struct AttachmentDownloads {
     init(state: URL, address: VaultAddress) {
         self.address = address
         let member = AccountScope.member(container: address.container, environment: address.environment, account: address.account)
-        directory = state.appendingPathComponent("v6").appendingPathComponent(member.uuidString)
+        directory = state.appendingPathComponent("v7").appendingPathComponent(member.uuidString)
             .appendingPathComponent("attachments").appendingPathComponent(address.binding)
     }
     func cache(_ vault: VerifiedVault) throws {

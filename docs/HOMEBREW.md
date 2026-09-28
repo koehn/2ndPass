@@ -1,80 +1,30 @@
-# Installing with Homebrew
+# Homebrew and 2ndPass
 
-> **Legacy 0.3.0 distribution only.** The current development backend requires
-> a signed, provisioned app bundle. The ad-hoc source formula below cannot access
-> its keys, including with `--HEAD`. Use the [signed source build](../README.md#signed-source-build).
-> Do not publish this backend using the existing source-archive release script;
-> a future Homebrew distribution must preserve the signed/provisioned bundle
-> (for example, a signed release cask). CI's formula checks cover compilation and
-> non-secret CLI behavior only, not the new installation/security model.
+The supported way to access current vaults is the [signed application build](../README.md#signed-source-build).
+The application and CLI require a provisioned bundle with CloudKit, App Groups,
+and Keychain access. An ad-hoc Homebrew executable cannot access those keys.
 
-mop requires macOS 15 or later and Xcode 16 or later to build. To access secrets,
-you also need iCloud Passwords & Keychain and an interactive login session.
+## Developer CLI build
 
-## Install
+`Formula/secondpass.rb` builds the renamed CLI from HEAD. Until a renamed release
+is published, there is no stable 2ndPass source archive. This formula is useful
+for development and non-secret CLI checks, not as a working vault installation.
 
 ```sh
 brew tap koehn/mop https://github.com/koehn/mop
-brew install koehn/mop/mop
+brew install --HEAD koehn/mop/secondpass
+2ndpass --help
+man 2ndpass
+brew test koehn/mop/secondpass
 ```
 
-Homebrew builds mop from source and installs the executable, manpage, and Bash,
-zsh, and Fish completions. Run `man mop` for the command reference, or follow the
-[getting-started instructions](../README.md#create-a-vault) to create a vault.
+The formula name is `secondpass`; the executable is `2ndpass`. The existing GitHub
+repository and tap still use `mop`. `Formula/mop.rb` remains pinned to the historical
+0.3.0 release and does not track HEAD.
 
-If you previously installed mop from source, check which copy your shell uses:
+A future supported Homebrew distribution should install the signed, provisioned
+app bundle, for example through a cask. See [release guidance](RELEASING.md).
 
-```sh
-type -a mop
-```
-
-An older copy in `~/.local/bin` may take precedence over the Homebrew installation.
-
-## Shell completions
-
-Follow the [shell completion setup](../README.md#manpage-and-shell-completions).
-The same instructions work for Homebrew and source installations.
-
-## Upgrade
-
-```sh
-brew update
-brew upgrade koehn/mop/mop
-```
-
-Keep your `~/Library/Application Support/Mop` directory when upgrading. It contains your default vault,
-caches and trusted vault fingerprints. If you share a vault between
-Macs, check the [upgrade notes](../README.md#file-boundaries-and-upgrades) before
-using a new file format.
-
-## Check the installation
-
-```sh
-mop --version
-brew test koehn/mop/mop
-```
-
-The Homebrew test checks command execution and installed files without opening
-your vault or prompting for authentication.
-
-## Uninstall
-
-```sh
-brew uninstall mop
-brew untap koehn/mop
-```
-
-Uninstalling removes the program and its documentation. Your vaults, recovery
-files, and local application state remain in place. The synchronized account
-identity remains in iCloud Keychain.
-
-## Development builds
-
-To install the latest source from `main`:
-
-```sh
-brew install --HEAD koehn/mop/mop
-```
-
-Development builds may contain changes that have not been released. Maintainers
-can find packaging and release instructions in [Releasing mop](RELEASING.md).
+Uninstalling the developer CLI (`brew uninstall secondpass`) does not delete vaults
+or device keys. Do not remove existing Mop application-support directories or
+change signing identifiers as part of the rename; see [branding and identity](BRANDING.md).

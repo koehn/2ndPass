@@ -24,7 +24,7 @@ extension Item {
             catch let code as ExitCode { throw code }
             catch {
                 let message = (error as? ImportFailure)?.errorDescription ?? (error as? MopError)?.errorDescription ?? "Import could not be completed."
-                IO.diagnostic("mop: " + message + "\n")
+                IO.diagnostic("2ndpass: " + message + "\n")
                 throw ExitCode(1)
             }
         }
@@ -41,7 +41,7 @@ extension Item {
             if !yes {
                 guard isatty(STDIN_FILENO) != 0, !json else { throw MopError.confirmationRequired }
                 try emit(preview.report)
-                try IO.output("Affected vaults require updated Mop clients. Import these items? [y/N] ")
+                try IO.output("Affected vaults require updated 2ndPass clients. Import these items? [y/N] ")
                 guard ["y", "yes"].contains(readLine()?.lowercased() ?? "") else { return }
             }
             let selected = Set(document.records.map(\.id))

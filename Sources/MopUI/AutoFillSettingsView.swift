@@ -26,7 +26,7 @@ struct AutoFillSettingsView: View {
             Button("Open AutoFill Settings…") {
                 Task {
                     do { try await ASSettingsHelper.openCredentialProviderAppSettings() }
-                    catch { settingsError = "Open System Settings (Settings on iPhone or iPad), choose AutoFill & Passwords, and enable Mop." }
+                    catch { settingsError = "Open System Settings (Settings on iPhone or iPad), choose AutoFill & Passwords, and enable 2ndPass." }
                 }
             }
             Button("Open Verification Code Settings…") {
@@ -41,8 +41,8 @@ struct AutoFillSettingsView: View {
             } else {
                 Button("Unlock to Refresh Suggestions") { model.unlock() }.disabled(!model.canUnlock)
             }
-            Text("Websites and usernames appear in system suggestions. Item and vault names stay encrypted until you authenticate in Mop’s picker. Each AutoFill request requires authentication.").font(.caption)
-            Text("Mop fills saved passwords and verification codes. Passkeys, saving new logins, and generating passwords inside AutoFill are not supported.").font(.caption).foregroundStyle(.secondary)
+            Text("Websites and usernames appear in system suggestions. Item and vault names stay encrypted until you authenticate in 2ndPass’s picker. Each AutoFill request requires authentication.").font(.caption)
+            Text("2ndPass fills saved passwords and verification codes. Passkeys, saving new logins, and generating passwords inside AutoFill are not supported.").font(.caption).foregroundStyle(.secondary)
         }
         .task {
             while !Task.isCancelled {
@@ -53,7 +53,7 @@ struct AutoFillSettingsView: View {
     }
     private var title: String {
         switch status.phase {
-        case .disabled: "Mop AutoFill is disabled"
+        case .disabled: "2ndPass AutoFill is disabled"
         case .updating: "Updating suggestions…"
         case .current: "Suggestions are up to date"
         case .failed: "Suggestions need attention"

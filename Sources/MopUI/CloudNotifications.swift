@@ -42,7 +42,7 @@ extension Notification.Name {
             guard NetworkAvailability.shared.isOnline,
                   let config = try? DefaultVaultPlatformConfiguration().cloudConfiguration() else { return }
             let container = CKContainer(identifier: config.container)
-            let databases = [(container.privateCloudDatabase, "mop-private-database-v6"), (container.sharedCloudDatabase, "mop-shared-database-v6")]
+            let databases = [(container.privateCloudDatabase, "mop-private-database-v7"), (container.sharedCloudDatabase, "mop-shared-database-v7")]
             for (database, subscriptionID) in databases {
             let subscription = CKDatabaseSubscription(subscriptionID: subscriptionID)
             let info = CKSubscription.NotificationInfo()
@@ -61,7 +61,7 @@ extension Notification.Name {
     }
     private func received(_ userInfo: [AnyHashable: Any]) -> Bool {
         guard let notification = CKNotification(fromRemoteNotificationDictionary: userInfo),
-              ["mop-private-database-v6", "mop-shared-database-v6"].contains(notification.subscriptionID ?? "") else { return false }
+              ["mop-private-database-v7", "mop-shared-database-v7"].contains(notification.subscriptionID ?? "") else { return false }
         NotificationCenter.default.post(name: .mopCloudChanged, object: nil)
         return true
     }
