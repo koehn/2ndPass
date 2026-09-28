@@ -89,6 +89,9 @@ public struct VaultItem: Codable, Equatable, Sendable {
     public var deletion: ItemDeletion?
     public var autoFill: AutoFillMapping?
     public var metadata: ItemMetadata?
+    /// Verified catalog projection, never serialized or accepted from an edit/import.
+    public var storageID: String? = nil
+    private enum CodingKeys: String, CodingKey { case name, type, fields, deletion, autoFill, metadata }
     public var isArchived: Bool { metadata?.archived == true }
     public var isFavorite: Bool { metadata?.favorite == true }
     public var requiresExtendedModel: Bool {
@@ -109,6 +112,7 @@ public struct ItemCatalog: Codable, Sendable {
     public var revision: String
     public var items: [VaultItem]
     public var canEdit: Bool?
+    public var usageScope: String? = nil
     public init(vault: String, revision: String, items: [VaultItem]) { self.vault = vault; self.revision = revision; self.items = items }
 }
 
@@ -131,11 +135,15 @@ public struct ImportSourceIdentity: Codable, Equatable, Sendable {
     }
 }
 public struct ItemMetadata: Codable, Equatable, Sendable {
+    public var createdAt: Date?
+    public var addedAt: Date?
+    public var updatedAt: Date?
     public var tags: [String]
     public var favorite: Bool
     public var archived: Bool
     public var source: ImportSourceIdentity?
-    public init(tags: [String] = [], favorite: Bool = false, archived: Bool = false, source: ImportSourceIdentity? = nil) {
+    public init(tags: [String] = [], favorite: Bool = false, archived: Bool = false, source: ImportSourceIdentity? = nil, createdAt: Date? = nil, addedAt: Date? = nil, updatedAt: Date? = nil) {
         self.tags = tags; self.favorite = favorite; self.archived = archived; self.source = source
+        self.createdAt = createdAt; self.addedAt = addedAt; self.updatedAt = updatedAt
     }
 }

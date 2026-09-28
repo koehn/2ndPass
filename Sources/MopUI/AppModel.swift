@@ -16,19 +16,33 @@ final class AppModel {
     let clipboard: any SecretClipboardAccess
     var isActive = true
     var vaults: [VaultDescriptor] = []
-    var vault = "" { didSet { invalidateItemSearch() } }
-    var allVaults = false { didSet { invalidateItemSearch() } }
-    var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch() } }
+    var vault = "" {
+        didSet {
+            if case .vault = collection { collection = .vault(vault) }
+            invalidateItemSearch()
+        }
+    }
+    var collection: ItemCollection = .vault("") { didSet { invalidateItemSearch() } }
+    // Convenience accessors for actions, backed by one collection state.
+    var allVaults: Bool {
+        get { if case .vault = collection { return false }; return collection != .recentlyDeleted }
+        set { collection = newValue ? .all : .vault(vault) }
+    }
+    var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch(); reloadUsage() } }
     var deletedCatalogs: [String: ItemCatalog] = [:] { didSet { invalidateDeletedSearch() } }
-    var selectedDeleted: ItemRow.ID?
+    var selectedDeleted: ItemRow.ID? { didSet { rememberSelection() } }
     var itemToDelete: ItemRow?
     var retentionDate = Date() { didSet { invalidateDeletedSearch() } }
     private var nextRetentionSweep = Date.distantPast
     @ObservationIgnored private let wallNow: () -> Date
     var passwordQualities: [String: PasswordQuality] = [:]
     private var launchAttempted = false
-    var page = AppPage.secrets
-    var selectedItem: String?
+    var page: AppPage {
+        get { collection == .recentlyDeleted ? .recentlyDeleted : .secrets }
+        set { if newValue == .recentlyDeleted { collection = .recentlyDeleted }
+            else if collection == .recentlyDeleted { collection = .vault(vault) } }
+    }
+    var selectedItem: String? { didSet { rememberSelection() } }
     var catalog: ItemCatalog? { didSet { invalidateItemSearch() } }
     var references: [SecretReference] = []
     var selected: SecretReference?
@@ -38,12 +52,18 @@ final class AppModel {
     var importFraction: Double?
     var importReport: ImportReport?
     var importFailed = false
-    var showArchived = false { didSet { invalidateItemSearch() } }
-    var favoritesOnly = false { didSet { invalidateItemSearch() } }
+    var showArchived: Bool {
+        get { collection == .archive }
+        set { if newValue { collection = .archive } else if collection == .archive { collection = .all } }
+    }
+    var favoritesOnly: Bool {
+        get { collection == .favorites }
+        set { if newValue { collection = .favorites } else if collection == .favorites { collection = .all } }
+    }
     var search = ""
     var searchIsFocused = false
     var searchHighlighted: ItemRow.ID?
-    var searchScope: String { page == .recentlyDeleted ? "Recently Deleted" : showArchived ? "Archive" : favoritesOnly ? "Favorites" : allVaults ? "All Items" : vaultName.isEmpty ? "Items" : vaultName }
+    var searchScope: String { collection.title ?? (vaultName.isEmpty ? "Items" : vaultName) }
     var members: [VaultMemberRecord] = []
     var settingsVisible = false
     var devices: [VaultDeviceRecord] = []
@@ -52,9 +72,11 @@ final class AppModel {
     var offline = false
     private var cloudRefreshPending = false
     private var nextCloudRefresh = Date.distantPast
-    var authenticated = false
+    var authenticated = false { didSet { if authenticated { reloadUsage() } } }
     var revealed: SecretBytes?
     var busy = false
+    private(set) var localOperation = false
+    var showsCloudProgress: Bool { !offline && ((busy && !localOperation) || refreshing) }
     var refreshing = false
     private var foregroundRevision = 0
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
@@ -112,6 +134,52 @@ final class AppModel {
 
     @ObservationIgnored private let now: () -> TimeInterval
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private var restoreLastSelection = true
+    @ObservationIgnored private var restoringSelection = false
+    private struct SavedSelection: Codable {
+        let collection: ItemCollection
+        let vault: String
+        let item: String?
+    }
+    // Device-local defaults contain only opaque account/vault/item IDs. Names and
+    // field values remain in the encrypted vault, and are resolved after unlock.
+    private func rememberSelection() {
+        guard authenticated, !unlocking, !restoringSelection else { return }
+        let id = collection == .recentlyDeleted ? selectedDeleted?.vault ?? vault : vault
+        guard let account = catalogs[id]?.usageScope else { return }
+        let item = collection == .recentlyDeleted
+            ? deletedCatalogs[id]?.items.first(where: { $0.name == selectedDeleted?.name })
+            : catalogs[id]?.items.first(where: { $0.name == selectedItem })
+        let selection = SavedSelection(collection: collection, vault: id, item: item?.storageID)
+        if let bytes = try? JSONEncoder().encode(selection) {
+            defaults.set(bytes, forKey: "lastSelection." + account)
+        }
+    }
+    private func restoreSelection() {
+        guard restoreLastSelection,
+              let account = catalogs[vault]?.usageScope ?? catalogs.sorted(by: { $0.key < $1.key }).first?.value.usageScope,
+              let bytes = defaults.data(forKey: "lastSelection." + account),
+              let saved = try? JSONDecoder().decode(SavedSelection.self, from: bytes) else { return }
+        restoringSelection = true
+        defer { restoringSelection = false }
+        guard let source = catalogs[saved.vault], source.usageScope == account else {
+            collection = .all; selectedItem = nil; selectedDeleted = nil
+            return
+        }
+        vault = saved.vault
+        collection = saved.collection
+        try? applyCatalog(source)
+        selectedItem = nil; selectedDeleted = nil
+        guard let id = saved.item else { return }
+        if collection == .recentlyDeleted {
+            if let item = deletedCatalogs[vault]?.items.first(where: { $0.storageID == id && $0.deletion?.isExpired(at: wallNow()) == false }) {
+                selectedDeleted = .init(vault: vault, name: item.name)
+            }
+        } else if let item = source.items.first(where: { $0.storageID == id && $0.deletion == nil }),
+                  item.isArchived == (collection == .archive), collection != .favorites || item.isFavorite {
+            selectedItem = item.name
+        }
+    }
     @ObservationIgnored private var inactivityTask: Task<Void, Never>?
     @ObservationIgnored private var operationTask: Task<Void, Never>?
     private var lastActivity: TimeInterval?
@@ -165,11 +233,13 @@ final class AppModel {
     init(service: any VaultService = NativeVaultService(), clipboard: (any SecretClipboardAccess)? = nil,
          defaults: UserDefaults = .standard, lifecycle: (any AppLifecycleMonitoring)? = nil,
          documents: any DocumentAccessing = SystemDocumentAccess(),
+         usageStore: any ItemUsageStoring = ItemUsageStore(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init) {
         self.lifecycle = lifecycle ?? SystemAppLifecycleMonitor()
         self.wallNow = wallNow; retentionDate = wallNow()
         self.service = service
+        self.usageStore = usageStore
         self.documents = documents
         self.clipboard = clipboard ?? SecretClipboard()
         self.defaults = defaults; self.now = now
@@ -196,7 +266,7 @@ final class AppModel {
             }
         }
     }
-    deinit { inactivityTask?.cancel(); automaticUnlockTask?.cancel(); enrollmentTask?.cancel() }
+    deinit { usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); enrollmentTask?.cancel() }
     func checkExpiration() {
         if let started = service.authenticatedAt {
             if lastActivity == nil { lastActivity = started }
@@ -237,6 +307,51 @@ final class AppModel {
         guard isActive else { return }
         if service.isAuthenticated { lastActivity = now() }
     }
+    private let usageStore: any ItemUsageStoring
+    private(set) var lastUsed: [ItemUsageIdentity: Date] = [:] {
+        didSet { if collection == .recentlyUsed { invalidateItemSearch() } }
+    }
+    @ObservationIgnored private var usageLoadTask: Task<Void, Never>?
+    private var usageLoadGeneration = 0
+    func reloadUsage() {
+        guard authenticated else { return }
+        usageLoadTask?.cancel()
+        usageLoadGeneration += 1
+        let load = usageLoadGeneration, security = securityGeneration
+        let accounts = Set(catalogs.values.compactMap(\.usageScope))
+        let store = usageStore
+        usageLoadTask = Task { [weak self] in
+            do {
+                let loaded = try await store.load(accounts: accounts)
+                guard let self, !Task.isCancelled, self.authenticated,
+                      self.securityGeneration == security, self.usageLoadGeneration == load else { return }
+                self.lastUsed = loaded.merging(self.lastUsed.filter { accounts.contains($0.key.account) }, uniquingKeysWith: max)
+            } catch { if !Task.isCancelled { ItemUsageLogging.failure(error) } }
+        }
+    }
+    func recordUsage(_ identity: ItemUsageIdentity?) {
+        guard authenticated, isActive, let identity else { return }
+        let date = wallNow()
+        lastUsed[identity] = max(lastUsed[identity] ?? .distantPast, date)
+        let store = usageStore
+        Task { await ItemUsageLogging.record([identity], at: date, store: store) }
+    }
+    func recordSelectedItemUsage() {
+        guard let item = selectedTypedItem else { return }
+        recordUsage(catalog?.usageIdentity(for: item, vaultID: vault))
+    }
+    func lastUsedDate(for item: VaultItem, vaultID: String) -> Date? {
+        guard let identity = catalogs[vaultID]?.usageIdentity(for: item, vaultID: vaultID) else { return nil }
+        return lastUsed[identity]
+    }
+    func recentDate(for row: ItemRow) -> Date? {
+        switch collection {
+        case .recentlyAdded: row.item.metadata?.addedAt
+        case .recentlyChanged: row.item.metadata?.updatedAt
+        case .recentlyUsed: lastUsedDate(for: row.item, vaultID: row.id.vault)
+        default: nil
+        }
+    }
     var selectedVaultDescriptor: VaultDescriptor? { vaults.first { $0.id == vault } }
     var canExportBackup: Bool { !allVaults && !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
     var vaultName: String { catalog?.vault ?? references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "" }
@@ -261,11 +376,23 @@ final class AppModel {
         _ = itemSearchRevision
         if let itemSearchIndex { return itemSearchIndex }
         let included = allVaults ? catalogs : catalog.map { [vault: $0] } ?? [:]
-        let rows = included.flatMap { id, catalog in
-            catalog.items.filter { $0.isArchived == showArchived && (!favoritesOnly || $0.isFavorite) }.map { item in
+        var rows = included.flatMap { id, catalog in
+            catalog.items.filter { $0.deletion == nil && $0.isArchived == showArchived && (!favoritesOnly || $0.isFavorite) }.map { item in
                 ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item)
             }
-        }.sorted { ($0.item.name, $0.vaultName, $0.id.vault) < ($1.item.name, $1.vaultName, $1.id.vault) }
+        }
+        if collection.isRecent {
+            rows = rows.compactMap { row in
+                guard let date = recentDate(for: row) else { return nil }
+                var result = row; result.recentDate = date; return result
+            }.sorted {
+                if $0.recentDate != $1.recentDate { return $0.recentDate! > $1.recentDate! }
+                return ($0.item.name, $0.id.vault, $0.item.storageID ?? "") < ($1.item.name, $1.id.vault, $1.item.storageID ?? "")
+            }
+            rows = Array(rows.prefix(50))
+        } else {
+            rows.sort { ($0.item.name, $0.vaultName, $0.id.vault) < ($1.item.name, $1.vaultName, $1.id.vault) }
+        }
         let index = ItemSearchIndex(rows: rows)
         itemSearchIndex = index
         return index
@@ -308,7 +435,7 @@ final class AppModel {
     var selectedDeletedItem: ItemRow? { allDeletedRows.first { $0.id == selectedDeleted } }
     func chooseRecentlyDeleted() {
         guard !busy, allowTransition(.recentlyDeleted) else { return }
-        page = .recentlyDeleted; allVaults = false
+        collection = .recentlyDeleted
         changedVault()
         scheduleAutomaticUnlock()
     }
@@ -405,8 +532,12 @@ final class AppModel {
     }
     func chooseCollection(archived: Bool) {
         guard !busy, allowTransition(.collection(archived: archived)) else { return }
-        allVaults = true; page = .secrets
-        showArchived = archived; favoritesOnly = !archived
+        collection = archived ? .archive : .favorites
+        changedVault()
+    }
+    func chooseRecent(_ collection: ItemCollection) {
+        guard collection.isRecent, !busy, allowTransition(.recent(collection)) else { return }
+        self.collection = collection
         changedVault()
     }
     func toggleFavorite() {
@@ -418,10 +549,13 @@ final class AppModel {
         saveItemDraft()
     }
     var sidebarSelection: String {
-        get { page == .recentlyDeleted ? "deleted" : showArchived ? "archive" : favoritesOnly ? "favorites" : allVaults ? "all" : "vault:" + vault }
+        get { collection.sidebarID }
         set {
             guard newValue != sidebarSelection else { return }
-            if newValue == "archive" { chooseCollection(archived: true) }
+            if newValue == "recent-added" { chooseRecent(.recentlyAdded) }
+            else if newValue == "recent-changed" { chooseRecent(.recentlyChanged) }
+            else if newValue == "recent-used" { chooseRecent(.recentlyUsed) }
+            else if newValue == "archive" { chooseCollection(archived: true) }
             else if newValue == "favorites" { chooseCollection(archived: false) }
             else if newValue == "deleted" { chooseRecentlyDeleted() }
             else if newValue == "all" { chooseAllVaults() }
@@ -529,12 +663,12 @@ final class AppModel {
         if addField { itemDraft?.fields.append(ItemDraft.Field(ItemField(path: "", value: ""), existing: false)) }
         let protectedFields = item.fields.filter { ($0.type == .password || $0.type.isCompound) && $0.value == nil && (path == nil || $0.path == path) }
         guard !protectedFields.isEmpty, let draft = itemDraft else { return }
-        perform { token in
+        perform(local: true) { token in
             do {
                 for field in protectedFields {
                     let reference = try SecretReference(vault: catalog.vault,
                         relativePath: SecretReference.encode(item.name) + "/" + field.path)
-                    let result = try await self.service.execute(.read(reference), vault: draft.vault, offline: false)
+                    let result = try await self.service.readLocal(reference, vault: draft.vault)
                     guard self.current(token), self.itemDraft?.id == draft.id,
                           self.vault == draft.vault, self.selectedItem == draft.originalName else { return }
                     guard let value = result.value else { throw MopError.invalidVault }
@@ -606,6 +740,7 @@ final class AppModel {
     func deactivate() { isActive = false; visibilityGeneration += 1; conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil }
     func activate() {
         checkExpiration(); isActive = true
+        reloadUsage()
         if service.isAuthenticated, !busy { lastActivity = now() }
         scheduleAutomaticUnlock(); checkRetention()
         if launchAttempted && authenticated { cloudChanged() }
@@ -619,13 +754,16 @@ final class AppModel {
         vaultDetailsTarget = nil; deleteConfirmation = false; documentRequest = nil; error = nil
     }
     private func clearView() {
+        authenticated = false
         clearSelection()
-        catalogs = [:]; deletedCatalogs = [:]; authenticated = false
+        catalogs = [:]; deletedCatalogs = [:]
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
+        rememberSelection(); restoreLastSelection = true
         enrollmentGeneration += 1; enrollmentTask?.cancel(); enrollmentTask = nil; enrollmentWorking = false
         for id in submittedEnrollments { enrollmentProgress[id, default: EnrollmentProgress()].phase = .paused }
         securityGeneration += 1
+        usageLoadTask?.cancel(); usageLoadGeneration += 1; lastUsed = [:]
         search = ""; searchHighlighted = nil; searchIsFocused = false; lastBackupURL = nil
         lockReason = reason; unlocking = false; launchUnlockAvailable = false
         cancelPendingTransition()
@@ -636,6 +774,7 @@ final class AppModel {
         status = "Locked"
     }
     func changedVault() {
+        restoreLastSelection = false
         checkExpiration()
         clearSelection()
         guard service.isAuthenticated else { authenticated = false; status = "Ready to authenticate"; return }
@@ -705,15 +844,15 @@ final class AppModel {
     }
     func cancelImportOperation() { operationTask?.cancel() }
 
-    func perform(operation: String = #function, file: String = #fileID, line: Int = #line, _ action: @escaping @MainActor (Int) async throws -> Void) {
+    func perform(local: Bool = false, operation: String = #function, file: String = #fileID, line: Int = #line, _ action: @escaping @MainActor (Int) async throws -> Void) {
         checkExpiration()
         guard !busy else { return }
         foregroundRevision += 1
-        busy = true; error = nil; notice = nil
+        busy = true; localOperation = local; error = nil; notice = nil
         let token = generation
         operationTask = Task {
             defer {
-                busy = false; checkExpiration()
+                busy = false; localOperation = false; checkExpiration()
                 removingDevice = false; removalProgress = nil
                 if savingTransition {
                     if itemDraft == nil && error == nil && token == generation { completePendingTransition() }
@@ -807,7 +946,7 @@ final class AppModel {
         launchUnlockAvailable = false
         let openingSession = !authenticated
         if openingSession { unlocking = true }
-        defer { if openingSession { unlocking = false } }
+        defer { if openingSession { unlocking = false; rememberSelection() } }
         do {
             let ids = requestedVaultIDs
             guard !ids.isEmpty else { status = "Connect this device to a vault to get started."; return }
@@ -827,11 +966,8 @@ final class AppModel {
             if vault.isEmpty { vault = ids[0] }
             if let catalog = loaded[vault] { try applyCatalog(catalog) }
             else { catalog = nil; references = [] }
-            // Prepare search before exposing the unlocked UI, including when a
-            // compact layout opens directly to a detail instead of the item list.
-            if page == .recentlyDeleted { _ = deletedIndex.search(search) }
-            else { _ = activeIndex.search(search) }
             authenticated = true; accessNeedsRepair = false
+            if openingSession { restoreSelection() }
             if lastActivity == nil { lastActivity = now() }
             for (id, catalog) in loaded {
                 vaults.removeAll { $0.id == id }
@@ -873,7 +1009,7 @@ final class AppModel {
     func currentOTP(_ reference: SecretReference) async throws -> (code: String, expires: Date, period: Int) {
         let token = generation, visibility = visibilityGeneration, id = vault, item = selectedItem
         guard isActive, authenticated, service.isAuthenticated else { throw MopError.authentication }
-        let result = try await service.execute(.read(reference), vault: id, offline: false)
+        let result = try await service.readLocal(reference, vault: id)
         guard current(token), !Task.isCancelled, isActive, visibilityGeneration == visibility,
               vault == id, selectedItem == item, let value = result.value else { throw MopError.authentication }
         guard let expires = result.otpExpiresAt, let period = result.otpPeriod else { throw MopError.invalidOTP }
@@ -894,8 +1030,8 @@ final class AppModel {
         guard let selected else { return }
         conceal()
         let visibility = visibilityGeneration
-        perform { token in
-            let result = try await self.service.execute(.read(selected), vault: self.selectedVault, offline: false)
+        perform(local: true) { token in
+            let result = try await self.service.readLocal(selected, vault: self.selectedVault)
             guard self.current(token), self.selected == selected, self.isActive, self.visibilityGeneration == visibility else { return }
             guard let value = result.value else { throw MopError.invalidVault }
             if copy {
@@ -908,6 +1044,7 @@ final class AppModel {
                     guard !Task.isCancelled else { return }; self?.conceal()
                 }
             }
+            self.recordUsage(result.usageIdentity)
             if self.offline { self.status = "Read only · verified cache from \(result.offlineDate.map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time")" }
         }
     }
@@ -1327,6 +1464,7 @@ final class AppModel {
     var showsSetupChecklist = false
     func createVault(name: String, recovery: URL? = nil, fingerprint: String? = nil) {
         guard !offline, !busy else { return }
+        restoreLastSelection = false
         conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; members = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
@@ -1405,6 +1543,7 @@ final class AppModel {
 enum PendingTransition {
     case item(ItemRow.ID?), vault(String), allItems, recentlyDeleted
     case collection(archived: Bool)
+    case recent(ItemCollection)
     case vaultTarget(String), sheet(AppSheet), presentation(SheetRequest), details(VaultDescriptor?), refresh, trash(ItemRow)
     case closeWindow, quit
 }
@@ -1491,6 +1630,7 @@ extension AppModel {
         case .vault(let id): chooseVault(id)
         case .allItems: chooseAllVaults()
         case .collection(let archived): chooseCollection(archived: archived)
+        case .recent(let collection): chooseRecent(collection)
         case .recentlyDeleted: chooseRecentlyDeleted()
         case .vaultTarget(let id):
             guard prepareVaultAction(id) else { completion?(false); return }

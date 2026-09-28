@@ -1,0 +1,21 @@
+---
+layout: base.njk
+pagination:
+  data: vaultDocuments
+  size: 1
+  alias: document
+permalink: "{{ document.slug }}.html"
+eleventyComputed:
+  title: "{{ document.title }}"
+  description: "{{ document.description }}"
+---
+<div class="doc-layout wrap">
+  <nav class="toc" aria-label="Vault documentation">
+    <strong>Vault documentation</strong>
+    <a href="vault.html">Vault protocol</a>
+    <a href="vault-validation.html">Validation record</a>
+    <a href="security.html">Security overview</a>
+    <a href="docs.html">User guide</a>
+  </nav>
+  <article class="prose">{{ document.content | renderContent("md") | safe }}</article>
+</div>

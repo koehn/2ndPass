@@ -53,6 +53,8 @@ The [build README](https://github.com/koehn/2ndPass#build-and-provision), [Cloud
 
 ## First vault
 
+For the technical design, read the [vault protocol](vault.html) and its [validation record](vault-validation.html).
+
 Open 2ndPass and choose **Create a vault**. Name it, authenticate, and start adding items. Device keys are generated automatically. One device is enough to begin; a recovery device is optional and can be added later.
 
 The CLI equivalent is:

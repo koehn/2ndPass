@@ -50,8 +50,11 @@ Use root hosting for the public domain. Prefix uploads are useful for staging;
 canonical URLs, the sitemap, and the error page assume the domain root. Adapt those
 before making a subdirectory deployment canonical.
 
-The security copy follows the repository's `docs/SECURITY.md`, `docs/VAULT-NEXT.md`,
-and validation records. Update public claims when implementation or acceptance
+The security copy follows the repository's `docs/SECURITY.md`, `docs/VAULT-V7.md`,
+and validation records. `vault.html` and `vault-validation.html` are generated from
+the canonical v7 documents by `src/_data/vaultDocuments.js`; update that manifest
+when publishing a newer validation record. Their linked profiling data is also
+included in the build. Update public claims when implementation or acceptance
 status changes. The origin FAQ separates the creator's judgment from the linked
 funding announcement and news reporting, reviewed September 27, 2026.
 

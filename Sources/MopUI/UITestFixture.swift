@@ -31,6 +31,13 @@ final class UITestVaultService: VaultService, Sendable {
                 result.defaultVault = Self.vaultID
                 return result
             case .catalog:
+                if let account = ProcessInfo.processInfo.environment["MOP_UI_SELECTION_TEST"] {
+                    state.catalog.usageScope = account
+                    state.catalog.items[0].storageID = "00000000-0000-0000-0000-000000000002"
+                }
+                if ProcessInfo.processInfo.environment["MOP_UI_RECENTS_TEST"] == "1" {
+                    state.catalog.items[0].metadata = ItemMetadata(createdAt: Date(), addedAt: Date(), updatedAt: Date())
+                }
                 if ProcessInfo.processInfo.environment["MOP_UI_IDENTITY_PENDING"] == "1" { throw MopError.identityPending }
                 if ProcessInfo.processInfo.environment["MOP_UI_VAULT_TRUST_FAILURE"] == "1" { throw MopError.vaultUntrusted }
                 state.authenticatedAt = ProcessInfo.processInfo.systemUptime

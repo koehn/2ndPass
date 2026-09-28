@@ -50,6 +50,8 @@ struct NextRegistry {
             }
             let attachments = cache.directory.appendingPathComponent("attachments")
             if FileManager.default.fileExists(atPath: attachments.path) { try FileManager.default.removeItem(at: attachments) }
+            let usage = cache.directory.appendingPathComponent("usage.json")
+            if FileManager.default.fileExists(atPath: usage.path) { try FileManager.default.removeItem(at: usage) }
             try write([NextEntry](), "vaults.json")
         }
     }

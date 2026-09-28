@@ -7,9 +7,9 @@ import MopCore
 import MopAuth
 import MopVaultNext
 
-/// One authenticated operation at a time. Hardware handles and transient keys
-/// never survive an operation; only the authenticated LAContext spans the session; locking invalidates pending authentication and
-/// rejects results from an earlier generation.
+/// Cloud mutations are serialized; local reads use verified session snapshots.
+/// Hardware handles and transient keys never survive an operation. Locking clears
+/// snapshots, invalidates authentication, and rejects earlier-generation results.
 public final class NativeVaultService: VaultService, @unchecked Sendable {
     private let control = SessionControl()
     private let gate = OperationGate()
@@ -18,6 +18,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     public var operationFraction: Double? { progressState.withLock { $0?.1 } }
     private func reportProgress(_ message: String, fraction: Double? = nil) { progressState.withLock { $0 = (message, fraction) } }
     private let state: URL
+    private let wallNow: @Sendable () -> Date
+    private let usageStore: any ItemUsageStoring
     private let configuration: any VaultPlatformConfiguration
     private let documents: any DocumentAccessing
     private let makeTransport: (String, String) throws -> any VaultTransport
@@ -31,7 +33,9 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     private let publishesAutoFill: Bool
     private var accountObserver: NSObjectProtocol?
     public var authenticatedAt: TimeInterval? { control.authenticatedAt }
-    public init(state: URL? = nil, allowsAttachments: Bool = true, configuration: any VaultPlatformConfiguration = DefaultVaultPlatformConfiguration(), documents: any DocumentAccessing = SystemDocumentAccess()) {
+    public init(state: URL? = nil, allowsAttachments: Bool = true, configuration: any VaultPlatformConfiguration = DefaultVaultPlatformConfiguration(), documents: any DocumentAccessing = SystemDocumentAccess(), usageStore: (any ItemUsageStoring)? = nil, wallNow: @escaping @Sendable () -> Date = Date.init) {
+        self.wallNow = wallNow
+        self.usageStore = usageStore ?? ItemUsageStore(state: state ?? configuration.stateDirectory)
         self.allowsAttachments = allowsAttachments
         makeTransport = { try CloudRevisionTransport(container: $0, environment: $1) }
         deleteDevice = { try DeviceKeychain.remove(scope: $0, member: $1) }
@@ -50,7 +54,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     init(state: URL, configuration: any VaultPlatformConfiguration, transport: any VaultTransport, allowsAttachments: Bool = true, attachmentSyncOverride: Bool? = nil,
          openDevice: @escaping (String, UUID, LAContext, Bool) throws -> any DeviceOperations,
          deleteDevice: @escaping (String, UUID) throws -> Void = { _, _ in },
-         authenticate: @escaping (@escaping (LAContext) throws -> Void) async throws -> LAContext) {
+         authenticate: @escaping (@escaping (LAContext) throws -> Void) async throws -> LAContext, usageStore: (any ItemUsageStoring)? = nil, wallNow: @escaping @Sendable () -> Date = Date.init) {
+        self.wallNow = wallNow; self.usageStore = usageStore ?? ItemUsageStore(state: state)
         self.allowsAttachments = allowsAttachments; self.attachmentSyncOverride = attachmentSyncOverride
         self.state = state; self.configuration = configuration; documents = SystemDocumentAccess()
         publishesAutoFill = false; makeTransport = { _, _ in transport }
@@ -58,9 +63,43 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     }
     public func lock() { control.lock() }
     deinit { control.lock(); if let accountObserver { NotificationCenter.default.removeObserver(accountObserver) } }
+    /// Read the already verified session snapshot independently of the cloud
+    /// operation queue. Only the requested field's item key is unwrapped.
+    public func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult {
+        let token = control.generation
+        let session = try control.localRead(vault: vault, name: reference.vault, token: token)
+        let task = Task.detached { [self] in
+            try control.check(token)
+            let account = try NextAccountBinding.account(state: state, container: session.container, environment: session.environment)
+            guard account == session.account else { throw MopError.cloudAccount }
+            let registry = try NextRegistry(state: state, container: session.container, environment: session.environment, account: account)
+            guard try !registry.removed() else { throw MopError.deviceRemoved }
+            let key = try openDevice(session.container + "/" + session.environment + "/device", registry.member, session.context.context, false)
+            defer {
+                if let enclave = key as? EnclaveDevice { enclave.releaseHandles() }
+                else { key.close() }
+            }
+            let read = try session.reader.read(reference, device: key, allowsAttachments: allowsAttachments)
+            var result = VaultResult(); result.usingCache = true; result.offlineDate = session.verifiedAt
+            if read.field.type == .otp {
+                let otp = try TimeBasedOTP(String(decoding: read.value, as: UTF8.self)), now = wallNow()
+                result.value = SecretBytes(utf8: try otp.code(at: now)); result.otpExpiresAt = otp.expires(at: now); result.otpPeriod = otp.period
+            } else { result.value = read.value }
+            result.valueIsConcealed = read.field.type.concealed
+            if let id = read.itemID {
+                result.usageIdentity = ItemUsageIdentity(account: registry.member.uuidString, vault: session.reader.vault.id.uuidString, item: id)
+            }
+            try control.check(token)
+            return result
+        }
+        let id = UUID(); control.registerTask(id, token: token) { task.cancel() }
+        defer { control.finishedTask(id) }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
     public func execute(_ operation: VaultOperation, vault: String?, offline: Bool = false) async throws -> VaultResult {
         if case .manage(.automaticEnrollment) = operation, !isAuthenticated { throw MopError.authentication }
         let token = control.generation
+        let started = wallNow()
         let task = Task.detached { [self] in
             await gate.enter()
             progressState.withLock { $0 = nil }
@@ -68,6 +107,15 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 try control.check(token)
                 var result = try await run(operation, selection: vault, offline: offline, token: token)
                 try control.check(token)
+                result.catalog?.usageScope = result.usageScope
+                result.deletedCatalog?.usageScope = result.usageScope
+                if !offline, let account = result.usageScope, let retained = result.retainedItemIDs, let vault = result.usageVault {
+                    let usageStore = self.usageStore
+                    Task {
+                        do { try await usageStore.prune(account: account, vault: vault, keeping: retained, before: started) }
+                        catch { ItemUsageLogging.failure(error) }
+                    }
+                }
                 if publishesAutoFill, let catalog = result.catalog, let vault, UUID(uuidString: vault) != nil {
                     do { try await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault) }
                     catch { result.autoFillStatus = await AutoFillPublisher.shared.status() }
@@ -113,7 +161,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         }
         try control.check(token)
         let registry = try NextRegistry(state: state, container: config.container, environment: config.environment, account: account)
-        var result = VaultResult(); result.usingCache = offline
+        var result = VaultResult(); result.usingCache = offline; result.usageScope = registry.member.uuidString
         if try registry.removed() {
             // Also retries an interrupted local cleanup before offering reconnection.
             try await clearRemovedAccount(registry)
@@ -649,6 +697,9 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             let path = [reference.section, reference.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
             guard let field = catalog.items.first(where: { $0.name == reference.item })?.fields.first(where: { $0.path == path }) else { throw MopError.notFound }
             guard allowsAttachments || field.type != .attachment else { throw MopError.notFound }
+            if let itemID = catalog.items.first(where: { $0.name == reference.item })?.storageID {
+                result.usageIdentity = ItemUsageIdentity(account: registry.member.uuidString, vault: current.id.uuidString, item: itemID)
+            }
             let value = try VaultEngine.read(reference.relativePath, in: current, device: key)
             if field.type == .otp {
                 let otp = try TimeBasedOTP(String(decoding: value, as: UTF8.self)), now = Date()
@@ -665,24 +716,24 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             guard vaultID == current.id, revision == current.digest else { throw MopError.vaultConflict }
             let plan = try VaultEngine.previewImport(document, selected: selected, in: current, device: key)
             if !plan.items.isEmpty {
-                proposal = try VaultEngine.importItems(plan.items, revision: revision, in: current, device: key) { completed, total in
+                proposal = try VaultEngine.importItems(plan.items, revision: revision, in: current, device: key, at: wallNow()) { completed, total in
                     try self.control.check(token)
                     self.reportProgress("Encrypting items: \(completed) of \(total)", fraction: total > 0 ? Double(completed) / Double(total) : nil)
                 }
             }
             var report = plan.preview.report; report.imported = plan.items.count; report.committed = true
             result.importReport = report
-        case .save(let edit): proposal = try VaultEngine.saveItem(edit, in: current, device: key)
+        case .save(let edit): proposal = try VaultEngine.saveItem(edit, in: current, device: key, at: wallNow())
         case .write(let reference, let value, let replace):
             guard reference.vault == current.name else { throw MopError.vaultSelectionMismatch }
             let exists = try VaultEngine.references(in: current, device: key).contains(reference.relativePath)
             guard exists == replace else { throw exists ? MopError.duplicate : MopError.notFound }
-            proposal = try VaultEngine.write(reference.relativePath, value: value, in: current, device: key)
+            proposal = try VaultEngine.write(reference.relativePath, value: value, in: current, device: key, at: wallNow())
         case .delete(let reference):
             guard reference.vault == current.name else { throw MopError.vaultSelectionMismatch }
-            proposal = try VaultEngine.write(reference.relativePath, value: nil, in: current, device: key)
-        case .trashItem(let name, let revision): proposal = try VaultEngine.trashItem(name: name, revision: revision, in: current, device: key)
-        case .restoreItem(let id, let revision): proposal = try VaultEngine.restoreItem(id: id, revision: revision, in: current, device: key)
+            proposal = try VaultEngine.write(reference.relativePath, value: nil, in: current, device: key, at: wallNow())
+        case .trashItem(let name, let revision): proposal = try VaultEngine.trashItem(name: name, revision: revision, in: current, device: key, at: wallNow())
+        case .restoreItem(let id, let revision): proposal = try VaultEngine.restoreItem(id: id, revision: revision, in: current, device: key, at: wallNow())
         case .members:
             let names: [UUID: String]
             if entry.address.database == .private {
@@ -709,6 +760,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         case .deleteVault:
             guard current.membership.role(of: key.identity) == .owner else { throw MopError.cloudPermission }
             try control.check(token); try await transport.delete(at: entry.address); try registry.forget(entry)
+            control.removeLocalRead(current.id.uuidString)
+            result.retainedItemIDs = []; result.usageVault = current.id.uuidString
             result.message = "Cloud vault deleted. Existing local ciphertext and backups retained."; return result
         case .manage(let action):
             switch action {
@@ -772,8 +825,13 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         }
         let verified = proposal ?? current
         if verified.membership.role(of: key.identity) == nil { return result }
-        result.catalog = try VaultEngine.catalog(in: verified, device: key)
-        result.deletedCatalog = try VaultEngine.catalog(in: verified, device: key, deleted: true)
+        let catalogs = try VaultEngine.catalogs(in: verified, device: key)
+        try control.saveLocalRead(LocalReadSession(reader: catalogs.reader, verifiedAt: await coordinator.offlineSnapshot().1, account: account,
+            container: config.container, environment: config.environment, context: ContextInvalidator(context)), token: token)
+        result.catalog = catalogs.active
+        result.deletedCatalog = catalogs.deleted
+        result.retainedItemIDs = catalogs.retainedIDs
+        result.usageVault = verified.id.uuidString
         return result
     }
 }

@@ -2,6 +2,27 @@ import Foundation
 import CryptoKit
 import MopCore
 
+/// An unlocked session's verified ciphertext and catalog. No concealed field plaintext,
+/// private keys, or unwrapped item keys are retained here.
+public struct VaultReadSnapshot: Sendable {
+    public let vault: VerifiedVault
+    public let catalog: ItemCatalog
+    fileprivate let references: [String: String]
+
+    public func read(_ reference: SecretReference, device: any DeviceOperations, allowsAttachments: Bool = true) throws -> (value: SecretBytes, field: ItemField, itemID: String?) {
+        guard reference.vault == vault.name else { throw MopError.vaultSelectionMismatch }
+        guard vault.membership.role(of: device.identity) != nil else { throw MopError.notVaultMember }
+        let path = [reference.section, reference.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
+        guard let item = catalog.items.first(where: { $0.name == reference.item }),
+              let field = item.fields.first(where: { $0.path == path }),
+              let id = references[reference.relativePath] else { throw MopError.notFound }
+        guard allowsAttachments || field.type != .attachment else { throw MopError.notFound }
+        var bytes = try VaultEngine.openRecord(id, in: vault, device: device)
+        defer { SecretBytes.wipe(&bytes) }
+        return (SecretBytes(copying: bytes), field, item.storageID)
+    }
+}
+
 public extension VaultEngine {
     static func purgeExpired(in vault: VerifiedVault, device: any DeviceOperations, at date: Date = Date()) throws -> VerifiedVault? {
         let role = vault.membership.role(of: device.identity)
@@ -20,6 +41,14 @@ public extension VaultEngine {
         let payload = try vault.revision.payload(device: device)
         return try catalog(payload, in: vault, device: device, deleted: deleted)
     }
+    /// One payload decryption for both lists and the authoritative usage-pruning inventory.
+    static func catalogs(in vault: VerifiedVault, device: any DeviceOperations) throws -> (active: ItemCatalog, deleted: ItemCatalog, retainedIDs: Set<String>, reader: VaultReadSnapshot) {
+        let payload = try vault.revision.payload(device: device)
+        let active = try catalog(payload, in: vault, device: device)
+        return (active,
+                try catalog(payload, in: vault, device: device, deleted: true),
+                Set(payload.itemIDs.values), VaultReadSnapshot(vault: vault, catalog: active, references: payload.references))
+    }
     internal static func catalog(_ payload: CatalogPayload, in vault: VerifiedVault, device: any DeviceOperations, deleted: Bool = false) throws -> ItemCatalog {
         var items = payload.items
         // Raw reference writes also appear as custom items in the catalog.
@@ -30,6 +59,7 @@ public extension VaultEngine {
                 if !items[index].fields.contains(where: { $0.path == field }) { items[index].fields.append(ItemField(path: field)) }
             } else { items.append(VaultItem(name: reference.item, fields: [ItemField(path: field)])) }
         }
+        for index in items.indices { items[index].storageID = payload.itemIDs[items[index].name] }
         var result = ItemCatalog(vault: vault.name, revision: vault.digest, items: items.filter {
             deleted ? ($0.deletion != nil && !$0.deletion!.isExpired(at: Date())) : $0.deletion == nil
         }.sorted { $0.name < $1.name })
@@ -38,13 +68,13 @@ public extension VaultEngine {
         return result
     }
 
-    static func saveItem(_ edit: ItemEdit, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
+    static func saveItem(_ edit: ItemEdit, in vault: VerifiedVault, device: any DeviceOperations, at date: Date = Date()) throws -> VerifiedVault {
         guard edit.revision == vault.digest else { throw MopError.vaultConflict }
         let role = vault.membership.role(of: device.identity)
         guard role == .owner || role == .editor else { throw MopError.cloudPermission }
         var payload = try vault.revision.payload(device: device)
         var records = vault.revision.records, keys = vault.revision.itemKeys
-        try apply(edit, payload: &payload, records: &records, keys: &keys, vault: vault, device: device)
+        try apply(edit, payload: &payload, records: &records, keys: &keys, vault: vault, device: device, at: date)
         do {
             return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
                 records: records, itemKeys: keys, items: payload.items, signer: device))
@@ -53,7 +83,7 @@ public extension VaultEngine {
         }
     }
 
-    private static func apply(_ edit: ItemEdit, payload: inout CatalogPayload, records: inout [String: SealedObject], keys: inout [String: ItemKey], vault: VerifiedVault, device: any DeviceOperations) throws {
+    private static func apply(_ edit: ItemEdit, payload: inout CatalogPayload, records: inout [String: SealedObject], keys: inout [String: ItemKey], vault: VerifiedVault, device: any DeviceOperations, at date: Date, importing: Bool = false) throws {
         var current = payload.items.filter { $0.deletion == nil }
         for path in payload.references.keys.sorted() {
             let ref = try SecretReference(vault: vault.name, relativePath: path)
@@ -72,6 +102,15 @@ public extension VaultEngine {
               Set(edit.item.fields.map(\.path)).count == edit.item.fields.count else { throw MopError.invalidVault }
         guard edit.item.autoFill?.validationError(in: edit.item.fields) == nil else { throw MopError.invalidVault }
         var item = edit.item
+        item.storageID = nil
+        if item.metadata == nil { item.metadata = ItemMetadata() }
+        if importing {
+            item.metadata?.addedAt = date
+        } else {
+            item.metadata?.createdAt = edit.create ? date : old?.metadata?.createdAt
+            item.metadata?.addedAt = edit.create ? date : old?.metadata?.addedAt
+            item.metadata?.updatedAt = date
+        }
         let existingID = try payload.references.first { try SecretReference(vault: vault.name, relativePath: $0.key).item == original }.flatMap { records[$0.value]?.itemID }
         let itemID = existingID ?? UUID().uuidString
         var itemKey: SymmetricKey?
@@ -133,14 +172,14 @@ public extension VaultEngine {
     }
 
     /// Prepares a single revision; callers publish it once through PublicationCoordinator.
-    static func importItems(_ items: [VaultItem], revision: String, in vault: VerifiedVault, device: any DeviceOperations, progress: ((Int, Int) throws -> Void)? = nil) throws -> VerifiedVault {
+    static func importItems(_ items: [VaultItem], revision: String, in vault: VerifiedVault, device: any DeviceOperations, at date: Date = Date(), progress: ((Int, Int) throws -> Void)? = nil) throws -> VerifiedVault {
         guard revision == vault.digest else { throw MopError.vaultConflict }
         guard let role = vault.membership.role(of: device.identity), role == .owner || role == .editor else { throw MopError.cloudPermission }
         var payload = try vault.revision.payload(device: device), records = vault.revision.records, keys = vault.revision.itemKeys
         try progress?(0, items.count)
         for (index, item) in items.enumerated() {
             try Task.checkCancellation()
-            try apply(ItemEdit(revision: revision, item: item, create: true), payload: &payload, records: &records, keys: &keys, vault: vault, device: device)
+            try apply(ItemEdit(revision: revision, item: item, create: true), payload: &payload, records: &records, keys: &keys, vault: vault, device: device, at: date, importing: true)
             try progress?(index + 1, items.count)
         }
         do {
@@ -169,11 +208,11 @@ public extension VaultEngine {
         return (plan.items, ImportPreview(vault: vault.id, revision: vault.digest, report: plan.report))
     }
 
-    static func trashItem(name: String, revision: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
+    static func trashItem(name: String, revision: String, in vault: VerifiedVault, device: any DeviceOperations, at date: Date = Date()) throws -> VerifiedVault {
         var payload = try vault.revision.payload(device: device)
         guard let item = try catalog(payload, in: vault, device: device).items.first(where: { $0.name == name }) else { throw MopError.notFound }
         var deleted = item
-        deleted.deletion = ItemDeletion(originalName: name, deletedAt: Date())
+        deleted.deletion = ItemDeletion(originalName: name, deletedAt: date)
         deleted.name = "deleted-" + deleted.deletion!.id.uuidString
         for field in item.fields {
             let old = SecretReference.encode(name) + "/" + field.path
@@ -182,16 +221,18 @@ public extension VaultEngine {
         payload.items.removeAll { $0.name == name }; payload.items.append(deleted)
         return try metadata(payload, expected: revision, in: vault, device: device)
     }
-    static func restoreItem(id: UUID, revision: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
+    static func restoreItem(id: UUID, revision: String, in vault: VerifiedVault, device: any DeviceOperations, at date: Date = Date()) throws -> VerifiedVault {
         var payload = try vault.revision.payload(device: device)
         guard let index = payload.items.firstIndex(where: { $0.deletion?.id == id }),
-              let deletion = payload.items[index].deletion, !deletion.isExpired(at: Date()),
+              let deletion = payload.items[index].deletion, !deletion.isExpired(at: date),
               !payload.items.contains(where: { $0.name == deletion.originalName }) else { throw MopError.duplicate }
         let oldName = payload.items[index].name
         for field in payload.items[index].fields {
             payload.references[SecretReference.encode(deletion.originalName) + "/" + field.path] = payload.references.removeValue(forKey: SecretReference.encode(oldName) + "/" + field.path)
         }
         payload.items[index].name = deletion.originalName; payload.items[index].deletion = nil
+        if payload.items[index].metadata == nil { payload.items[index].metadata = ItemMetadata() }
+        payload.items[index].metadata?.updatedAt = date
         return try metadata(payload, expected: revision, in: vault, device: device)
     }
     private static func metadata(_ payload: CatalogPayload, expected: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {

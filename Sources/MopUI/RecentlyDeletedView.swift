@@ -35,6 +35,7 @@ struct RecentlyDeletedDetail: View {
             VStack(alignment: .leading, spacing: 16) {
                 Label(row.vaultName + " › Recently Deleted", systemImage: "trash").foregroundStyle(.secondary)
                 Text(deletion.originalName).font(.title2).fontWeight(.semibold)
+                ItemDatesView(item: row.item, lastUsed: model.lastUsedDate(for: row.item, vaultID: row.id.vault))
                 Text("Deleted " + deletion.deletedAt.formatted(date: .abbreviated, time: .shortened))
                 Text("Expires " + deletion.expiresAt.formatted(date: .abbreviated, time: .shortened))
                     .foregroundStyle(.secondary)

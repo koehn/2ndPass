@@ -18,11 +18,14 @@ public enum AutoFillSessionError: Error, Equatable, Sendable { case expired, end
 /// One fresh authentication may authorize one fill, never a later request.
 @MainActor public final class AutoFillRequestSession {
     private let service: any VaultService
+    private let usageStore: any ItemUsageStoring
+    private var preparedUsage: ItemUsageIdentity?
     private let now: () -> TimeInterval
     private let deadline: TimeInterval
     private var ended = false
     public private(set) var unavailableVaults = 0
-    public init(service: any VaultService = NativeVaultService(allowsAttachments: false), now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+    public init(service: any VaultService = NativeVaultService(allowsAttachments: false), usageStore: any ItemUsageStoring = ItemUsageStore(), now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.usageStore = usageStore
         self.service = service; self.now = now; deadline = now() + 60
         service.lock()
     }
@@ -65,6 +68,7 @@ public enum AutoFillSessionError: Error, Equatable, Sendable { case expired, end
         let (entry, secret) = try await AutoFillAccess.resolve(recordIdentifier: identity.recordIdentifier, kind: .password, service: service)
         try check()
         guard let bytes = secret.value else { throw MopError.notFound }
+        preparedUsage = secret.usageIdentity
         return ASPasswordCredential(user: entry.username, password: String(decoding: bytes, as: UTF8.self))
     }
     public func code(_ identity: AutoFillIdentity) async throws -> (credential: ASOneTimeCodeCredential, expiresAt: Date) {
@@ -74,6 +78,15 @@ public enum AutoFillSessionError: Error, Equatable, Sendable { case expired, end
         try check()
         guard let bytes = secret.value, let expiry = secret.otpExpiresAt, expiry > Date(),
               let period = secret.otpPeriod, period > 0 else { throw MopError.invalidOTP }
+        preparedUsage = secret.usageIdentity
         return (ASOneTimeCodeCredential(code: String(decoding: bytes, as: UTF8.self)), expiry)
     }
+    /// Called only by the controller when handing the validated credential to the OS.
+    /// Merely constructing a credential or listing choices is not usage.
+    public func recordDeliveredUsage() async {
+        guard !Task.isCancelled, now() < deadline, let identity = preparedUsage else { return }
+        preparedUsage = nil
+        await ItemUsageLogging.record([identity], store: usageStore)
+    }
+
 }

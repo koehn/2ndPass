@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import MopCore
 import ZIPFoundation
 
@@ -269,6 +270,8 @@ public enum PasswordImport {
             let id = text(entry["id"]), container = text(entry["organizationId"])
             item.metadata = ItemMetadata(tags: tags, favorite: flag(entry["favorite"]), archived: flag(entry["archived"]) || (entry["archivedDate"] != nil && !(entry["archivedDate"] is NSNull)),
                 source: id.isEmpty ? nil : ImportSourceIdentity(provider: "bitwarden", container: container.isEmpty ? "personal" : container, item: id))
+            item.metadata?.createdAt = importedDate(entry["creationDate"])
+            item.metadata?.updatedAt = importedDate(entry["revisionDate"])
             add(type == .secureNote ? "note" : "notes", type == .secureNote ? .concealed : .notes, entry["notes"], to: &item)
             if let login = entry["login"] as? [String: Any] {
                 add("username", .username, login["username"], to: &item)
@@ -421,6 +424,8 @@ public enum PasswordImport {
                     item.metadata = ItemMetadata(tags: Array(Set(tags)).sorted(), favorite: (source["favIndex"] as? Int ?? 0) > 0,
                         archived: flag(source["state"]) || text(source["state"]) == "archived",
                         source: sourceID.isEmpty ? nil : ImportSourceIdentity(provider: "1password", container: text(accountInfo["uuid"]) + ":" + text(attrs["uuid"]), item: sourceID))
+                    item.metadata?.createdAt = importedDate(source["createdAt"])
+                    item.metadata?.updatedAt = importedDate(source["updatedAt"])
                     add(type == .secureNote ? "note" : "notes", type == .secureNote ? .concealed : .notes, details["notesPlain"], to: &item)
                     add("password", .password, details["password"], to: &item)
                     var urls = overview["urls"] as? [[String: Any]] ?? []
@@ -518,4 +523,19 @@ public enum PasswordImport {
         }
         return ImportDocument(format: .onePasswordArchive, records: records)
     }
+}
+
+
+// Unknown or malformed historical dates remain unknown rather than becoming the import date.
+private func importedDate(_ value: Any?) -> Date? {
+    if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+        let seconds = number.doubleValue
+        return seconds.isFinite && seconds >= 0 ? Date(timeIntervalSince1970: seconds) : nil
+    }
+    guard let text = value as? String else { return nil }
+    let parser = ISO8601DateFormatter()
+    parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = parser.date(from: text) { return date }
+    parser.formatOptions = [.withInternetDateTime]
+    return parser.date(from: text)
 }

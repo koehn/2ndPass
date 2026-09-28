@@ -115,6 +115,45 @@ import XCTest
         XCTAssertFalse(app.buttons["Use as OTP"].exists)
     }
 
+    func testRestoresSelectedItemAfterRelaunch() {
+        let app = XCUIApplication()
+        app.launchEnvironment["MOP_UI_TESTING"] = "1"
+        app.launchEnvironment["MOP_UI_SELECTION_TEST"] = UUID().uuidString
+        app.launch()
+        openItems(app)
+        app.staticTexts["Example Login"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5))
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertTrue(app.buttons["Copy password value"].exists)
+        XCTAssertFalse(app.staticTexts["ui-fixture-password"].exists)
+    }
+
+    func testRecentVirtualVaults() {
+        for title in ["Recently Added", "Recently Changed", "Recently Used"] {
+            let app = XCUIApplication()
+            app.launchEnvironment["MOP_UI_TESTING"] = "1"
+            app.launchEnvironment["MOP_UI_RECENTS_TEST"] = "1"
+            app.launch()
+            openItems(app)
+            app.buttons["BackButton"].tap()
+            let link = app.staticTexts[title].firstMatch
+            XCTAssertTrue(link.waitForExistence(timeout: 10), app.debugDescription)
+            link.tap()
+            XCTAssertTrue(app.textFields["Item search"].waitForExistence(timeout: 5))
+            if title == "Recently Used" {
+                XCTAssertFalse(app.staticTexts["Example Login"].exists)
+            } else {
+                let item = app.staticTexts["Example Login"].firstMatch
+                XCTAssertTrue(item.waitForExistence(timeout: 5))
+                item.tap()
+                XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Created: '")).firstMatch.waitForExistence(timeout: 5))
+            }
+            app.terminate()
+        }
+    }
+
     func testSearchFiltersListAndOpensItem() {
         let app = launch()
         openItems(app)
@@ -147,7 +186,7 @@ import XCTest
         search.typeText("s")
         let server = app.staticTexts["SSH Server"].firstMatch
         XCTAssertTrue(server.waitForExistence(timeout: 5))
-        XCTAssertFalse(example.exists)
+        XCTAssertTrue(example.waitForNonExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["ssh username: sshd"].exists)
         search.typeText("h")
         XCTAssertTrue(server.exists)

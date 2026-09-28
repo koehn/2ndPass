@@ -56,6 +56,10 @@ extension VaultOperation {
     }
 }
 public struct VaultResult: Sendable {
+    public var usageScope: String?
+    public var usageVault: String?
+    public var usageIdentity: ItemUsageIdentity?
+    public var retainedItemIDs: Set<String>?
     public var importPreview: ImportPreview?
     public var importReport: ImportReport?
     public var vaults: [VaultDescriptor] = []
@@ -90,12 +94,17 @@ public protocol VaultService: Sendable {
     var operationFraction: Double? { get }
     func lock()
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult
+    func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult
 }
 
 public extension VaultService {
     var operationProgress: String? { nil }
     var operationFraction: Double? { nil }
     var isAuthenticated: Bool { authenticatedAt != nil }
+    func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult {
+        guard isAuthenticated else { throw MopError.authentication }
+        return try await execute(.read(reference), vault: vault, offline: true)
+    }
 }
 
 // LAContext explicitly supports invalidation of a pending evaluation. This box
@@ -106,19 +115,46 @@ final class ContextInvalidator: @unchecked Sendable {
     func invalidate() { context.invalidate() }
 }
 
-// Locking never waits for network I/O or a blocking biometric evaluation. Only
-// the LAContext invalidation callback crosses the worker's isolation boundary.
+struct LocalReadSession: Sendable {
+    let reader: VaultReadSnapshot
+    let verifiedAt: Date
+    let account: String
+    let container: String
+    let environment: String
+    let context: ContextInvalidator
+}
+
+// Locking clears snapshots and cancels reads without waiting for network I/O.
 final class SessionControl: Sendable {
     struct State {
         var generation = 0
         var authenticatedAt: TimeInterval?
         var invalidate: (@Sendable () -> Void)?
         var tasks: [UUID: @Sendable () -> Void] = [:]
+        var localReads: [String: LocalReadSession] = [:]
     }
     private let state = Mutex(State())
     var generation: Int { state.withLock { $0.generation } }
     var authenticated: Bool { authenticatedAt != nil }
     var authenticatedAt: TimeInterval? { state.withLock { $0.authenticatedAt } }
+    func saveLocalRead(_ session: LocalReadSession, token: Int) throws {
+        try state.withLock { value in
+            guard value.generation == token, value.authenticatedAt != nil else { throw MopError.authentication }
+            value.localReads[session.reader.vault.id.uuidString] = session
+        }
+    }
+    func localRead(vault: String?, name: String, token: Int) throws -> LocalReadSession {
+        try state.withLock { value in
+            guard value.generation == token, value.authenticatedAt != nil else { throw MopError.authentication }
+            let matches = value.localReads.values.filter { session in
+                let selection = vault ?? name
+                return selection == session.reader.vault.id.uuidString || selection == session.reader.vault.name
+            }
+            guard matches.count == 1, let session = matches.first else { throw MopError.notFound }
+            return session
+        }
+    }
+    func removeLocalRead(_ vault: String) { state.withLock { $0.localReads[vault] = nil } }
     func check(_ token: Int) throws {
         guard state.withLock({ $0.generation == token }) else { throw MopError.authentication }
         try Task.checkCancellation()
@@ -147,6 +183,7 @@ final class SessionControl: Sendable {
     func lock() {
         let callbacks = state.withLock { value in
             value.generation += 1; value.authenticatedAt = nil
+            value.localReads.removeAll()
             let callbacks = Array(value.tasks.values) + [value.invalidate].compactMap { $0 }
             value.invalidate = nil; value.tasks.removeAll(); return callbacks
         }

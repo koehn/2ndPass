@@ -27,6 +27,22 @@ Formerly Mop. See [branding and upgrade compatibility](docs/BRANDING.md) for ret
 
 Read [the plain-language security explanation](docs/SECURITY-EXPLAINER.md), [architecture](docs/VAULT-NEXT.md), and [concrete validation results and outstanding physical checks](docs/VAULT-NEXT-VALIDATION.md). Cross-account sharing code is implemented; actual participant-side acceptance with a second Apple Account remains a required release check.
 
+## Recent items
+
+Recently Added, Recently Changed, and Recently Used show the newest 50 active,
+unarchived items across connected vaults. Search filters those 50 items. Item
+details show known creation, addition, change, and device-local usage times.
+Existing items have no invented historical dates; imports preserve source dates
+when available and record when they were added to 2ndPass.
+
+Usage records successful copies, explicit reveals, AutoFill, and CLI reads
+(including injection and command execution). Browsing, editing preloads, OTP
+refreshes, and exports do not count. Usage stays in private app-group storage on
+this device, outside cloud synchronization and backups.
+
+Upgrade the Mac app, iOS app, AutoFill extensions, and CLI together before editing
+timestamped items. This change has no feature flag or mixed-version support.
+
 ## Start a vault
 
 Open the signed Mac, iPhone or iPad app. If no v6 vaults exist in iCloud, 2ndPass

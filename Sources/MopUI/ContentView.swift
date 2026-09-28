@@ -43,6 +43,9 @@ struct ContentView: View {
                 List(selection: Binding<String?>(get: { model.sidebarSelection }, set: { if let value = $0 { model.sidebarSelection = value } })) {
                     NavigationLink(value: "all") { Label("All Items", systemImage: "square.stack.3d.up") }
                     NavigationLink(value: "favorites") { Label("Favorites", systemImage: "star") }
+                    NavigationLink(value: "recent-added") { Label("Recently Added", systemImage: "plus.circle") }
+                    NavigationLink(value: "recent-changed") { Label("Recently Changed", systemImage: "pencil.circle") }
+                    NavigationLink(value: "recent-used") { Label("Recently Used", systemImage: "clock") }
                     Section("Vaults", isExpanded: $vaultsExpanded) {
                         ForEach(model.vaults.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }) { vault in
                             NavigationLink(value: "vault:" + vault.id) {
@@ -80,6 +83,10 @@ struct ContentView: View {
                                     .foregroundStyle(Color.accentColor).frame(width: 22)
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(row.item.name).fontWeight(.medium)
+                                    if let date = row.recentDate {
+                                        Text(date, style: .relative).font(.caption).foregroundStyle(.secondary)
+                                            .help(date.formatted(date: .complete, time: .standard))
+                                    }
                                     if let subtitle = row.subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                                     if model.allVaults { Text(row.vaultName).font(.caption).foregroundStyle(.secondary) }
                                     if let detail = row.searchDetail {
@@ -170,7 +177,7 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                 Divider()
                 HStack(spacing: 8) {
-                    if model.busy { ProgressView().controlSize(.small) }
+                    if model.showsCloudProgress { ProgressView().controlSize(.small).accessibilityLabel("iCloud activity") }
                     Image(systemName: model.offline ? "icloud.slash" : "icloud")
                     Text(model.sessionStatus)
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)

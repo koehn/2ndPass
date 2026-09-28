@@ -7,6 +7,7 @@ struct ItemRow: Identifiable {
     let vaultName: String
     let item: VaultItem
     var searchDetail: String? = nil
+    var recentDate: Date? = nil
     var subtitle: String? {
         item.fields.first { [.username, .email, .website].contains($0.type) && !($0.value ?? "").isEmpty }?.value
     }

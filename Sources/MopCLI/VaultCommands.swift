@@ -23,14 +23,24 @@ struct VaultOptions: ParsableArguments {
 
 final class CommandStore: AsyncSecretStore {
     let options: VaultOptions
-    let service: NativeVaultService
-    init(options: VaultOptions) { self.options = options; service = options.native() }
+    let service: any VaultService
+    private let usageStore: any ItemUsageStoring
+    private var used: Set<ItemUsageIdentity> = []
+    init(options: VaultOptions, service: (any VaultService)? = nil, usageStore: (any ItemUsageStoring)? = nil) {
+        self.options = options; self.service = service ?? options.native()
+        self.usageStore = usageStore ?? ItemUsageStore(state: options.stateURL)
+    }
     func close() { service.lock() }
     func perform(_ operation: VaultOperation, reference: SecretReference? = nil) async throws -> VaultResult {
         try await service.execute(operation, vault: options.vault ?? reference?.vault, offline: options.offline)
     }
     func read(_ reference: SecretReference) async throws -> SecretBytes {
-        guard let value = try await perform(.read(reference), reference: reference).value else { throw MopError.notFound }; return value
+        let result = try await perform(.read(reference), reference: reference)
+        guard let value = result.value else { throw MopError.notFound }
+        if let identity = result.usageIdentity, used.insert(identity).inserted {
+            await ItemUsageLogging.record([identity], store: usageStore)
+        }
+        return value
     }
     func write(_ reference: SecretReference, value: SecretBytes, replace: Bool) async throws { _ = try await perform(.write(reference, value, replace: replace), reference: reference) }
     func delete(_ reference: SecretReference) async throws { _ = try await perform(.delete(reference), reference: reference) }

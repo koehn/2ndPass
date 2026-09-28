@@ -194,6 +194,8 @@ import MopCore
                     let result = try await value.code(identity)
                     guard token == generation, !Task.isCancelled else { return }
                     guard result.expiresAt > Date() else { throw MopError.invalidOTP }
+                    await value.recordDeliveredUsage()
+                    guard token == generation, !Task.isCancelled else { return }
                     finish()
                     #if os(iOS)
                     if field == .code { extensionContext.completeRequest(withTextToInsert: result.credential.code, completionHandler: nil); return }
@@ -201,6 +203,8 @@ import MopCore
                     extensionContext.completeOneTimeCodeRequest(using: result.credential, completionHandler: nil)
                 } else {
                     let credential = try await value.password(identity)
+                    guard token == generation, !Task.isCancelled else { return }
+                    await value.recordDeliveredUsage()
                     guard token == generation, !Task.isCancelled else { return }
                     finish()
                     #if os(iOS)

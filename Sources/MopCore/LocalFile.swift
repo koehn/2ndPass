@@ -2,6 +2,14 @@ import Darwin
 import Foundation
 
 public enum LocalFile {
+    // mkdir applies the private mode atomically. Foundation's recursive creation
+    // can expose a directory before applying its requested attributes to it.
+    private static func createPrivateDirectory(_ url: URL) throws {
+        if Darwin.mkdir(url.path, 0o700) == 0 || errno == EEXIST { return }
+        guard errno == ENOENT else { throw MopError.inputOutput }
+        try createPrivateDirectory(url.deletingLastPathComponent())
+        guard Darwin.mkdir(url.path, 0o700) == 0 || errno == EEXIST else { throw MopError.inputOutput }
+    }
     private static func withReadDescriptor<T>(_ url: URL, privateFile: Bool, limit: Int, body: (Int32) throws -> T) throws -> T {
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard fd >= 0 else { throw errno == ENOENT ? MopError.vaultMissing : MopError.inputOutput }
@@ -30,8 +38,7 @@ public enum LocalFile {
     public static func privateDirectory(_ url: URL, ownerOnly: Bool = true) throws {
         do {
             if !FileManager.default.fileExists(atPath: url.path) {
-                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
-                                                        attributes: [.posixPermissions: 0o700])
+                try createPrivateDirectory(url)
             }
             var status = stat()
             guard lstat(url.path, &status) == 0, status.st_mode & S_IFMT == S_IFDIR,

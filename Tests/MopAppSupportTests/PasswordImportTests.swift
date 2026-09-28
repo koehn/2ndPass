@@ -293,3 +293,13 @@ extension PasswordImportTests {
         #expect(bank.text(for: "owner") == "Alternate owner" && bank.text(for: "nameOnAccount") == "Test")
     }
 }
+
+@Test func importsPreserveSourceDatesWithoutInventingMissingHistory() throws {
+    let json = #"{"encrypted":false,"items":[{"type":1,"name":"Dated","creationDate":"2020-01-01T00:00:00.000Z","revisionDate":"2021-01-01T00:00:00Z","login":{"password":"p"}},{"type":1,"name":"Unknown","login":{"password":"p"}}]}"#
+    let records = try PasswordImport.parse(Data(json.utf8)).records
+    #expect(records[0].item?.metadata?.createdAt == Date(timeIntervalSince1970: 1577836800))
+    #expect(records[0].item?.metadata?.updatedAt == Date(timeIntervalSince1970: 1609459200))
+    #expect(records[0].item?.metadata?.addedAt == nil)
+    #expect(records[1].item?.metadata?.createdAt == nil)
+    #expect(records[1].item?.metadata?.updatedAt == nil)
+}

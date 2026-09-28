@@ -39,7 +39,7 @@ public enum VaultEngine {
             membership: membership ?? vault.membership, operation: operation,
             acceptedInvitations: (invitations ?? old.acceptedInvitations).sorted { $0.uuidString < $1.uuidString })
     }
-    public static func write(_ reference: String, value: SecretBytes?, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
+    public static func write(_ reference: String, value: SecretBytes?, in vault: VerifiedVault, device: any DeviceOperations, at date: Date = Date()) throws -> VerifiedVault {
         guard !reference.isEmpty, reference.utf8.count <= 4096 else { throw MopError.invalidReference }
         let role = vault.membership.role(of: device.identity)
         guard role == .owner || role == .editor else { throw MopError.cloudPermission }
@@ -64,10 +64,20 @@ public enum VaultEngine {
             records[id] = try SealedObject.field(bytes, key: key, vault: vault.id, item: itemID, generation: keys[itemID]!.generation, id: id)
             references[reference] = id
         }
-        var items = payload.items
+        var items = try catalog(payload, in: vault, device: device).items + payload.items.filter { $0.deletion != nil }
+        if !items.contains(where: { $0.name == name }), value != nil {
+            var item = VaultItem(name: name, fields: [])
+            item.metadata = ItemMetadata(createdAt: date, addedAt: date, updatedAt: date)
+            items.append(item)
+        }
         if let parsed = try? SecretReference(vault: vault.name, relativePath: reference),
            let item = items.firstIndex(where: { $0.name == parsed.item }) {
             let path = [parsed.section, parsed.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
+            if items[item].metadata == nil { items[item].metadata = ItemMetadata() }
+            items[item].metadata?.updatedAt = date
+            if !items[item].fields.contains(where: { $0.path == path }), value != nil {
+                items[item].fields.append(ItemField(path: path))
+            }
             if let field = items[item].fields.firstIndex(where: { $0.path == path }) {
                 if let value {
                     if items[item].fields[field].type == .attachment { _ = try Attachment.decode(String(decoding: value, as: UTF8.self)) }

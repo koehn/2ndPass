@@ -41,6 +41,69 @@ additional enrollment consequences above. 2ndPass does not promise availability
 against a malicious server, secrecy from an authorized recipient, or protection
 of plaintext on a compromised endpoint.
 
+## Common attacks and how 2ndPass responds
+
+### Stealing stored vault data
+
+An attacker might copy a device's files, an encrypted backup, or the records in
+iCloud. 2ndPass encrypts item fields with per-item AES-GCM keys and encrypts the
+catalog with a separate key before storage or upload. Those keys are wrapped for
+authorized devices using HPKE. Opening them requires a device's non-exportable
+Secure Enclave private key and local authorization; there is no master-password
+hash in the vault for an attacker to crack offline. Device-key representations
+are stored in the non-synchronizing, device-bound Data Protection Keychain.
+
+Copying encrypted data therefore does not supply the means to decrypt it. This
+protection does not extend to plaintext exports or credentials already copied out
+of the app, and some cloud metadata, such as vault names and record sizes, remains
+visible.
+
+### Reading secrets from memory
+
+Malware may try to inspect an unlocked password manager's process. 2ndPass keeps
+long-lived device private keys inside the Secure Enclave and decrypts concealed
+fields on demand. Its unlocked read cache holds verified encrypted records and
+the decoded catalog, not a cache of revealed passwords or unwrapped item keys.
+Owned secret buffers are wiped when released. Locking clears session state and
+hardware-key handles, invalidates authentication, and rejects late results.
+
+A password must still enter application memory to be displayed, copied, or
+filled, and temporary symmetric keys also enter memory. These measures reduce
+exposure; they cannot defeat an attacker who controls the authorized process or
+operating system. Swift strings and framework copies also prevent a guarantee
+that every plaintext copy is immediately erased.
+
+### Replacing or modifying the app
+
+A modified binary could attempt to steal passwords as they are used. Apple code
+signing, provisioning, and Keychain access groups restrict access to the stored
+device identity. The macOS client checks its signing identity and requires the
+hardened runtime, with debugger access and library-validation bypass entitlements
+disabled. These controls make simply patching or re-signing a binary insufficient
+to inherit the legitimate app's Keychain access and constrain code injection.
+
+They depend on the operating system enforcing those boundaries. Malicious code
+with an accepted signing identity, or code already running inside an authorized
+client, can misuse access after authorization. Device enrollment proves possession
+of keys; it is not remote attestation that a device runs an approved binary.
+
+### Altering or replaying cloud records
+
+Authenticated encryption detects changes to encrypted contents. Signed revisions,
+membership checks, and locally pinned checkpoints let 2ndPass reject unauthorized
+updates and rollbacks that conflict with its trusted history. A server can still
+withhold updates or deny service; a valid older view is not proof that no newer
+revision exists. Initial enrollment also relies on the account or invitation
+channel described above.
+
+### Capturing copied or displayed passwords
+
+Concealed fields, timed re-concealment, and the locked screen reduce casual visual
+exposure. Secret clipboard writes are local to the device and expire; locking
+also clears the app's clipboard content when it has not been replaced. These
+controls shorten exposure, but cannot retract a password that a clipboard reader,
+screen capture, or receiving application has already copied.
+
 ## Hardware keys, Keychain and authentication
 
 ### What the Secure Enclave does

@@ -76,6 +76,9 @@ struct ItemDetailView: View {
                 }
                 if !metadata.tags.isEmpty { TagBadges(tags: metadata.tags) }
             }
+            if !editingItem, let item = model.selectedTypedItem {
+                ItemDatesView(item: item, lastUsed: model.lastUsedDate(for: item, vaultID: model.vault))
+            }
             if editingItem, model.itemDraft?.type == .login { autoFillMappingEditor }
             if let item = model.itemDraft?.item ?? model.selectedTypedItem, item.type == .login {
                 ForEach(AutoFillKind.allCases.filter { $0 == .password || item.fields.contains { $0.type == .otp } || item.autoFill?.oneTimeCode != nil }, id: \.self) { kind in
@@ -418,6 +421,7 @@ struct ItemDetailView: View {
                         }
                         Button(revealedEditor == field.id ? "Conceal details" : "Edit " + field.type.label.lowercased() + " details") {
                             revealedEditor = revealedEditor == field.id ? nil : field.id
+                            if revealedEditor != nil { model.recordSelectedItemUsage() }
                         }
                     }
                 }
@@ -432,6 +436,7 @@ struct ItemDetailView: View {
                     }.accessibilityLabel("\(field.path) value")
                     Button {
                         revealedEditor = revealedEditor == field.id ? nil : field.id
+                        if revealedEditor != nil { model.recordSelectedItemUsage() }
                     } label: {
                         Image(systemName: revealedEditor == field.id ? "eye.slash" : "eye")
                     }
@@ -446,6 +451,7 @@ struct ItemDetailView: View {
                     } else { SecureField(placeholder, text: valueBinding(field)) }
                     Button(revealedEditor == field.id ? "Conceal input" : "Edit multiline value") {
                         revealedEditor = revealedEditor == field.id ? nil : field.id
+                        if revealedEditor != nil { model.recordSelectedItemUsage() }
                     }
                 }
             } else if field.type.concealed {

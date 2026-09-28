@@ -16,14 +16,16 @@ private final class Material {
 }
 private final class TestHandle: DeviceOperations {
     let material: Material
+    let unwraps: Counter
     var closed = false
-    init(_ material: Material) { self.material = material }
+    init(_ material: Material, unwraps: Counter) { self.material = material; self.unwraps = unwraps }
     var identity: DevicePublicKey { material.identity }
     func sign(_ bytes: Data) throws -> Data { guard !closed else { throw MopError.authentication }; return try material.signing.signature(for: bytes).rawRepresentation }
-    func unwrap(_ envelope: KeyEnvelope, context: Data) throws -> SymmetricKey { guard !closed else { throw MopError.authentication }; return try envelope.open(using: material.encryption, context: context) }
+    func unwrap(_ envelope: KeyEnvelope, context: Data) throws -> SymmetricKey { unwraps.withLock { $0 += 1 }; guard !closed else { throw MopError.authentication }; return try envelope.open(using: material.encryption, context: context) }
     func close() { closed = true }
 }
 private final class TestHardware: @unchecked Sendable {
+    let unwraps = Counter()
     private let lock = NSLock()
     private var keys: [String: Material] = [:]
     private var deletionBlocked = false
@@ -37,10 +39,17 @@ private final class TestHardware: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let id = scope + member.uuidString
         if keys[id] == nil { guard create else { throw MopError.invalidIdentity }; keys[id] = Material(member) }
-        return TestHandle(keys[id]!)
+        return TestHandle(keys[id]!, unwraps: unwraps)
     }
 }
 private actor Server {
+    var readRequests = 0
+    var readGate: AuthenticationGate?
+    func setReadGate(_ gate: AuthenticationGate?) { readGate = gate }
+    func recordReadRequest() async {
+        readRequests += 1
+        if let readGate { await readGate.wait() }
+    }
     struct State { var head: String; var version: Int; var revisions: [String: Data] }
     var vaults: [UUID: State] = [:]
     var attachments: [UUID: [String: Data]] = [:]
@@ -90,16 +99,16 @@ private actor Server {
 }
 private struct Transport: VaultTransport {
     let server: Server, accountID: String
-    func attachment(_ digest: String, at address: VaultAddress) async throws -> Data { try await server.attachment(digest, address.vault) }
+    func attachment(_ digest: String, at address: VaultAddress) async throws -> Data { await server.recordReadRequest(); return try await server.attachment(digest, address.vault) }
     func uploadAttachment(_ bytes: Data, digest: String, at address: VaultAddress) async throws { await server.uploadAttachment(bytes, digest, address.vault) }
     func enrollment(at address: VaultAddress) async throws -> EnrollmentInbox { await server.enrollment(address) }
     func saveEnrollment(_ mailbox: EnrollmentMailbox, version: Data?, at address: VaultAddress) async throws { try await server.saveEnrollment(mailbox, version, address) }
     func discover() async throws -> [VaultAddress] { await server.discover(accountID) }
-    func account() async throws -> String { accountID }
-    func validateOfflineAccount() async throws {}
+    func account() async throws -> String { await server.recordReadRequest(); return accountID }
+    func validateOfflineAccount() async throws { await server.recordReadRequest() }
     func initialize(_ genesis: VerifiedVault, at address: VaultAddress) async throws { try await server.initialize(genesis); await server.remember(address) }
-    func head(at address: VaultAddress) async throws -> RevisionHead { try await server.head(address.vault) }
-    func revision(_ digest: String, at address: VaultAddress) async throws -> Data { try await server.revision(digest, address.vault) }
+    func head(at address: VaultAddress) async throws -> RevisionHead { await server.recordReadRequest(); return try await server.head(address.vault) }
+    func revision(_ digest: String, at address: VaultAddress) async throws -> Data { await server.recordReadRequest(); return try await server.revision(digest, address.vault) }
     func upload(_ bytes: Data, digest: String, at address: VaultAddress) async throws { try await server.upload(bytes, digest, address.vault) }
     func publish(_ digest: String, expectedVersion: Data, at address: VaultAddress) async throws { try await server.publish(digest, expectedVersion, address.vault) }
     func share(with account: String, role: MemberRole, at address: VaultAddress) async throws -> URL { URL(string: "https://www.icloud.com/share/model")! }
@@ -243,6 +252,7 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
 
 private actor AuthenticationGate {
     var entered = false
+    var isWaiting: Bool { continuation != nil }
     private var continuation: CheckedContinuation<Void, Never>?
     func wait() async { entered = true; await withCheckedContinuation { continuation = $0 } }
     func release() { continuation?.resume(); continuation = nil }
@@ -664,4 +674,80 @@ private actor AuthenticationGate {
     let rotated = try #require(try await syncReader.service.execute(.read(reference), vault: id).value)
     #expect(try Attachment.decode(String(decoding: rotated, as: UTF8.self)) == file)
     #expect(await cloud.attachmentReads == 3)
+}
+
+@Test func rejectedPublicationDoesNotChangeCachedItemDates() async throws {
+    let server = Server(), owner = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let reference = try SecretReference("secondpass://personal/login/password")
+    let saved = try await owner.service.execute(.write(reference, SecretBytes(utf8: "first"), replace: false), vault: id)
+    let before = try #require(saved.catalog?.items.first)
+    #expect(before.metadata?.createdAt != nil)
+    await server.rejectPublication(after: 0)
+    do {
+        _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "rejected"), replace: true), vault: id)
+        Issue.record("Publication should fail")
+    } catch {}
+    let cached = try await owner.service.execute(.catalog, vault: id, offline: true)
+    #expect(cached.catalog?.items.first?.metadata == before.metadata)
+    #expect(cached.catalog?.items.first?.storageID == before.storageID)
+}
+
+@Test func unlockedLocalReadsNeverContactCloudOrAuthenticateAgain() async throws {
+    let server = Server(), owner = Client(server, "a")
+    let id = UUID().uuidString, reference = try SecretReference("secondpass://personal/login/password")
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    _ = try await owner.service.execute(.write(reference, "secret", replace: false), vault: id)
+    let requests = await server.readRequests, authentications = owner.calls.withLock { $0 }
+    let unwraps = owner.hardware.unwraps.withLock { $0 }
+    let result = try await owner.service.readLocal(reference, vault: id)
+    #expect(owner.hardware.unwraps.withLock { $0 } == unwraps + 1)
+    #expect(result.value == SecretBytes(utf8: "secret"))
+    #expect(result.usageIdentity != nil)
+    #expect(await server.readRequests == requests)
+    #expect(owner.calls.withLock { $0 } == authentications)
+    try NextAccountBinding.invalidate(state: owner.state)
+    await #expect(throws: MopError.cloudAccount) { try await owner.service.readLocal(reference, vault: id) }
+    owner.service.lock()
+    await #expect(throws: MopError.authentication) { try await owner.service.readLocal(reference, vault: id) }
+    #expect(await server.readRequests == requests)
+}
+
+@Test func localReadDoesNotWaitBehindCloudRefresh() async throws {
+    let server = Server(), owner = Client(server, "a"), barrier = AuthenticationGate()
+    let id = UUID().uuidString, reference = try SecretReference("secondpass://personal/login/password")
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    _ = try await owner.service.execute(.write(reference, "secret", replace: false), vault: id)
+    await server.setReadGate(barrier)
+    let service = owner.service!
+    let refresh = Task { try await service.execute(.sync, vault: id) }
+    while !(await barrier.entered) { await Task.yield() }
+    // Prevent a regression from hanging the test process indefinitely.
+    let watchdog = Task {
+        do { try await Task.sleep(for: .seconds(5)) } catch { return }
+        await server.setReadGate(nil); await barrier.release()
+    }
+    let unwraps = owner.hardware.unwraps.withLock { $0 }
+    let result = try await owner.service.readLocal(reference, vault: id)
+    #expect(owner.hardware.unwraps.withLock { $0 } == unwraps + 1)
+    #expect(result.value == SecretBytes(utf8: "secret"))
+    #expect(await barrier.isWaiting)
+    watchdog.cancel()
+    await server.setReadGate(nil); await barrier.release()
+    _ = try await refresh.value
+}
+
+@Test func localReadSnapshotTracksCommittedEditsAndDeletion() async throws {
+    let owner = Client(Server(), "a"), id = UUID().uuidString
+    let reference = try SecretReference("secondpass://personal/login/password")
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    _ = try await owner.service.execute(.write(reference, "first", replace: false), vault: id)
+    #expect(try await owner.service.readLocal(reference, vault: id).value == SecretBytes(utf8: "first"))
+    _ = try await owner.service.execute(.write(reference, "second", replace: true), vault: id)
+    let result = try await owner.service.readLocal(reference, vault: id)
+    #expect(result.value == SecretBytes(utf8: "second"))
+    #expect(result.offlineDate != nil)
+    _ = try await owner.service.execute(.delete(reference), vault: id)
+    await #expect(throws: MopError.notFound) { try await owner.service.readLocal(reference, vault: id) }
 }

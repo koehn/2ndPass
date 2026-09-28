@@ -1721,7 +1721,7 @@ extension AppModelTests {
         #expect(app.displayedItems.count == 1)
         app.showArchived = true
         #expect(app.displayedItems.isEmpty)
-        app.showArchived = false
+        app.collection = .vault(app.vault)
         #expect(app.displayedItems.count == 1)
         app.allVaults = true
         #expect(app.displayedItems.isEmpty)
@@ -1768,5 +1768,258 @@ extension AppModelTests {
         print("Search benchmark: 5,000 items, index \(indexing), first query \(firstQuery), slowest query + 50 row reads \(slowest)")
         app.search = "never-search-this"
         #expect(app.displayedItems.isEmpty)
+    }
+}
+
+private actor RecentUsageMemory: ItemUsageStoring {
+    var values: [ItemUsageIdentity: Date] = [:]
+    func load(accounts: Set<String>) -> [ItemUsageIdentity: Date] { values.filter { accounts.contains($0.key.account) } }
+    func record(_ identities: Set<ItemUsageIdentity>, at date: Date) { for id in identities { values[id] = max(values[id] ?? .distantPast, date) } }
+    func prune(account: String, vault: String, keeping items: Set<String>, before date: Date) {}
+}
+
+extension AppModelTests {
+    @Test func recentCollectionsLimitBeforeSearchAndExcludeUnknownArchivedDeleted() async throws {
+        let service = FakeService(), store = RecentUsageMemory(), date = Date(timeIntervalSince1970: 1_700_000_000)
+        let app = AppModel(service: service, defaults: UserDefaults(suiteName: UUID().uuidString)!, usageStore: store, now: { 0 }, automaticTimer: false, wallNow: { date })
+        let account = UUID().uuidString, vault = UUID().uuidString
+        app.vault = vault
+        app.vaults = [VaultDescriptor(id: vault, name: "personal", format: "mop-vault-v7", enrolled: true)]
+        var items = (0..<60).map { n in
+            var item = VaultItem(name: String(format: "Item %02d", n), type: .login, fields: [])
+            item.storageID = UUID().uuidString
+            item.metadata = ItemMetadata(addedAt: date.addingTimeInterval(Double(n)), updatedAt: date.addingTimeInterval(Double(60 - n)))
+            return item
+        }
+        var unknown = VaultItem(name: "Unknown", type: .login, fields: [])
+        unknown.storageID = UUID().uuidString
+        var archived = items[59]; archived.name = "Archived"; archived.metadata?.archived = true
+        var deleted = items[59]; deleted.name = "Deleted"; deleted.deletion = ItemDeletion(originalName: "Deleted", deletedAt: date)
+        items += [unknown, archived, deleted]
+        var catalog = ItemCatalog(vault: "personal", revision: "r", items: items); catalog.usageScope = account
+        app.catalogs = [vault: catalog]; app.catalog = catalog
+        service.authenticate(); app.authenticated = true
+        app.chooseRecent(.recentlyAdded)
+        #expect(app.displayedItems.count == 50)
+        #expect(app.displayedItems.first?.item.name == "Item 59")
+        app.search = "Item 00"
+        #expect(app.displayedItems.isEmpty)
+        app.search = ""
+        app.chooseRecent(.recentlyChanged)
+        #expect(app.displayedItems.count == 50)
+        #expect(app.displayedItems.first?.item.name == "Item 00")
+        app.chooseRecent(.recentlyUsed)
+        #expect(app.displayedItems.isEmpty)
+        let id = try #require(catalog.usageIdentity(for: items[20], vaultID: vault))
+        app.recordUsage(id)
+        #expect(app.displayedItems.map(\.item.name) == ["Item 20"])
+        app.selectedRow = app.displayedItems.first?.id
+        let selected = app.selectedRow
+        app.recordUsage(try #require(catalog.usageIdentity(for: items[21], vaultID: vault)))
+        #expect(app.selectedRow == selected)
+        #expect(app.displayedItems.map(\.item.name) == ["Item 20", "Item 21"])
+        app.lock()
+        #expect(app.lastUsed.isEmpty)
+        #expect(app.catalogs.isEmpty)
+    }
+
+    @Test func recentCollectionsUseVaultAndStableIDForDateTies() {
+        let app = model(FakeService()), date = Date()
+        var first = VaultItem(name: "Same", type: .login, fields: [])
+        first.storageID = "b"; first.metadata = ItemMetadata(addedAt: date)
+        var second = first; second.storageID = "a"
+        app.catalogs = ["b": ItemCatalog(vault: "A", revision: "r", items: [first]),
+                        "a": ItemCatalog(vault: "Z", revision: "r", items: [first, second])]
+        app.collection = .recentlyAdded
+        #expect(app.displayedItems.map(\.id.vault) == ["a", "a", "b"])
+        #expect(app.displayedItems.map(\.item.storageID) == ["a", "b", "b"])
+    }
+}
+
+extension AppModelTests {
+    @Test func recentCollectionPreparationPerformance() {
+        let app = model(FakeService()), date = Date(), clock = ContinuousClock()
+        let items = (0..<5_000).map { n in
+            var item = VaultItem(name: "Item \(n)", type: .login, fields: [ItemField(path: "username", type: .username, value: "user\(n)@example.test")])
+            item.storageID = UUID().uuidString
+            item.metadata = ItemMetadata(addedAt: date.addingTimeInterval(Double(n)), updatedAt: date.addingTimeInterval(Double(n)))
+            return item
+        }
+        let load = clock.measure { app.catalogs = [app.vault: ItemCatalog(vault: "personal", revision: "r", items: items)] }
+        app.collection = .recentlyAdded
+        let prepare = clock.measure { #expect(app.displayedItems.count == 50) }
+        let search = clock.measure { app.search = "user4999"; #expect(app.displayedItems.count == 1) }
+        print("RECENT_PERFORMANCE 5000 items: catalog assignment \(load), recent preparation \(prepare), first search \(search)")
+    }
+}
+
+extension AppModelTests {
+    @Test func explicitAccessCountsButPreloadsOTPAndReferencesDoNot() async throws {
+        let store = RecentUsageMemory(), date = Date()
+        let id = ItemUsageIdentity(account: UUID().uuidString, vault: UUID().uuidString, item: UUID().uuidString)
+        let service = FakeService { operation, _, offline in
+            var result = VaultResult()
+            if case .read = operation {
+                #expect(offline)
+                result.value = SecretBytes(utf8: "123456"); result.usageIdentity = id
+                result.otpExpiresAt = date.addingTimeInterval(30); result.otpPeriod = 30
+            }
+            return result
+        }
+        let app = AppModel(service: service, defaults: UserDefaults(suiteName: UUID().uuidString)!, usageStore: store, now: { 0 }, automaticTimer: false, wallNow: { date })
+        app.vault = id.vault
+        var item = VaultItem(name: "Login", type: .login, fields: [ItemField(path: "password", type: .password)])
+        item.storageID = id.item
+        var catalog = ItemCatalog(vault: "personal", revision: "r", items: [item]); catalog.usageScope = id.account
+        try app.applyCatalog(catalog)
+        service.authenticate(); app.authenticated = true; app.selectedItem = item.name
+        let ref = try SecretReference(vault: "personal", relativePath: "Login/password")
+        app.selected = ref
+        app.beginItemEditing(); try await finish(app)
+        #expect(app.lastUsed.isEmpty)
+        app.cancelItemEditing()
+        app.selected = ref
+        _ = try await app.currentOTP(ref)
+        app.copyReference()
+        #expect(app.lastUsed.isEmpty)
+        app.read(copy: false)
+        #expect(app.busy && !app.showsCloudProgress)
+        try await finish(app)
+        #expect(app.lastUsed[id] == date)
+        app.read(copy: true)
+        #expect(app.busy && !app.showsCloudProgress)
+        try await finish(app)
+        #expect(app.copyFeedback != nil)
+        app.lock()
+        #expect(app.lastUsed.isEmpty)
+    }
+}
+
+private struct DelayedUsageStore: ItemUsageStoring {
+    let barrier: Barrier
+    let identity: ItemUsageIdentity
+    func load(accounts: Set<String>) async throws -> [ItemUsageIdentity: Date] {
+        await barrier.wait()
+        return [identity: Date()]
+    }
+    func record(_ identities: Set<ItemUsageIdentity>, at date: Date) async throws {}
+    func prune(account: String, vault: String, keeping items: Set<String>, before date: Date) async throws {}
+}
+extension AppModelTests {
+    @Test func usageLoadingNeverBlocksUnlockStateOrRestoresDataAfterLock() async throws {
+        let barrier = Barrier(), identity = ItemUsageIdentity(account: UUID().uuidString, vault: UUID().uuidString, item: UUID().uuidString)
+        let app = AppModel(service: FakeService(), defaults: UserDefaults(suiteName: UUID().uuidString)!,
+                           usageStore: DelayedUsageStore(barrier: barrier, identity: identity), now: { 0 }, automaticTimer: false)
+        var catalog = ItemCatalog(vault: "personal", revision: "r", items: []); catalog.usageScope = identity.account
+        app.catalogs = [identity.vault: catalog]
+        app.authenticated = true
+        #expect(app.authenticated && app.lastUsed.isEmpty)
+        while !(await barrier.entered) { await Task.yield() }
+        app.lock()
+        await barrier.release()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(!app.authenticated && app.lastUsed.isEmpty)
+    }
+}
+
+extension AppModelTests {
+    private func selectionModel(_ catalogs: [String: ItemCatalog], defaults: UserDefaults,
+                                deleted: [String: ItemCatalog] = [:]) -> (AppModel, FakeService) {
+        let service = FakeService { operation, id, _ in
+            var result = VaultResult()
+            if case .catalog = operation, let id { result.catalog = catalogs[id]; result.deletedCatalog = deleted[id] }
+            return result
+        }
+        service.authenticate()
+        let app = AppModel(service: service, defaults: defaults, usageStore: RecentUsageMemory(), now: { 0 }, automaticTimer: false)
+        app.vaults = catalogs.map { VaultDescriptor(id: $0.key, name: $0.value.vault, format: "mop-vault-v7", enrolled: true) }
+        return (app, service)
+    }
+
+    @Test func selectionSurvivesLockRestartAndItemRenameUsingDeviceLocalIDs() async throws {
+        let suite = "selection-test-" + UUID().uuidString, account = UUID().uuidString, vault = UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var item = VaultItem(name: "Private Item Name", fields: [ItemField(path: "password")]); item.storageID = UUID().uuidString
+        var catalog = ItemCatalog(vault: "personal", revision: "r", items: [item]); catalog.usageScope = account
+        let (app, service) = selectionModel([vault: catalog], defaults: defaults)
+        app.unlock(); try await finish(app)
+        app.chooseVault(vault)
+        app.selectedRow = .init(vault: vault, name: item.name)
+        app.lock()
+        #expect(app.selectedItem == nil && app.catalogs.isEmpty)
+        let saved = try #require(defaults.data(forKey: "lastSelection." + account))
+        #expect(!String(decoding: saved, as: UTF8.self).contains(item.name))
+        service.authenticate(); app.unlock(); try await finish(app)
+        #expect(app.collection == .vault(vault) && app.selectedItem == item.name)
+        item.name = "Renamed Item"; catalog.items = [item]
+        let (restarted, _) = selectionModel([vault: catalog], defaults: defaults)
+        #expect(restarted.selectedItem == nil)
+        restarted.unlock(); try await finish(restarted)
+        #expect(restarted.selectedItem == item.name && restarted.vault == vault)
+        let (otherDevice, _) = selectionModel([vault: catalog], defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        otherDevice.unlock(); try await finish(otherDevice)
+        #expect(otherDevice.selectedItem == nil)
+    }
+
+    @Test func restoresVirtualCollectionsAndIgnoresMissingOrOtherAccountItems() async throws {
+        let account = UUID().uuidString, vault = UUID().uuidString
+        var item = VaultItem(name: "Entry", fields: []); item.storageID = UUID().uuidString
+        item.metadata = ItemMetadata(favorite: true, addedAt: Date(), updatedAt: Date())
+        var catalog = ItemCatalog(vault: "personal", revision: "r", items: [item]); catalog.usageScope = account
+        for collection: ItemCollection in [.all, .favorites, .recentlyAdded, .recentlyChanged, .recentlyUsed, .archive, .recentlyDeleted] {
+            let suite = UUID().uuidString, defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            var source = catalog
+            source.items[0].metadata?.archived = collection == .archive
+            var trash = item; trash.deletion = ItemDeletion(originalName: item.name, deletedAt: Date())
+            let deleted = [vault: ItemCatalog(vault: "personal", revision: "r", items: [trash])]
+            let (first, _) = selectionModel([vault: source], defaults: defaults, deleted: deleted)
+            first.unlock(); try await finish(first)
+            first.collection = collection
+            if collection == .recentlyDeleted { first.selectedDeleted = .init(vault: vault, name: item.name) }
+            else { first.selectedRow = .init(vault: vault, name: item.name) }
+            first.lock()
+            let (next, _) = selectionModel([vault: source], defaults: defaults, deleted: deleted)
+            next.unlock(); try await finish(next)
+            #expect(next.collection == collection)
+            #expect(collection == .recentlyDeleted ? next.selectedDeleted?.name == item.name : next.selectedItem == item.name)
+            var other = source; other.usageScope = UUID().uuidString
+            let (isolated, _) = selectionModel([vault: other], defaults: defaults)
+            isolated.unlock(); try await finish(isolated)
+            #expect(isolated.selectedItem == nil && isolated.selectedDeleted == nil)
+            source.items = []
+            let (missing, _) = selectionModel([vault: source], defaults: defaults)
+            missing.unlock(); try await finish(missing)
+            #expect(missing.selectedItem == nil && missing.selectedDeleted == nil)
+        }
+    }
+}
+
+extension AppModelTests {
+    @Test func rememberedVaultWinsDefaultButNotExplicitChoiceAndMissingVaultFallsBack() async throws {
+        let suite = UUID().uuidString, defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let account = UUID().uuidString, firstID = UUID().uuidString, secondID = UUID().uuidString
+        var item = VaultItem(name: "Entry", fields: []); item.storageID = UUID().uuidString
+        var first = ItemCatalog(vault: "first", revision: "r", items: [item]); first.usageScope = account
+        var second = ItemCatalog(vault: "second", revision: "r", items: []); second.usageScope = account
+        let catalogs = [firstID: first, secondID: second]
+        let (original, _) = selectionModel(catalogs, defaults: defaults)
+        original.unlock(); try await finish(original)
+        original.chooseVault(firstID); original.selectedRow = .init(vault: firstID, name: item.name)
+        original.lock()
+        let saved = try #require(defaults.data(forKey: "lastSelection." + account))
+        let (restored, _) = selectionModel(catalogs, defaults: defaults)
+        restored.vault = secondID
+        restored.unlock(); try await finish(restored)
+        #expect(restored.vault == firstID && restored.selectedItem == item.name)
+        let (chosen, _) = selectionModel(catalogs, defaults: defaults)
+        chosen.chooseVault(secondID); try await finish(chosen)
+        #expect(chosen.vault == secondID && chosen.selectedItem == nil)
+        defaults.set(saved, forKey: "lastSelection." + account)
+        let (removed, _) = selectionModel([secondID: second], defaults: defaults)
+        removed.unlock(); try await finish(removed)
+        #expect(removed.vault == secondID && removed.selectedItem == nil && removed.collection == .all)
     }
 }

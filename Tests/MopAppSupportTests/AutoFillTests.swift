@@ -352,6 +352,7 @@ private actor AutoFillPublishingSwitch {
 private final class PickerService: VaultService, Sendable {
     struct State { var authenticated = false; var prompts = 0; var reads = 0 }
     let state = Mutex(State())
+    let usage = ItemUsageIdentity(account: UUID().uuidString, vault: UUID().uuidString, item: UUID().uuidString)
     let catalog = ItemCatalog(vault: "private-vault", revision: "r", items: [login()])
     var authenticatedAt: TimeInterval? { state.withLock { $0.authenticated ? 0 : nil } }
     func lock() { state.withLock { $0.authenticated = false } }
@@ -360,7 +361,7 @@ private final class PickerService: VaultService, Sendable {
         var result = VaultResult()
         switch operation {
         case .catalog: result.catalog = catalog
-        case .read: state.withLock { $0.reads += 1 }; result.value = SecretBytes(utf8: "password")
+        case .read: state.withLock { $0.reads += 1 }; result.value = SecretBytes(utf8: "password"); result.usageIdentity = usage
         default: throw MopError.notFound
         }
         return result
@@ -434,4 +435,25 @@ private final class PickerService: VaultService, Sendable {
     #expect(!({ focus.shouldInterrupt(activated: 200, foreground: nil) }()))
     #expect(!({ focus.shouldInterrupt(activated: 100, foreground: 100) }()))
     #expect(({ focus.shouldInterrupt(activated: 300, foreground: 300) }()))
+}
+
+private actor DeliveredUsageStore: ItemUsageStoring {
+    var records: Set<ItemUsageIdentity> = []
+    var writes = 0
+    func load(accounts: Set<String>) -> [ItemUsageIdentity: Date] { [:] }
+    func record(_ identities: Set<ItemUsageIdentity>, at date: Date) { records.formUnion(identities); writes += 1 }
+    func prune(account: String, vault: String, keeping items: Set<String>, before date: Date) {}
+}
+@MainActor @Test func autoFillRecordsOnlyExplicitDeliveryAndWaitsForPersistence() async throws {
+    let service = PickerService(), store = DeliveredUsageStore()
+    let identity = AutoFillIdentity(entry: try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: UUID().uuidString).first))
+    let session = AutoFillRequestSession(service: service, usageStore: store)
+    _ = try await session.choices(for: [identity])
+    #expect(await store.writes == 0)
+    _ = try await session.password(identity)
+    #expect(await store.writes == 0)
+    await session.recordDeliveredUsage()
+    #expect(await store.records == [service.usage])
+    await session.recordDeliveredUsage()
+    #expect(await store.writes == 1)
 }

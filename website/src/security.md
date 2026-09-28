@@ -8,6 +8,7 @@ heading: "Know what you’re trusting."
 intro: "Hardware-protected device keys. Encryption before sync. Explicit boundaries, including the uncomfortable ones."
 toc:
   - {id: encryption, label: Encryption & keys}
+  - {id: attacks, label: Common attacks}
   - {id: icloud, label: iCloud & account trust}
   - {id: devices, label: Devices & sharing}
   - {id: recovery, label: Recovery}
@@ -17,13 +18,35 @@ toc:
 ---
 ## Encryption
 
-Each enrolled device creates a P-256 private key in its Secure Enclave. That private key is non-exportable: the app asks the hardware to perform operations without extracting it. Independent symmetric keys encrypt secret fields; the encrypted catalog protects item organization and metadata within the vault.
+Each enrolled device creates separate P-256 private keys for decryption and signing in its Secure Enclave. Those private keys are non-exportable: the app asks the hardware to perform operations without extracting them. Each item has its own symmetric key for its separately encrypted fields; a separately encrypted catalog protects item organization and metadata within the vault.
 
 2ndPass uses authenticated encryption and HPKE (`P256_SHA256_AES_GCM_256`) to wrap secret keys for authorized devices. Signed revisions and verified checkpoints help clients detect tampering and rollback relative to the state they already trust. Vault contents are encrypted locally before they leave the device.
 
 **Secure Enclave protection is not a promise that plaintext never enters memory.** Derived key material and decrypted secrets are used in the app’s process. A compromised, unlocked device or malicious software with sufficient privileges can still expose them. The enclave protects the device’s private key, not everything an application does with a password.
 
-The [security design](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md) and [vault protocol](https://github.com/koehn/2ndPass/blob/main/docs/VAULT-NEXT.md) describe the algorithms, checks, and trust model in detail.
+The [security design](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md) and [vault protocol](vault.html) describe the algorithms, checks, and trust model in detail.
+
+## Attacks
+
+### Stolen files, backups, or cloud data
+
+Vault contents are encrypted before storage or upload. Item keys are wrapped for authorized devices, whose private keys stay in the Secure Enclave. The app stores device-bound key representations in the non-synchronizing Keychain and requires local authentication to use them. A copied encrypted vault does not provide a master-password hash to crack or a portable private key. Plaintext exports and some metadata, including vault names and record sizes, are outside this protection.
+
+### Reading application memory
+
+2ndPass decrypts concealed fields when needed, rather than keeping every password decrypted. Its unlocked read cache contains encrypted records and the decoded catalog, not revealed passwords or unwrapped item keys. It wipes owned secret buffers when released and clears session state and hardware-key handles on lock. Passwords and temporary decryption keys still enter memory during use: malware controlling the app or operating system can capture them, and not every copy made by the UI or system frameworks can be reliably erased.
+
+### Modified binaries and injected code
+
+Apple code signing, provisioning, and Keychain access groups protect access to the device identity. On macOS, 2ndPass also checks its signing identity and requires hardened-runtime protections with debugger access and library-validation bypasses disabled. Simply modifying or re-signing the app does not grant an attacker the legitimate app's Keychain access. These protections rely on the operating system; they do not make malicious code with an accepted signing identity safe, and enrollment does not remotely verify which binary another device runs.
+
+### Tampered or replayed cloud records
+
+Authenticated encryption detects altered ciphertext. Signed revisions and locally trusted checkpoints help reject unauthorized updates and rollback against known history. They cannot force a server to deliver the latest data or remain available. Account takeover is a separate threat because the Apple Account participates in new-device enrollment, as explained below.
+
+### Clipboard and screen capture
+
+Passwords are concealed until requested, revealed values hide again after a timeout, and secret clipboard copies stay local to the device and expire. Locking hides vault contents and clears the app's unchanged clipboard copy. These measures limit exposure, but cannot erase a password another application or screen capture has already obtained.
 
 ## iCloud
 
@@ -80,4 +103,4 @@ Treat those outputs as credentials. Removing a temporary file is ordinary deleti
 
 Outstanding release gates include an independent security audit, sharing between two actual Apple Accounts, recovery on separate physical hardware, and signed iOS/AutoFill acceptance on physical devices. Simulator builds do not verify Secure Enclave behavior.
 
-Keep your existing password manager and a verified recovery route while evaluating the project. The repository’s [validation record](https://github.com/koehn/2ndPass/blob/main/docs/VALIDATION.md) and [vault validation checklist](https://github.com/koehn/2ndPass/blob/main/docs/VAULT-NEXT-VALIDATION.md) are the authoritative place to follow progress.
+Keep your existing password manager and a verified recovery route while evaluating the project. The [v7 validation record](vault-validation.html) documents completed checks, measurements, and remaining live acceptance work as of September 27, 2026.
