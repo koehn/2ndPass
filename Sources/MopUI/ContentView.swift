@@ -42,6 +42,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 12) {
                 List(selection: Binding<String?>(get: { model.sidebarSelection }, set: { if let value = $0 { model.sidebarSelection = value } })) {
                     NavigationLink(value: "all") { Label("All Items", systemImage: "square.stack.3d.up") }
+                    NavigationLink(value: "favorites") { Label("Favorites", systemImage: "star") }
                     Section("Vaults", isExpanded: $vaultsExpanded) {
                         ForEach(model.vaults.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }) { vault in
                             NavigationLink(value: "vault:" + vault.id) {
@@ -51,6 +52,7 @@ struct ContentView: View {
                             .contextMenu { Button("Vault Details…") { model.openVaultDetails(vault) }.disabled(model.busy) }
                         }
                     }
+                    NavigationLink(value: "archive") { Label("Archive", systemImage: "archivebox") }
                     NavigationLink(value: "deleted") { Label("Recently Deleted", systemImage: "trash") }
                 }.listStyle(.sidebar).disabled(model.busy).id(model.selectionGeneration)
             }
@@ -60,12 +62,8 @@ struct ContentView: View {
             Group {
                 if model.page == .secrets {
                 VStack(spacing: 0) {
+                    ItemSearchBar(model: model)
                     SearchSummary(model: model)
-                    HStack {
-                        Toggle("Archived", isOn: $model.showArchived)
-                        Toggle("Favorites", isOn: $model.favoritesOnly)
-                        TextField("Filter tag", text: $model.tagFilter)
-                    }.font(.caption).padding(.horizontal)
 
                     if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
                         ContentUnavailableView {
@@ -84,13 +82,13 @@ struct ContentView: View {
                                     Text(row.item.name).fontWeight(.medium)
                                     if let subtitle = row.subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                                     if model.allVaults { Text(row.vaultName).font(.caption).foregroundStyle(.secondary) }
-                                    if !model.search.isEmpty, let result = model.searchResults.first(where: { $0.id == row.id }) {
-                                        Text(result.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    if let detail = row.searchDetail {
+                                        Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                                     }
                                 }
                             }.padding(.vertical, 2) }.tag(row.id).id(row.id)
                                 .contextMenu {
-                                    Button("Move to Recently Deleted…", role: .destructive) { model.itemToDelete = row }
+                                    Button("Delete", role: .destructive) { model.itemToDelete = row }
                                         .disabled(model.offline || model.busy)
                                 }
                         }.disabled(model.busy).id(model.selectionGeneration)
@@ -121,8 +119,7 @@ struct ContentView: View {
             }.mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout)
         } detail: {
                 ScrollView {
-                    if let target = model.vaultDetailsTarget { VaultDetailsView(model: model, target: target) }
-                    else if model.page == .recentlyDeleted { RecentlyDeletedDetail(model: model) }
+                    if model.page == .recentlyDeleted { RecentlyDeletedDetail(model: model) }
                     else if let draft = model.itemDraft, draft.isNew, model.authenticated {
                         ItemDetailView(model: model, itemName: "").id(draft.id)
                     }
@@ -210,10 +207,15 @@ struct ContentView: View {
         .toolbar { SessionToolbar(model: model, settings: $settingsPresented) }
         #endif
     }
-    private var content: some View {
-        navigation
-        .mopSearch(model: model)
-        .onChange(of: model.vaultDetailsTarget?.id) { _, id in if id != nil { showDetail() } }
+    private var sessionContent: some View {
+        Group {
+            if !model.authenticated && !model.vaults.isEmpty {
+                LockedView(model: model)
+            } else {
+                navigation
+            }
+        }
+        .transaction { if !model.authenticated { $0.disablesAnimations = true } }
         .sheet(isPresented: $settingsPresented) { SessionSettings(model: model) }
         .documentTransfers(model: model)
         .task(id: model.notice) {
@@ -234,12 +236,19 @@ struct ContentView: View {
         .onChange(of: model.selectedDeleted) { _, row in if row != nil { showDetail() } }
         .onChange(of: model.selectedItem) { _, _ in model.selected = nil }
         .onChange(of: model.selected) { _, _ in model.conceal() }
-        .sheet(item: Binding<SheetRequest?>(get: { model.sheetRequest?.inSettings == false ? model.sheetRequest : nil }, set: { if model.sheetRequest?.inSettings == false { model.sheetRequest = $0 } })) { sheet in
+        .sheet(item: Binding<SheetRequest?>(get: { model.vaultDetailsTarget == nil && model.sheetRequest?.inSettings == false ? model.sheetRequest : nil }, set: { if model.sheetRequest?.inSettings == false { model.sheetRequest = $0 } })) { sheet in
             AppSheetView(model: model, request: sheet)
         }
-        .alert("Operation not completed", isPresented: Binding(get: { !model.settingsVisible && model.sheetRequest == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
+    }
+    private var content: some View {
+        sessionContent
+        .sheet(item: $model.vaultDetailsTarget) { target in
+            VaultDetailsDialog(model: model, target: target)
+        }
+        .alert("Operation not completed", isPresented: Binding(get: { !model.settingsVisible && model.vaultDetailsTarget == nil && model.sheetRequest == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
+            if model.developerDiagnosticsEnabled { Button("Copy Details") { model.copyErrorDetails() } }
             Button("OK") { model.error = nil }
-        } message: { Text(model.error ?? "") }
+        } message: { Text(model.errorMessage) }
         .confirmationDialog("Move item to Recently Deleted?", isPresented: Binding(get: { model.itemToDelete != nil }, set: { if !$0 { model.itemToDelete = nil } }), titleVisibility: .visible) {
             if let row = model.itemToDelete {
                 Button("Delete “" + row.item.name + "”…", role: .destructive) { model.trashItem(row) }

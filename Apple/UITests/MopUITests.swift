@@ -118,7 +118,7 @@ import XCTest
     func testSearchFiltersListAndOpensItem() {
         let app = launch()
         openItems(app)
-        let search = app.searchFields.firstMatch
+        let search = app.textFields["Item search"]
         if !search.exists, app.buttons["Search"].firstMatch.exists { app.buttons["Search"].firstMatch.tap() }
         XCTAssertTrue(search.waitForExistence(timeout: 5), app.debugDescription)
         search.tap(); search.typeText("sample@example.test")
@@ -129,7 +129,7 @@ import XCTest
         menuImage.name = "Filtered search results"; menuImage.lifetime = .keepAlways
         add(menuImage)
         result.tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertTrue(app.descendants(matching: .any)["sample@example.test"].firstMatch.exists)
         XCTAssertTrue(app.buttons["Copy username value"].exists)
     }
@@ -140,7 +140,7 @@ import XCTest
         app.launchEnvironment["MOP_UI_SEARCH_TEST"] = "1"
         app.launch()
         openItems(app)
-        let search = app.searchFields.firstMatch
+        let search = app.textFields["Item search"]
         search.tap(); search.typeText("s")
         let example = app.staticTexts["Example Login"].firstMatch
         XCTAssertTrue(example.waitForExistence(timeout: 5))
@@ -153,7 +153,7 @@ import XCTest
         XCTAssertTrue(server.exists)
         XCTAssertTrue(app.staticTexts["ssh username: sshd"].exists)
         server.tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertTrue(app.descendants(matching: .any)["sshd"].firstMatch.exists)
     }
 
@@ -204,7 +204,7 @@ import XCTest
         let app = launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        let edit = app.buttons["Edit item"]
+        let edit = app.buttons["Edit"]
         XCTAssertTrue(edit.waitForExistence(timeout: 5))
         let settings = app.buttons["Settings"].firstMatch
         XCTAssertGreaterThanOrEqual(edit.frame.minY, settings.frame.maxY)
@@ -225,8 +225,8 @@ import XCTest
         let app = launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
-        app.buttons["Edit item"].tap()
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5), app.debugDescription)
+        app.buttons["Edit"].tap()
         let generator = app.buttons["Generate password"].firstMatch
         let detail = app.scrollViews["Item detail"]
         for _ in 0..<4 {
@@ -242,7 +242,7 @@ import XCTest
             detail.swipeDown()
         }
         app.buttons["Save"].tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5), app.debugDescription)
         app.buttons["Lock"].tap()
         XCTAssertFalse(app.textFields["password value"].exists)
         XCTAssertFalse(app.staticTexts["sample@example.test"].exists)
@@ -278,7 +278,7 @@ import XCTest
             detail.swipeDown()
         }
         app.buttons["Save"].tap()
-        XCTAssertTrue(app.buttons["Edit item"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5), app.debugDescription)
         XCUIDevice.shared.orientation = .portrait
     }
     func testTrustFailureDoesNotAutomaticallyRetry() {
@@ -307,7 +307,7 @@ import XCTest
         XCUIDevice.shared.press(.home)
         app.activate()
         XCTAssertTrue(app.staticTexts["sample@example.test"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["Edit item"].exists)
+        XCTAssertTrue(app.buttons["Edit"].exists)
         XCTAssertFalse(app.buttons["Unlock"].exists)
     }
     func testAccessibilityTextSizeKeepsEditingReachable() {
@@ -317,7 +317,7 @@ import XCTest
         app.launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        let edit = app.buttons["Edit item"]
+        let edit = app.buttons["Edit"]
         XCTAssertTrue(edit.waitForExistence(timeout: 5))
         XCTAssertTrue(edit.isHittable)
         edit.tap()
@@ -359,7 +359,7 @@ extension MopUITests {
         let app = launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        app.buttons["Edit item"].tap()
+        app.buttons["Edit"].tap()
         let field = app.textFields["username value"]
         XCTAssertTrue(field.waitForExistence(timeout: 5))
         field.tap(); field.typeText("edited")
@@ -388,7 +388,7 @@ extension MopUITests {
     }
     private func edit(_ app: XCUIApplication) {
         app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.click()
-        app.buttons["Edit item"].click()
+        app.buttons["Edit"].click()
         XCTAssertTrue(app.secureTextFields["password value"].waitForExistence(timeout: 5))
     }
     private func changeName(_ app: XCUIApplication) {
@@ -425,7 +425,8 @@ extension MopUITests {
         app.buttons["Lock"].click()
         let unlock = app.buttons["Unlock 2ndPass"]
         XCTAssertTrue(unlock.waitForExistence(timeout: 5))
-        app.buttons["All Items"].click()
+        XCTAssertFalse(app.buttons["All Items"].exists)
+        XCTAssertFalse(app.buttons["Refresh"].exists)
         app.typeKey("r", modifierFlags: .command)
         XCTAssertTrue(unlock.exists)
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.exists)
@@ -476,7 +477,7 @@ extension MopUITests {
         let app = launch()
         edit(app); changeName(app)
         app.typeKey("f", modifierFlags: .command)
-        let search = app.searchFields.firstMatch
+        let search = app.textFields["Item search"]
         XCTAssertTrue(search.waitForExistence(timeout: 5), app.debugDescription)
         search.typeText("no-match")
         XCTAssertTrue(app.staticTexts["No Search Results"].waitForExistence(timeout: 5))
@@ -492,7 +493,9 @@ extension MopUITests {
     }
     func testVaultDetailsAndRenameDiscardGuard() {
         let app = launch()
-        app.buttons["Vault Details"].click()
+        XCTAssertFalse(app.buttons["Vault Details"].exists)
+        app.buttons["personal"].firstMatch.rightClick()
+        app.menuItems["Vault Details…"].click()
         XCTAssertTrue(app.buttons["Rename Vault…"].waitForExistence(timeout: 5))
         app.buttons["Rename Vault…"].click()
         let name = app.sheets.textFields["Name"]

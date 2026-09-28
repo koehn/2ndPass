@@ -1,4 +1,5 @@
 import SwiftUI
+import OSLog
 import MopCore
 import MopAppSupport
 import MopVaultNext
@@ -15,20 +16,20 @@ final class AppModel {
     let clipboard: any SecretClipboardAccess
     var isActive = true
     var vaults: [VaultDescriptor] = []
-    var vault = ""
-    var allVaults = false
-    var catalogs: [String: ItemCatalog] = [:]
-    var deletedCatalogs: [String: ItemCatalog] = [:]
+    var vault = "" { didSet { invalidateItemSearch() } }
+    var allVaults = false { didSet { invalidateItemSearch() } }
+    var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch() } }
+    var deletedCatalogs: [String: ItemCatalog] = [:] { didSet { invalidateDeletedSearch() } }
     var selectedDeleted: ItemRow.ID?
     var itemToDelete: ItemRow?
-    var retentionDate = Date()
+    var retentionDate = Date() { didSet { invalidateDeletedSearch() } }
     private var nextRetentionSweep = Date.distantPast
     @ObservationIgnored private let wallNow: () -> Date
     var passwordQualities: [String: PasswordQuality] = [:]
     private var launchAttempted = false
     var page = AppPage.secrets
     var selectedItem: String?
-    var catalog: ItemCatalog?
+    var catalog: ItemCatalog? { didSet { invalidateItemSearch() } }
     var references: [SecretReference] = []
     var selected: SecretReference?
     var importAfterCreation = false
@@ -37,13 +38,12 @@ final class AppModel {
     var importFraction: Double?
     var importReport: ImportReport?
     var importFailed = false
-    var showArchived = false
-    var favoritesOnly = false
-    var tagFilter = ""
+    var showArchived = false { didSet { invalidateItemSearch() } }
+    var favoritesOnly = false { didSet { invalidateItemSearch() } }
     var search = ""
     var searchIsFocused = false
     var searchHighlighted: ItemRow.ID?
-    var searchScope: String { page == .recentlyDeleted ? "Recently Deleted" : allVaults ? "All Items" : vaultName.isEmpty ? "Items" : vaultName }
+    var searchScope: String { page == .recentlyDeleted ? "Recently Deleted" : showArchived ? "Archive" : favoritesOnly ? "Favorites" : allVaults ? "All Items" : vaultName.isEmpty ? "Items" : vaultName }
     var members: [VaultMemberRecord] = []
     var settingsVisible = false
     var devices: [VaultDeviceRecord] = []
@@ -58,7 +58,29 @@ final class AppModel {
     var refreshing = false
     private var foregroundRevision = 0
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
-    var error: String?
+    private static let logger = Logger(subsystem: "com.koehn.mop", category: "App")
+    var errorDetails: String?
+    var developerDiagnosticsEnabled: Bool { defaults.bool(forKey: DeveloperPreferences.key) }
+    var error: String? {
+        didSet {
+            errorDetails = nil
+            if let error { Self.logger.error("Operation failed: \(error, privacy: .private)") }
+        }
+    }
+    var errorMessage: String {
+        guard developerDiagnosticsEnabled else { return error ?? "" }
+        return (error ?? "") + "\n\n" + (errorDetails ?? "App validation: " + (error ?? "Unknown error"))
+    }
+    func recordError(_ failure: Error, operation: String) {
+        let ns = failure as NSError
+        Self.logger.error("\(operation, privacy: .public): \(ns.domain, privacy: .public) (\(ns.code)) — \(String(reflecting: failure), privacy: .private)")
+        if developerDiagnosticsEnabled {
+            errorDetails = "Operation: \(operation)\nType: \(String(reflecting: type(of: failure)))\nDomain: \(ns.domain)\nCode: \(ns.code)\n\(String(reflecting: failure))\nUser info: \(ns.userInfo)"
+        }
+    }
+    func copyErrorDetails() {
+        clipboard.copy(SecretBytes(utf8: errorMessage), concealed: true)
+    }
     var notice: String?
     struct CopyFeedback {
         let id = UUID()
@@ -222,60 +244,64 @@ final class AppModel {
         references.filter { search.isEmpty || $0.description.localizedCaseInsensitiveContains(search) }
     }
     var items: [String] { Array(Set(filtered.map(\.item))).sorted() }
-    var unfilteredItems: [ItemRow] {
+    // Revisions keep Observation informed even when the underlying cache is reused.
+    private var itemSearchRevision = 0
+    private var deletedSearchRevision = 0
+    @ObservationIgnored private var itemSearchIndex: ItemSearchIndex?
+    @ObservationIgnored private var deletedSearchIndex: ItemSearchIndex?
+    private func invalidateItemSearch() {
+        itemSearchIndex = nil
+        itemSearchRevision &+= 1
+    }
+    private func invalidateDeletedSearch() {
+        deletedSearchIndex = nil
+        deletedSearchRevision &+= 1
+    }
+    private var activeIndex: ItemSearchIndex {
+        _ = itemSearchRevision
+        if let itemSearchIndex { return itemSearchIndex }
         let included = allVaults ? catalogs : catalog.map { [vault: $0] } ?? [:]
-        return included.flatMap { id, catalog in
-            catalog.items.filter { $0.isArchived == showArchived && (!favoritesOnly || $0.isFavorite) && (tagFilter.isEmpty || ($0.metadata?.tags.contains(tagFilter) == true)) }.map { item in
+        let rows = included.flatMap { id, catalog in
+            catalog.items.filter { $0.isArchived == showArchived && (!favoritesOnly || $0.isFavorite) }.map { item in
                 ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item)
             }
         }.sorted { ($0.item.name, $0.vaultName, $0.id.vault) < ($1.item.name, $1.vaultName, $1.id.vault) }
+        let index = ItemSearchIndex(rows: rows)
+        itemSearchIndex = index
+        return index
     }
-    var displayedItems: [ItemRow] { search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? unfilteredItems : searchResults.map(\.row) }
-    var listSelection: ItemRow.ID? {
-        get {
-            if searchIsFocused, !search.isEmpty { return searchHighlighted }
-            return displayedItems.contains { $0.id == selectedRow } ? selectedRow : nil
-        }
-        set {
-            if newValue == nil, let selectedRow, !displayedItems.contains(where: { $0.id == selectedRow }) { return }
-            self.selectedRow = newValue
-        }
-    }
-    var searchResults: [ItemSearchResult] {
-        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return [] }
-        return unfilteredItems.compactMap { row in
-            let field = row.item.fields.first { field in
-                guard !field.type.concealed else { return false }
-                let label = field.path.removingPercentEncoding ?? field.path
-                return label.localizedCaseInsensitiveContains(query) || field.value?.localizedCaseInsensitiveContains(query) == true
-            }
-            guard field != nil || row.item.name.localizedCaseInsensitiveContains(query)
-                    || row.vaultName.localizedCaseInsensitiveContains(query) else { return nil }
-            return ItemSearchResult(row: row, field: field)
-        }
-    }
-
-    var allDeletedRows: [ItemRow] {
-        deletedCatalogs.flatMap { id, catalog in
+    private var deletedIndex: ItemSearchIndex {
+        _ = deletedSearchRevision
+        if let deletedSearchIndex { return deletedSearchIndex }
+        let rows = deletedCatalogs.flatMap { id, catalog in
             catalog.items.compactMap { item -> ItemRow? in
                 guard let deletion = item.deletion, !deletion.isExpired(at: retentionDate) else { return nil }
                 return ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item)
             }
         }.sorted { ($0.item.deletion?.deletedAt ?? .distantPast) > ($1.item.deletion?.deletedAt ?? .distantPast) }
+        let index = ItemSearchIndex(rows: rows, deleted: true)
+        deletedSearchIndex = index
+        return index
     }
-    var deletedRows: [ItemRow] {
-        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        return allDeletedRows.filter { row in
-            query.isEmpty || (row.item.deletion?.originalName ?? row.item.name).localizedCaseInsensitiveContains(query)
-            || row.vaultName.localizedCaseInsensitiveContains(query)
-            || row.item.fields.contains { !$0.type.concealed && (($0.path.removingPercentEncoding ?? $0.path).localizedCaseInsensitiveContains(query) || $0.value?.localizedCaseInsensitiveContains(query) == true) }
+    var unfilteredItems: [ItemRow] { activeIndex.rows }
+    var displayedItems: [ItemRow] { activeIndex.search(search).rows }
+    var listSelection: ItemRow.ID? {
+        get {
+            if searchIsFocused, !search.isEmpty { return searchHighlighted }
+            return selectedRow.flatMap { activeIndex.search(search).ids.contains($0) ? $0 : nil }
+        }
+        set {
+            if newValue == nil, let selectedRow, !activeIndex.search(search).ids.contains(selectedRow) { return }
+            self.selectedRow = newValue
         }
     }
+    var searchResults: [ItemSearchResult] { activeIndex.search(search).results }
+    var allDeletedRows: [ItemRow] { deletedIndex.rows }
+    var deletedRows: [ItemRow] { deletedIndex.search(search).rows }
     var deletedListSelection: ItemRow.ID? {
-        get { searchIsFocused && !search.isEmpty ? searchHighlighted : (deletedRows.contains { $0.id == selectedDeleted } ? selectedDeleted : nil) }
+        get { searchIsFocused && !search.isEmpty ? searchHighlighted : selectedDeleted.flatMap { deletedIndex.search(search).ids.contains($0) ? $0 : nil } }
         set {
-            if newValue == nil, let selectedDeleted, !deletedRows.contains(where: { $0.id == selectedDeleted }) { return }
+            if newValue == nil, let selectedDeleted, !deletedIndex.search(search).ids.contains(selectedDeleted) { return }
             selectedDeleted = newValue
         }
     }
@@ -348,6 +374,7 @@ final class AppModel {
     }
     func chooseVault(_ id: String) {
         guard !busy, allowTransition(.vault(id)) else { return }
+        showArchived = false; favoritesOnly = false
         allVaults = false; page = .secrets; vault = id
         changedVault()
         if vaults.first(where: { $0.id == id })?.enrolled == false { sheet = .enrollDevice; return }
@@ -371,15 +398,32 @@ final class AppModel {
 
     func chooseAllVaults() {
         guard !busy, allowTransition(.allItems) else { return }
+        showArchived = false; favoritesOnly = false
         allVaults = true; page = .secrets
         changedVault()
         scheduleAutomaticUnlock()
     }
+    func chooseCollection(archived: Bool) {
+        guard !busy, allowTransition(.collection(archived: archived)) else { return }
+        allVaults = true; page = .secrets
+        showArchived = archived; favoritesOnly = !archived
+        changedVault()
+    }
+    func toggleFavorite() {
+        guard authenticated, !busy, !offline, itemDraft == nil, let item = selectedTypedItem else { return }
+        guard let catalog else { return }
+        itemDraft = ItemDraft(vault: vault, revision: catalog.revision, item: item)
+        if itemDraft?.metadata == nil { itemDraft?.metadata = ItemMetadata() }
+        itemDraft?.metadata?.favorite = !item.isFavorite
+        saveItemDraft()
+    }
     var sidebarSelection: String {
-        get { page == .recentlyDeleted ? "deleted" : allVaults ? "all" : "vault:" + vault }
+        get { page == .recentlyDeleted ? "deleted" : showArchived ? "archive" : favoritesOnly ? "favorites" : allVaults ? "all" : "vault:" + vault }
         set {
             guard newValue != sidebarSelection else { return }
-            if newValue == "deleted" { chooseRecentlyDeleted() }
+            if newValue == "archive" { chooseCollection(archived: true) }
+            else if newValue == "favorites" { chooseCollection(archived: false) }
+            else if newValue == "deleted" { chooseRecentlyDeleted() }
             else if newValue == "all" { chooseAllVaults() }
             else if newValue.hasPrefix("vault:") { chooseVault(String(newValue.dropFirst(6))) }
         }
@@ -661,7 +705,7 @@ final class AppModel {
     }
     func cancelImportOperation() { operationTask?.cancel() }
 
-    func perform(_ action: @escaping @MainActor (Int) async throws -> Void) {
+    func perform(operation: String = #function, file: String = #fileID, line: Int = #line, _ action: @escaping @MainActor (Int) async throws -> Void) {
         checkExpiration()
         guard !busy else { return }
         foregroundRevision += 1
@@ -700,6 +744,7 @@ final class AppModel {
                     } else {
                         self.error = (error as? MopError)?.errorDescription ?? (error as? ImportFailure)?.errorDescription ?? (error as? AttachmentFailure)?.errorDescription ?? (error as? CompoundFieldFailure)?.errorDescription ?? "The operation could not be completed."
                     }
+                    self.recordError(error, operation: "\(operation) at \(file):\(line)")
                 }
             }
         }
@@ -782,6 +827,10 @@ final class AppModel {
             if vault.isEmpty { vault = ids[0] }
             if let catalog = loaded[vault] { try applyCatalog(catalog) }
             else { catalog = nil; references = [] }
+            // Prepare search before exposing the unlocked UI, including when a
+            // compact layout opens directly to a detail instead of the item list.
+            if page == .recentlyDeleted { _ = deletedIndex.search(search) }
+            else { _ = activeIndex.search(search) }
             authenticated = true; accessNeedsRepair = false
             if lastActivity == nil { lastActivity = now() }
             for (id, catalog) in loaded {
@@ -1271,6 +1320,7 @@ final class AppModel {
                 } else {
                     cloudRefreshPending = true
                 }
+                recordError(error, operation: "Background cloud refresh")
             }
         }
     }
@@ -1354,6 +1404,7 @@ final class AppModel {
 /// User-initiated transitions that can replace the single, session-local draft.
 enum PendingTransition {
     case item(ItemRow.ID?), vault(String), allItems, recentlyDeleted
+    case collection(archived: Bool)
     case vaultTarget(String), sheet(AppSheet), presentation(SheetRequest), details(VaultDescriptor?), refresh, trash(ItemRow)
     case closeWindow, quit
 }
@@ -1439,6 +1490,7 @@ extension AppModel {
         case .item(let id): selectedRow = id
         case .vault(let id): chooseVault(id)
         case .allItems: chooseAllVaults()
+        case .collection(let archived): chooseCollection(archived: archived)
         case .recentlyDeleted: chooseRecentlyDeleted()
         case .vaultTarget(let id):
             guard prepareVaultAction(id) else { completion?(false); return }

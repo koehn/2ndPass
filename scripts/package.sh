@@ -42,7 +42,8 @@ if [[ "$product" == 2ndpass ]]; then
     cp "$bin_dir/MopApp" "$app/Contents/MacOS/MopApp"
     /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable MopApp' "$app/Contents/Info.plist"
     mkdir -p "$app/Contents/Resources"
-    # SwiftPM resources used by the in-process password-strength estimator.
+    # SwiftPM resources used by the UI and password-strength estimator.
+    cp -R "$bin_dir/2ndpass_MopUI.bundle" "$app/Contents/Resources/"
     cp -R "$bin_dir/zxcvbn_zxcvbn.bundle" "$app/Contents/Resources/"
     cp .build/checkouts/zxcvbn-swift/LICENSE "$app/Contents/Resources/zxcvbn-LICENSE.txt"
     cp assets/Mop.icns "$app/Contents/Resources/Mop.icns"

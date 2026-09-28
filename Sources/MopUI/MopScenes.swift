@@ -91,27 +91,34 @@ struct SessionSettings: View {
     private let durations = [1, 5, 10, 15, 30, 60]
     var body: some View {
         Group {
-            #if os(macOS)
-            TabView(selection: $model.settingsCategory) {
-                ForEach(SettingsCategory.allCases) { category in
-                    categoryView(category).tabItem { Label(category.rawValue, systemImage: category.symbol) }.tag(category)
+            if !model.authenticated && model.hasConnectedVaults {
+                LockedView(model: model)
+                    #if os(macOS)
+                    .frame(width: 620, height: 560)
+                    #endif
+            } else {
+                #if os(macOS)
+                TabView(selection: $model.settingsCategory) {
+                    ForEach(SettingsCategory.allCases) { category in
+                        categoryView(category).tabItem { Label(category.rawValue, systemImage: category.symbol) }.tag(category)
+                    }
+                }.frame(width: 620, height: 560)
+                #else
+                NavigationStack(path: $categoryPath) {
+                    List(SettingsCategory.allCases) { category in
+                        NavigationLink(value: category) { Label(category.rawValue, systemImage: category.symbol) }
+                    }
+                    .navigationTitle("Settings")
+                    .navigationDestination(for: SettingsCategory.self) { category in
+                        categoryView(category).navigationTitle(category.rawValue)
+                            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+                    }
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 }
-            }.frame(width: 620, height: 560)
-            #else
-            NavigationStack(path: $categoryPath) {
-                List(SettingsCategory.allCases) { category in
-                    NavigationLink(value: category) { Label(category.rawValue, systemImage: category.symbol) }
-                }
-                .navigationTitle("Settings")
-                .navigationDestination(for: SettingsCategory.self) { category in
-                    categoryView(category).navigationTitle(category.rawValue)
-                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-                }
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+                .onAppear { categoryPath = [model.settingsCategory] }
+                .onChange(of: categoryPath) { _, path in if let category = path.last { model.settingsCategory = category } }
+                #endif
             }
-            .onAppear { categoryPath = [model.settingsCategory] }
-            .onChange(of: categoryPath) { _, path in if let category = path.last { model.settingsCategory = category } }
-            #endif
         }
         .draftTransitionPrompt(model: model, inSettings: true)
         .onAppear { model.settingsVisible = true }
@@ -130,8 +137,9 @@ struct SessionSettings: View {
             }
         }
         .alert("Operation not completed", isPresented: Binding(get: { model.sheet == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
+            if model.developerDiagnosticsEnabled { Button("Copy Details") { model.copyErrorDetails() } }
             Button("OK") { model.error = nil }
-        } message: { Text(model.error ?? "") }
+        } message: { Text(model.errorMessage) }
     }
     private func categoryView(_ category: SettingsCategory) -> some View {
         Form {

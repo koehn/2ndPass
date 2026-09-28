@@ -11,6 +11,18 @@ struct ItemDraftTests {
             ItemField(path: "notes", type: .notes, value: "details", isTemplate: true)
         ])
     }
+    @Test func tagsPreserveTypingAndNormalizeSavedMetadata() {
+        var draft = ItemDraft(vault: "uuid", revision: "r1", item: item)
+        draft.tagsText = "work, "
+        #expect(draft.tagsText == "work, ")
+        draft.tagsText += "shared accounts, work"
+        #expect(draft.tagsText == "work, shared accounts, work")
+        #expect(draft.item.metadata?.tags == ["shared accounts", "work"])
+        #expect(draft.isModified)
+        draft.tagsText = ""
+        #expect(draft.item.metadata?.tags == [])
+    }
+
     @Test func templateFieldsAndLegacyProtectionSurviveTypeChange() {
         for type in ItemType.templateTypes {
             #expect(type.template.contains { $0.path == "notes" && $0.type == .notes } == (type != .secureNote))

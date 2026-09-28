@@ -6,6 +6,7 @@ struct ItemRow: Identifiable {
     let id: ID
     let vaultName: String
     let item: VaultItem
+    var searchDetail: String? = nil
     var subtitle: String? {
         item.fields.first { [.username, .email, .website].contains($0.type) && !($0.value ?? "").isEmpty }?.value
     }
@@ -29,11 +30,12 @@ extension ItemType {
 }
 
 struct ItemSearchResult: Identifiable {
-    let row: ItemRow
+    var row: ItemRow
     let field: ItemField?
+    var tag: String? = nil
     var id: ItemRow.ID { row.id }
     var detail: String {
-        guard let field else { return row.vaultName }
+        guard let field else { return tag.map { "Tag: " + $0 } ?? row.vaultName }
         let label = (field.path.removingPercentEncoding ?? field.path).replacingOccurrences(of: "/", with: " / ")
         return label + (field.value.map { ": " + $0 } ?? "")
     }

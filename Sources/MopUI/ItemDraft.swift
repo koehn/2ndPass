@@ -70,6 +70,14 @@ struct ItemDraft: Identifiable {
     var name: String
     var type: ItemType
     var fields: [Field]
+    var tagsText: String {
+        didSet {
+            if metadata == nil { metadata = ItemMetadata() }
+            metadata?.tags = Array(Set(tagsText.split(separator: ",").map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty })).sorted()
+        }
+    }
     var metadata: ItemMetadata?
     var autoFill: AutoFillMapping
     var mode: Mode
@@ -80,6 +88,7 @@ struct ItemDraft: Identifiable {
     var isModified: Bool { vault != initialVault || item != initialItem }
 
     init(vault: String, revision: String, item: VaultItem, mode: Mode = .item, isNew: Bool = false) {
+        tagsText = item.metadata?.tags.joined(separator: ", ") ?? ""
         metadata = item.metadata
         autoFill = item.autoFill ?? AutoFillMapping()
         initialVault = vault

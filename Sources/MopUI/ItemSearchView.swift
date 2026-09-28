@@ -1,30 +1,39 @@
 import SwiftUI
 
-extension View {
-    func mopSearch(model: AppModel) -> some View { modifier(ItemSearchModifier(model: model)) }
-}
-private struct ItemSearchModifier: ViewModifier {
+struct ItemSearchBar: View {
     @Bindable var model: AppModel
     @FocusState private var focused: Bool
-    @State private var presented = false
     private var rows: [ItemRow] { model.page == .recentlyDeleted ? model.deletedRows : model.displayedItems }
-    func body(content: Content) -> some View {
-        content
-            .searchable(text: $model.search, isPresented: $presented, placement: .toolbar, prompt: "Search " + model.searchScope)
-            .searchFocused($focused)
-            .onChange(of: model.searchFocusRequest) { _, _ in presented = true; focused = true }
-            .onChange(of: focused) { _, value in model.searchIsFocused = value }
-            .onChange(of: model.search) { _, _ in model.searchHighlighted = rows.first?.id }
-            .onChange(of: model.selectedRow) { _, _ in focused = false }
-            .onChange(of: model.selectedDeleted) { _, _ in focused = false }
-            .onSubmit(of: .search) { openHighlighted() }
-            .onKeyPress(.downArrow) { guard focused else { return .ignored }; move(1); return .handled }
-            .onKeyPress(.upArrow) { guard focused else { return .ignored }; move(-1); return .handled }
-            .onKeyPress(.escape) {
-                guard focused else { return .ignored }
-                if model.search.isEmpty { focused = false; presented = false } else { model.search = "" }
-                return .handled
+    var body: some View {
+        HStack {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Search " + model.searchScope, text: Binding(get: { model.search }, set: {
+                ItemSearchIndex.noteInput()
+                model.search = $0
+            }))
+                .textFieldStyle(.plain)
+                .focused($focused)
+                .accessibilityLabel("Search " + model.searchScope).accessibilityIdentifier("Item search")
+            if !model.search.isEmpty {
+                Button("Clear Search", systemImage: "xmark.circle.fill") { model.search = "" }
+                    .labelStyle(.iconOnly).buttonStyle(.plain).help("Clear Search")
             }
+        }
+        .padding(8).background(.quaternary, in: RoundedRectangle(cornerRadius: 8)).padding(10)
+        .onChange(of: model.searchFocusRequest) { _, _ in focused = true }
+        .onChange(of: focused) { _, value in model.searchIsFocused = value }
+        .onDisappear { model.searchIsFocused = false }
+        .onChange(of: model.search) { _, _ in model.searchHighlighted = rows.first?.id }
+        .onChange(of: model.selectedRow) { _, _ in focused = false }
+        .onChange(of: model.selectedDeleted) { _, _ in focused = false }
+        .onSubmit { openHighlighted() }
+        .onKeyPress(.downArrow) { guard focused else { return .ignored }; move(1); return .handled }
+        .onKeyPress(.upArrow) { guard focused else { return .ignored }; move(-1); return .handled }
+        .onKeyPress(.escape) {
+            guard focused else { return .ignored }
+            if model.search.isEmpty { focused = false } else { model.search = "" }
+            return .handled
+        }
     }
     private func move(_ offset: Int) {
         guard !rows.isEmpty else { return }

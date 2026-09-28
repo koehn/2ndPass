@@ -79,7 +79,12 @@ struct AppSheetView: View {
                 TextField("Type the vault name to confirm", text: $confirmation)
 
             }
-            if let error = model.error ?? controls.error ?? localError { Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
+            if let error = model.error.map({ _ in model.errorMessage }) ?? controls.error ?? localError {
+                Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                if model.developerDiagnosticsEnabled, model.error != nil {
+                    Button("Copy Details") { model.copyErrorDetails() }
+                }
+            }
             if let notice = model.notice { Text(notice).font(.callout).textSelection(.enabled) }
             if model.busy { ProgressView("Waiting for authentication or iCloud…") }
         }.padding(24).disabled(model.busy) }

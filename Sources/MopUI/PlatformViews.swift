@@ -39,23 +39,19 @@ struct SessionToolbar: ToolbarContent {
                     .disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil || model.page != .secrets)
                 Button("Import…") { model.beginImport() }.disabled(model.busy || model.offline || !model.authenticated)
                 Button("New Vault…") { model.presentSheet(.createVault) }.disabled(model.busy || model.offline)
-            } label: { Label("New", systemImage: "plus") }
-            if let target = model.selectedVaultDescriptor {
-                Button("Vault Details", systemImage: "info.circle") { model.openVaultDetails(target) }
-                    .disabled(model.busy)
-            }
+            } label: { Label("New", systemImage: "plus") }.help("New item or vault")
             Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
-                .accessibilityLabel("Refresh").keyboardShortcut("r")
+                .help("Refresh").accessibilityLabel("Refresh").keyboardShortcut("r")
                 .disabled(model.busy)
             if model.authenticated {
                 Button("Lock", systemImage: "lock") { model.lock() }
-                    .accessibilityLabel("Lock").keyboardShortcut("l", modifiers: [.command, .shift])
+                    .help("Lock 2ndPass").accessibilityLabel("Lock").keyboardShortcut("l", modifiers: [.command, .shift])
             } else {
                 Button("Unlock", systemImage: "lock.open") { model.unlock() }
-                    .accessibilityLabel("Unlock").disabled(!model.canUnlock)
+                    .help("Unlock 2ndPass").accessibilityLabel("Unlock").disabled(!model.canUnlock)
             }
             #if os(iOS)
-            Button("Settings", systemImage: "gear") { settings = true }.accessibilityLabel("Settings")
+            Button("Settings", systemImage: "gear") { settings = true }.help("Settings").accessibilityLabel("Settings")
             #endif
         }
     }

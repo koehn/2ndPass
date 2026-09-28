@@ -47,7 +47,14 @@ struct ItemDetailView: View {
                 if !creating && model.itemDraft?.name != itemName {
                     Text("Renaming changes this item’s references.").font(.caption).foregroundStyle(.secondary)
                 }
-            } else { Text(itemName).font(.title2).fontWeight(.semibold) }
+            } else {
+                HStack {
+                    Text(itemName).font(.title2).fontWeight(.semibold)
+                    if model.selectedTypedItem?.isFavorite == true {
+                        Image(systemName: "star.fill").foregroundStyle(.yellow).accessibilityLabel("Favorite")
+                    }
+                }
+            }
             if editingItem {
                 Picker("Item type", selection: Binding(get: { model.itemDraft?.type ?? .custom }, set: { model.changeDraftType($0) })) {
                     ForEach(ItemType.templateTypes, id: \.self) { Text($0.label).tag($0) }
@@ -57,18 +64,17 @@ struct ItemDetailView: View {
                     .font(.caption).foregroundStyle(.secondary)
             } else { Text(model.selectedTypedItem?.type.label ?? "Custom").foregroundStyle(.secondary) }
             if editingItem {
-                TextField("Tags (comma-separated)", text: Binding(get: { model.itemDraft?.metadata?.tags.joined(separator: ", ") ?? "" }, set: { value in
-                    if model.itemDraft?.metadata == nil { model.itemDraft?.metadata = ItemMetadata() }
-                    model.itemDraft?.metadata?.tags = Array(Set(value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })).sorted()
-                }))
-                Toggle("Favorite", isOn: Binding(get: { model.itemDraft?.metadata?.favorite ?? false }, set: { value in
-                    if model.itemDraft?.metadata == nil { model.itemDraft?.metadata = ItemMetadata() }; model.itemDraft?.metadata?.favorite = value
-                }))
+                TextField("Tags (comma-separated)", text: Binding(get: { model.itemDraft?.tagsText ?? "" }, set: {
+                    model.activity(); model.itemDraft?.tagsText = $0
+                })).accessibilityLabel("Tags (comma-separated)")
                 Toggle("Archived", isOn: Binding(get: { model.itemDraft?.metadata?.archived ?? false }, set: { value in
                     if model.itemDraft?.metadata == nil { model.itemDraft?.metadata = ItemMetadata() }; model.itemDraft?.metadata?.archived = value
                 }))
             } else if let metadata = model.selectedTypedItem?.metadata {
-                Text(([metadata.favorite ? "Favorite" : "", metadata.archived ? "Archived" : ""] + metadata.tags).filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption)
+                if metadata.archived {
+                    Label("Archived", systemImage: "archivebox").font(.caption).foregroundStyle(.secondary)
+                }
+                if !metadata.tags.isEmpty { TagBadges(tags: metadata.tags) }
             }
             if editingItem, model.itemDraft?.type == .login { autoFillMappingEditor }
             if let item = model.itemDraft?.item ?? model.selectedTypedItem, item.type == .login {
@@ -210,15 +216,20 @@ struct ItemDetailView: View {
     @ViewBuilder private var editActions: some View {
                 if model.itemDraft == nil {
                     HStack(spacing: 12) {
-                        Button("Edit item") { change { model.beginItemEditing() }; focusedField = "item-name" }
+                        Button("Edit") { change { model.beginItemEditing() }; focusedField = "item-name" }
                             .disabled(model.busy || model.offline)
                         Menu {
-                            Button("Move to Recently Deleted…", role: .destructive) {
+                            Button(model.selectedTypedItem?.isFavorite == true ? "Remove from Favorites" : "Add to Favorites", systemImage: "star") {
+                                model.toggleFavorite()
+                            }.disabled(model.busy || model.offline)
+
+                            Button("Delete", role: .destructive) {
                                 if let item = model.selectedTypedItem {
                                     model.itemToDelete = ItemRow(id: .init(vault: model.vault, name: item.name), vaultName: model.vaultName, item: item)
                                 }
                             }.disabled(model.busy || model.offline)
                         } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Item actions") }
+                        .mopMenuStyle().help("Item actions")
                     }
                 } else if editingItem { saveControls }
     }

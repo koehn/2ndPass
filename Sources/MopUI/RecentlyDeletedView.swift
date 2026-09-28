@@ -4,6 +4,7 @@ struct RecentlyDeletedList: View {
     @Bindable var model: AppModel
     var body: some View {
         VStack(spacing: 0) {
+            ItemSearchBar(model: model)
             SearchSummary(model: model)
             if model.authenticated {
                 List(model.deletedRows, selection: $model.deletedListSelection) { row in
@@ -37,6 +38,7 @@ struct RecentlyDeletedDetail: View {
                 Text("Deleted " + deletion.deletedAt.formatted(date: .abbreviated, time: .shortened))
                 Text("Expires " + deletion.expiresAt.formatted(date: .abbreviated, time: .shortened))
                     .foregroundStyle(.secondary)
+                if let tags = row.item.metadata?.tags, !tags.isEmpty { TagBadges(tags: tags) }
                 ForEach(row.item.fields, id: \.path) { field in
                     VStack(alignment: .leading, spacing: 4) {
                         Text(field.path.removingPercentEncoding ?? field.path).font(.caption).foregroundStyle(.secondary)

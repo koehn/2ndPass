@@ -1545,7 +1545,7 @@ extension AppModelTests {
     #expect(model.displayedItems.map { $0.item.name } == ["Active"])
     model.showArchived = true
     #expect(model.displayedItems.map { $0.item.name } == ["Archived"])
-    model.tagFilter = "missing"
+    model.search = "missing"
     #expect(model.displayedItems.isEmpty)
     model.beginImport(); #expect(model.sheet == .importItems)
     catalog.canEdit = false; model.catalogs["v"] = catalog
@@ -1621,4 +1621,152 @@ extension AppModelTests {
     #expect(model.importFailed)
     #expect(model.importReport == nil)
     #expect(model.importStatus?.contains("confirmation is pending") == true)
+}
+
+
+extension AppModelTests {
+    @Test func favoritesSaveWithoutReadingConcealedFields() async throws {
+        let service = FakeService { operation, _, _ in
+            guard case .save(let edit) = operation else { throw MopError.invalidProcess }
+            #expect(edit.item.isFavorite)
+            #expect(edit.item.fields.first { $0.path == "password" }?.value == nil)
+            var result = VaultResult()
+            result.catalog = ItemCatalog(vault: "personal", revision: "r2", items: [edit.item])
+            return result
+        }
+        service.authenticate()
+        let app = model(service); app.authenticated = true
+        let item = VaultItem(name: "Login", type: .login, fields: [ItemField(path: "password", type: .password)])
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r1", items: [item]))
+        app.selectedItem = item.name
+        app.toggleFavorite()
+        try await finish(app)
+        #expect(app.selectedTypedItem?.isFavorite == true)
+        #expect(app.itemDraft == nil && app.error == nil)
+    }
+
+    @Test func virtualCollectionsResetFiltersAndRespectUnsavedDrafts() throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service); app.authenticated = true
+        try app.applyCatalog(Self.catalog)
+        app.sidebarSelection = "favorites"
+        #expect(app.favoritesOnly && !app.showArchived && app.allVaults)
+        #expect(app.searchScope == "Favorites")
+        app.sidebarSelection = "archive"
+        #expect(!app.favoritesOnly && app.showArchived && app.sidebarSelection == "archive")
+        app.sidebarSelection = "vault:" + app.vault
+        #expect(!app.favoritesOnly && !app.showArchived)
+        app.selectedItem = "github"; app.beginItemEditing()
+        app.itemDraft?.name = "Changed"
+        app.sidebarSelection = "archive"
+        #expect(app.showsUnsavedChanges && !app.showArchived)
+        app.discardAndContinue()
+        #expect(app.showArchived && app.itemDraft == nil)
+    }
+
+    @Test func developerErrorsIncludeUnderlyingFailureAndClearStaleDetails() async throws {
+        let defaults = UserDefaults(suiteName: "mop-diagnostics-" + UUID().uuidString)!
+        defaults.set(true, forKey: DeveloperPreferences.key)
+        let app = AppModel(service: FakeService(), defaults: defaults, automaticTimer: false)
+        app.perform(operation: "Test operation") { _ in
+            throw NSError(domain: "ExampleFailure", code: 42, userInfo: [NSLocalizedDescriptionKey: "Useful diagnostic"])
+        }
+        try await finish(app)
+        #expect(app.errorMessage.contains("ExampleFailure"))
+        #expect(app.errorMessage.contains("42"))
+        #expect(app.errorMessage.contains("Test operation"))
+        #expect(app.errorMessage.contains("Useful diagnostic"))
+        defaults.set(false, forKey: DeveloperPreferences.key)
+        #expect(!app.errorMessage.contains("ExampleFailure"))
+        app.error = nil
+        #expect(app.errorDetails == nil)
+    }
+}
+
+
+extension AppModelTests {
+    @Test func searchMatchesPartialTagsAcrossCollections() throws {
+        let app = model(FakeService())
+        var item = VaultItem(name: "Login", fields: [ItemField(path: "password", type: .password, value: "hidden-secret")])
+        item.metadata = ItemMetadata(tags: ["Shared Accounts"], favorite: true)
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r1", items: [item]))
+        app.search = "  ACCOUNTS  "
+        #expect(app.displayedItems.count == 1)
+        #expect(app.searchResults.first?.detail == "Tag: Shared Accounts")
+        app.favoritesOnly = true
+        #expect(app.displayedItems.count == 1)
+        item.metadata?.archived = true
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r2", items: [item]))
+        app.showArchived = true
+        #expect(app.displayedItems.count == 1)
+        item.deletion = ItemDeletion(originalName: "Login", deletedAt: Date())
+        app.deletedCatalogs[app.vault] = ItemCatalog(vault: "personal", revision: "r3", items: [item])
+        #expect(app.deletedRows.count == 1)
+        app.search = "hidden-secret"
+        #expect(app.displayedItems.isEmpty && app.deletedRows.isEmpty)
+    }
+}
+
+extension AppModelTests {
+    @Test func searchCacheTracksCatalogEditsScopeAndLock() throws {
+        let app = model(FakeService())
+        var item = VaultItem(name: "Entry", fields: [ItemField(path: "username", type: .username, value: "first")])
+        item.metadata = ItemMetadata(tags: ["team"], favorite: true)
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r1", items: [item]))
+        app.search = "first"
+        #expect(app.displayedItems.first?.searchDetail == "username: first")
+        app.catalog?.items[0].fields[0].value = "second"
+        #expect(app.displayedItems.isEmpty)
+        app.search = "second"
+        #expect(app.displayedItems.count == 1)
+        app.showArchived = true
+        #expect(app.displayedItems.isEmpty)
+        app.showArchived = false
+        #expect(app.displayedItems.count == 1)
+        app.allVaults = true
+        #expect(app.displayedItems.isEmpty)
+        app.catalogs[app.vault]?.items[0].fields[0].value = "second"
+        #expect(app.displayedItems.count == 1)
+        app.catalogs[app.vault]?.items[0].metadata?.favorite = false
+        app.favoritesOnly = true
+        #expect(app.displayedItems.isEmpty)
+        app.favoritesOnly = false
+        #expect(app.displayedItems.count == 1)
+        app.lock()
+        #expect(app.displayedItems.isEmpty && app.searchResults.isEmpty && app.deletedRows.isEmpty)
+    }
+
+    @Test func largeCatalogSearchTiming() throws {
+        let app = model(FakeService())
+        let items = (0..<5_000).map { index in
+            var item = VaultItem(name: "Account \(index)", type: .login, fields: [
+                ItemField(path: "username", type: .username, value: "person\(index)@example.test"),
+                ItemField(path: "website", type: .website, value: "https://example.test/\(index)"),
+                ItemField(path: "notes", type: .notes, value: "A sample account for search benchmarking."),
+                ItemField(path: "password", type: .password, value: "never-search-this")
+            ])
+            item.metadata = ItemMetadata(tags: ["Shared Accounts"])
+            return item
+        }
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r1", items: items))
+        let clock = ContinuousClock()
+        let indexing = clock.measure { _ = app.displayedItems }
+        var firstQuery = Duration.zero
+        var slowest = Duration.zero
+        for query in ["s", "sh", "sha", "shar", "share", "shared", "shared ", "shared a", "shared ac", "shared acc"] {
+            let elapsed = clock.measure {
+                app.search = query
+                #expect(app.displayedItems.count == 5_000)
+                _ = app.searchResults
+                _ = app.listSelection
+                // Simulate rendering visible rows; each carries its own match text.
+                for row in app.displayedItems.prefix(50) { #expect(row.searchDetail != nil) }
+            }
+            if query == "s" { firstQuery = elapsed }
+            slowest = max(slowest, elapsed)
+        }
+        print("Search benchmark: 5,000 items, index \(indexing), first query \(firstQuery), slowest query + 50 row reads \(slowest)")
+        app.search = "never-search-this"
+        #expect(app.displayedItems.isEmpty)
+    }
 }

@@ -22,7 +22,7 @@ let package = Package(
     targets: [
         .target(name: "MopCore", dependencies: [.product(name: "zxcvbn", package: "zxcvbn-swift")]),
         .target(name: "MopAppSupport", dependencies: ["ZIPFoundation", "MopCore", "MopAuth", "MopKeychain", "MopVaultNext"]),
-        .target(name: "MopUI", dependencies: ["MopAppSupport", "MopCore", "MopVaultNext"]),
+        .target(name: "MopUI", dependencies: ["MopAppSupport", "MopCore", "MopVaultNext"], resources: [.process("Resources")]),
         .executableTarget(name: "MopApp", dependencies: ["MopUI"]),
         .testTarget(name: "MopAppSupportTests", dependencies: ["MopAppSupport", "MopCore", "MopVaultNext"]),
         .testTarget(name: "MopAppTests", dependencies: ["MopUI", "MopAppSupport", "MopCore"]),

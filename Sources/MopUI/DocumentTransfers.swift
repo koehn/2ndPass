@@ -10,8 +10,8 @@ struct DocumentRequest: Identifiable {
 }
 
 extension View {
-    func documentTransfers(model: AppModel, inSheet: Bool = false, inSettings: Bool = false) -> some View {
-        modifier(DocumentTransfers(model: model, inSheet: inSheet, inSettings: inSettings))
+    func documentTransfers(model: AppModel, inSheet: Bool = false, inSettings: Bool = false, inDetails: Bool = false) -> some View {
+        modifier(DocumentTransfers(model: model, inSheet: inSheet, inSettings: inSettings, inDetails: inDetails))
     }
 }
 
@@ -19,9 +19,10 @@ private struct DocumentTransfers: ViewModifier {
     @Bindable var model: AppModel
     let inSheet: Bool
     let inSettings: Bool
+    let inDetails: Bool
     @State private var pending: DocumentRequest?
     private var presented: Binding<Bool> {
-        Binding(get: { model.documentRequest != nil && (model.sheet != nil) == inSheet && (inSheet || model.settingsVisible == inSettings) },
+        Binding(get: { model.documentRequest != nil && (inSheet || (model.vaultDetailsTarget != nil) == inDetails) && (model.sheet != nil) == inSheet && (inSheet || model.settingsVisible == inSettings) },
                 set: { if !$0 { model.documentRequest = nil } })
     }
     func body(content: Content) -> some View {
