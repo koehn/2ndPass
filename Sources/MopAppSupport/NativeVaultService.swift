@@ -233,12 +233,27 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             }
         }
         if case .discover = operation {
-            let entries = try registry.entries()
+            var entries = try registry.entries()
             result.vaults = entries.map { VaultDescriptor(id: $0.address.vault.uuidString, name: $0.name, format: "mop-vault-v7", enrolled: $0.ready) }
             if !offline {
                 let discovered = try await transport.discover()
                 try control.check(token)
                 guard discovered.allSatisfy({ $0.account == account && $0.container == config.container && $0.environment == config.environment }) else { throw MopError.cloudAccount }
+                // A complete zone listing plus a missing head confirms remote
+                // deletion. Never forget vaults on permission or network failures.
+                for entry in entries where entry.submitted && !discovered.contains(entry.address) {
+                    do { _ = try await transport.head(at: entry.address) }
+                    catch MopError.vaultMissing {
+                        try control.check(token)
+                        try registry.forget(entry)
+                        control.removeLocalRead(entry.address.vault.uuidString)
+                    }
+                }
+                entries = try registry.entries()
+                result.vaults = entries.map { VaultDescriptor(id: $0.address.vault.uuidString, name: $0.name, format: "mop-vault-v7", enrolled: $0.ready) }
+                if publishesAutoFill {
+                    try await AutoFillPublisher.shared.prune(keeping: Set(entries.map { $0.address.vault.uuidString }))
+                }
                 for address in discovered where !entries.contains(where: { $0.address == address }) {
                     // No registry pin and no key access: cloud visibility is not trust.
                     if !result.vaults.contains(where: { $0.id == address.vault.uuidString }) {

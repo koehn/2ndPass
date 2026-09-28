@@ -92,12 +92,31 @@ private actor Barrier {
         }
         service.authenticate()
         let app = model(service)
+        app.showsSetupChecklist = true
         app.pollCloudEnrollment(owner: true, automatic: true); try await finish(app)
+        #expect(!app.showsSetupChecklist)
         #expect(app.sheet == nil)
         #expect(app.deviceAddedNotice != nil)
         app.deviceAddedNotice = nil
+        app.showsSetupChecklist = true
         app.pollCloudEnrollment(owner: true, automatic: true); try await finish(app)
         #expect(app.deviceAddedNotice == nil)
+        #expect(!app.showsSetupChecklist)
+    }
+    @Test func setupChecklistRemainsForEmptyEnrollmentPoll() async throws {
+        let service = FakeService()
+        service.authenticate()
+        let app = model(service)
+        app.showsSetupChecklist = true
+        app.pollCloudEnrollment(owner: true, automatic: true); try await finish(app)
+        #expect(app.showsSetupChecklist)
+    }
+    @Test func startingDeviceConnectionDismissesSetupChecklist() {
+        let app = model(FakeService())
+        app.showsSetupChecklist = true
+        app.presentSheet(.addDevice)
+        #expect(app.sheet == .addDevice)
+        #expect(!app.showsSetupChecklist)
     }
     @Test func removedDeviceShowsReconnectAndDoesNotSendEnrollment() async throws {
         let service = FakeService { operation, _, _ in
@@ -2021,5 +2040,41 @@ extension AppModelTests {
         let (removed, _) = selectionModel([secondID: second], defaults: defaults)
         removed.unlock(); try await finish(removed)
         #expect(removed.vault == secondID && removed.selectedItem == nil && removed.collection == .all)
+    }
+}
+
+
+extension AppModelTests {
+    @Test func unlockRemovesDeletedVaultAndOpensRemainingVaults() async throws {
+        let gone = UUID().uuidString, retained = UUID().uuidString
+        let service = FakeService { operation, id, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [VaultDescriptor(id: retained, name: "personal", format: "mop-vault-v7", enrolled: true)]
+            } else if id == gone { throw MopError.vaultMissing }
+            else { result.catalog = Self.catalog }
+            return result
+        }
+        service.authenticate()
+        let app = model(service)
+        app.vault = gone
+        app.vaults = [gone, retained].map { VaultDescriptor(id: $0, name: $0, format: "mop-vault-v7", enrolled: true) }
+        app.unlock(); try await finish(app)
+        #expect(app.error == nil)
+        #expect(app.authenticated)
+        #expect(app.vault == retained)
+        #expect(app.vaults.map(\.id) == [retained])
+        #expect(app.catalogs[gone] == nil && app.catalogs[retained] != nil)
+    }
+    @Test func unlockAfterLastVaultDeletionOffersCreation() async throws {
+        let service = FakeService { operation, _, _ in
+            if case .discover = operation { return VaultResult() }
+            throw MopError.vaultMissing
+        }
+        let app = model(service)
+        app.unlock(); try await finish(app)
+        #expect(app.error == nil)
+        #expect(!app.authenticated && app.vaults.isEmpty && app.vault.isEmpty)
+        #expect(app.sheet == .createVault)
     }
 }

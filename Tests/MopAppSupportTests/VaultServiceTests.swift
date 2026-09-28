@@ -73,6 +73,7 @@ private actor Server {
     }
     var addresses: [UUID: VaultAddress] = [:]
     func discover(_ account: String) -> [VaultAddress] { addresses.values.filter { $0.account == account } }
+    func hide(_ id: UUID) { addresses[id] = nil }
     func remember(_ address: VaultAddress) { addresses[address.vault] = address }
     var dropAcknowledgement = false
     var rejectAfter: Int?
@@ -81,7 +82,9 @@ private actor Server {
         guard vaults[root.id] == nil else { throw MopError.vaultConflict }
         vaults[root.id] = State(head: root.digest, version: 1, revisions: [root.digest: root.bytes])
     }
-    func head(_ id: UUID) throws -> RevisionHead { guard let value = vaults[id] else { throw MopError.vaultMissing }; return RevisionHead(digest: value.head, version: Data(String(value.version).utf8)) }
+    var headFailure: MopError?
+    func failHead(_ error: MopError) { headFailure = error }
+    func head(_ id: UUID) throws -> RevisionHead { if let headFailure { throw headFailure }; guard let value = vaults[id] else { throw MopError.vaultMissing }; return RevisionHead(digest: value.head, version: Data(String(value.version).utf8)) }
     func revision(_ digest: String, _ id: UUID) throws -> Data { guard let bytes = vaults[id]?.revisions[digest] else { throw MopError.vaultMissing }; return bytes }
     func upload(_ bytes: Data, _ digest: String, _ id: UUID) throws { guard vaults[id] != nil, Codec.digest(bytes) == digest else { throw MopError.invalidVault }; vaults[id]!.revisions[digest] = bytes }
     func publish(_ digest: String, _ version: Data, _ id: UUID) throws {
@@ -95,7 +98,7 @@ private actor Server {
         if dropAcknowledgement { dropAcknowledgement = false; throw MopError.cloudUnavailable }
     }
     func dropNext() { dropAcknowledgement = true }
-    func delete(_ id: UUID) { vaults[id] = nil }
+    func delete(_ id: UUID) { vaults[id] = nil; addresses[id] = nil }
 }
 private struct Transport: VaultTransport {
     let server: Server, accountID: String
@@ -750,4 +753,39 @@ private actor AuthenticationGate {
     #expect(result.offlineDate != nil)
     _ = try await owner.service.execute(.delete(reference), vault: id)
     await #expect(throws: MopError.notFound) { try await owner.service.readLocal(reference, vault: id) }
+}
+
+@Test func discoveryForgetsVaultDeletedByAnotherDevice() async throws {
+    let server = Server()
+    let primary = Client(server, "a"), secondary = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await primary.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id)
+    try await enroll(secondary, owner: primary, vault: id, role: .owner)
+    _ = try await secondary.service.execute(.catalog, vault: id)
+    _ = try await primary.service.execute(.deleteVault, vault: id)
+    #expect(try await secondary.service.execute(.discover, vault: nil, offline: true).vaults.count == 1)
+    #expect(try await secondary.service.execute(.discover, vault: nil).vaults.isEmpty)
+    secondary.reopen()
+    #expect(try await secondary.service.execute(.discover, vault: nil, offline: true).vaults.isEmpty)
+    await #expect(throws: MopError.vaultMissing) { try await secondary.service.execute(.catalog, vault: id, offline: true) }
+}
+
+@Test func discoveryRetainsVaultWhenHeadStillExists() async throws {
+    let server = Server(), id = UUID()
+    let client = Client(server, "a")
+    _ = try await client.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id.uuidString)
+    await server.hide(id)
+    #expect(try await client.service.execute(.discover, vault: nil).vaults.map(\.id) == [id.uuidString])
+    #expect(try await client.service.execute(.catalog, vault: id.uuidString).catalog != nil)
+}
+
+@Test(arguments: [MopError.cloudUnavailable, .cloudPermission, .cloudAccount])
+func discoveryFailureDoesNotForgetVault(error: MopError) async throws {
+    let server = Server(), id = UUID()
+    let client = Client(server, "a")
+    _ = try await client.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id.uuidString)
+    await server.hide(id)
+    await server.failHead(error)
+    await #expect(throws: error) { try await client.service.execute(.discover, vault: nil) }
+    #expect(try await client.service.execute(.discover, vault: nil, offline: true).vaults.map(\.id) == [id.uuidString])
 }

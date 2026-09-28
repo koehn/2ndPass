@@ -1,11 +1,13 @@
 import Foundation
 import OSLog
+import Observation
 import MopCore
 
 /// Session-only index of public catalog text. Concealed field names and values
 /// are deliberately excluded, just as they are in the catalog search UI.
+@MainActor @Observable
 final class ItemSearchIndex {
-    private static let signposter = OSSignposter(subsystem: "com.koehn.mop", category: "Search")
+    nonisolated private static let signposter = OSSignposter(subsystem: "com.koehn.mop", category: "Search")
 
     /// Timing only: never record queries, tags, item names, or values.
     static func noteInput() { signposter.emitEvent("Search input") }
@@ -15,7 +17,7 @@ final class ItemSearchIndex {
         let results: [ItemSearchResult]
         let ids: Set<ItemRow.ID>
     }
-    private struct Entry {
+    private struct Entry: Sendable {
         let row: ItemRow
         let name: String
         let vault: String
@@ -23,30 +25,53 @@ final class ItemSearchIndex {
         let fields: [(field: ItemField, label: String, value: String)]
     }
     let rows: [ItemRow]
-    private let entries: [Entry]
+    private var entries: [Entry]?
+    @ObservationIgnored private var preparation: Task<[Entry]?, Never>?
+    private let deleted: Bool
+    var isPreparing: Bool { entries == nil }
     private let locale: Locale
-    private var lastQuery: String?
-    private var lastSnapshot: Snapshot?
+    @ObservationIgnored private var lastQuery: String?
+    @ObservationIgnored private var lastSnapshot: Snapshot?
 
     init(rows: [ItemRow], deleted: Bool = false) {
-        let interval = Self.signposter.beginInterval("Build search index")
-        defer { Self.signposter.endInterval("Build search index", interval) }
         self.rows = rows
+        self.deleted = deleted
         let locale = Locale.current
         self.locale = locale
-        entries = rows.map { row in
-            Entry(row: row,
-                  name: Self.normalize(deleted ? row.item.deletion?.originalName ?? row.item.name : row.item.name, locale: locale),
-                  vault: Self.normalize(row.vaultName, locale: locale),
-                  tags: (row.item.metadata?.tags ?? []).map { ($0, Self.normalize($0, locale: locale)) },
-                  fields: row.item.fields.filter { !$0.type.concealed }.map {
-                      ($0, Self.normalize($0.path.removingPercentEncoding ?? $0.path, locale: locale),
-                       Self.normalize($0.value ?? "", locale: locale))
-                  })
+        if rows.isEmpty { entries = []; return }
+        let task = Task.detached(priority: .userInitiated) {
+            let interval = Self.signposter.beginInterval("Build search index")
+            defer { Self.signposter.endInterval("Build search index", interval) }
+            var entries: [Entry] = []
+            entries.reserveCapacity(rows.count)
+            for row in rows {
+                guard !Task.isCancelled else { return nil as [Entry]? }
+                entries.append(Self.entry(row, deleted: deleted, locale: locale))
+            }
+            return entries as [Entry]?
+        }
+        preparation = task
+        Task { [weak self] in
+            guard let entries = await task.value, let self else { return }
+            self.entries = entries
+            self.preparation = nil
         }
     }
 
-    private static func normalize(_ value: String, locale: Locale) -> String {
+    deinit { preparation?.cancel() }
+
+    nonisolated private static func entry(_ row: ItemRow, deleted: Bool, locale: Locale) -> Entry {
+        Entry(row: row,
+              name: normalize(deleted ? row.item.deletion?.originalName ?? row.item.name : row.item.name, locale: locale),
+              vault: normalize(row.vaultName, locale: locale),
+              tags: (row.item.metadata?.tags ?? []).map { ($0, normalize($0, locale: locale)) },
+              fields: row.item.fields.filter { !$0.type.concealed }.map {
+                  ($0, normalize($0.path.removingPercentEncoding ?? $0.path, locale: locale),
+                   normalize($0.value ?? "", locale: locale))
+              })
+    }
+
+    nonisolated private static func normalize(_ value: String, locale: Locale) -> String {
         value.folding(options: .caseInsensitive, locale: locale).precomposedStringWithCanonicalMapping
     }
 
@@ -59,7 +84,10 @@ final class ItemSearchIndex {
         if query.isEmpty {
             snapshot = Snapshot(rows: rows, results: [], ids: Set(rows.map(\.id)))
         } else {
-            let results = entries.compactMap { entry -> ItemSearchResult? in
+            // Queries remain usable while preparation runs. Empty queries never
+            // normalize fields, so rendering the unlocked list does not wait.
+            let candidates = entries ?? rows.map { Self.entry($0, deleted: deleted, locale: locale) }
+            let results = candidates.compactMap { entry -> ItemSearchResult? in
                 let field = entry.fields.first { $0.label.contains(query) || $0.value.contains(query) }?.field
                 let tag = entry.tags.first { $0.normalized.contains(query) }?.text
                 guard field != nil || tag != nil || entry.name.contains(query) || entry.vault.contains(query) else { return nil }

@@ -5,6 +5,20 @@ import MopCore
 @testable import MopAppSupport
 
 @Suite struct PasswordImportTests {
+    @Test func screenshotDemoFilesImportWithRichTypes() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let showcase = try PasswordImport.parse(Data(contentsOf: root.appendingPathComponent("examples/demo-showcase.1pux")))
+        #expect(showcase.records.count == 26)
+        #expect(showcase.records.allSatisfy { $0.item != nil && $0.warnings.isEmpty })
+        let items = showcase.records.compactMap(\.item)
+        #expect(Set(items.map(\.type)) == Set(ItemType.templateTypes))
+        let fields = Set(items.flatMap(\.fields).map(\.type))
+        #expect(Set([FieldType.otp, .recoveryCodes, .cardNumber, .expirationMonthYear, .address, .phone, .email, .date, .privateKey, .attachment]).isSubset(of: fields))
+        let csv = try PasswordImport.parse(Data(contentsOf: root.appendingPathComponent("examples/demo-credentials.csv")))
+        #expect(csv.format == .bitwardenCSV)
+        #expect(csv.records.count == 20)
+        #expect(Set(csv.records.compactMap { $0.item?.type }) == Set([.login, .password, .secureNote]))
+    }
     @Test func allCSVAdaptersAndExactSecrets() throws {
         let fixtures: [(ImportFormat, String)] = [
             (.appleCSV, "Title,URL,Username,Password,Notes,OTPAuth\r\nExample,https://example.test,alice, secret ,note,\r\n"),

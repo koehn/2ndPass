@@ -42,7 +42,7 @@ app-package:
     bash scripts/package.sh
 
 # Install the packaged macOS app and CLI using the existing installer.
-app-install:
+app-install: app-package
     bash scripts/install.sh
 
 # Run the Swift unit tests.

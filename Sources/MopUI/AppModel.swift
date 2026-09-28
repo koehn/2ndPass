@@ -954,7 +954,17 @@ final class AppModel {
             var deleted = refresh ? [:] : deletedCatalogs.filter { ids.contains($0.key) }
             var dates: [String: Date] = [:]
             for id in ids where refresh || loaded[id] == nil {
-                let result = try await service.execute(.catalog, vault: id, offline: false)
+                let result: VaultResult
+                do { result = try await service.execute(.catalog, vault: id, offline: false) }
+                catch MopError.vaultMissing {
+                    let discovery = try await service.execute(.discover, vault: nil, offline: false)
+                    guard current(token) else { return }
+                    guard !discovery.vaults.contains(where: { $0.id == id }) else { throw MopError.vaultMissing }
+                    vaults = discovery.vaults
+                    loaded.removeValue(forKey: id); deleted.removeValue(forKey: id)
+                    if vault == id { vault = "" }
+                    continue
+                }
                 guard current(token) else { return }
                 loaded[id] = try result.requireCatalog()
                 deleted[id] = result.deletedCatalog
@@ -963,7 +973,14 @@ final class AppModel {
             guard current(token) else { return }
             offline = !dates.isEmpty
             catalogs = loaded; deletedCatalogs = deleted; retentionDate = wallNow()
-            if vault.isEmpty { vault = ids[0] }
+            guard !loaded.isEmpty else {
+                service.lock(); authenticated = false; lastActivity = nil
+                catalog = nil; references = []; vault = ""
+                status = vaults.isEmpty ? "Create your first vault" : "Connect this device to a vault to get started."
+                sheet = vaults.isEmpty ? .createVault : .enrollDevice
+                return
+            }
+            if vault.isEmpty { vault = ids.first(where: { loaded[$0] != nil }) ?? "" }
             if let catalog = loaded[vault] { try applyCatalog(catalog) }
             else { catalog = nil; references = [] }
             authenticated = true; accessNeedsRepair = false
@@ -1264,6 +1281,12 @@ final class AppModel {
                     self.updateEnrollmentProgress(id, owner: owner) { $0.lastContact = self.wallNow() }
                     self.cloudEnrollments = result.enrollments
                     if owner {
+                        // An empty inbox poll is not enrollment. Dismiss once a
+                        // request is underway or signed membership shows another device,
+                        // even if its notification was already acknowledged.
+                        if result.enrollments.contains(where: { !$0.rejected }) || !result.addedDevices.isEmpty {
+                            self.showsSetupChecklist = false
+                        }
                         let key = "enrollment-notified-" + id
                         var seen = Set(self.defaults.stringArray(forKey: key) ?? [])
                         let added = result.addedDevices.filter { !seen.contains($0.uuidString) }
@@ -1421,7 +1444,13 @@ final class AppModel {
                 let discovery = try await service.execute(.discover, vault: nil, offline: false)
                 guard current(token), !Task.isCancelled else { return }
                 let available = Set(discovery.vaults.map(\.id))
-                guard requested.allSatisfy({ available.contains($0) }) else { lock(); return }
+                guard requested.allSatisfy({ available.contains($0) }) else {
+                    vaults = discovery.vaults
+                    if !available.contains(vault) { vault = "" }
+                    lock()
+                    if vaults.isEmpty { sheet = .createVault }
+                    return
+                }
                 var loaded: [String: ItemCatalog] = [:], deleted: [String: ItemCatalog] = [:]
                 var dates: [Date] = []
                 for id in requested {
@@ -1635,7 +1664,9 @@ extension AppModel {
         case .vaultTarget(let id):
             guard prepareVaultAction(id) else { completion?(false); return }
         case .sheet(let kind): sheet = kind
-        case .presentation(let request): sheetRequest = request
+        case .presentation(let request):
+            sheetRequest = request
+            if request.kind == .addDevice { showsSetupChecklist = false }
         case .details(let target): conceal(); vaultDetailsTarget = target
         case .refresh: discover()
         case .trash(let row): trashItem(row)
