@@ -18,13 +18,16 @@ The following deliberately retain their original names:
 
 - Bundle ID `com.koehn.mop` and AutoFill ID `com.koehn.mop.AutoFill`.
 - CloudKit container `iCloud.com.koehn.mop`, App Groups, and Keychain access groups.
-- Device-key service names, local `Mop`/`MopV6` directories, preferences, cloud
+- Device-key service names, local `Mop`/`MopV7` directories, preferences, cloud
   record/subscription identifiers, cryptographic domains, and backup format markers.
 - Swift modules, Xcode project/schemes, and internal Info.plist configuration keys.
 - Existing GitHub repository URLs and dated security-audit evidence.
 
-These identities preserve access to existing device keys and vaults. A product
-rename must not silently change them. The extension display name is 2ndPass
+Stable application/container/access-group identifiers preserve the platform
+identity across product renames. The separate v7 protocol cutover deliberately
+uses new device-key, state, record and backup namespaces; it neither reads nor
+migrates v6 vaults. See [Vault v7](VAULT-V7.md). Branding alone must not silently
+change identifiers or imply format compatibility. The extension display name is 2ndPass
 AutoFill even though the build target is still MopAutoFill.
 
 ## Developer account and possible future identifiers

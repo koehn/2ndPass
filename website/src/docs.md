@@ -170,6 +170,13 @@ All references must resolve before the command starts. The launched process and 
 
 Exact secret occurrences in stdout and stderr are masked by default. This is not a sandbox: encoded or transformed secrets, files, and network output can still leak. Use `--no-masking` when direct terminal behavior is necessary, knowing it disables output filtering.
 
+The child process, its dependencies and inheriting descendants receive plaintext
+secrets and become trusted with them. Environment variables may leak through the
+program, diagnostics or privileged host access. 2ndPass cannot control arbitrary
+child-process file writes, network traffic or transformed output. `read` likewise
+releases plaintext to stdout or its requested output file. This is the necessary
+boundary of developer-secret automation; see [local exposure](security.html#local).
+
 ## Templates
 
 For software that needs a configuration file, write a template containing placeholders:
@@ -193,7 +200,7 @@ Store the npm token, then materialize the configuration only for the command:
 )
 ```
 
-The generated file contains plaintext. Cleanup is ordinary deletion, not secure erasure, and a forced process kill may prevent the trap from running. `inject` inserts values literally; it does not escape JSON, YAML, INI, or URL syntax. Use a serializer for values requiring format-specific escaping.
+The generated file contains plaintext. The receiving program and anyone able to read its output files are trusted with it; file permissions do not encrypt the contents. Cleanup is ordinary deletion, not secure erasure, and a forced process kill may prevent the trap from running. `inject` inserts values literally; it does not escape JSON, YAML, INI, or URL syntax. Use a serializer for values requiring format-specific escaping.
 
 ## From op
 
@@ -225,13 +232,17 @@ Export creates a plaintext, owner-only file and refuses to overwrite an existing
 
 ## Sharing
 
-**Your devices:** open 2ndPass on the new device, select the existing vault, and connect. Keep an enrolled owner device unlocked to process the request. Your Apple Account’s private iCloud mailbox is trusted during this bootstrap, so account security matters.
+**Your devices:** open 2ndPass on the new device, select the existing vault, and connect. Keep an enrolled owner device unlocked to process the request. Apple account/device security, signing, provisioning and CloudKit entitlements protect the private per-user namespace used for bootstrap. An owner then grants membership cryptographically. Account credentials alone do not authorize arbitrary enrollment writes; see the [precise enrollment threat](security.html#icloud). No extra human comparison is required for this ordinary flow.
 
 **Another person:** use **Share with another person**. Choose editor or viewer access, exchange the invitation/acceptance files, verify the identity details requested by the app, and complete approval. An iCloud share invitation alone does not grant decryption rights. Both people need compatible clients.
 
-**Removal:** use **Settings → devices** for enrolled personal devices, or the vault’s membership controls for other people. Removal rotates current encryption keys. It cannot revoke plaintext or old backups already copied by a recipient; change the underlying service password when necessary.
+**Removal:** use **Settings → devices** for enrolled personal devices, or the vault’s membership controls for other people. Removal rotates per-item keys and the catalog key and rewrites all retained field ciphertext, including recently deleted items and attachments. It cannot revoke plaintext or old backups already copied by a recipient; change the underlying service password when necessary.
 
-Cross-account sharing is implemented, but physical two-account acceptance remains a release gate. See [validation status](security.html#status) and the [full enrollment and sharing commands](https://github.com/koehn/2ndPass#add-devices-and-share).
+Cross-account vault sharing is not yet implemented as a supported feature; the
+controls and commands above describe preliminary code. The
+[mailbox design detail](security.html#devices) must be addressed when implementing
+sharing, followed by physical two-account validation. It is not a current product
+vulnerability. See the [enrollment and sharing commands](https://github.com/koehn/2ndPass#add-devices-and-share).
 
 ## Recovery
 

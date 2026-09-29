@@ -4,8 +4,11 @@ import Synchronization
 import MopCore
 import MopKeychain
 
-/// V6 uses its own zones and record types. Transport permissions are independent
-/// of the signed roster: a CKShare alone never authorizes a cryptographic change.
+/// V7 uses its own zones and record types. Transport permissions are independent
+/// of the signed roster: CKShare is not itself a cryptographic grant. Enrollment
+/// occupies the vault zone. Sharing is an unfinished feature; account-private
+/// mailbox isolation is a design detail to resolve before completing it. See
+/// docs/SECURITY.md's shared-zone discussion.
 public final class CloudRevisionTransport: VaultTransport, @unchecked Sendable {
     private let cloud: CKContainer
     private let container: String
@@ -285,8 +288,9 @@ public extension CloudRevisionTransport {
         } catch let error as CKError where [.networkUnavailable, .networkFailure, .serviceUnavailable, .accountTemporarilyUnavailable].contains(error.code) {
             // Explicit offline access uses the last independently verified scope.
         }
-        // A cached read cannot prove remote freshness. Only explicit offline
-        // reads may use a locally pinned account after an indeterminate status.
+        // A cached read cannot prove remote freshness. Read-only cached access
+        // uses the locally pinned account after an indeterminate status; an
+        // online refresh is required before the UI enables writes.
     }
     func share(with account: String, role: MemberRole, at address: VaultAddress) async throws -> URL {
         try await check(address)

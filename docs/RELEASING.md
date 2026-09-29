@@ -5,19 +5,23 @@ The public app name is **2ndPass**, its executable is `2ndpass`, and its domain 
 
 ## Signed application releases
 
-Follow the [signed build instructions](../README.md#signed-source-build) and
+Follow the [signed build instructions](../README.md#build-and-provision) and
 [mobile distribution guide](MOBILE.md). Packaging produces `dist/2ndPass.app`
 and shell resources. `scripts/install.sh` installs `/Applications/2ndPass.app`
 and `/usr/local/bin/2ndpass`.
 
 Keep the existing bundle ID, Keychain groups, CloudKit container, and environment
 consistent across Mac/mobile builds and updates. The branding change does not
-migrate identities or the v6 vault format. See [branding and identity](BRANDING.md).
+migrate identities or vault formats. The separate v7 cutover has no v6 reader or migration. See [branding and identity](BRANDING.md).
 
 Before release, update versions and complete the current checks in
 [validation](VAULT-NEXT-VALIDATION.md), including the outstanding physical-device,
 AutoFill, recovery, cross-account sharing, and Production CloudKit acceptance.
-Historical audit results do not establish current release readiness.
+Historical audit results do not establish current release readiness. 2ndPass has
+not yet received an independent security audit. Review both protocol correctness
+and implementation correctness; open source is not a substitute. The
+[documentation audit](security-audit/2026-09-29-documentation.md) lists trust-boundary
+questions for acceptance and the eventual auditor.
 
 ## Homebrew development formula
 

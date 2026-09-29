@@ -44,6 +44,9 @@ private final class TestHardware: @unchecked Sendable {
 }
 private actor Server {
     var readRequests = 0
+    var headGates: [UUID: AuthenticationGate] = [:]
+    func setHeadGate(_ gate: AuthenticationGate, for id: UUID) { headGates[id] = gate }
+    func waitForHead(_ id: UUID) async { if let gate = headGates[id] { await gate.wait() } }
     var readGate: AuthenticationGate?
     func setReadGate(_ gate: AuthenticationGate?) { readGate = gate }
     func recordReadRequest() async {
@@ -110,7 +113,7 @@ private struct Transport: VaultTransport {
     func account() async throws -> String { await server.recordReadRequest(); return accountID }
     func validateOfflineAccount() async throws { await server.recordReadRequest() }
     func initialize(_ genesis: VerifiedVault, at address: VaultAddress) async throws { try await server.initialize(genesis); await server.remember(address) }
-    func head(at address: VaultAddress) async throws -> RevisionHead { await server.recordReadRequest(); return try await server.head(address.vault) }
+    func head(at address: VaultAddress) async throws -> RevisionHead { await server.recordReadRequest(); await server.waitForHead(address.vault); return try await server.head(address.vault) }
     func revision(_ digest: String, at address: VaultAddress) async throws -> Data { await server.recordReadRequest(); return try await server.revision(digest, address.vault) }
     func upload(_ bytes: Data, digest: String, at address: VaultAddress) async throws { try await server.upload(bytes, digest, address.vault) }
     func publish(_ digest: String, expectedVersion: Data, at address: VaultAddress) async throws { try await server.publish(digest, expectedVersion, address.vault) }
@@ -667,6 +670,8 @@ private actor AuthenticationGate {
     let syncReader = Client(cloud, "a")
     try await enroll(syncReader, owner: writer, vault: id, role: .owner)
     syncReader.reopen(duringSync: true)
+    _ = try await syncReader.service.execute(.catalog, vault: id)
+    #expect(await cloud.attachmentReads == 1)
     _ = try await syncReader.service.execute(.sync, vault: id)
     #expect(await cloud.attachmentReads == 2)
     _ = try await syncReader.service.execute(.read(reference), vault: id, offline: true)
@@ -788,4 +793,49 @@ func discoveryFailureDoesNotForgetVault(error: MopError) async throws {
     await server.failHead(error)
     await #expect(throws: error) { try await client.service.execute(.discover, vault: nil) }
     #expect(try await client.service.execute(.discover, vault: nil, offline: true).vaults.map(\.id) == [id.uuidString])
+}
+
+
+@Test func distinctCatalogsReachCloudConcurrentlyAndShareAuthentication() async throws {
+    let server = Server(), client = Client(server, "a")
+    let first = UUID(), second = UUID()
+    _ = try await client.service.execute(.create(name: "first", recovery: nil, fingerprint: nil), vault: first.uuidString)
+    _ = try await client.service.execute(.create(name: "second", recovery: nil, fingerprint: nil), vault: second.uuidString)
+    client.service.lock()
+    let authBefore = client.calls.withLock { $0 }
+    let firstGate = AuthenticationGate(), secondGate = AuthenticationGate()
+    await server.setHeadGate(firstGate, for: first); await server.setHeadGate(secondGate, for: second)
+    let service = client.service!
+    let firstTask = Task { try await service.execute(.catalog, vault: first.uuidString) }
+    let secondTask = Task { try await service.execute(.catalog, vault: second.uuidString) }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while ContinuousClock.now < deadline {
+        if await firstGate.entered, await secondGate.entered { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(await firstGate.entered)
+    #expect(await secondGate.entered)
+    #expect(client.calls.withLock { $0 } == authBefore + 1)
+    await firstGate.release(); await secondGate.release()
+    #expect(try await firstTask.value.catalog?.vault == "first")
+    #expect(try await secondTask.value.catalog?.vault == "second")
+}
+
+
+@Test func cachedUnlockSkipsCloudHeadAndStillChecksAccountBinding() async throws {
+    let server = Server(), client = Client(server, "a"), id = UUID().uuidString
+    _ = try await client.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id)
+    _ = try await client.service.execute(.catalog, vault: id)
+    client.service.lock()
+    await server.failHead(.cloudUnavailable)
+    let cached = try #require(try await client.service.cachedCatalog(vault: id))
+    #expect(cached.usingCache && cached.offlineDate != nil && cached.catalog?.vault == "personal")
+    await #expect(throws: MopError.cloudUnavailable) { try await client.service.execute(.catalog, vault: id) }
+    try NextAccountBinding.invalidate(state: client.state)
+    await #expect(throws: MopError.cloudAccount) { try await client.service.cachedCatalog(vault: id) }
+}
+
+@Test func cachedUnlockWithoutLocalVaultRequestsOnlineFallback() async throws {
+    let client = Client(Server(), "a")
+    #expect(try await client.service.cachedCatalog(vault: UUID().uuidString) == nil)
 }

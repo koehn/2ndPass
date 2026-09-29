@@ -21,11 +21,11 @@ An Apple-native password and developer-secrets manager. Product domain: [2ndpass
 
 Formerly Mop. See [branding and upgrade compatibility](docs/BRANDING.md) for retained signing identities, settings, and legacy secret references.
 
-2ndPass is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. Personal and shared vaults use the same v6 format. Each device has independent Secure Enclave keys; signing into an Apple Account does not enroll a device.
+2ndPass is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. Personal and shared vaults use the same v7 format. Each device has independent Secure Enclave keys; signing in alone does not grant decryption access; an unlocked enrolled owner can automatically grant same-account membership through the provisioned private CloudKit channel.
 
 **This is a coordinated format replacement.** There is no old-format reader, migration, synchronized software private key, or portable recovery private key. Existing files, cloud zones, backups and Keychain items are left untouched. Keep a compatible older client separately if you still need old data.
 
-Read [the plain-language security explanation](docs/SECURITY-EXPLAINER.md), [architecture](docs/VAULT-NEXT.md), and [concrete validation results and outstanding physical checks](docs/VAULT-NEXT-VALIDATION.md). Cross-account sharing code is implemented; actual participant-side acceptance with a second Apple Account remains a required release check.
+Read [the plain-language security explanation](docs/SECURITY-EXPLAINER.md), [architecture](docs/VAULT-NEXT.md), and [concrete validation results and outstanding physical checks](docs/VAULT-NEXT-VALIDATION.md). Cross-account vault sharing is not yet implemented as a supported feature; preliminary code requires completion, mailbox isolation and two-account acceptance.
 
 ## Recent items
 
@@ -45,7 +45,7 @@ timestamped items. This change has no feature flag or mixed-version support.
 
 ## Start a vault
 
-Open the signed Mac, iPhone or iPad app. If no v6 vaults exist in iCloud, 2ndPass
+Open the signed Mac, iPhone or iPad app. If no v7 vaults exist in iCloud, 2ndPass
 prompts you to create one. Choose a name and authenticate: this device’s Secure
 Enclave keys are generated automatically, and you can save secrets immediately.
 The CLI equivalent is:
@@ -57,7 +57,7 @@ The CLI equivalent is:
 Recovery is optional. Until another device or hardware recovery is added, losing
 this device means losing access. No second device is required for creation.
 
-If v6 vaults exist in iCloud but this device has no trusted enrollment, 2ndPass opens
+If v7 vaults exist in iCloud but this device has no trusted enrollment, 2ndPass opens
 **Connect this device** instead. Discovery is only a hint: it neither trusts a
 checkpoint nor grants decryption rights. A CloudKit failure is reported, not
 treated as an empty account. Old-format zones are ignored and preserved.
@@ -76,13 +76,26 @@ the vault. Update all participating apps together for this enrollment change;
 older builds cannot resolve referenced invitations. Existing inline invitations
 remain readable, and vault data and device keys do not change.
 
-Same-account enrollment now trusts access to the private iCloud mailbox for
-bootstrap identity. An attacker with that account access can enroll while an
-owner device is unlocked. Secure Enclave private keys still never transfer.
-Cross-account sharing does not use automatic enrollment.
+Same-account enrollment composes Apple's account/device security, code signing,
+provisioning and CloudKit entitlements with private per-user storage and 2ndPass's
+independent device-membership protocol. An attacker able to operate an authorized
+client in that user's iCloud context and access the private 2ndPass container may
+receive membership if an unlocked, online owner processes the request. Account
+credentials alone do not authorize arbitrary writes. This deliberately reuses
+Apple's authentication ceremony; it does not query Apple's private iCloud
+Keychain trust circle. Secure Enclave private keys never transfer. Cross-account
+sharing retains independent verification and explicit owner approval. See the
+[full trust model](docs/SECURITY.md#composed-apple--2ndpass-trust-model), including
+the Mac app/CLI versus extension sandbox distinction.
 
 Sharing with another account remains a separate **Share with another person**
 flow with editor/viewer permissions and file-based invitations.
+
+**Sharing design detail:** cross-account vault sharing is not yet implemented as
+a supported feature. Preliminary code places enrollment in the same zone it would
+share; mailbox isolation must be addressed when implementing sharing. This is a
+design issue, not a current product vulnerability. See the
+[design review](docs/SECURITY.md#shared-zone-enrollment-exposure).
 
 ## Add optional recovery later
 
@@ -104,12 +117,16 @@ The CLI equivalent is:
 Retain the encrypted backup and independently recorded checkpoint. Recovery,
 when configured, remains hardware-only; there is no software recovery key.
 Losing every authorized device and any configured recovery device makes the
-vault unrecoverable. Optional recovery can also be supplied during CLI creation
+vault unrecoverable. Apple Account recovery cannot reconstruct lost device keys,
+and no vendor-held recovery master key exists. Reduced remote recovery attack
+surface comes with increased permanent-data-loss risk. Optional recovery can also be supplied during CLI creation
 with paired `--recovery-request` and `--fingerprint` options.
 
 ## Add devices and share
 
-The app handles own-account enrollment automatically. CLI equivalents are:
+The app handles own-account enrollment automatically. The CLI also retains this
+manual diagnostic exchange; its comparison steps are not required by the app
+and cannot prevent another unlocked owner app from processing a request automatically:
 
 ```sh
 # New device (use the UUID shown by vault list):
@@ -201,6 +218,14 @@ Offline access uses a previously verified encrypted checkpoint and is read-only.
 
 The GUI retains an authenticated session context until lock/expiry, while releasing hardware key handles and individual secret keys after operations. CLI commands own their session. AutoFill always starts fresh authentication and locks after filling. Plaintext necessarily reaches 2ndPass, clipboard destinations, and commands receiving secrets.
 
+`read` releases plaintext to stdout or a selected file; `inject` produces plaintext
+configuration on stdout or disk. `run` supplies plaintext environment variables
+to a child: that program, its dependencies and inheriting descendants become
+trusted with the secret. Environments can leak through diagnostics or privileged
+host access. Default masking only filters exact secret bytes in stdout/stderr;
+it does not constrain transformed output, files or network traffic. 2ndPass cannot
+control a child's use of plaintext. See [CLI boundaries](docs/SECURITY.md#cli-and-extension-disclosure-boundaries).
+
 ## Hardware recovery
 
 Generate ordinary and recovery requests on the replacement owner device and a new separate recovery device. Compare both fingerprints. On the **currently enrolled recovery device**:
@@ -221,13 +246,13 @@ If account access is lost, use `--copy` on the recovery device signed into the n
 
 ## Backups and deletion
 
-Export returns an encrypted v6 checkpoint; record its digest independently. Import requires that digest and an already enrolled device. For a shared-database checkpoint, also supply `--shared-owner` with its actual zone owner record name. Import never creates or overwrites a cloud zone.
+Export returns an encrypted v7 checkpoint; record its digest independently. Import requires that digest and an already enrolled device. For a shared-database checkpoint, also supply `--shared-owner` with its actual zone owner record name. Import never creates or overwrites a cloud zone.
 
 ```sh
 2ndpass vault delete --vault VAULT_UUID --confirm VAULT_UUID
 ```
 
-Deletion requires owner authorization, removes the cloud zone, and forgets its active registry entry. Existing local ciphertext and exported backups remain. Old-format data cannot be selected or deleted through v6 commands.
+Deletion requires owner authorization, removes the cloud zone, and forgets its active registry entry. Existing local ciphertext and exported backups remain. Old-format data cannot be selected or deleted through v7 commands.
 
 ## Build and provision
 

@@ -92,8 +92,9 @@ public struct Acceptance: Codable, Sendable {
         let invitation: String
         let device: DevicePublicKey
     }
-    /// The expected checkpoint comes from the owner independently, never from an
-    /// invitation fetched through the same untrusted channel as its signer key.
+    /// Manual/cross-account callers independently verify the owner's checkpoint.
+    /// Automatic same-account callers instead trust the provisioned private
+    /// CloudKit bootstrap channel; this check does not authenticate that channel.
     public init(invitation: Invitation, expectedCheckpoint: String, device: any DeviceOperations, now: Date = Date()) throws {
         try invitation.validate(now: now)
         guard invitation.checkpoint == expectedCheckpoint, invitation.member == device.identity.member else { throw MopError.vaultUntrusted }

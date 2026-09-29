@@ -1,8 +1,8 @@
 # Testing and validation
 
-The supported format is `mop-vault-v6`. Read the current [validation record](VAULT-NEXT-VALIDATION.md)
+The supported format is `mop-vault-v7`. Read the current [validation record](V7-VALIDATION-2026-09-27.md)
 for concrete results, retained test resources and unperformed physical checks.
-Recovery is optional; configuring hardware recovery uses a separate recovery device. No v5 migration or
+Recovery is optional; configuring hardware recovery uses a separate recovery device. No old-format migration or
 software-key fallback is supported; existing user data must be preserved.
 
 ## Automated checks
@@ -17,7 +17,7 @@ python3 scripts/test-install-layout.py
 bash -n scripts/package.sh scripts/install.sh scripts/mobile.sh
 xcodebuild -project Apple/Mop.xcodeproj -scheme Mop \
   -destination 'generic/platform=iOS Simulator' \
-  -derivedDataPath .build/v6-apple -clonedSourcePackagesDirPath .build \
+  -derivedDataPath .build/v7-apple -clonedSourcePackagesDirPath .build \
   CODE_SIGNING_ALLOWED=NO -disableAutomaticPackageResolution build-for-testing
 ```
 
@@ -31,7 +31,7 @@ Layout checks stub signing. Build-for-testing compiles tests but does not run th
 
 Restricted sandboxes can block compiler caches, Security services and PTYs. Record
 host checks separately. Historical audit reports describe earlier implementations;
-their counts and platform results are not current v6 acceptance.
+their counts and platform results are not current v7 acceptance.
 
 ## Signed packaging and live checks
 
@@ -48,12 +48,12 @@ MOP_LIVE_CLOUD_TEST=1 python3 scripts/test-hardware.py \
   dist/2ndPass.app/Contents/MacOS/2ndpass
 ```
 
-The live script creates a fresh v6 CloudKit vault and retains its local state.
+The live script creates a fresh v7 CloudKit vault and retains its local state.
 Use dedicated test Apple Accounts and Development CloudKit. To include optional
 recovery, pass --recovery-request and --fingerprint together, using a separate
 hardware device and independently verified fingerprint. State-directory isolation does not isolate device Keychain identities.
 Do not delete an identity as test-vault cleanup. The updated script has not yet
-completed a live v6 run.
+completed a live v7 run.
 
 ## Physical and release acceptance
 
@@ -65,8 +65,13 @@ Check cancellation, screen lock, protected-data loss, app/CLI/AutoFill routing,
 offline reads, account changes, exports and interrupted publication.
 
 Development signing is sufficient for hardware checks. Production distribution
-is separate: deploy the v6 schema and run disposable creation, sharing, reading,
+is separate: deploy the v7 schema and run disposable creation, sharing, reading,
 editing, export and hardware recovery checks with distribution-signed builds.
 Verify entitlements on the installed artifacts. No mocked or simulator test
 substitutes for the physical and cross-account acceptance. Do not release until
-these gates pass.
+these gates pass. Cross-account sharing is not yet implemented as a supported
+feature. Address the [mailbox design detail](SECURITY.md#shared-zone-enrollment-exposure)
+when completing sharing, then validate with disposable accounts: a writable share participant must not be able to
+induce owner enrollment through the mailbox. Existing per-address model mailboxes
+do not establish this server-side isolation. Independent professional security
+review remains outstanding; protocol and implementation require separate review.

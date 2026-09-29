@@ -29,12 +29,12 @@ remain protected by the Secure Enclave throughout the process.
 
 ## Your passwords are encrypted separately
 
-Each secret has its own randomly generated encryption key. 2ndPass encrypts a copy
+Each item has its own randomly generated encryption key, shared by its separately encrypted fields. 2ndPass encrypts a copy
 of that small key for each enrolled device. Your list of items has a separate
 key, so browsing the list does not require opening every password.
 
 When you ask for one password, 2ndPass uses your device's protected key to unlock
-that password's encryption key, then reads the password. It checks the encrypted
+that item's encryption key, then reads the password. It checks the encrypted
 data for tampering along the way. Someone who merely obtains your encrypted
 cloud data or an encrypted backup does not get the device keys needed to read it.
 
@@ -57,17 +57,32 @@ provide extra phishing protection. 2ndPass relies on the system's authenticated
 iCloud session; it never collects your Apple Account password or verification
 code. These protections help secure automatic enrollment.
 
-**Your Apple Account is part of this security boundary.** Someone who gains
-control of the account's private iCloud mailbox could enroll their own device
-while your existing 2ndPass session is unlocked and gain access to your vault.
-A compromised mailbox could also mislead a new device about which vault to trust
-when it first connects. Protect your Apple Account with a strong password and
+**Apple platform security and 2ndPass membership work together.** Apple's code
+signing, provisioning and CloudKit entitlements restrict native access to the
+2ndPass container; the system's authenticated iCloud context selects your private
+database. A new device creates independent Secure Enclave keys and sends a signed
+request through that protected namespace. An enrolled owner grants membership
+cryptographically. Account credentials alone do not allow arbitrary container
+writes. This deliberately avoids repeating Apple's device/account authentication
+ceremony; 2ndPass does not directly query Apple's iCloud Keychain trust circle.
+
+An attacker able to operate an authorized 2ndPass client in your Apple environment
+and access that private container may request membership. If an unlocked, online
+owner processes the exchange, the attacker may gain access to existing secrets.
+A compromised bootstrap mailbox could also mislead a new device about which
+vault to trust when it first connects. Protect your Apple Account with a strong password and
 two-factor authentication, and investigate unfamiliar devices.
 
 Sharing with another person's account requires an explicit invitation,
 verification and approval. The owner controls membership. Editors can change
 contents; viewers can read them. Accepting an iCloud sharing invitation alone
 does not give a device the keys to your passwords.
+
+**Sharing is not yet implemented as a supported feature.** Preliminary code
+exists, but the enrollment mailbox must remain private to the owner's account
+when sharing is implemented. This is a design detail to address, not a current
+product vulnerability. See the
+[design review](SECURITY.md#shared-zone-enrollment-exposure).
 
 ## Removing a device or person's access
 
@@ -85,8 +100,8 @@ that is offline cannot learn about removal immediately.
 Removal cannot erase passwords someone already copied or old backups they could
 already read. If a password must stop working for that person, change it at the
 website or service too. If your Apple Account was compromised, secure the account
-as well: an attacker who retains access could request enrollment with a new
-identity.
+as well: an attacker who retains authorized access to the private 2ndPass
+container could request enrollment with a new identity.
 
 ## What these protections mean in everyday situations
 
@@ -100,7 +115,9 @@ identity.
 
 These protections rely on a trustworthy device, as all password managers do.
 Keep your operating system updated and protect your device's unlock credentials;
-malware controlling your device can capture passwords when you use them.
+malware controlling your unlocked device may invoke authorized hardware operations,
+observe decrypted item keys and secrets, and capture clipboard, AutoFill or CLI
+outputs. Device private keys can remain non-exportable despite that misuse.
 
 ## What iCloud and AutoFill can see
 
@@ -124,7 +141,8 @@ your everyday device.
 **If you lose every enrolled device and every configured recovery device, your
 vault cannot be recovered.** Restoring your Apple Account or finding an encrypted
 backup does not recreate the hardware keys. There is no recovery seed or hidden
-master key that bypasses this protection.
+master key that bypasses this protection. This reduces remote recovery attack
+surface but increases the risk of permanent data loss.
 
 ## How these protections have been checked
 
@@ -133,7 +151,9 @@ cryptographic algorithms. The implementation has been exercised with real
 Secure Enclave keys, saved-key reloads and private iCloud storage on a Mac, along
 with automated tests for access, tampering, enrollment, removal and recovery.
 
-Validation is still in progress. Sharing between two real Apple Accounts,
+2ndPass is not yet independently audited. Protocol correctness and implementation
+correctness require separate scrutiny; open source does not replace professional
+review. Validation is still in progress. Sharing between two real Apple Accounts,
 recovery on separate physical devices, and signed iPhone/iPad and AutoFill
 workflows still need the physical-device checks recorded in the
 [validation report](VAULT-NEXT-VALIDATION.md). Automated tests and simulator builds

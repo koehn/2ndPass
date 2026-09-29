@@ -42,8 +42,10 @@ public struct EnrollmentExchange: Codable, Sendable, Identifiable {
     public var superseded: [UUID]?
     public var id: UUID { request.id }
     public init(request: EnrollmentRequest) { self.request = request }
-    /// A truncated SHA-256 transcript fingerprint (96 bits), compared on both
-    /// devices before owner approval. Not a password, locator or decryption key.
+    /// A truncated SHA-256 transcript fingerprint (96 bits), available for manual
+    /// CLI comparison. Automatic same-account enrollment does not require human
+    /// comparison; it trusts the provisioned private CloudKit bootstrap channel.
+    /// Not a password, locator or decryption key.
     public var verificationCode: String? {
         guard let invitation else { return nil }
         let digest = Codec.digest(Data("mop-v7-enrollment-comparison".utf8) + (try! Codec.encode(request)) + (try! Codec.encode(invitation)))

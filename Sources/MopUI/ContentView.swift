@@ -76,7 +76,10 @@ struct ContentView: View {
                             Button("Connect this device…") { model.presentSheet(.enrollDevice) }
                         }
                     } else if model.authenticated {
-                        ScrollViewReader { reader in
+                        // Selection can be restored while catalogs change. Calling
+                        // ScrollViewProxy.scrollTo during that update traps in
+                        // SwiftUI's macOS OutlineListCoordinator. Let List manage
+                        // its selection without forcing an outline traversal.
                         List(model.displayedItems, selection: $model.listSelection) { row in
                             NavigationLink(value: row.id) { HStack(spacing: 10) {
                                 Image(systemName: row.item.type.symbol)
@@ -99,10 +102,6 @@ struct ContentView: View {
                                         .disabled(model.offline || model.busy)
                                 }
                         }.disabled(model.busy).id(model.selectionGeneration)
-                        .onChange(of: model.selectedRow) { _, id in
-                            if let id { reader.scrollTo(id, anchor: .center) }
-                        }
-                        }
                         if model.displayedItems.isEmpty {
                             ContentUnavailableView {
                                 Label(model.search.isEmpty ? "No items" : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")

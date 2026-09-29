@@ -69,6 +69,7 @@ final class AppModel {
     var devices: [VaultDeviceRecord] = []
     var deviceRemoved = false
     var removalCleanupPending = false
+    private var cachedVaults: Set<String> = []
     var offline = false
     private var cloudRefreshPending = false
     private var nextCloudRefresh = Date.distantPast
@@ -80,6 +81,13 @@ final class AppModel {
     var refreshing = false
     private var foregroundRevision = 0
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var catalogLoadTask: Task<Void, Never>?
+    private var catalogLoadGeneration = 0
+    private(set) var loadingVaults = false
+    private func cancelCatalogLoading() {
+        catalogLoadGeneration += 1
+        catalogLoadTask?.cancel(); catalogLoadTask = nil; loadingVaults = false
+    }
     private static let logger = Logger(subsystem: "com.koehn.mop", category: "App")
     var errorDetails: String?
     var developerDiagnosticsEnabled: Bool { defaults.bool(forKey: DeveloperPreferences.key) }
@@ -266,7 +274,7 @@ final class AppModel {
             }
         }
     }
-    deinit { usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); enrollmentTask?.cancel() }
+    deinit { catalogLoadTask?.cancel(); usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); enrollmentTask?.cancel() }
     func checkExpiration() {
         if let started = service.authenticatedAt {
             if lastActivity == nil { lastActivity = started }
@@ -756,7 +764,7 @@ final class AppModel {
     private func clearView() {
         authenticated = false
         clearSelection()
-        catalogs = [:]; deletedCatalogs = [:]
+        catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
         rememberSelection(); restoreLastSelection = true
@@ -769,6 +777,7 @@ final class AppModel {
         cancelPendingTransition()
         copyFeedback = nil; exchangeOutput = ""
         automaticUnlockTask?.cancel(); automaticUnlockTask = nil
+        cancelCatalogLoading()
         service.lock(); operationTask?.cancel(); refreshTask?.cancel(); lastActivity = nil
         clearView(); if clearClipboard { self.clearClipboard() }
         status = "Locked"
@@ -779,7 +788,7 @@ final class AppModel {
         clearSelection()
         guard service.isAuthenticated else { authenticated = false; status = "Ready to authenticate"; return }
         let ids = requestedVaultIDs
-        if !ids.isEmpty && ids.allSatisfy({ catalogs[$0] != nil }) {
+        if !ids.isEmpty && catalogs[vault] != nil {
             if let cached = catalogs[vault] { try? applyCatalog(cached) }
             authenticated = true
             status = offline ? "Read only · verified cached catalogs" : "Unlocked"
@@ -796,12 +805,12 @@ final class AppModel {
     func vaultIcon(_ descriptor: VaultDescriptor) -> String {
         if !descriptor.supported { return "exclamationmark.triangle" }
         if !descriptor.enrolled { return "externaldrive.badge.plus" }
-        return authenticated ? "lock.open" : "lock.rectangle"
+        return authenticated && catalogs[descriptor.id] != nil ? "lock.open" : "lock.rectangle"
     }
     func vaultConnectionLabel(_ descriptor: VaultDescriptor) -> String {
         if !descriptor.supported { return "Unsupported vault" }
         if !descriptor.enrolled { return "Not connected to this device" }
-        return authenticated ? "Unlocked" : "Locked"
+        return authenticated && catalogs[descriptor.id] != nil ? "Unlocked" : "Locked"
     }
 
     func beginImport() {
@@ -943,19 +952,25 @@ final class AppModel {
         perform { token in try await self.unlockContents(token) }
     }
     private func unlockContents(_ token: Int, refresh: Bool = true) async throws {
+        cancelCatalogLoading()
         launchUnlockAvailable = false
         let openingSession = !authenticated
         if openingSession { unlocking = true }
-        defer { if openingSession { unlocking = false; rememberSelection() } }
+        defer { if openingSession { unlocking = false; if !loadingVaults { rememberSelection() } } }
         do {
-            let ids = requestedVaultIDs
+            let requested = requestedVaultIDs
+            let ids = requested.contains(vault) ? [vault] + requested.filter { $0 != vault } : requested
             guard !ids.isEmpty else { status = "Connect this device to a vault to get started."; return }
             var loaded = refresh ? [:] : catalogs.filter { ids.contains($0.key) }
             var deleted = refresh ? [:] : deletedCatalogs.filter { ids.contains($0.key) }
             var dates: [String: Date] = [:]
-            for id in ids where refresh || loaded[id] == nil {
+            for id in ids {
+                if loaded[id] != nil { break }
                 let result: VaultResult
-                do { result = try await service.execute(.catalog, vault: id, offline: false) }
+                do {
+                    if openingSession, let cached = try await service.cachedCatalog(vault: id) { result = cached }
+                    else { result = try await service.execute(.catalog, vault: id, offline: false) }
+                }
                 catch MopError.vaultMissing {
                     let discovery = try await service.execute(.discover, vault: nil, offline: false)
                     guard current(token) else { return }
@@ -969,9 +984,11 @@ final class AppModel {
                 loaded[id] = try result.requireCatalog()
                 deleted[id] = result.deletedCatalog
                 dates[id] = result.offlineDate
+                if result.usingCache { cachedVaults.insert(id) } else { cachedVaults.remove(id) }
+                break
             }
             guard current(token) else { return }
-            offline = !dates.isEmpty
+            offline = !cachedVaults.isEmpty || !dates.isEmpty
             catalogs = loaded; deletedCatalogs = deleted; retentionDate = wallNow()
             guard !loaded.isEmpty else {
                 service.lock(); authenticated = false; lastActivity = nil
@@ -994,13 +1011,103 @@ final class AppModel {
             if let selected, !references.contains(selected) { self.selected = nil }
             let date = dates.values.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
             status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
+            loadRemainingCatalogs(ids.filter { (loaded[$0] == nil || cachedVaults.contains($0)) && requestedVaultIDs.contains($0) }, token: token)
         } catch {
-            // Publish no partial unlocked state, even for a network failure in a
-            // later vault after earlier vaults have successfully authenticated.
+            // The selected vault must verify before opening the session.
             service.lock(); lastActivity = nil; authenticated = false
             catalog = nil; catalogs = [:]; deletedCatalogs = [:]; references = []
             passwordQualities = [:]; conceal(); clearClipboard()
             throw error
+        }
+    }
+    private func loadRemainingCatalogs(_ ids: [String], token: Int) {
+        guard !ids.isEmpty else { return }
+        let load = catalogLoadGeneration, editing = editorGeneration
+        let revisions = catalogs.mapValues(\.revision)
+        let service = service
+        loadingVaults = true
+        catalogLoadTask = Task { [weak self] in
+            await withTaskGroup(of: (String, Result<VaultResult, Error>).self) { group in
+                for id in ids {
+                    group.addTask {
+                        do { return (id, .success(try await service.execute(.catalog, vault: id, offline: false))) }
+                        catch { return (id, .failure(error)) }
+                    }
+                }
+                for await (id, outcome) in group {
+                    guard let self, !Task.isCancelled, self.current(token), self.authenticated,
+                          self.catalogLoadGeneration == load else { group.cancelAll(); return }
+                    do {
+                        let result = try outcome.get()
+                        // A foreground edit/refresh supersedes this snapshot.
+                        guard self.catalogs[id]?.revision == revisions[id], self.editorGeneration == editing, self.itemDraft == nil else {
+                            self.cloudRefreshPending = true; continue
+                        }
+                        guard self.requestedVaultIDs.contains(id) else { continue }
+                        let fresh = try result.requireCatalog()
+                        if self.vault == id, self.catalog?.revision != fresh.revision { self.conceal() }
+                        try self.applyTargetCatalog(fresh, id: id)
+                        self.deletedCatalogs[id] = result.deletedCatalog
+                        if let index = self.vaults.firstIndex(where: { $0.id == id }), let catalog = result.catalog {
+                            self.vaults[index] = VaultDescriptor(id: id, name: catalog.vault, format: "mop-vault-v7", enrolled: true)
+                        }
+                        self.restoreSelection()
+                        if self.vault == id {
+                            if let item = self.selectedItem, !fresh.items.contains(where: { $0.name == item }) { self.selectedItem = nil }
+                            if let selected = self.selected, !self.references.contains(selected) { self.selected = nil }
+                        }
+                        if result.usingCache { self.cachedVaults.insert(id) } else { self.cachedVaults.remove(id) }
+                        self.offline = !self.cachedVaults.isEmpty
+                        if !self.offline { self.status = "Unlocked · \(self.catalogs.count) vaults" }
+                    } catch {
+                        if error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
+                            self.showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending)
+                            group.cancelAll(); return
+                        }
+                        if let failure = error as? MopError,
+                           [.authentication, .cloudAccount, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember].contains(failure) {
+                            self.lock(reason: .accessFailure)
+                            self.error = failure.errorDescription
+                            group.cancelAll(); return
+                        }
+                        if error as? MopError == .vaultMissing {
+                            do {
+                                let discovery = try await service.execute(.discover, vault: nil, offline: false)
+                                guard self.current(token), !Task.isCancelled, self.catalogLoadGeneration == load else { group.cancelAll(); return }
+                                if discovery.deviceRemoved {
+                                    self.showDeviceRemoved(); group.cancelAll(); return
+                                }
+                                if !discovery.vaults.contains(where: { $0.id == id }) {
+                                    self.vaults.removeAll { $0.id == id }
+                                    self.catalogs[id] = nil; self.deletedCatalogs[id] = nil
+                                    self.cachedVaults.remove(id)
+                                    if self.vault == id {
+                                        self.vault = ""; self.lock(reason: .accessFailure)
+                                        if self.vaults.isEmpty { self.sheet = .createVault }
+                                        group.cancelAll(); return
+                                    }
+                                    self.offline = !self.cachedVaults.isEmpty
+                                    continue
+                                }
+                            } catch {
+                                if error as? MopError == .cloudAccount {
+                                    self.lock(reason: .accessFailure)
+                                    self.error = MopError.cloudAccount.errorDescription
+                                    group.cancelAll(); return
+                                }
+                                // Preserve references when discovery fails.
+                            }
+                        }
+                        // A slow/unavailable secondary vault must not close the
+                        // verified selected vault. Periodic refresh retries it.
+                        self.notice = "Some vaults could not be loaded. Refresh to retry."
+                        self.cloudRefreshPending = true
+                    }
+                }
+            }
+            guard let self, self.catalogLoadGeneration == load else { return }
+            self.loadingVaults = false; self.catalogLoadTask = nil
+            self.rememberSelection()
         }
     }
     func loadPasswordQuality() async {
@@ -1426,7 +1533,7 @@ final class AppModel {
         refreshCloudIfNeeded()
     }
     func refreshCloudIfNeeded() {
-        guard launchAttempted, isActive, !busy, !refreshing, itemDraft == nil, sheet == nil,
+        guard launchAttempted, isActive, !busy, !refreshing, !loadingVaults, itemDraft == nil, sheet == nil,
               !accessNeedsRepair, pendingTransition == nil, wallNow() >= nextCloudRefresh else { return }
         guard cloudRefreshPending || authenticated else { return }
         cloudRefreshPending = false
@@ -1468,7 +1575,7 @@ final class AppModel {
                 }
                 if catalog?.revision != loaded[vault]?.revision { conceal() }
                 vaults = discovery.vaults; catalogs = loaded; deletedCatalogs = deleted
-                retentionDate = wallNow(); offline = !dates.isEmpty
+                retentionDate = wallNow(); cachedVaults = []; offline = !dates.isEmpty
                 if let next = loaded[vault] { try applyCatalog(next) }
                 if let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
                 if let selected, !references.contains(selected) { self.selected = nil }

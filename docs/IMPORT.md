@@ -40,9 +40,9 @@ may have committed despite a lost response, refresh to reconcile before retrying
 
 Update 2ndPass on every connected device before using the new item types or metadata.
 Affected revisions contain a signed capability marker. Older clients reject
-those revisions rather than silently discarding metadata. Existing v6 vaults
-remain readable by the updated app, and encrypted backups/recovery retain the
-new fields. This does not add support for pre-v6 vaults.
+those revisions rather than silently discarding metadata. Current v7 encrypted backups/recovery retain the new fields. This is not an
+old-format reader: v6 and earlier vaults require a compatible older client and
+are not migrated. Create a v7 vault and import a supported source export.
 
 ## Command line
 
@@ -120,11 +120,11 @@ Encrypted backups include every referenced blob, including Recently Deleted
 items, and are bounded to 256 MiB. Import comparison may also download attachments
 to compare their contents. Failed downloads stop operations that require them.
 
-Existing inline attachment revisions remain readable. The next content or
+Inline attachment records within the supported v7 format remain readable. The next content or
 membership revision moves their ciphertext into separate assets. Historical
 revisions/backups are unchanged. Update every client before writing the new
 `attachment-blobs-1` capability. Production CloudKit schema must include the new
-`MopV6Attachment` record type before release.
+`MopV7Attachment` record type before release.
 
 Deleting an attachment removes its reference from subsequent revisions. Historical
 blobs are retained for recovery; automatic history/blob garbage collection is not

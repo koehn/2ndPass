@@ -3,7 +3,7 @@
 Use 2ndpass with command-line tools that accept credentials through environment
 variables, stdin, files, or file descriptors. These examples use Bash or zsh.
 
-Install 2ndpass using either method in the [README](../README.md#install) and make
+Install a signed, provisioned 2ndpass bundle using the [README](../README.md#build-and-provision) and make
 sure `2ndpass` is on your `PATH`. Start with an initialized vault and the relevant
 third-party CLI installed. Each
 `2ndpass write` below prompts for a value; paste the actual credential at that prompt.
@@ -19,7 +19,15 @@ system password.
 | A configuration file | `2ndpass inject --in-file ... --out-file ...` |
 | A key or other multiline text file | `2ndpass read --no-newline --out-file ...` |
 
-## Use GitHub CLI without exporting a plaintext token
+Secrets leave the vault's protection when deliberately delivered. `read` exposes
+stdout or a file; `inject` creates plaintext output; `run` gives plaintext
+environment variables to the child. The child, its dependencies and inheriting
+descendants become trusted with those secrets. Environment variables can be
+exposed through diagnostics, privileged inspection or the receiving program.
+Exact-byte output masking cannot prevent arbitrary file/network disclosure or
+transformed output. These examples control delivery, not subsequent secret use.
+
+## Use GitHub CLI without exporting a token into the parent shell
 
 Store a GitHub token with the permissions your command needs:
 
@@ -86,8 +94,8 @@ PGHOST=staging-db.example.com
 
 Later files override earlier files, then 2ndpass expands variables inside references
 using the final environment. Thus both lookups select `staging`. The logical
-names `development` and `staging` do not impose access permissions; use
-[separate files](../README.md#file-boundaries-and-upgrades) for that.
+names `development` and `staging` select vaults, not additional access policies;
+configure each vault's membership separately when access must differ.
 
 For a program that needs normal terminal detection, use:
 
@@ -236,7 +244,7 @@ lookup in your 1Password account or Apple's Passwords app. The familiar `read`,
 - Use percent-encoded names, including `%20` for spaces.
 - Each reference selects its named encrypted vault. `run` and `inject` can use several vaults; `--vault NAME-OR-UUID` constrains the selection.
 
-See the [CLI behavior reference](../README.md#secret-commands) for the precise
+See the [CLI behavior reference](../README.md#read-write-run-and-inject) for the precise
 rules and [validation notes](VALIDATION.md) for what has been exercised. These
 recipes have been checked for shell syntax; external account logins and SSH
 connections are not part of the automated test suite.

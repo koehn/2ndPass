@@ -99,11 +99,25 @@ and verification through a trusted device or phone number. Optional
 this against phishing. 2ndPass uses the operating system's authenticated iCloud
 session; it does not collect the Apple Account password or verification code.
 
-These protections support trust in the same-account enrollment mailbox. They do
-not turn it into an independent identity check: an attacker controlling an
-account session can request enrollment while an owner is unlocked. Protect trusted
-devices and recovery channels as well as the account password. Apple account
-security keys are distinct from 2ndPass's hardware vault recovery device.
+The native CloudKit channel also requires application code signing, provisioning
+and container entitlements, in the authenticated user's private database. Account
+credentials alone do not authorize arbitrary enrollment writes. An attacker able
+to operate an authorized client in that Apple environment and access the private
+2ndPass container may request admission; an unlocked, online owner processing the
+exchange may grant it. Protect the entire access path, including trusted devices
+and recovery channels. This deliberate reuse of Apple's authentication avoids an
+additional ordinary same-account comparison ceremony. 2ndPass does not directly
+query Apple's iCloud Keychain trust circle. Account security keys are distinct
+from 2ndPass's hardware vault recovery device. See the
+[composed trust model](SECURITY.md#composed-apple--2ndpass-trust-model), including
+the platform-specific sandbox and shared Keychain boundaries.
+
+**Unfinished sharing design:** cross-account vault sharing is not yet implemented
+as a supported feature. Preliminary code would share the mailbox's zone, so
+account-private mailbox isolation must be addressed when completing sharing.
+See [the design review](SECURITY.md#shared-zone-enrollment-exposure). This is not
+classified as a current product vulnerability or a reason to add another approval
+ceremony to ordinary same-account enrollment.
 
 ## Membership and invitation state machine
 
@@ -115,7 +129,7 @@ an owner publishes its cryptographic grant. Owner transfer is a separate recover
 operation into a new owner zone, since CloudKit zone ownership is not assumed
 transferable.
 
-Invitation states: prepared, transport invited, transport accepted, key request
+For the manual/cross-account flow, invitation states are: prepared, transport invited, transport accepted, key request
 received, independently verified, cryptographically granted. Cancellation/expiry
 before grant confers no key access. An invitation binds vault UUID, random nonce,
 intended member UUID, role, expiry, and owner checkpoint. Acceptance signs that
@@ -137,17 +151,20 @@ than granting temporary CloudKit write permission.
 
 ## Device addition and removal
 
-For an approved device, an owner opens each current catalog/item key once and
-creates an HPKE envelope for the new device. No existing plaintext value needs to
-be decrypted merely to add a recipient. Publish all envelopes and the owner-signed
+For an approved device, an owner opens each current item key once and creates an
+HPKE envelope for the new device, preserving existing item envelopes and field
+ciphertext. It decrypts the catalog, including visible values, and reseals it
+with a fresh catalog key for the resulting revision. Concealed field plaintext
+and attachment plaintext need not be decrypted merely to add a recipient. Publish all envelopes and the owner-signed
 membership in one revision. Enrollment grants current contents, not arbitrary
 historical revisions. An offline owner cannot approve a device. New owner devices
 are enrolled per vault; account login does not imply access to every vault.
 
 Removing an account removes all its devices. Removing a device removes only its
 key pair. Removal rotates the catalog key and **all retained item keys**, reseals
-each retained record, including recently deleted items, and omits removed recipients. Recovery recipient changes
-require the same rotation. Field edits receive fresh record IDs and nonces while preserving the item key. The new
+each retained record, including recently deleted items, and omits removed recipients. Replacing an existing recovery recipient
+requires the same rotation; adding the first recovery recipient only adds item-key
+envelopes and reseals the catalog. Field edits receive fresh record IDs and nonces while preserving the item key. The new
 membership epoch and all rotated ciphertext publish together at the head CAS.
 Staging is not a committed removal. After CAS, revoke CloudKit transport access
 where applicable; if that fails, report crypto removal complete/transport cleanup
@@ -191,12 +208,14 @@ Losing Apple Account access: a hardware key does not restore CloudKit transport
 access. With an accessible encrypted backup and a surviving authorized recovery
 device, create a recovered vault in a new account/zone with a new UUID/root,
 rotate keys, and reinvite members. Never overwrite/delete the original vault.
-The surviving device can operate on the backup while offline; publication into
-the destination account requires that account's authenticated transport.
+The pure recovery engine can decrypt an accessible verified backup without the
+source account. The shipping recovery command is online: it authenticates the
+destination account and publishes the new vault there.
 
 Losing **every authorized and recovery device** makes decryption impossible,
 even with the encrypted backup, Apple Account access, or support intervention.
-This is the user-selected security tradeoff. Without an accessible snapshot,
+There is no vendor-held recovery master key: reduced remote recovery attack
+surface comes with increased permanent-data-loss risk. Without an accessible snapshot,
 hardware keys alone cannot recreate data. There is no support backdoor or
 portable recovery exception.
 
@@ -224,7 +243,9 @@ independent root. Validate exact parent hash and incrementing generation/epoch;
 reject unauthorized self-promotions, new recovery keys, and revoked signers.
 Fresh-device approval carries a verified checkpoint; follow its signed descendants.
 Local generation/digest watermarks reject observed rollback and same-generation
-substitution, but do not prove global freshness.
+substitution relative to intact trusted local state, but do not prove global
+freshness. They are files, not hardware monotonic state; restoring the whole
+local trust store can remove evidence of newer observations.
 
 Reuse immutable uploads + manifest + `.ifServerRecordUnchanged` head publication.
 Journals bind the expected parent, operation ID, proposed revision, and membership
@@ -273,4 +294,5 @@ the ordinary device Keychain record or caches. Cleanup is retryable; app/extensi
 operations and registry writes refuse the removed account. Checkpoint cleanup takes
 per-vault leases and preserves lock inodes. Exported backups and separately scoped
 hardware recovery keys are outside this cleanup. The marker remains until an explicit
-Reconnect action. Account compromise can still enroll an attacker with fresh keys.
+Reconnect action. An attacker retaining authorized access to the private 2ndPass container may
+still enroll fresh keys when an unlocked owner processes the exchange.

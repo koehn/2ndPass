@@ -95,9 +95,12 @@ public protocol VaultService: Sendable {
     func lock()
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult
     func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult
+    /// A verified, explicitly stale catalog for initial display, if available.
+    func cachedCatalog(vault: String) async throws -> VaultResult?
 }
 
 public extension VaultService {
+    func cachedCatalog(vault: String) async throws -> VaultResult? { nil }
     var operationProgress: String? { nil }
     var operationFraction: Double? { nil }
     var isAuthenticated: Bool { authenticatedAt != nil }
@@ -191,16 +194,27 @@ final class SessionControl: Sendable {
     }
 }
 
-/// A FIFO permit, held across suspension points. Actor reentrancy alone would
-/// allow a second mutation to enter while the first waits for CloudKit.
+/// FIFO permits held across suspension points. Distinct catalog vaults may
+/// overlap; aliases, same-vault operations and account-wide mutations cannot.
 actor OperationGate {
-    private var occupied = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-    func enter() async {
-        if !occupied { occupied = true; return }
-        await withCheckedContinuation { waiters.append($0) }
+    private var exclusive = false
+    private var vaults: Set<String> = []
+    private var waiters: [(String?, CheckedContinuation<Void, Never>)] = []
+    private func available(_ vault: String?) -> Bool {
+        guard !exclusive else { return false }
+        return vault.map { !vaults.contains($0) } ?? vaults.isEmpty
     }
-    func leave() {
-        if waiters.isEmpty { occupied = false } else { waiters.removeFirst().resume() }
+    private func occupy(_ vault: String?) {
+        if let vault { vaults.insert(vault) } else { exclusive = true }
+    }
+    func enter(vault: String? = nil) async {
+        if waiters.isEmpty && available(vault) { occupy(vault); return }
+        await withCheckedContinuation { waiters.append((vault, $0)) }
+    }
+    func leave(vault: String? = nil) {
+        if let vault { vaults.remove(vault) } else { exclusive = false }
+        while let first = waiters.first, available(first.0) {
+            waiters.removeFirst(); occupy(first.0); first.1.resume()
+        }
     }
 }

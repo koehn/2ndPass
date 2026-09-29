@@ -7,12 +7,14 @@ import MopCore
 import MopAuth
 import MopVaultNext
 
-/// Cloud mutations are serialized; local reads use verified session snapshots.
+/// Catalogs for distinct vaults may overlap; other cloud operations are exclusive.
+/// Local reads use verified session snapshots.
 /// Hardware handles and transient keys never survive an operation. Locking clears
 /// snapshots, invalidates authentication, and rejects earlier-generation results.
 public final class NativeVaultService: VaultService, @unchecked Sendable {
     private let control = SessionControl()
     private let gate = OperationGate()
+    private let authorizationGate = OperationGate()
     private let progressState = Mutex<(String, Double?)?>(nil)
     public var operationProgress: String? { progressState.withLock { $0?.0 } }
     public var operationFraction: Double? { progressState.withLock { $0?.1 } }
@@ -24,7 +26,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     private let documents: any DocumentAccessing
     private let makeTransport: (String, String) throws -> any VaultTransport
     private let deleteDevice: (String, UUID) throws -> Void
-    private var removedRegistry: NextRegistry?
+    private let removedRegistry = Mutex<NextRegistry?>(nil)
     private let openDevice: (String, UUID, LAContext, Bool) throws -> any DeviceOperations
     private let authenticate: (@escaping (LAContext) throws -> Void) async throws -> LAContext
     private var authorization: (token: Int, context: LAContext)?
@@ -60,6 +62,10 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         self.state = state; self.configuration = configuration; documents = SystemDocumentAccess()
         publishesAutoFill = false; makeTransport = { _, _ in transport }
         self.openDevice = openDevice; self.deleteDevice = deleteDevice; self.authenticate = authenticate
+    }
+    public func cachedCatalog(vault: String) async throws -> VaultResult? {
+        do { return try await execute(.catalog, vault: vault, offline: true) }
+        catch MopError.vaultMissing { return nil }
     }
     public func lock() { control.lock() }
     deinit { control.lock(); if let accountObserver { NotificationCenter.default.removeObserver(accountObserver) } }
@@ -100,8 +106,11 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         if case .manage(.automaticEnrollment) = operation, !isAuthenticated { throw MopError.authentication }
         let token = control.generation
         let started = wallNow()
+        let catalogVault: String?
+        if case .catalog = operation { catalogVault = vault.flatMap(UUID.init(uuidString:))?.uuidString }
+        else { catalogVault = nil }
         let task = Task.detached { [self] in
-            await gate.enter()
+            await gate.enter(vault: catalogVault)
             progressState.withLock { $0 = nil }
             do {
                 try control.check(token)
@@ -121,14 +130,24 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     catch { result.autoFillStatus = await AutoFillPublisher.shared.status() }
                 }
                 progressState.withLock { $0 = nil }
-                await gate.leave(); return result
+                await gate.leave(vault: catalogVault); return result
             } catch {
                 progressState.withLock { $0 = nil }
-                if let registry = removedRegistry {
-                    do { control.lock(); try await clearRemovedAccount(registry); removedRegistry = nil }
-                    catch { await gate.leave(); throw error }
+                let needsCleanup = removedRegistry.withLock { $0 != nil }
+                if needsCleanup { control.lock() }
+                await gate.leave(vault: catalogVault)
+                if needsCleanup {
+                    // Drain concurrent catalogs before deleting account caches/keys.
+                    await gate.enter()
+                    do {
+                        if let registry = removedRegistry.withLock({ $0 }) {
+                            try await clearRemovedAccount(registry)
+                            removedRegistry.withLock { $0 = nil }
+                        }
+                    } catch { await gate.leave(); throw error }
+                    await gate.leave()
                 }
-                await gate.leave(); throw error
+                throw error
             }
         }
         let id = UUID(); control.registerTask(id, token: token) { task.cancel() }
@@ -143,6 +162,25 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             if (try? AutoFillStorage.directory()) != nil { try await AutoFillPublisher.shared.prune(keeping: []) }
             authorization?.context.invalidate(); authorization = nil
         } catch { throw MopError.deviceRemovalPending }
+    }
+    private func authorizedContext(token: Int) async throws -> LAContext {
+        await authorizationGate.enter()
+        do {
+            try control.check(token)
+            let context: LAContext
+            if let cached = authorization, cached.token == token { context = cached.context }
+            else {
+                authorization?.context.invalidate(); authorization = nil
+                context = try await authenticate { context in
+                    let invalidator = ContextInvalidator(context)
+                    try self.control.register({ invalidator.invalidate() }, token: token)
+                }
+                try control.check(token); try control.authorized(token)
+                authorization = (token, context)
+            }
+            await authorizationGate.leave()
+            return context
+        } catch { await authorizationGate.leave(); throw error }
     }
     private func run(_ operation: VaultOperation, selection: String?, offline: Bool, token: Int) async throws -> VaultResult {
         if offline && !operation.allowsCachedRead {
@@ -163,6 +201,10 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         let registry = try NextRegistry(state: state, container: config.container, environment: config.environment, account: account)
         var result = VaultResult(); result.usingCache = offline; result.usageScope = registry.member.uuidString
         if try registry.removed() {
+            if case .catalog = operation {
+                removedRegistry.withLock { $0 = registry }
+                throw MopError.deviceRemoved
+            }
             // Also retries an interrupted local cleanup before offering reconnection.
             try await clearRemovedAccount(registry)
             if case .manage(.reconnect) = operation {
@@ -219,7 +261,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     }
                     devices.removeValue(forKey: id)
                     if removingSelf {
-                        try registry.setRemoved(true); removedRegistry = registry
+                        try registry.setRemoved(true); removedRegistry.withLock { $0 = registry }
                         throw MopError.deviceRemoved
                     }
                 }
@@ -266,17 +308,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             return result
         }
         if offline && !operation.allowsCachedRead { throw MopError.offlineWrite }
-        let context: LAContext
-        if let cached = authorization, cached.token == token { context = cached.context }
-        else {
-            authorization?.context.invalidate(); authorization = nil
-            context = try await authenticate { context in
-                let invalidator = ContextInvalidator(context)
-                try self.control.register({ invalidator.invalidate() }, token: token)
-            }
-            try control.check(token); try control.authorized(token)
-            authorization = (token, context)
-        }
+        let context = try await authorizedContext(token: token)
         func close(_ device: any DeviceOperations) {
             if let enclave = device as? EnclaveDevice { enclave.releaseHandles() }
             else { device.close() }
@@ -581,7 +613,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             guard root.membership.role(of: key.identity) != nil ||
                     (current.membership.removedDevices ?? []).contains(key.identity.device) else { throw MopError.notVaultMember }
             try registry.setRemoved(true)
-            removedRegistry = registry
+            removedRegistry.withLock { $0 = registry }
             throw MopError.deviceRemoved
         }
         let attachments = AttachmentDownloads(state: state, address: entry.address)
@@ -599,7 +631,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     reportProgress("Preparing encrypted files…")
                     needed = current.attachmentDigests
                 }
-            case .sync, .catalog:
+            case .sync:
                 if !offline && (attachmentSyncOverride ?? AttachmentDownloadSettings.duringSync) { needed = current.attachmentDigests }
             default: break
             }

@@ -18,11 +18,13 @@ toc:
 ---
 ## Encryption
 
-Each enrolled device creates separate P-256 private keys for decryption and signing in its Secure Enclave. Those private keys are non-exportable: the app asks the hardware to perform operations without extracting them. Each item has its own symmetric key for its separately encrypted fields; a separately encrypted catalog protects item organization and metadata within the vault.
+Each enrolled device creates separate P-256 private keys for decryption and signing in its Secure Enclave. Those independently generated, hardware-bound device identity keys are non-exportable: the app holds opaque references and asks the Secure Enclave to perform operations without exposing private key material to normal application memory. Each item has its own symmetric key for its separately encrypted fields; a separately encrypted catalog protects item organization and metadata within the vault.
 
 2ndPass uses authenticated encryption and HPKE (`P256_SHA256_AES_GCM_256`) to wrap secret keys for authorized devices. Signed revisions and verified checkpoints help clients detect tampering and rollback relative to the state they already trust. Vault contents are encrypted locally before they leave the device.
 
-**Secure Enclave protection is not a promise that plaintext never enters memory.** Derived key material and decrypted secrets are used in the app’s process. A compromised, unlocked device or malicious software with sufficient privileges can still expose them. The enclave protects the device’s private key, not everything an application does with a password.
+**Secure Enclave protection is not a promise that plaintext never enters memory.** Derived key material and decrypted secrets are used in the app’s process. A compromised, unlocked device or malicious software with sufficient privileges can invoke authorized key operations and capture their plaintext results even when the device private key remains non-exportable. The enclave protects the device’s private key, not everything an application does with a password.
+
+Apple Passwords/iCloud Keychain also uses substantial Secure Enclave-backed protection; see Apple's [Keychain security documentation](https://support.apple.com/guide/security/secb0694df1a/web). 2ndPass's distinction is its explicit, inspectable device-identity and item-key protocol, not exclusive use of Apple security hardware or a claim of greater security. Apple's system is integrated deeper into the OS and its complete implementation is not publicly inspectable.
 
 The [security design](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md) and [vault protocol](vault.html) describe the algorithms, checks, and trust model in detail.
 
@@ -30,7 +32,7 @@ The [security design](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.m
 
 ### Stolen files, backups, or cloud data
 
-Vault contents are encrypted before storage or upload. Item keys are wrapped for authorized devices, whose private keys stay in the Secure Enclave. The app stores device-bound key representations in the non-synchronizing Keychain and requires local authentication to use them. A copied encrypted vault does not provide a master-password hash to crack or a portable private key. Plaintext exports and some metadata, including vault names and record sizes, are outside this protection.
+Vault contents are encrypted before storage or upload. Item keys are wrapped for authorized devices, whose private keys stay in the Secure Enclave. The app stores device-bound key representations in the non-synchronizing Keychain and requires local authentication to use them. A copied encrypted vault does not provide a master-password hash to crack or a portable private key. Copying local storage or the opaque Keychain representation cannot reconstruct the device private key on another machine. Plaintext exports and some metadata, including vault names and record sizes, are outside this protection.
 
 ### Reading application memory
 
@@ -42,7 +44,7 @@ Apple code signing, provisioning, and Keychain access groups protect access to t
 
 ### Tampered or replayed cloud records
 
-Authenticated encryption detects altered ciphertext. Signed revisions and locally trusted checkpoints help reject unauthorized updates and rollback against known history. They cannot force a server to deliver the latest data or remain available. Account takeover is a separate threat because the Apple Account participates in new-device enrollment, as explained below.
+Authenticated encryption detects altered ciphertext. Signed revisions and locally trusted checkpoints help reject unauthorized updates and rollback against known history. They cannot force a server to deliver the latest data or remain available. Checkpoints depend on intact local trust state; restoring older local state can remove evidence of a rollback. Account takeover is a separate threat because the Apple Account participates in new-device enrollment, as explained below.
 
 ### Clipboard and screen capture
 
@@ -54,7 +56,11 @@ CloudKit provides transport and storage through your Apple Account. There is no 
 
 Apple protects account sign-in with [two-factor authentication](https://support.apple.com/en-us/102660), enabled by default for most accounts: a new device requires the account password and verification through a trusted device or phone number. Optional [Security Keys for Apple Account](https://support.apple.com/en-us/102637) add protection against phishing. 2ndPass uses the system's authenticated iCloud session and never asks for your Apple Account password or verification code. These account security keys are separate from 2ndPass's vault recovery hardware.
 
-**Your Apple Account is part of the trust boundary.** For your own devices, an enrolled owner device can automatically approve a new device through the account’s private iCloud mailbox while the owner app is unlocked. Someone who compromises that account may be able to enroll an attacker-controlled device during that window. Protect the account and its trusted devices accordingly.
+**Apple and 2ndPass provide different layers of the trust model.** Apple authenticates the iCloud environment; code signing, provisioning and CloudKit entitlements restrict native client access to the 2ndPass container and its private per-user database. A new device creates its own Secure Enclave identity, submits a signed request through that namespace, and receives item-key envelopes only after an enrolled owner device publishes a signed membership grant. See Apple's [container access](https://developer.apple.com/documentation/cloudkit/ckcontainer) and [private database](https://developer.apple.com/documentation/cloudkit/ckcontainer/privateclouddatabase) documentation.
+
+Ordinary same-account enrollment deliberately reuses Apple's account/device authentication and authorized app access without adding another comparison ceremony. It does not directly query or join Apple's private iCloud Keychain trust circle. Platform sandboxing also contributes on iOS/iPadOS and in the Mac AutoFill extension; the packaged Mac app and CLI use the hardened runtime and restricted entitlements but do not enable App Sandbox.
+
+**Residual enrollment threat:** an attacker with enough control of your Apple environment to operate an authorized 2ndPass client and access your private 2ndPass container may submit a valid request. If an enrolled owner session processes the exchange while unlocked and online, that identity may receive owner membership and access to existing secrets. Apple Account credentials alone do not permit arbitrary writes into this container. Compromise of the bootstrap mailbox could also substitute a new device's initial trust root; existing devices still check against their previously trusted history.
 
 Encryption does not conceal all metadata. Cloud records can expose vault names, public identities, record sizes, and timing. The local AutoFill index and Apple’s suggestion system receive website, username, and opaque identifier metadata. Passwords and OTP seeds are not placed in that index.
 
@@ -64,15 +70,20 @@ Offline reads require a previously verified local checkpoint. They cannot establ
 
 Each authorized device has its own hardware key. Sharing with someone on another Apple Account requires an invitation, acceptance, identity verification, and owner approval. An iCloud share invitation alone does not supply the decryption keys. Viewer and editor roles control access within the vault protocol.
 
-Removing a device or member rotates current encryption keys. It cannot erase plaintext someone already copied or make old backups disappear. If a removed member knew a service password, rotate that password at the service too.
+Removing a device or member generates fresh per-item keys, rewrites all retained field ciphertext (including recently deleted items and attachments), and excludes the removed recipient from the new key envelopes. The catalog also gets a fresh key. Adding a device wraps existing item keys; a role-only change does not rotate them. Removal cannot erase plaintext, retained keys, or historical ciphertext a recipient could already decrypt. If a removed member knew a service password, rotate that password at the service too.
 
-Cross-account sharing needs further physical acceptance testing before release. See the current [validation status](#status).
+Cross-account vault sharing is not yet implemented as a supported feature.
+Preliminary sharing code places enrollment in the zone it would share with other
+accounts. Keeping that mailbox account-private is a design detail to address
+when implementing sharing, followed by controlled two-account validation. This
+is an unfinished-feature design issue, not a current product vulnerability. See
+the [design review](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md#shared-zone-enrollment-exposure).
 
 ## Recovery
 
 A separate hardware recovery device is optional. Set it up while you still have a working owner device, compare its fingerprint independently, and store it separately. An encrypted backup preserves data; it is not a substitute for surviving authorized hardware.
 
-**If every authorized device and every configured recovery device is lost, the vault is unrecoverable.** Restoring an Apple Account or downloading a backup does not recreate Secure Enclave private keys. There is no vendor password-reset back door.
+**If every authorized device and every configured recovery device is lost, the vault is unrecoverable.** Restoring an Apple Account or downloading a backup does not recreate Secure Enclave private keys. There is no vendor-held recovery master key. This reduces remote recovery attack surface but increases permanent-data-loss risk; it is a security/availability tradeoff.
 
 Follow the [recovery guide](docs.html#recovery), including checkpoint verification. Separate-device recovery acceptance remains outstanding; do not make an untested recovery path your only plan.
 
@@ -82,10 +93,14 @@ The app conceals sensitive fields and uses authentication to unlock access. Auto
 
 The CLI deliberately releases plaintext where you ask it to:
 
-- `read` writes a secret to standard output.
+- `read` writes a plaintext secret to standard output or the requested file.
 - `run` gives resolved secrets to a child process through its environment. Default output masking matches exact secret bytes; transformed output, files, and network traffic are outside that protection.
-- `inject` writes literal values into generated configuration. It does not escape values for the destination format.
+- `inject` writes literal plaintext values to stdout or generated configuration files. It does not escape values for the destination format.
 - Attachment exports and password-manager import files contain plaintext.
+
+The child process, its dependencies and descendants receiving the environment become trusted with the secret. Environment variables can leak through the program itself, diagnostics or privileged host access; they are not a secure container. 2ndPass cannot control what an arbitrary child does with plaintext. This disclosure is necessary for developer-secret automation.
+
+AutoFill shares the app's provisioned Keychain group and device identity, but requires its own fresh authentication. Its extension and the receiving app/site are also within the plaintext trust boundary.
 
 Treat those outputs as credentials. Removing a temporary file is ordinary deletion, not a guarantee of secure erasure. Shell history, logs, screen sharing, backups, and a child process can all create additional copies.
 

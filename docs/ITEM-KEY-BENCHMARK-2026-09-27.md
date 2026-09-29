@@ -1,3 +1,5 @@
+> Historical measurements preceding the v7 cutover. Statements about the then-current production format are not current architecture claims. See [Vault v7](VAULT-V7.md) and [v7 validation](V7-VALIDATION-2026-09-27.md); measurements below are preserved as recorded.
+
 # Item-key prototype benchmark — 2026-09-27
 
 A test-only prototype with one wrapped key per item reduces the measured Secure Enclave removal loop from **35.72 seconds to 5.14 seconds (6.96×)**. Combining item keys with append-only enrollment reduces enrollment cryptographic work from **40.11 seconds to 4.86 seconds (8.24×)**. These are local cryptographic measurements, not complete app operation timings. Production vault format and application behavior are unchanged.

@@ -1,6 +1,6 @@
 # Shared Apple application
 
-**V6 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](VAULT-NEXT-VALIDATION.md); remaining physical acceptance is not implied by historical build notes below.
+**V7 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](V7-VALIDATION-2026-09-27.md); remaining physical acceptance is not implied by historical build notes below.
 
 2ndPass uses the same SwiftUI views and application model on macOS, iPhone, and iPad.
 `Sources/MopUI` owns the interface; `MopApp` is a thin entry point. The existing
@@ -145,7 +145,7 @@ account:
 
 - Face ID, Touch ID on supported hardware, passcode fallback,
   cancellation, changed biometric enrollment, and pending authentication at lock.
-- Explicit hardware device enrollment, independent recovery evidence, v6
+- Explicit hardware device enrollment, independent recovery evidence, v7
   backup recovery, ownership-change key rotation, concurrent edits, and account changes.
 - Verified offline reads, automatic fallback on disconnection and refresh on reconnection, Recently Deleted,
   and confirmation that remote changes cannot erase previously obtained offline data.

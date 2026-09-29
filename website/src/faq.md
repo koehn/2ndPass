@@ -48,7 +48,7 @@ Secret references use `secondpass://`, spelled out because a URI scheme cannot s
 
 2ndPass joins two daily workflows: filling a password in an app, and supplying a credential to a command. Native Apple apps and AutoFill handle the first; references, environment injection, and configuration templates handle the second.
 
-Each device has its own Secure Enclave private key. iCloud carries encrypted vault data using your Apple Account, without a separate 2ndPass-hosted vault service. Those choices come with real tradeoffs: Apple-only platforms, an account trust boundary during device enrollment, and hardware-based recovery. Read the [security explanation](security.html) before deciding whether they fit your needs.
+Each device has its own Secure Enclave private key. iCloud carries encrypted vault data using your Apple Account, without a separate 2ndPass-hosted vault service. Those choices come with real tradeoffs: Apple-only platforms, an Apple platform and provisioned private-container trust boundary during device enrollment, and hardware-based recovery. Read the [security explanation](security.html) before deciding whether they fit your needs.
 
 ## Op
 
@@ -74,7 +74,7 @@ Build and installation documentation is for the copyright holder and separately 
 
 The project targets macOS 15+ and iOS/iPadOS 18+ with supported Secure Enclave hardware. The command-line tool runs on Mac. There is no Windows, Linux, Android, or browser vault client.
 
-Passwords, TOTP codes, typed items, encrypted attachments, imports, sharing, and developer integrations are implemented. Passkeys, an SSH agent, system AutoFill for cards/identities, and AutoFill-based saving of new logins are not currently supported. Some implemented features still have outstanding physical validation; see [release status](security.html#status).
+Passwords, TOTP codes, typed items, encrypted attachments, imports, and developer integrations are implemented. Cross-account vault sharing is not yet implemented as a supported feature; preliminary code exists. Passkeys, an SSH agent, system AutoFill for cards/identities, and AutoFill-based saving of new logins are not currently supported. Enrollment-mailbox isolation is a design detail to address when completing sharing, not a current product vulnerability; see [release status](security.html#status).
 
 ## Account
 
@@ -82,7 +82,7 @@ Passwords, TOTP codes, typed items, encrypted attachments, imports, sharing, and
 
 There is no separate 2ndPass service account. Synchronization uses your Apple Account and CloudKit. The project does not operate a vault server that receives your secrets.
 
-That does not make iCloud irrelevant to security: your account is trusted during own-device enrollment, and cloud metadata is not all concealed. Read the [iCloud trust boundary](security.html#icloud).
+That does not make iCloud irrelevant to security: Apple account/device security and provisioned, entitlement-protected container access are trusted during own-device enrollment before an owner grants cryptographic membership, and cloud metadata is not all concealed. Read the [iCloud trust boundary](security.html#icloud).
 
 This public website uses no analytics, cookies, or third-party scripts. A hosting provider may still process ordinary access logs. Following an external link takes you to that provider’s site.
 

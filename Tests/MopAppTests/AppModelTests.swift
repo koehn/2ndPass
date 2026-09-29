@@ -15,7 +15,16 @@ private final class FakeService: VaultService, Sendable {
     }
     let state = Mutex(State())
     let handler: @Sendable (VaultOperation, String?, Bool) async throws -> VaultResult
-    init(_ handler: @escaping @Sendable (VaultOperation, String?, Bool) async throws -> VaultResult = { _, _, _ in VaultResult() }) { self.handler = handler }
+    let cachedHandler: @Sendable (String) async throws -> VaultResult?
+    init(_ handler: @escaping @Sendable (VaultOperation, String?, Bool) async throws -> VaultResult = { _, _, _ in VaultResult() }) {
+        cachedHandler = { _ in nil }; self.handler = handler
+    }
+    init(cached: @escaping @Sendable (String) async throws -> VaultResult?,
+         _ handler: @escaping @Sendable (VaultOperation, String?, Bool) async throws -> VaultResult) {
+        cachedHandler = cached; self.handler = handler
+    }
+    func cachedCatalog(vault: String) async throws -> VaultResult? { try await cachedHandler(vault) }
+
     var authenticatedAt: TimeInterval? { state.withLock { $0.started } }
     var operationProgress: String? { state.withLock { $0.progress } }
     var operationFraction: Double? { state.withLock { $0.fraction } }
@@ -146,7 +155,7 @@ private actor Barrier {
     }
     private func finish(_ model: AppModel) async throws {
         for _ in 0..<500 {
-            if !model.busy && !model.refreshing && !model.enrollmentWorking { return }
+            if !model.busy && !model.refreshing && !model.enrollmentWorking && !model.loadingVaults { return }
             try await Task.sleep(for: .milliseconds(10))
         }
         Issue.record("Operation did not finish")
@@ -867,7 +876,7 @@ extension AppModelTests {
 
 
 extension AppModelTests {
-    @Test func openingSelectedVaultOpensEveryConnectedVaultAtomically() async throws {
+    @Test func unavailableSecondaryVaultDoesNotCloseSelectedVault() async throws {
         let first = UUID().uuidString, second = UUID().uuidString, unconnected = UUID().uuidString
         let attempts = Mutex<[String]>([])
         let service = FakeService { _, id, _ in
@@ -883,10 +892,12 @@ extension AppModelTests {
         }
         model.unlock(); try await finish(model)
         #expect(attempts.withLock { $0 } == [first, second])
-        #expect(!model.authenticated && !service.isAuthenticated)
-        #expect(model.catalogs.isEmpty && model.catalog == nil && model.references.isEmpty)
-        #expect(model.vaultIcon(model.vaults[2]) == "externaldrive.badge.plus")
-        #expect(model.vaultIcon(model.vaults[0]) == "lock.rectangle")
+        #expect(model.authenticated && service.isAuthenticated)
+        #expect(model.catalogs[first] != nil && model.catalogs[second] == nil)
+        #expect(model.notice?.contains("could not be loaded") == true)
+        #expect(model.vaultIcon(try #require(model.vaults.first { $0.id == unconnected })) == "externaldrive.badge.plus")
+        #expect(model.vaultIcon(try #require(model.vaults.first { $0.id == first })) == "lock.open")
+        #expect(model.vaultIcon(try #require(model.vaults.first { $0.id == second })) == "lock.rectangle")
     }
 
     @Test func backgroundReturnReusesSessionUntilInactivityExpires() async throws {
@@ -2075,6 +2086,138 @@ extension AppModelTests {
         app.unlock(); try await finish(app)
         #expect(app.error == nil)
         #expect(!app.authenticated && app.vaults.isEmpty && app.vault.isEmpty)
+        #expect(app.sheet == .createVault)
+    }
+}
+
+
+extension AppModelTests {
+    @Test func selectedVaultUnlocksBeforeConcurrentBackgroundCatalogs() async throws {
+        let first = UUID().uuidString, second = UUID().uuidString, third = UUID().uuidString
+        let secondGate = Barrier(), thirdGate = Barrier()
+        let calls = Mutex<[String]>([])
+        let service = FakeService { _, id, _ in
+            calls.withLock { $0.append(id!) }
+            if id == second { await secondGate.wait() }
+            if id == third { await thirdGate.wait() }
+            var result = VaultResult(); result.catalog = Self.catalog; return result
+        }
+        service.authenticate()
+        let app = model(service); app.vault = first
+        app.vaults = [second, third, first].map { VaultDescriptor(id: $0, name: $0, format: "mop-vault-v7", enrolled: true) }
+        app.unlock()
+        try await entered(secondGate); try await entered(thirdGate)
+        #expect(calls.withLock { $0.first } == first)
+        #expect(app.authenticated && !app.busy && app.loadingVaults)
+        #expect(app.catalogs.count == 1 && app.catalogs[first] != nil)
+        await secondGate.release(); await thirdGate.release()
+        try await finish(app)
+        #expect(app.catalogs.count == 3 && app.authenticated)
+    }
+
+    @Test func lockDiscardsLateBackgroundCatalogs() async throws {
+        let first = UUID().uuidString, second = UUID().uuidString, barrier = Barrier()
+        let service = FakeService { _, id, _ in
+            if id == second { await barrier.wait() }
+            var result = VaultResult(); result.catalog = Self.catalog; return result
+        }
+        service.authenticate()
+        let app = model(service); app.vault = first
+        app.vaults = [first, second].map { VaultDescriptor(id: $0, name: $0, format: "mop-vault-v7", enrolled: true) }
+        app.unlock(); try await entered(barrier)
+        #expect(app.authenticated)
+        app.lock(); await barrier.release()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(!app.authenticated && !app.loadingVaults && app.catalogs.isEmpty)
+    }
+}
+
+
+extension AppModelTests {
+    @Test func backgroundCatalogCannotOverwriteForegroundUpdate() async throws {
+        let first = UUID().uuidString, second = UUID().uuidString, barrier = Barrier()
+        let service = FakeService { _, id, _ in
+            if id == second { await barrier.wait() }
+            var result = VaultResult(); result.catalog = Self.catalog; return result
+        }
+        service.authenticate()
+        let app = model(service); app.vault = first
+        app.vaults = [first, second].map { VaultDescriptor(id: $0, name: $0, format: "mop-vault-v7", enrolled: true) }
+        app.unlock(); try await entered(barrier)
+        app.perform { _ in
+            app.catalogs[second] = ItemCatalog(vault: "updated", revision: "new", items: [])
+        }
+        while app.busy { try await Task.sleep(for: .milliseconds(1)) }
+        await barrier.release(); try await finish(app)
+        #expect(app.authenticated && app.catalogs[second]?.revision == "new")
+    }
+
+    @Test func backgroundDeletionRemovesReferenceWithoutClosingSelectedVault() async throws {
+        let first = UUID().uuidString, deleted = UUID().uuidString
+        let service = FakeService { operation, id, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-vault-v7", enrolled: true)]
+            } else if id == deleted { throw MopError.vaultMissing }
+            else { result.catalog = Self.catalog }
+            return result
+        }
+        service.authenticate()
+        let app = model(service); app.vault = first
+        app.vaults = [first, deleted].map { VaultDescriptor(id: $0, name: $0, format: "mop-vault-v7", enrolled: true) }
+        app.unlock(); try await finish(app)
+        #expect(app.authenticated && app.vault == first && app.error == nil)
+        #expect(app.vaults.map(\.id) == [first])
+    }
+}
+
+
+extension AppModelTests {
+    @Test func cachedSelectedVaultOpensBeforeItsSyncAndBecomesWritableAfterward() async throws {
+        let barrier = Barrier()
+        let service = FakeService(cached: { _ in
+            var result = VaultResult(); result.catalog = Self.catalog
+            result.usingCache = true; result.offlineDate = Date(timeIntervalSince1970: 100)
+            return result
+        }) { _, _, _ in
+            await barrier.wait()
+            var result = VaultResult()
+            result.catalog = ItemCatalog(vault: "personal", revision: "fresh", items: Self.catalog.items)
+            return result
+        }
+        service.authenticate()
+        let app = model(service); app.unlock(); try await entered(barrier)
+        #expect(app.authenticated && !app.busy && app.offline && app.loadingVaults)
+        #expect(app.catalog?.revision == Self.catalog.revision)
+        // Local interaction must not cause the background sync to be discarded.
+        app.perform(local: true) { _ in }
+        while app.busy { try await Task.sleep(for: .milliseconds(1)) }
+        await barrier.release(); try await finish(app)
+        #expect(app.authenticated && !app.offline && app.catalog?.revision == "fresh")
+    }
+
+    @Test func failedBackgroundSyncKeepsCachedVaultReadOnly() async throws {
+        let service = FakeService(cached: { _ in
+            var result = VaultResult(); result.catalog = Self.catalog
+            result.usingCache = true; result.offlineDate = Date(); return result
+        }) { _, _, _ in throw MopError.cloudUnavailable }
+        service.authenticate()
+        let app = model(service); app.unlock(); try await finish(app)
+        #expect(app.authenticated && app.offline && app.catalog != nil)
+        #expect(app.notice != nil && app.error == nil)
+    }
+
+    @Test func deletionDuringCachedUnlockClearsSelectedVault() async throws {
+        let service = FakeService(cached: { _ in
+            var result = VaultResult(); result.catalog = Self.catalog
+            result.usingCache = true; result.offlineDate = Date(); return result
+        }) { operation, _, _ in
+            if case .discover = operation { return VaultResult() }
+            throw MopError.vaultMissing
+        }
+        service.authenticate()
+        let app = model(service); app.unlock(); try await finish(app)
+        #expect(!app.authenticated && app.catalogs.isEmpty && app.vaults.isEmpty)
         #expect(app.sheet == .createVault)
     }
 }

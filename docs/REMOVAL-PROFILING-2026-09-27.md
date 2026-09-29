@@ -1,3 +1,5 @@
+> Historical measurements preceding the v7 cutover. Statements about the then-current production format are not current architecture claims. See [Vault v7](VAULT-V7.md) and [v7 validation](V7-VALIDATION-2026-09-27.md); measurements below are preserved as recorded.
+
 # Device-removal profiling — 2026-09-27
 
 Synthetic fixtures; no existing vault contents or device keys are used.

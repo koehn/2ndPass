@@ -1,4 +1,4 @@
-.Dd September 25, 2026
+.Dd September 29, 2026
 .Dt 2NDPASS 1
 .Os
 .Sh NAME
@@ -9,87 +9,155 @@
 .Ar command
 .Op Ar options
 .Sh DESCRIPTION
-2ndPass v6 generates device private keys in Secure Enclave. Personal vaults are the
-one-member case of shared vaults. Every additional device requires explicit
-owner approval. The application, AutoFill and CLI share device-local encrypted
-checkpoints and device-only Keychain representations. There is no software-key
-fallback, old-format reader, migration or portable recovery private key.
+2ndPass v7 generates independent, non-exportable device agreement and signing
+keys in Secure Enclave.
+Personal vaults are the one-member case of shared vaults.
+Same-account enrollment is automatic when an unlocked owner app processes the
+exchange.
+Cross-account sharing requires independent verification and explicit owner
+approval.
+The application, AutoFill and CLI share device-local encrypted checkpoints and
+device-only Keychain representations.
+There is no software-key fallback, old-format reader, migration or portable
+recovery private key.
 .Pp
-Plaintext passwords and temporary record keys reach application memory.
-Commands receiving a password receive plaintext. Removing access protects later
-changes, but cannot erase copied secrets or old backups.
+Plaintext passwords and temporary per-item keys reach application memory.
+Commands receiving a password receive plaintext.
+Removing access protects later changes, but cannot erase copied secrets or old
+backups.
 .Sh COMMANDS
 Use
 .Nm command --help
-for complete arguments. Secret commands are read, write, list, delete, run,
-inject and item. Values are supplied by hidden prompt or stdin, never positional
-password arguments. References use secondpass://vault/item/[section/]field.
+for complete arguments.
+Secret commands are read, write, list, delete, run, inject and item.
+Values are supplied by hidden prompt or stdin, never positional password
+arguments.
+References use secondpass://vault/item/[section/]field.
 .Pp
 Device request creates a public enrollment document; --recovery selects this
-device's separate hardware recovery identity. Vault init creates a vault on this
-device without recovery by default. Optional --recovery-request and --fingerprint
-must be supplied together. Use replace-recovery to add hardware recovery later.
+device's separate hardware recovery identity.
+Vault init creates a vault on this device without recovery by default.
+Optional --recovery-request and --fingerprint must be supplied together.
+Use replace-recovery to add hardware recovery later.
 .Pp
 Vault invite, accept and approve exchange public documents, independently
 compared fingerprints/checkpoints and (for other accounts) a private iCloud
-share URL. An iCloud invitation alone cannot decrypt the vault. Members,
-remove-member, remove-device, role and reconcile-share manage access.
+share URL.
+An iCloud invitation alone cannot decrypt the vault.
+Members, remove-member, remove-device, role and reconcile-share manage access.
 .Pp
-Vault list includes trusted roots and untrusted iCloud enrollment hints. Rename changes references. Sync verifies
-signed descendants and reconciles uncertain commits without replaying edits.
+Vault list includes trusted roots and untrusted iCloud enrollment hints.
+Rename changes references.
+Sync verifies signed descendants and reconciles uncertain commits without
+replaying edits.
 Export writes an encrypted checkpoint; import requires independent checkpoint
 evidence and an already enrolled device.
 .Pp
 Vault recover runs on the enrolled hardware recovery device with a verified
 backup and replacement public requests. --copy creates a new UUID/root under
-the current account, preserving the source. Losing every authorized and recovery
-device makes recovery impossible even with a backup.
+the current account, preserving the source.
+Losing every authorized and recovery device makes recovery impossible even
+with a backup.
 .Pp
-Vault delete requires --vault UUID --confirm UUID. It deletes the cloud zone;
-existing local ciphertext and exported backups remain.
+Vault delete requires --vault UUID --confirm UUID.
+It deletes the cloud zone; existing local ciphertext and exported backups
+remain.
 .Sh OPTIONS
 .Fl -vault Ar NAME-OR-UUID
-constrains selection. Management requires an explicit selection when multiple
-vaults are registered.
+constrains selection.
+Management requires an explicit selection when multiple vaults are registered.
 .Pp
 .Fl -offline
-uses a previously verified checkpoint read-only. Remote revocation and
-unobserved account changes cannot be detected offline.
+uses a previously verified checkpoint read-only.
+Remote revocation and unobserved account changes cannot be detected offline.
 .Pp
 .Fl -state-directory Ar PATH
-or MOP_STATE_DIRECTORY overrides device-local state. Never synchronize it.
+or MOP_STATE_DIRECTORY overrides device-local state.
+Never synchronize it.
 .Sh SECURITY
-Operational access requires a provisioned signed application, matching Keychain
-access group/CloudKit environment, Secure Enclave and local authentication.
-Every fill starts fresh authorization. GUI contexts last until lock/expiry;
-hardware handles and individual secret keys are released after operations.
+Operational access requires a provisioned signed application, matching
+Keychain access group/CloudKit environment, Secure Enclave and local
+authentication.
+Every fill starts fresh authorization.
+GUI contexts last until lock/expiry; hardware handles and individual secret
+keys are released after operations.
 .Pp
-Conflicting edits fail. Submitted operations may finish after cancellation;
-journals and conditional version barriers determine their outcome. Do not
-blindly repeat an uncertain mutation. No existing old-format data is deleted.
+Conflicting edits fail.
+Submitted operations may finish after cancellation; journals and conditional
+version barriers determine their outcome.
+Do not blindly repeat an uncertain mutation.
+No existing old-format data is deleted.
+.Pp
+Read emits plaintext to stdout or an output file.
+Inject writes literal plaintext to stdout or a generated file, without
+format-specific escaping.
+Run passes resolved secrets in the child environment.
+That child, its dependencies and inheriting descendants become trusted with
+those secrets.
+Environment variables may be exposed by the program, diagnostics or privileged
+host software.
+Default masking filters exact secret bytes in captured stdout/stderr only; it
+cannot constrain transformed output, files or network disclosure.
+.Pp
+Same-account enrollment composes Apple's account security, code signing,
+provisioning and CloudKit entitlements with private per-user storage and a
+signed 2ndPass membership grant.
+Account credentials alone do not permit arbitrary container writes.
+An attacker able to operate an authorized client in that user's iCloud context
+may obtain membership if an unlocked owner processes the exchange.
+.Pp
+Secure Enclave resists extraction and portability of device private keys, not
+malicious use on an unlocked endpoint.
+Recovery requires surviving enrolled or recovery hardware and accessible
+ciphertext.
+Apple Account recovery alone cannot recreate device keys; no vendor-held
+recovery master key exists.
+This reduces remote recovery attack surface but increases permanent-data-loss
+risk.
+.Pp
+2ndPass is not independently audited.
+Signed revisions detect unauthorized changes and rollback relative to intact
+trusted local state, not withheld newer updates or absolute freshness.
+Physical-device acceptance remains a release gate.
+.Pp
+Cross-account vault sharing is not yet implemented as a supported feature.
+Preliminary code would share the enrollment mailbox's zone.
+Account-private mailbox isolation must be addressed when implementing sharing.
+This is a design detail, not a current product vulnerability;
+see docs/SECURITY.md.
 .Sh SEE ALSO
-The project README, docs/SECURITY.md and docs/VAULT-NEXT-VALIDATION.md describe
-workflows, precise platform boundaries and remaining physical-device checks.
-
-.SH ICLOUD DEVICE ENROLLMENT
+The project README, docs/SECURITY.md and docs/VAULT-NEXT-VALIDATION.md
+describe workflows, precise platform boundaries and remaining physical-device
+checks.
+.Sh ICLOUD DEVICE ENROLLMENT
 Use vault enrollment request on the new device, inbox on an existing owner,
-status and confirm --code MATCHING_CODE on the new device, then approve --request-id UUID --code MATCHING_CODE on
-the owner after comparing both displays. A final status finishes enrollment.
-The app performs these exchanges automatically; explicit owner approval remains
-required. Decline rejects a request. Requests expire after one day. This flow
-is for the same Apple Account; sharing with another account remains separate.
-
+status and confirm --code MATCHING_CODE on the new device, then approve
+--request-id UUID --code MATCHING_CODE on the owner after comparing both
+displays.
+A final status finishes enrollment.
+The CLI commands provide a manual diagnostic exchange.
+The app performs same-account enrollment automatically without required human
+code comparison or approval; a concurrent unlocked owner app may grant a
+pending request.
+Decline rejects a request.
+Requests expire after one day.
+This flow is for the same Apple Account; sharing with another account remains
+separate.
+.Pp
 Use enrollment restart on the new device to replace a stuck request without
-replacing its hardware keys. Enrollment cancel stops the pending request.
+replacing its hardware keys.
+Enrollment cancel stops the pending request.
 Neither command deletes vault contents or revokes access already granted.
 The app displays request status, expiry and the last successful iCloud check.
-.SH DEVICE REMOVAL
-.B 2ndpass vault devices
+.Sh DEVICE REMOVAL
+.Sy 2ndpass vault devices
 lists own-account devices across enrolled personal vaults.
-.B 2ndpass vault devices --remove UUID
-revokes a device across those vaults. The last owner device cannot be removed.
-The removed device clears its local access after observing the signed revocation.
-.B 2ndpass vault enrollment reconnect
+.Sy 2ndpass vault devices --remove UUID
+revokes a device across those vaults.
+The last owner device cannot be removed.
+The removed device clears its local access after observing the signed
+revocation.
+.Sy 2ndpass vault enrollment reconnect
 explicitly permits fresh-key enrollment after removal; follow it with
-.B 2ndpass vault enrollment request --vault UUID
+.Sy 2ndpass vault enrollment request --vault UUID
 while another owner device is unlocked.

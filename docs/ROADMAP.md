@@ -1,6 +1,6 @@
 # Project direction and roadmap
 
-**V6 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](VAULT-NEXT-VALIDATION.md); remaining physical acceptance is not implied by historical build notes below.
+**Current v7 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](V7-VALIDATION-2026-09-27.md); remaining physical acceptance is not implied by historical build notes below.
 
 2ndPass is an open-source, Apple-native password and secrets manager built for the
 command line. It began with a practical need: keep passwords and other secrets
@@ -45,9 +45,9 @@ Handle plaintext interchange files explicitly and explain their exposure.
 
 Import now supports common CSV exports, Bitwarden JSON, and 1Password 1PUX; see
 [Importing password-manager data](IMPORT.md). Portable third-party export remains
-planned; encrypted v6 2ndPass backup export remains available. For future format changes, prioritize preserving access to
+planned; encrypted v7 2ndPass backup export remains available. For future format changes, prioritize preserving access to
 existing user data and provide an explicit compatibility or migration path.
-This does not change the current rejection of pre-v6 formats.
+This does not change the current rejection of pre-v7 formats.
 
 ### 2. Make runtime access exceptionally reliable
 
@@ -98,8 +98,9 @@ paid, maintained distribution can coexist.
   primary credential manager. Their hardware and recovery model needs a separate
   design and acceptance effort.
 
-Shared vaults are now implemented together with device hardware protection in v6.
-Their cross-account and physical-device release gates remain outstanding. Removing
+Device hardware protection is implemented. Cross-account vault sharing remains
+an unfinished feature with preliminary code; mailbox isolation and cross-account
+physical-device validation are part of completing it. Removing
 access cannot retract secrets already copied by a recipient.
 
 Passkeys are not a prerequisite for an initial open-source release. Prioritize

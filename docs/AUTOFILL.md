@@ -75,7 +75,19 @@ Both App IDs need AutoFill Credential Provider and the App Group
 same CloudKit container (`iCloud.com.koehn.mop`) and existing Keychain group
 `<AppIdentifierPrefix>com.koehn.mop`. Regenerate both profiles after enabling these
 capabilities. Keep the app's existing identifier/group so existing keys remain
-accessible. The Mac extension is sandboxed and uses the hardened runtime.
+accessible. The Mac extension is sandboxed and uses the hardened runtime. The packaged Mac
+app and CLI do not enable App Sandbox; iOS/iPadOS apply their platform sandbox.
+The Keychain access group authorizes identity access, the App Group shares local
+files, and CloudKit entitlements authorize container access. These are distinct
+capabilities. The extension intentionally has access to the same hardware-bound
+device identity, so its code is part of the vault's trusted computing base.
+
+Non-exportable device private keys do not prevent an authorized extension or
+sufficiently privileged malware from using keys during an unlocked operation.
+Decrypted item keys and the filled password/code reach normal memory. Once
+AuthenticationServices delivers the credential, the OS and destination app/site
+control its subsequent use; fresh fill authentication does not encrypt that
+plaintext destination.
 
 The `Mop` Xcode scheme builds and embeds MopAutoFill on both platforms. The separate
 MopAutoFill scheme supports the Mac packaging script. For that script, supply

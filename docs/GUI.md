@@ -1,16 +1,16 @@
 # Native app
 
-The SwiftUI Mac/iPhone/iPad app, CLI and AutoFill use the same v6 service and
+The SwiftUI Mac/iPhone/iPad app, CLI and AutoFill use the same v7 service and
 device-local identity. Old-format vaults are not displayed or converted.
 
 ## Guided setup
 
-Successful iCloud discovery with no v6 vaults opens **Create a vault**. Enter a
+Successful iCloud discovery with no v7 vaults opens **Create a vault**. Enter a
 name (the displayed Personal default creates `personal`) and authenticate; 2ndPass generates the device’s hardware keys and opens the
 vault immediately. Recovery is optional and does not block creation. A notice
 explains the risk of losing the only authorized device.
 
-When iCloud contains v6 vaults that this device cannot access, **Connect this
+When iCloud contains v7 vaults that this device cannot access, **Connect this
 device** opens instead. Selecting an unenrolled vault also opens that flow.
 Discovery does not authenticate cloud data or create a local trust pin. Failed
 CloudKit discovery reports an error rather than claiming the account is empty.
@@ -31,7 +31,13 @@ the OS suspends an app is not guaranteed. Retry and restart remain available.
 **Share with another person** is separate: choose editor/viewer access and use
 the private iCloud share URL during acceptance. Cloud enrollment is private-database/same-account only; other-account sharing
 uses the separate explicit invitation and permission flow.
-Explicit approval remains necessary for cross-account sharing.
+These cross-account controls are preliminary: vault sharing is not yet a
+completed, supported feature. The [mailbox design detail](SECURITY.md#shared-zone-enrollment-exposure)
+must be addressed when implementing sharing; it is not a current vulnerability. Same-account
+bootstrap deliberately relies on Apple's account/device security and provisioned,
+entitlement-protected private CloudKit access; credentials alone do not grant
+container writes. See [the threat model](SECURITY.md#automatic-same-account-enrollment)
+for automatic admission risks when that access path is compromised.
 
 **Set up or replace hardware recovery** can be used after secrets are saved.
 Generate the recovery request on a separate device and import it on an owner
@@ -42,7 +48,7 @@ checkpoint import and cloud permission reconciliation.
 
 ## Items and sessions
 
-The existing item editor supports typed fields, renaming, password-strength metadata, concealed values, TOTP, trash/restore and encrypted backup export. Catalog browsing opens its own key; revealing a password opens that record's key. Values passed to an edit are plaintext inside 2ndPass. The catalog stores concealed fields without values.
+The existing item editor supports typed fields, renaming, password-strength metadata, concealed values, TOTP, trash/restore and encrypted backup export. Catalog browsing opens its own key; revealing a password opens that item's key. Values passed to an edit are plaintext inside 2ndPass. The catalog stores concealed fields without values.
 
 2ndPass attempts authentication once at launch while active. After cancelling, locking,
 inactivity expiry, or waking from system lock, choose **Unlock 2ndPass** to authenticate.
@@ -68,7 +74,9 @@ and termination clear drafts and reject late results immediately. Security locki
 never waits for an unsaved-changes dialog. Drafts are not persisted across lock or
 restart; save important changes before leaving the session.
 
-Offline browsing is explicit and read-only. It cannot establish remote freshness or revocation. The CLI and GUI share device-local app-group checkpoints; never synchronize their local state directory.
+Unlock opens the selected vault from its verified local checkpoint after authentication and account validation, when a checkpoint is available. The UI is read-only while that cached catalog is displayed. An immediate background sync checks for changes, deletion, and revocation; successful refresh enables editing. Without a local checkpoint, unlock fetches the vault online first. Network failures preserve read-only access to the verified cache; trust, account, and access failures clear the session.
+
+Cached browsing cannot establish remote freshness or revocation. Local checkpoint verification and catalog decryption still occur during unlock, so their cost grows with vault size. The CLI and GUI share device-local app-group checkpoints; never synchronize their local state directory.
 
 ## Recovery
 
