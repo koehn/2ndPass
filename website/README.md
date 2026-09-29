@@ -34,6 +34,7 @@ The production build checks local links, anchors, missing assets, and duplicate 
 | `src/index.njk` | Landing page and feature overview |
 | `src/docs.md` | User documentation and command examples |
 | `src/security.md` | Security model, boundaries, and validation status |
+| `src/privacy.md` | Website/app data collection policy and service boundaries |
 | `src/faq.md` | Project origin and frequently asked questions |
 | `src/_includes/base.njk` | Shared head, navigation, and footer |
 | `src/_includes/guide.njk` | Documentation layout and table of contents |
@@ -54,7 +55,10 @@ The security copy follows the repository's `docs/SECURITY.md`, `docs/VAULT-V7.md
 and validation records. `vault.html` and `vault-validation.html` are generated from
 the canonical v7 documents by `src/_data/vaultDocuments.js`; update that manifest
 when publishing a newer validation record. Their linked profiling data is also
-included in the build. Update public claims when implementation or acceptance
+included in the build. When publishing new profiling files, explicitly review and add
+their output paths to `PUBLIC_PROFILING` in `deploy.py`; arbitrary JSONL logs are
+not permitted for deployment. Run `python3 website/test_deploy.py` from the
+repository root to check that boundary. Update public claims when implementation or acceptance
 status changes. The origin FAQ separates the creator's judgment from the linked
 funding announcement and news reporting, reviewed September 27, 2026.
 

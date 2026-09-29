@@ -84,7 +84,7 @@ There is no separate 2ndPass service account. Synchronization uses your Apple Ac
 
 That does not make iCloud irrelevant to security: Apple account/device security and provisioned, entitlement-protected container access are trusted during own-device enrollment before an owner grants cryptographic membership, and cloud metadata is not all concealed. Read the [iCloud trust boundary](security.html#icloud).
 
-This public website uses no analytics, cookies, or third-party scripts. A hosting provider may still process ordinary access logs. Following an external link takes you to that provider’s site.
+We do not collect personal data through the website or app. This website uses no analytics, cookies, or third-party scripts. Read the [privacy page](privacy.html) for details, including Apple services, hosting-provider logs, and data you choose to send elsewhere.
 
 ### Can I use it offline?
 

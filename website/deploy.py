@@ -7,6 +7,24 @@ import shlex
 import subprocess
 
 ROOT = Path(__file__).resolve().parent
+PUBLIC_PROFILING = {
+    'profiling/v7-cloud-2026-09-27.jsonl',
+    'profiling/v7-engine-hardware-2026-09-27.jsonl',
+    'profiling/v7-engine-software-2026-09-27.jsonl',
+}
+
+
+def validate_output(output):
+    if not (output / 'index.html').is_file():
+        raise ValueError('Build the site first: just site-build')
+    # Only the reviewed measurements linked by the validation page are public.
+    # Do not allow arbitrary JSONL logs merely because the build copied them.
+    for path in output.rglob('*'):
+        relative = path.relative_to(output).as_posix()
+        if path.is_symlink() or (path.is_file() and
+                path.suffix not in {'.html', '.css', '.js', '.png', '.txt', '.xml'} and
+                relative not in PUBLIC_PROFILING):
+            raise ValueError(f'Unexpected public output: {relative}')
 
 
 def commands(bucket, prefix, distribution):
@@ -44,13 +62,7 @@ def main():
     try:
         plan = commands(args.bucket, args.prefix, args.distribution)
         output = ROOT / 'dist'
-        if not (output / 'index.html').is_file():
-            raise ValueError('Build the site first: just site-build')
-        # Refuse accidental private files or links added to the public output.
-        for path in output.rglob('*'):
-            if path.is_symlink() or (path.is_file() and path.suffix not in
-                                    {'.html', '.css', '.js', '.png', '.txt', '.xml'}):
-                raise ValueError(f'Unexpected public output: {path.relative_to(output)}')
+        validate_output(output)
         subprocess.run(['python3', str(ROOT / 'check.py')], check=True)
         for command in plan:
             print(shlex.join(command), flush=True)
