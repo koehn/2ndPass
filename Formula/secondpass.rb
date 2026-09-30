@@ -1,8 +1,9 @@
 class Secondpass < Formula
   desc "Manage encrypted secrets with your Mac's Secure Enclave"
   homepage "https://2ndpass.app"
-  license "MIT"
-  head "https://github.com/koehn/mop.git", branch: "main"
+  # All rights reserved; builds require separate authorization. See LICENSE.
+  license :cannot_represent
+  head "https://github.com/koehn/2ndPass.git", branch: "main"
 
   depends_on xcode: ["16.0", :build]
   depends_on macos: :sequoia

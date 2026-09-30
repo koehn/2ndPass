@@ -25,6 +25,13 @@ struct SSHAgent: ParsableCommand {
     @Option(help: "ssh or git-signing") var purpose: String = "ssh"
     @Option(name: .customLong("identity"), help: "Identity name, UUID, or sp://VAULT/NAME; may be repeated") var identities: [String] = []
 
+    @Option(help: "Standalone approval lifetime in seconds, scoped to the requesting process and key (1–43200).")
+    var approvalSeconds: Int = 300
+
+    func validate() throws {
+        guard (1...43200).contains(approvalSeconds) else { throw ValidationError("--approval-seconds must be between 1 and 43200.") }
+    }
+
     func run() throws {
         guard let purpose = LocalIdentityProtocol(rawValue: purpose), [.ssh, .gitSigning].contains(purpose) else { throw MopError.localIdentityCapability }
         let selections = try identities.map { try IdentitySelection($0, vault: vault) }
@@ -43,10 +50,9 @@ struct SSHAgent: ParsableCommand {
         let ids = Set(rows.map(\.id))
         guard selected.isSubset(of: ids) else { throw MopError.notFound }
         guard !ids.isEmpty else { throw ValidationError("No \(purpose.rawValue) identities were found in the selected vault.") }
-        let context = try LocalAuthorization.authorize(reason: "authorize the \(purpose.rawValue) agent session", ids: ids, purposes: [purpose], operations: [.sign], oneShot: false)
-        defer { context.revoke() }
-        let backend = try StoreSSHAgentBackend(store: store, authorization: context, purpose: purpose, ids: ids)
-        let agent = MopLocalIdentity.SSHAgent(backend: backend)
+        let session = try SSHAgentSession(store: store, purpose: purpose, ids: ids, wrapped: !command.isEmpty, approvalLifetime: TimeInterval(approvalSeconds))
+        defer { session.stop() }
+        let agent = MopLocalIdentity.SSHAgent(connectionBackend: { try session.backend(socket: $0) }, onStop: { session.stop() })
         var template = Array("/tmp/sp-agent-XXXXXX".utf8CString)
         guard let directory = mkdtemp(&template) else { throw MopError.inputOutput }
         let directoryPath = String(cString: directory)
@@ -62,7 +68,7 @@ struct SSHAgent: ParsableCommand {
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { group.leave() }
                 do {
-                    try agent.serve(socketPath: socketPath, whileActive: { context.isActive }, onReady: {
+                    try agent.serve(socketPath: socketPath, whileActive: { session.isActive }, onReady: {
                         startup.withLock { $0 = .success(()) }; ready.signal()
                     })
                 } catch { startup.withLock { $0 = .failure(error) }; ready.signal() }
@@ -75,7 +81,7 @@ struct SSHAgent: ParsableCommand {
                 group.wait()
                 IO.diagnostic("agent socket removed.\n")
             }
-            let status = try Self.runChild(command, environment: Self.childEnvironment(sshAgentSocket: socketPath))
+            let status = try TerminalExecute.run(command, environment: Self.childEnvironment(sshAgentSocket: socketPath).mapValues { SecretBytes(utf8: $0) }, onSpawn: { try session.setCommand($0) }, onExit: { agent.stop() })
             throw ExitCode(status)
         }
 
@@ -83,7 +89,7 @@ struct SSHAgent: ParsableCommand {
         let handlers = signals.map { signal($0, SIG_IGN) }
         let sources = signals.map { number in
             let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
-            source.setEventHandler { context.revoke(); agent.stop() }
+            source.setEventHandler { session.stop(); agent.stop() }
             source.resume(); return source
         }
         defer {
@@ -91,7 +97,7 @@ struct SSHAgent: ParsableCommand {
             for (number, handler) in zip(signals, handlers) { signal(number, handler) }
         }
         IO.diagnostic("SSH_AUTH_SOCK=\(socketPath)\n")
-        try agent.serve(socketPath: socketPath, whileActive: { context.isActive })
+        try agent.serve(socketPath: socketPath, whileActive: { session.isActive })
     }
 
     static func validatePurpose(_ actual: LocalIdentityProtocol, requested: LocalIdentityProtocol, reference: String) throws {

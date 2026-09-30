@@ -12,7 +12,7 @@ private func relayTerminalSignal(_ number: Int32) {
 /// stay in the shell's foreground process group so the child can use the terminal.
 /// Like MaskedExecute, this is called once by the CLI and owns signal handlers.
 enum TerminalExecute {
-    static func run(_ arguments: [String], environment: [String: SecretBytes]) throws -> Int32 {
+    static func run(_ arguments: [String], environment: [String: SecretBytes], onSpawn: ((pid_t) throws -> Void)? = nil, onExit: () -> Void = {}) throws -> Int32 {
         try Execute.validate(arguments)
         let environmentBlock = try EnvironmentBlock(environment)
         let pointers = arguments.map { strdup($0) }
@@ -38,7 +38,7 @@ enum TerminalExecute {
         // Deliberately omit SETPGROUP: creating a background group stops terminal I/O.
         guard posix_spawnattr_setsigdefault(&attributes, &defaults) == 0,
               posix_spawnattr_setsigmask(&attributes, &mask) == 0,
-              posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0 else {
+              posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT | (onSpawn == nil ? 0 : POSIX_SPAWN_START_SUSPENDED))) == 0 else {
             throw MopError.launch
         }
         terminalPendingSignal = 0
@@ -65,6 +65,18 @@ enum TerminalExecute {
         }
         guard spawned else { throw denied ? MopError.launch : MopError.executableNotFound }
         terminalChild = child
+        defer { onExit() }
+        if let onSpawn {
+            do {
+                try onSpawn(child)
+                guard kill(child, SIGCONT) == 0 else { throw MopError.launch }
+            } catch {
+                _ = kill(child, SIGKILL)
+                var failedStatus: Int32 = 0
+                while waitpid(child, &failedStatus, 0) < 0 && errno == EINTR {}
+                throw error
+            }
+        }
         if terminalPendingSignal != 0 { _ = kill(child, terminalPendingSignal) }
         var status: Int32 = 0
         var waited: pid_t

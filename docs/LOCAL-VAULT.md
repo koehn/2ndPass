@@ -30,13 +30,40 @@ acknowledgement flag. Passkeys are created through a website’s WebAuthn flow,
 not by manufacturing a generic key through the CLI. Generic signing and ECDH
 are internal consumers only; there is no arbitrary-data signing command.
 
-The agent authorizes selected identities once per explicitly started session.
+The agent starts and lists public keys without authentication. A valid signing
+request triggers system authentication for the selected identity and requesting
+process. Invalid payloads and purpose mismatches are rejected before prompting.
 It offers only SSH keys by default; `--purpose git-signing` selects Git identities.
-Repeat `--identity` to limit the identities offered. Authorization ends on expiry
-(12 hours maximum), stop, child exit, device lock/sleep, or detection of a deleted
-identity. Only SSH authentication payloads and Git SSHSIG payloads in the `git`
-namespace are accepted for their respective purposes. No destination binding,
-agent forwarding restrictions, or arbitrary `ssh-add -T` signing are promised.
+Repeat `--identity` to limit the identities offered.
+
+With `-- COMMAND`, only that command and its current descendants may use the
+socket. Approval of each key lasts for the command tree's lifetime (at most 12
+hours). The command starts suspended until its process instance is recorded.
+Without a command, each connecting process instance and key needs separate
+approval, remembered for 300 seconds by default. Set `--approval-seconds N` for
+standalone sessions (1–43200 seconds). This deliberately does not grant approval
+to every process belonging to the same terminal application.
+
+The approval prompt names the requesting executable path, PID, identity, purpose,
+and approval lifetime. It does not claim to verify a remote destination. The
+kernel socket audit token, executable generation, same-user credentials, process
+start time, and (in wrapped mode) ancestry are checked before use and after
+approval/signing. Reparented or unverifiable callers fail closed. New connections
+from unrelated processes are rejected in wrapped mode, even for key listing.
+
+Device lock/sleep, session switching, agent stop, wrapped command exit, or detection
+of a deleted selected identity revokes authorization. Agents have a 12-hour maximum
+lifetime and do not automatically restart after lock/sleep. Expired standalone key
+approvals require fresh authentication. Pending prompts are invalidated on stop;
+late results are discarded. Only SSH authentication payloads and Git SSHSIG
+payloads in the `git` namespace are accepted for their respective purposes.
+
+Caller checks cannot protect an already-authorized process from code injection,
+or distinguish requests that it deliberately proxies or sends through a passed
+socket. No destination binding or remote agent-forwarding restrictions are claimed.
+Do not enable agent forwarding unless you intend to trust the remote host with
+signing requests during the authorized session. Arbitrary `ssh-add -T` signing
+is not supported by the purpose-restricted production agent.
 
 Sockets live in a fresh owner-only directory with mode 0600 on the socket. Startup
 uses explicit readiness/error reporting; 32 clients and 1 MiB frames bound socket

@@ -2,7 +2,7 @@
 
 **Current v7 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](V7-VALIDATION-2026-09-27.md); remaining physical acceptance is not implied by historical build notes below.
 
-2ndPass is an open-source, Apple-native password and secrets manager built for the
+2ndPass is an Apple-native password and secrets manager built for the
 command line. It began with a practical need: keep passwords and other secrets
 in an encrypted vault and make them available to commands at runtime, without
 depending on a separate password-manager vendor.
@@ -16,12 +16,13 @@ This document describes direction, not features already delivered or a release
 schedule. The [README](../README.md) describes current behavior, and
 [validation](VALIDATION.md) defines release acceptance requirements.
 
-## Open source first
+## Source availability first
 
-Keep the project open source under its existing [MIT license](../LICENSE).
-Prioritize useful documentation, inspectable implementation, and a practical path
-for others to build and maintain it. Publishing source enables review; it does not
-by itself establish security or guarantee contributors and support.
+Publish the source for inspection and security review under the [copyright notice](../LICENSE).
+All rights are reserved by Koehn Consulting, Inc. Viewing and analysis are permitted;
+building, modifying, executing, or distributing the code requires separate authorization.
+Prioritize useful documentation and inspectable implementation. Publishing source
+enables review; it does not by itself establish security or guarantee support.
 
 The initial audience is Apple-using developers who want personal passwords and
 runtime secrets in one native application. A useful, sustainable project for
@@ -89,7 +90,7 @@ not a prerequisite for the project's success. Evaluate Mac App Store packaging
 and CLI compatibility before committing to that channel. A paid app or one-time
 unlock with a clear future-upgrade policy is the initial commercial direction to
 explore; pricing and a business model are not decided. Access to existing
-credentials and export should not depend on continued payment. Open source and
+credentials and export should not depend on continued payment. Source availability and
 paid, maintained distribution can coexist.
 
 ## Features deferred until there is a demonstrated need
@@ -103,7 +104,7 @@ an unfinished feature with preliminary code; mailbox isolation and cross-account
 physical-device validation are part of completing it. Removing
 access cannot retract secrets already copied by a recipient.
 
-Passkeys are not a prerequisite for an initial open-source release. Prioritize
+Passkeys are not a prerequisite for an initial release. Prioritize
 the original runtime-secrets problem, user control, and reliable operation over
 feature parity. Future expansion should follow the maintainer's needs or evidence
 from people actually using 2ndPass.

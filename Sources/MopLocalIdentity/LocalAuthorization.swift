@@ -24,15 +24,16 @@ public final class LocalAuthorization: @unchecked Sendable {
         self.context = context; self.ids = ids; self.purposes = purposes; self.operations = operations
         self.expires = expires; self.oneShot = oneShot
     }
-    public static func authorize(reason: String, ids: Set<UUID>, purposes: Set<LocalIdentityProtocol>, operations: Set<LocalKeyOperation>, oneShot: Bool = true) throws -> LocalAuthorization {
-        let value = LocalAuthorization(context: try Authentication.authorize(reason: reason), ids: ids, purposes: purposes, operations: operations, expires: Date().addingTimeInterval(oneShot ? 60 : 43200), oneShot: oneShot)
+    public static func authorize(reason: String, ids: Set<UUID>, purposes: Set<LocalIdentityProtocol>, operations: Set<LocalKeyOperation>, oneShot: Bool = true, lifetime: TimeInterval? = nil, contextCreated: (LAContext) throws -> Void = { _ in }) throws -> LocalAuthorization {
+        if let lifetime { guard lifetime.isFinite, lifetime > 0, lifetime <= 43200 else { throw MopError.authentication } }
+        let value = LocalAuthorization(context: try Authentication.authorize(reason: reason, contextCreated: contextCreated), ids: ids, purposes: purposes, operations: operations, expires: Date().addingTimeInterval(lifetime ?? (oneShot ? 60 : 43200)), oneShot: oneShot)
         value.watchDeviceState(); return value
     }
     public static func authorizeAsync(reason: String, ids: Set<UUID>, purposes: Set<LocalIdentityProtocol>, operations: Set<LocalKeyOperation>, oneShot: Bool = true) async throws -> LocalAuthorization {
         let value = LocalAuthorization(context: try await Authentication.authorizeAsync(reason: reason), ids: ids, purposes: purposes, operations: operations, expires: Date().addingTimeInterval(oneShot ? 60 : 43200), oneShot: oneShot)
         value.watchDeviceState(); return value
     }
-    private func watchDeviceState() {
+    func watchDeviceState() {
         // A dedicated run loop also receives lock notifications while the CLI waits
         // for a foreground ssh/git child. No key handle is retained by this thread.
         let ready = DispatchSemaphore(value: 0)

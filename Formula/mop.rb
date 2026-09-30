@@ -1,9 +1,9 @@
 class Mop < Formula
   desc "Manage encrypted secrets with your Mac's Secure Enclave"
-  homepage "https://github.com/koehn/mop"
-  url "https://github.com/koehn/mop/archive/38a1cccd7ea18794a04ac5cff6f571cc92a9d29f.tar.gz"
+  homepage "https://github.com/koehn/2ndPass"
+  url "https://github.com/koehn/2ndPass/archive/38a1cccd7ea18794a04ac5cff6f571cc92a9d29f.tar.gz"
   version "0.3.0"
-  sha256 "e921fd4dee0da4e8372f55d32f2f0df508eb7fc65f3a01364d34ab108805151d"
+  sha256 "8be1d9c2ccc907df25a20c32410b8d721e3433f8a493182ab8cde096e5e009d3"
   license "MIT"
 
   depends_on xcode: ["16.0", :build]

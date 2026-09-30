@@ -216,7 +216,8 @@ final class SSHAgentIO {
 /// a Unix socket and performs ECDSA signatures in the Secure Enclave. It never
 /// imports, exports, or deletes keys and never writes private material.
 public final class SSHAgent: @unchecked Sendable {
-    private let backend: SSHAgentBackend
+    private let connectionBackend: (Int32) throws -> any SSHAgentBackend
+    private let onStop: () -> Void
     private let lock = NSLock()
     private let backendLock = NSLock()
     private var started = false
@@ -224,7 +225,13 @@ public final class SSHAgent: @unchecked Sendable {
     private var clients = Set<Int32>()
 
     public init(backend: SSHAgentBackend) {
-        self.backend = backend
+        self.connectionBackend = { _ in backend }
+        self.onStop = {}
+    }
+
+    public init(connectionBackend: @escaping (Int32) throws -> any SSHAgentBackend, onStop: @escaping () -> Void) {
+        self.connectionBackend = connectionBackend
+        self.onStop = onStop
     }
 
     /// Serve independent client connections until stopped. An instance is single-use.
@@ -288,6 +295,7 @@ public final class SSHAgent: @unchecked Sendable {
     /// Wake all connected readers/writers. The listener checks cancellation at
     /// most 100ms later, and serve waits for every worker before returning.
     public func stop() {
+        onStop()
         lock.withLock {
             stopped = true
             // Keep the lock through shutdown so a worker cannot close an fd and
@@ -309,6 +317,7 @@ public final class SSHAgent: @unchecked Sendable {
         var noSigPipe: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         defer { finishConnection(fd) }
+        guard let backend = try? connectionBackend(fd) else { return }
         let io = SSHAgentIO(fd: fd)
         while true {
             guard let length = io.readUInt32(), length >= 1, length <= 1024 * 1024 else { break }
@@ -322,7 +331,7 @@ public final class SSHAgent: @unchecked Sendable {
                 return (try? SSHAgentFraming.handle(command: command, payload: payload, backend: backend))
                     ?? SSHAgentFraming.simple(SSHAgentCommand.failure)
             }
-            guard io.writeAll(SSHAgentFraming.frame(response)) else { break }
+            guard !isStopped, io.writeAll(SSHAgentFraming.frame(response)) else { break }
         }
     }
 

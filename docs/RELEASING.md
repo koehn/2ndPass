@@ -1,7 +1,9 @@
 # Releasing 2ndPass
 
 The public app name is **2ndPass**, its executable is `sp`, and its domain is
-`2ndpass.app`. The repository remains at `github.com/koehn/mop`.
+`2ndpass.app`. The repository is at `github.com/koehn/2ndPass`.
+
+These release procedures are for the copyright holder and separately authorized maintainers. The [copyright notice](../LICENSE) permits public inspection and analysis only.
 
 ## Signed application releases
 
@@ -19,7 +21,7 @@ Before release, update versions and complete the current checks in
 AutoFill, recovery, cross-account sharing, and Production CloudKit acceptance.
 Historical audit results do not establish current release readiness. 2ndPass has
 not yet received an independent security audit. Review both protocol correctness
-and implementation correctness; open source is not a substitute. The
+and implementation correctness; source availability is not a substitute. The
 [documentation audit](security-audit/2026-09-29-documentation.md) lists trust-boundary
 questions for acceptance and the eventual auditor.
 
@@ -38,7 +40,7 @@ After publishing a compatible source tag, maintainers can prepare metadata for
 the development formula with:
 
 ```sh
-python3 scripts/prepare-homebrew-release.py vMAJOR.MINOR.PATCH --license MIT
+python3 scripts/prepare-homebrew-release.py vMAJOR.MINOR.PATCH --license cannot_represent
 python3 scripts/test-homebrew-release.py
 ```
 

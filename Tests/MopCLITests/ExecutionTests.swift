@@ -23,6 +23,19 @@ import MopCore
         return (status, try Data(contentsOf: outURL), try Data(contentsOf: errURL))
     }
 
+    @Test func wrappedChildWaitsForScopeRegistrationAndRevokesAtExit() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: file) }
+        var registered = false, exited = false
+        let status = try TerminalExecute.run(["/usr/bin/touch", file.path], environment: [:], onSpawn: { pid in
+            #expect(pid > 0)
+            #expect(!FileManager.default.fileExists(atPath: file.path))
+            registered = true
+        }, onExit: { exited = true })
+        #expect(status == 0 && registered && exited)
+        #expect(FileManager.default.fileExists(atPath: file.path))
+    }
+
     @Test func agentChildStaysInParentProcessGroup() throws {
         let status = try SSHAgent.runChild(
             ["/usr/bin/python3", "-c", "import os,sys; sys.exit(0 if os.getpgrp() == int(sys.argv[1]) else 42)", String(getpgrp())],

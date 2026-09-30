@@ -1,6 +1,8 @@
 # Homebrew and 2ndPass
 
-The supported way to access current vaults is the [signed application build](../README.md#signed-source-build).
+Current source is published for inspection and security review only. These build instructions and the `secondpass` formula are for the copyright holder and separately authorized users. Contact Koehn Consulting, Inc. for licensing; see the [copyright notice](../LICENSE).
+
+The supported way to access current vaults is the [signed application build](../README.md#build-and-provision).
 The application and CLI require a provisioned bundle with CloudKit, App Groups,
 and Keychain access. An ad-hoc Homebrew executable cannot access those keys.
 
@@ -11,16 +13,17 @@ is published, there is no stable 2ndPass source archive. This formula is useful
 for development and non-secret CLI checks, not as a working vault installation.
 
 ```sh
-brew tap koehn/mop https://github.com/koehn/mop
-brew install --HEAD koehn/mop/secondpass
+brew tap koehn/2ndpass https://github.com/koehn/2ndPass
+brew install --HEAD koehn/2ndpass/secondpass
 sp --help
 man sp
-brew test koehn/mop/secondpass
+brew test koehn/2ndpass/secondpass
 ```
 
 The formula name is `secondpass`; the executable is `sp`. The existing GitHub
-repository and tap still use `mop`. `Formula/mop.rb` remains pinned to the historical
-0.3.0 release and does not track HEAD.
+repository is `koehn/2ndPass`; Homebrew normalizes the tap name to `koehn/2ndpass`. `Formula/mop.rb` remains pinned to the historical
+0.3.0 release and does not track HEAD. Its MIT license describes that historical
+release; the current `secondpass` formula has no public build or redistribution license.
 
 A future supported Homebrew distribution should install the signed, provisioned
 app bundle, for example through a cask. See [release guidance](RELEASING.md).

@@ -152,7 +152,7 @@ Secure Enclave keys, saved-key reloads and private iCloud storage on a Mac, alon
 with automated tests for access, tampering, enrollment, removal and recovery.
 
 2ndPass is not yet independently audited. Protocol correctness and implementation
-correctness require separate scrutiny; open source does not replace professional
+correctness require separate scrutiny; source availability does not replace professional
 review. Validation is still in progress. Sharing between two real Apple Accounts,
 recovery on separate physical devices, and signed iPhone/iPad and AutoFill
 workflows still need the physical-device checks recorded in the

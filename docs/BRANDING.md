@@ -24,7 +24,9 @@ The following deliberately retain their original names:
 - Device-key service names, local `Mop`/`MopV7` directories, preferences, cloud
   record/subscription identifiers, cryptographic domains, and backup format markers.
 - Swift modules, Xcode project/schemes, and internal Info.plist configuration keys.
-- Existing GitHub repository URLs and dated security-audit evidence.
+- Dated security-audit evidence.
+
+The GitHub repository is now [koehn/2ndPass](https://github.com/koehn/2ndPass).
 
 Stable application/container/access-group identifiers preserve the platform
 identity across product renames. The separate v7 protocol cutover deliberately

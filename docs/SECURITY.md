@@ -519,7 +519,7 @@ Apple Passwords/iCloud Keychain is integrated deeper into the operating system;
 its full implementation is not publicly inspectable. 2ndPass makes its
 non-exportable device identity and per-item wrapping an explicit, inspectable
 part of its end-to-end vault protocol. This is a concrete design distinction,
-not evidence that 2ndPass is categorically more secure. Open source enables
+not evidence that 2ndPass is categorically more secure. Source availability enables
 inspection but does not substitute for professional review.
 
 ## Attacks and practical limits
@@ -602,3 +602,26 @@ passkey is not backup eligibility for the first credential. Apple credential-pro
 acceptance of these flags requires physical-device validation and may prevent use
 on current platforms. See [local vault operation and acceptance](LOCAL-VAULT.md).
 2ndPass is not FIPS certified and makes no blanket Apple-module certification claim.
+
+### SSH agent caller authorization
+
+The local SSH agent authenticates only after receiving a valid signing request;
+public-key enumeration needs no authentication. Wrapped-command mode restricts
+connections to the recorded command process instance and its current descendants.
+Standalone approvals are scoped to the exact kernel-audited process instance and
+identity, defaulting to five minutes, rather than all clients with the socket path.
+macOS peer audit tokens and `proc_pidpath_audittoken` detect exited/reused/exec-changed
+peers; process start times and repeated ancestry checks bind wrapped requests to
+the launched command. Unverifiable callers fail closed. Inputs are purpose-checked
+before authentication and authorization/caller validity is checked again before
+returning signatures. Stop cancels pending authentication and revokes cached contexts.
+Device lock/sleep and user-session switching stop the agent, as does the 12-hour
+session limit. Wrapped command exit revokes its approvals immediately.
+
+This is an operation-access boundary, not protection against code injection into
+an authorized process. A cooperating authorized process can relay requests or
+pass its socket; peer identity does not authenticate the original source behind
+such a relay. Destination binding and forwarding restrictions are not implemented.
+The system authentication prompt identifies the local executable and key but does
+not claim a verified remote host. Physical-device review must exercise Touch ID,
+lock/sleep during an outstanding prompt, and late Secure Enclave results.

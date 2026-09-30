@@ -24,7 +24,7 @@ class ReleaseTests(unittest.TestCase):
                 files["LICENSE"] = "Test license fixture"
             for name, contents in files.items():
                 data = contents.encode()
-                member = tarfile.TarInfo("mop-0.3.1/" + name)
+                member = tarfile.TarInfo("2ndPass-0.3.1/" + name)
                 member.size = len(data)
                 source.addfile(member, io.BytesIO(data))
         with tempfile.TemporaryDirectory() as directory:
@@ -34,7 +34,7 @@ class ReleaseTests(unittest.TestCase):
             original = (ROOT / "Formula/secondpass.rb").read_text()
             formula.write_text(original)
             with patch.object(prepare, "__file__", str(root / "scripts/prepare-homebrew-release.py")), \
-                 patch.object(sys, "argv", ["prepare", "v0.3.1", "--license", "MIT"]), \
+                 patch.object(sys, "argv", ["prepare", "v0.3.1", "--license", "cannot_represent"]), \
                  patch.object(prepare.urllib.request, "urlopen", return_value=io.BytesIO(archive.getvalue())):
                 if version != "0.3.1" or not license_file:
                     with self.assertRaises((ValueError, KeyError)):
@@ -43,8 +43,8 @@ class ReleaseTests(unittest.TestCase):
                 else:
                     prepare.main()
                     updated = formula.read_text()
-                    self.assertIn('/archive/refs/tags/v0.3.1.tar.gz"', updated)
-                    self.assertIn('  license "MIT"', updated)
+                    self.assertIn('https://github.com/koehn/2ndPass/archive/refs/tags/v0.3.1.tar.gz"', updated)
+                    self.assertIn('  license :cannot_represent', updated)
                     self.assertNotIn('  version "0.3.0"', updated)
                     self.assertIn(prepare.hashlib.sha256(archive.getvalue()).hexdigest(), updated)
                     self.assertEqual(original.split("  head ", 1)[1], updated.split("  head ", 1)[1])

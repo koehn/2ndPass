@@ -12,12 +12,12 @@ import urllib.request
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tag", help="Published stable tag, e.g. v0.3.1")
-    parser.add_argument("--license", required=True, choices=["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"],
-                        help="SPDX identifier of the license already adopted in the release")
+    parser.add_argument("--license", required=True, choices=["cannot_represent", "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"],
+                        help="SPDX identifier adopted in the release, or cannot_represent for proprietary terms")
     args = parser.parse_args()
     if not re.fullmatch(r"v\d+\.\d+\.\d+", args.tag):
         parser.error("expected a stable vMAJOR.MINOR.PATCH tag")
-    url = f"https://github.com/koehn/mop/archive/refs/tags/{args.tag}.tar.gz"
+    url = f"https://github.com/koehn/2ndPass/archive/refs/tags/{args.tag}.tar.gz"
     with urllib.request.urlopen(url, timeout=60) as response:
         archive = response.read()
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as source:
@@ -38,11 +38,12 @@ def main():
         read("Package.resolved")
     formula = pathlib.Path(__file__).resolve().parents[1] / "Formula/secondpass.rb"
     current = formula.read_text()
+    license_value = ":cannot_represent" if args.license == "cannot_represent" else f'"{args.license}"'
     metadata = (f'  url "{url}"\n'
                 f'  sha256 "{hashlib.sha256(archive).hexdigest()}"\n'
-                f'  license "{args.license}"\n')
+                f'  license {license_value}\n')
     if not re.search(r"^  url ", current, re.M):
-        current = current.replace('  license "MIT"\n', '  url PLACEHOLDER\n  license "MIT"\n', 1)
+        current = re.sub(r'(?=^  license )', '  url PLACEHOLDER\n', current, count=1, flags=re.M)
     updated, count = re.subn(r'  url .*?\n(?=  head )', lambda _: metadata, current, count=1, flags=re.S)
     if count != 1:
         raise ValueError("could not locate formula metadata; no changes made")
