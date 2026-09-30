@@ -5,7 +5,7 @@ import Testing
 @Test func masksAcrossEveryChunkBoundary() {
     let patterns = MaskPatterns(secrets: ["abc", "abcd", "bc", "🔒\n秘密", "x", "", "abc"])
     let input = SecretBytes(copying: "-abcd-abc-🔒\n秘密-x-ab".utf8) + SecretBytes(copying: [0xff, 0x00])
-    let expected = SecretBytes(copying: "-[concealed by 2ndpass]-[concealed by 2ndpass]-[concealed by 2ndpass]-[concealed by 2ndpass]-ab".utf8) + SecretBytes(copying: [0xff, 0x00])
+    let expected = SecretBytes(copying: "-[concealed by sp]-[concealed by sp]-[concealed by sp]-[concealed by sp]-ab".utf8) + SecretBytes(copying: [0xff, 0x00])
     for boundary in 0...input.count {
         var filter = SecretMasker(patterns: patterns)
         let first = filter.consume(SecretBytes(copying: input.prefix(boundary)))
@@ -22,7 +22,7 @@ import Testing
 @Test func masksLongestOverlapsWithoutMaskingReplacement() {
     var filter = SecretMasker(patterns: MaskPatterns(secrets: ["ab", "aba", "bab", "mop"]))
     #expect(String(decoding: filter.consume(SecretBytes(copying: "abab mop".utf8), final: true), as: UTF8.self)
-            == "[concealed by 2ndpass]b [concealed by 2ndpass]")
+            == "[concealed by sp]b [concealed by sp]")
     var empty = SecretMasker(patterns: MaskPatterns(secrets: [""]))
     #expect(empty.consume(SecretBytes(copying: "literal".utf8), final: true) == SecretBytes(copying: "literal".utf8))
 }
@@ -36,7 +36,7 @@ import Testing
     #expect(out.consume(SecretBytes(utf8: ""), final: true) == SecretBytes(copying: "se".utf8))
     var prefix = SecretMasker(patterns: patterns)
     #expect(prefix.consume(SecretBytes(copying: "sec".utf8)).isEmpty)
-    #expect(prefix.consume(SecretBytes(utf8: ""), final: true) == SecretBytes(copying: "[concealed by 2ndpass]".utf8))
+    #expect(prefix.consume(SecretBytes(utf8: ""), final: true) == SecretBytes(copying: "[concealed by sp]".utf8))
 }
 
 @Test func masksCanonicallyEquivalentButByteDistinctSecrets() {
@@ -45,7 +45,7 @@ import Testing
     #expect(composed == decomposed)
     #expect(SecretBytes(copying: composed.utf8) != SecretBytes(copying: decomposed.utf8))
     let input = SecretBytes(copying: (composed + "|" + decomposed).utf8)
-    let expected = SecretBytes(copying: "[concealed by 2ndpass]|[concealed by 2ndpass]".utf8)
+    let expected = SecretBytes(copying: "[concealed by sp]|[concealed by sp]".utf8)
     for boundary in 0...input.count {
         var masker = SecretMasker(patterns: MaskPatterns(secrets: [composed, decomposed, composed].map { SecretBytes(utf8: $0) }))
         let first = masker.consume(SecretBytes(copying: input.prefix(boundary)))

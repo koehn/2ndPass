@@ -3,6 +3,7 @@ import Foundation
 import LocalAuthentication
 import Security
 import MopCore
+import MopKeychain
 
 /// Stores device-local, Secure Enclave-backed asymmetric identities.
 ///
@@ -12,6 +13,7 @@ import MopCore
 /// non-sensitive public key and metadata are persisted; the private key exists
 /// solely as an opaque Secure Enclave handle that cannot be exported.
 public final class LocalIdentityStore {
+    public static var isAvailable: Bool { SecureEnclave.isAvailable }
     public static let service = "mop.local-identity.v1"
 
     private let accessGroup: String
@@ -20,6 +22,7 @@ public final class LocalIdentityStore {
     /// Enclave key handle. The handle is not the private key and cannot be used
     /// outside the Secure Enclave.
     struct Record: Codable {
+        let version: Int
         let identity: LocalIdentity
         let opaqueKey: Data
     }
@@ -56,8 +59,8 @@ public final class LocalIdentityStore {
     // MARK: - Create
 
     /// Generate a new hardware identity for `protocolType` and persist it.
-    /// `context` must already be authenticated (device owner / biometric).
-    public func create(name: String, protocolType: LocalIdentityProtocol, context: LAContext) throws -> LocalIdentity {
+    /// Authorization must grant creation for exactly the requested purpose.
+    public func create(name: String, protocolType: LocalIdentityProtocol, authorization: LocalAuthorization, metadata: LocalProtocolMetadata? = nil) throws -> LocalIdentity {
         guard SecureEnclave.isAvailable else { throw MopError.enclaveUnavailable }
         let algorithm: LocalIdentityAlgorithm = protocolType.isSigning ? .p256Signing : .p256KeyAgreement
         let validatedName = try LocalIdentity.validateName(name)
@@ -65,32 +68,32 @@ public final class LocalIdentityStore {
         let existing = try list()
         guard !existing.contains(where: { $0.name == validatedName }) else { throw MopError.duplicate }
 
+        try authorization.begin(id: nil, purpose: protocolType, operation: .create)
         let accessControl = try makeAccessControl()
         let id = UUID()
         var publicKey: Data
         var opaque: Data
         switch algorithm {
         case .p256Signing:
-            let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: accessControl, authenticationContext: context)
+            let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: accessControl, authenticationContext: authorization.context)
             publicKey = key.publicKey.x963Representation
             opaque = key.dataRepresentation
         case .p256KeyAgreement:
-            let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: accessControl, authenticationContext: context)
+            let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: accessControl, authenticationContext: authorization.context)
             publicKey = key.publicKey.x963Representation
             opaque = key.dataRepresentation
         }
 
-        var metadata: [String: String] = [:]
-        if protocolType == .ssh { metadata["comment"] = validatedName }
         let identity = try LocalIdentity(id: id, name: validatedName, algorithm: algorithm,
                                          protocolType: protocolType, publicKey: publicKey, metadata: metadata)
-        let record = Record(identity: identity, opaqueKey: opaque)
+        let record = Record(version: 2, identity: identity, opaqueKey: opaque)
         var insert = baseQuery()
         insert[kSecAttrAccount as String] = identity.id.uuidString
         insert[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         insert[kSecValueData as String] = try Self.encode(record)
+        try authorization.check()
         let status = SecItemAdd(insert as CFDictionary, nil)
-        if status == errSecSuccess { return identity }
+        if status == errSecSuccess { try authorization.check(); return identity }
         if status == errSecDuplicateItem { throw MopError.duplicate }
         throw MopError.keychain(status)
     }
@@ -98,28 +101,35 @@ public final class LocalIdentityStore {
     // MARK: - Use
 
     /// Produce a DER-encoded ECDSA signature over `data` in the Secure Enclave.
-    public func sign(id: UUID, data: Data, context: LAContext) throws -> Data {
+    func sign(id: UUID, data: Data, authorization: LocalAuthorization, operation: LocalKeyOperation = .sign) throws -> Data {
         guard SecureEnclave.isAvailable else { throw MopError.enclaveUnavailable }
         let record = try fetch(id)
         guard record.identity.algorithm == .p256Signing else { throw MopError.localIdentityCapability }
-        let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: record.opaqueKey, authenticationContext: context)
-        return try key.signature(for: data).derRepresentation
+        try authorization.begin(id: id, purpose: record.identity.protocolType, operation: operation)
+        let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: record.opaqueKey, authenticationContext: authorization.context)
+        let signature = try key.signature(for: data).derRepresentation
+        try authorization.check()
+        guard try fetch(id).opaqueKey == record.opaqueKey else { throw MopError.notFound }
+        return signature
     }
 
     /// Perform Secure Enclave ECDH with `peerPublicKey` (x963) and return the
     /// shared secret. The private key never leaves the enclave.
-    public func deriveSharedSecret(id: UUID, peerPublicKey: Data, context: LAContext) throws -> SymmetricKey {
+    func deriveSharedSecret(id: UUID, peerPublicKey: Data, authorization: LocalAuthorization) throws -> SymmetricKey {
         guard SecureEnclave.isAvailable else { throw MopError.enclaveUnavailable }
         let record = try fetch(id)
         guard record.identity.algorithm == .p256KeyAgreement else { throw MopError.localIdentityCapability }
         guard let peer = try? P256.KeyAgreement.PublicKey(x963Representation: peerPublicKey) else {
             throw MopError.invalidLocalIdentity
         }
-        let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: record.opaqueKey, authenticationContext: context)
+        try authorization.begin(id: id, purpose: record.identity.protocolType, operation: .keyAgreement)
+        let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: record.opaqueKey, authenticationContext: authorization.context)
         let shared = try key.sharedSecretFromKeyAgreement(with: peer)
         var bytes = Data()
         shared.withUnsafeBytes { bytes.append(contentsOf: $0) }
         defer { SecretBytes.wipe(&bytes) }
+        try authorization.check()
+        _ = try fetch(id)
         return SymmetricKey(data: bytes)
     }
 
@@ -127,8 +137,10 @@ public final class LocalIdentityStore {
 
     /// Delete an identity. The caller must authorize this destructive operation first;
     /// fetching the public catalog record does not authenticate the user.
-    public func delete(id: UUID) throws {
-        _ = try fetch(id)
+    public func delete(id: UUID, authorization: LocalAuthorization) throws {
+        let record = try fetch(id)
+        try authorization.begin(id: id, purpose: record.identity.protocolType, operation: .delete)
+        try authorization.check()
         var query = baseQuery()
         query[kSecAttrAccount as String] = id.uuidString
         let status = SecItemDelete(query as CFDictionary)
@@ -138,7 +150,7 @@ public final class LocalIdentityStore {
 
     // MARK: - Plumbing
 
-    private func baseQuery() -> [String: Any] {
+    func baseQuery() -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecUseDataProtectionKeychain as String: true,
@@ -159,7 +171,7 @@ public final class LocalIdentityStore {
         return accessControl
     }
 
-    private func fetch(_ id: UUID) throws -> Record {
+    func fetch(_ id: UUID) throws -> Record {
         var query = baseQuery()
         query[kSecAttrAccount as String] = id.uuidString
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -173,17 +185,22 @@ public final class LocalIdentityStore {
     }
 
     private func decode(_ bytes: Data) throws -> Record {
-        do { return try JSONDecoder().decode(Record.self, from: bytes) }
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any], object["version"] as? Int == 2 else { throw MopError.unsupportedLocalIdentity }
+            let record = try JSONDecoder().decode(Record.self, from: bytes)
+            try record.identity.validate()
+            return record
+        } catch let error as MopError { throw error }
         catch { throw MopError.invalidLocalIdentity }
     }
 
-    private static func encode(_ record: Record) throws -> Data {
+    static func encode(_ record: Record) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return try encoder.encode(record)
     }
 
-    private static func check(_ status: OSStatus) throws {
+    static func check(_ status: OSStatus) throws {
         switch status {
         case errSecSuccess: return
         case errSecItemNotFound: throw MopError.notFound
@@ -195,31 +212,3 @@ public final class LocalIdentityStore {
     }
 }
 
-/// Production `SSHAgentBackend` backed by a `LocalIdentityStore`. Authenticates
-/// once for the session (via the supplied context) and serves existing keys only.
-public struct StoreSSHAgentBackend: SSHAgentBackend {
-    let store: LocalIdentityStore
-    let context: LAContext
-
-    public init(store: LocalIdentityStore, context: LAContext) {
-        self.store = store
-        self.context = context
-    }
-
-    public func identities() throws -> [SSHAgentIdentity] {
-        try store.list().compactMap { identity in
-            guard identity.algorithm == .p256Signing,
-                  let blob = try? SSHPublicKey.wireBlob(x963: identity.publicKey) else { return nil }
-            return SSHAgentIdentity(blob: blob, comment: identity.sshComment)
-        }
-    }
-
-    public func sign(blob: Data, data: Data) throws -> Data {
-        let match = try store.list().first { identity in
-            guard identity.algorithm == .p256Signing else { return false }
-            return (try? SSHPublicKey.wireBlob(x963: identity.publicKey)) == blob
-        }
-        guard let identity = match else { throw MopError.notFound }
-        return try store.sign(id: identity.id, data: data, context: context)
-    }
-}

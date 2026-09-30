@@ -48,32 +48,32 @@ run(["vault", "rename", "Invalid", "--vault", "personal"], code=23, output=b"")
 run(["vault", "rename", "private", "--vault", "personal", "--offline"], code=2, output=b"")
 run(["vault", "delete", "--vault", "personal", "--confirm", "personal"], code=2, output=b"")
 run(["list", "--cloud-vault", str(uuid.uuid4())], code=2, output=b"")
-run(["read", "secondpass://v/i/f", "--vault-file", "/unused"], code=2, output=b"")
-run(["write", "secondpass://v/i/f", "--offline"], code=2, output=b"")
-run(["delete", "secondpass://v/i/f", "--offline"], code=2, output=b"")
+run(["read", "sp://v/i/f", "--vault-file", "/unused"], code=2, output=b"")
+run(["write", "sp://v/i/f", "--offline"], code=2, output=b"")
+run(["delete", "sp://v/i/f", "--offline"], code=2, output=b"")
 run(["read", "invalid"], code=2, output=b"")
 run(["read"], code=2, output=b"")
 run(["unknown"], code=2, output=b"")
-result = run(["write", "secondpass://test/item/field", "accidental-secret-argument"], code=2, output=b"")
+result = run(["write", "sp://test/item/field", "accidental-secret-argument"], code=2, output=b"")
 assert b"accidental-secret-argument" not in result.stderr
-run(["read", "secondpass://test/item/field"], code=8, output=b"")
+run(["read", "sp://test/item/field"], code=8, output=b"")
 run(["list", "--json"], code=8, output=b"")
-run(["delete", "secondpass://test/item/field"], code=8, output=b"")
-run(["write", "secondpass://test/item/field"], data=b"disposable\n", code=8, output=b"")
-run(["write", "secondpass://test/item/field"], data=b"\xff", code=7, output=b"")
+run(["delete", "sp://test/item/field"], code=8, output=b"")
+run(["write", "sp://test/item/field"], data=b"disposable\n", code=8, output=b"")
+run(["write", "sp://test/item/field"], data=b"\xff", code=7, output=b"")
 run(["inject"], data="literal ✓ {{ other }}".encode(), output="literal ✓ {{ other }}".encode())
-run(["inject"], data=b"prefix {{secondpass://test/item/field}}", code=8, output=b"")
-run(["inject"], data=b"prefix {{secondpass://test/item/field", code=2, output=b"")
+run(["inject"], data=b"prefix {{sp://test/item/field}}", code=8, output=b"")
+run(["inject"], data=b"prefix {{sp://test/item/field", code=2, output=b"")
 run(["inject"], data=b"\xff", code=7, output=b"")
 run(["run"], code=2, output=b"")
 run(["run", "--", "/usr/bin/printf", "%s", "--literal argument"], output=b"--literal argument")
 run(["run", "--", "/bin/cat"], data=b"stdin\n", output=b"stdin\n")
 run(["run", "--", "/bin/sh", "-c", "exit 42"], code=42, output=b"")
 run(["run", "--", "/bin/sh", "-c", "kill -TERM $$"], code=-signal.SIGTERM, output=b"")
-run(["run", "--", "2ndpass-definitely-does-not-exist"], code=127, output=b"")
+run(["run", "--", "sp-definitely-does-not-exist"], code=127, output=b"")
 run(["run", "--", "printf", "%s", "path lookup"], output=b"path lookup")
 
-with tempfile.TemporaryDirectory(prefix="2ndpass-smoke-") as directory:
+with tempfile.TemporaryDirectory(prefix="sp-smoke-") as directory:
     root = pathlib.Path(directory)
     base = root / "base.env"
     override = root / "override.env"
@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix="2ndpass-smoke-") as directory:
     assert b"disposable-value-must-not-leak" not in result.stderr
     marker = root / "must-not-exist"
     run(["run", "--", "/usr/bin/touch", str(marker)],
-        env={"TOKEN": "secondpass://test/item/field"}, code=8, output=b"")
+        env={"TOKEN": "sp://test/item/field"}, code=8, output=b"")
     assert not marker.exists()
     script = root / "no-shebang"
     script.write_text("touch " + str(marker) + "\n")
@@ -104,17 +104,17 @@ with tempfile.TemporaryDirectory(prefix="2ndpass-smoke-") as directory:
     run(["inject", "--in-file", str(root / "missing")], code=7, output=b"")
 
 # New compatibility options fail before authentication and never truncate output.
-for args in (["read", "secondpass://v/i/f", "--force"], ["inject", "--file-mode", "0600"],
-             ["inject", "--out-file", "/tmp/unused-2ndpass-output", "--file-mode", "4755"]):
+for args in (["read", "sp://v/i/f", "--force"], ["inject", "--file-mode", "0600"],
+             ["inject", "--out-file", "/tmp/unused-sp-output", "--file-mode", "4755"]):
     run(args, code=2, output=b"")
-run(["inject"], data=b"{{secondpass://v/i/${MISSING}}}", code=2, output=b"")
-run(["inject"], data=b"{{secondpass://v/i/${FIELD}}}", env={"FIELD": "token"}, code=8, output=b"")
-run(["run", "--", "/bin/true"], env={"TOKEN": "secondpass://$MISSING/i/f"}, code=2, output=b"")
+run(["inject"], data=b"{{sp://v/i/${MISSING}}}", code=2, output=b"")
+run(["inject"], data=b"{{sp://v/i/${FIELD}}}", env={"FIELD": "token"}, code=8, output=b"")
+run(["run", "--", "/bin/true"], env={"TOKEN": "sp://$MISSING/i/f"}, code=2, output=b"")
 for extra in ([], ["--no-masking"]):
     run(["run", *extra, "--", "/bin/cat"], data=b"direct input", output=b"direct input")
     run(["run", *extra, "--", "/bin/sh", "-c", "exit 23"], code=23, output=b"")
 
-with tempfile.TemporaryDirectory(prefix="2ndpass-output-smoke-") as directory:
+with tempfile.TemporaryDirectory(prefix="sp-output-smoke-") as directory:
     root = pathlib.Path(directory)
     destination = root / "output"
     run(["inject", "-o", str(destination)], data=b"first", output=b"")
@@ -127,12 +127,12 @@ with tempfile.TemporaryDirectory(prefix="2ndpass-output-smoke-") as directory:
     assert destination.stat().st_mode & 0o777 == 0o640
     run(["inject", "-i", str(destination), "-o", str(destination), "-f"], output=b"")
     assert destination.read_bytes() == b"second"
-    run(["inject", "-o", str(destination), "-f"], data=b"{{secondpass://v/i/f}}", code=8, output=b"")
+    run(["inject", "-o", str(destination), "-f"], data=b"{{sp://v/i/f}}", code=8, output=b"")
     assert destination.read_bytes() == b"second"
-    run(["read", "secondpass://v/i/f", "-n", "-o", str(destination), "-f"], code=8, output=b"")
+    run(["read", "sp://v/i/f", "-n", "-o", str(destination), "-f"], code=8, output=b"")
     assert destination.read_bytes() == b"second"
     missing = root / "never-created"
-    run(["inject", "-o", str(missing)], data=b"{{secondpass://v/i/f}}", code=8, output=b"")
+    run(["inject", "-o", str(missing)], data=b"{{sp://v/i/f}}", code=8, output=b"")
     assert not missing.exists()
     alias = root / "alias"
     alias.symlink_to(destination)
@@ -186,7 +186,7 @@ for extra, expected in (([], b"True False"), (["--no-masking"], b"True True")):
 # Verify hidden input and echo restoration on a controlling terminal.
 pid, terminal = pty.fork()
 if pid == 0:
-    os.execve(cli, [cli, "write", "secondpass://test/item/field"], environment)
+    os.execve(cli, [cli, "write", "sp://test/item/field"], environment)
 transcript = b""
 status = None
 try:

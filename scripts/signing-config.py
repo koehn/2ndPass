@@ -32,7 +32,7 @@ if not any(fnmatch.fnmatchcase(shared_group, group) for group in entitlements.ge
 output = {'com.apple.application-identifier': app_id,
           'com.apple.developer.team-identifier': team,
           'keychain-access-groups': [shared_group]}
-if executable == '2ndpass' or is_extension:
+if executable == 'sp' or is_extension:
     container = 'iCloud.' + parent_bundle
     environment = os.environ.get('MOP_CLOUD_ENVIRONMENT', 'Production')
     if environment not in ('Development', 'Production'):
@@ -83,7 +83,7 @@ if is_extension:
     output['com.apple.security.app-sandbox'] = True
     output['com.apple.security.network.client'] = True
 # Carry the profile's APNs environment into native macOS app signatures.
-if executable == '2ndpass' and entitlements.get('com.apple.developer.aps-environment'):
+if executable == 'sp' and entitlements.get('com.apple.developer.aps-environment'):
     output['com.apple.developer.aps-environment'] = entitlements['com.apple.developer.aps-environment']
 with open(entitlements_path, 'wb') as f:
     plistlib.dump(output, f)

@@ -31,7 +31,7 @@ site-deploy bucket prefix="" distribution="": site-build
 
 # Compile the release CLI (vault access requires a provisioned app bundle).
 cli-build:
-    swift build -c release --product 2ndpass
+    swift build -c release --product sp
 
 # Compile the macOS app and CLI.
 app-build: cli-build

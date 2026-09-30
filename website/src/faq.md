@@ -38,9 +38,9 @@ The decision to leave, and the characterization above, are the creator’s own j
 
 ### Is it 2ndPass or Second Pass?
 
-Write **2ndPass**, say “Second Pass.” It’s a second pass at the tools used to protect and work with secrets. The website is **2ndpass.app** and the command is `2ndpass`.
+Write **2ndPass**, say “Second Pass.” It’s a second pass at the tools used to protect and work with secrets. The website is **2ndpass.app** and the command is `sp`.
 
-Secret references use `secondpass://`, spelled out because a URI scheme cannot start with a number. Older `mop://` references continue to work. Internal Apple identifiers retain their original names to preserve access to existing keys and vaults.
+Secret references use `sp://`, spelled out because a URI scheme cannot start with a number. Older `mop://` references continue to work. Internal Apple identifiers retain their original names to preserve access to existing keys and vaults.
 
 ## Different
 
@@ -52,7 +52,7 @@ Each device has its own Secure Enclave private key. iCloud carries encrypted vau
 
 ## Op
 
-### Can I replace `op` with `2ndpass`?
+### Can I replace `op` with `sp`?
 
 For supported workflows, yes: read a secret, launch a process with resolved environment variables, or populate a configuration template. Import your data and update your references and commands using the [migration guide](docs.html#from-op).
 

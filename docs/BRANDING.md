@@ -1,8 +1,8 @@
 # 2ndPass branding and Apple identity
 
 Use **2ndPass** in the interface and prose, pronounce it “Second Pass”, and use
-`2ndpass.app` for the product domain. The command is `2ndpass`; new secret
-references are `secondpass://vault/item/[section/]field`. URI schemes must start
+`2ndpass.app` for the product domain. The command is `sp`; new secret
+references are `sp://vault/item/[section/]field`. URI schemes must start
 with a letter. Existing `mop://` references remain accepted, including environment
 variables and templates; copying a reference emits the new spelling.
 
@@ -10,9 +10,12 @@ variables and templates; copying a reference emits the new spelling.
 
 The signed app is now `2ndPass.app`. Build/install it using the existing team and
 profiles, then verify access before retiring an older Mop.app or its CLI link.
-The installer does not delete the older app. Use `command -v 2ndpass` to check the
+The installer does not delete the older app. Use `command -v sp` to check the
 new command. Existing `MOP_*` build and runtime environment variables remain
-supported under their original names. Update shell commands from `mop` to `2ndpass`.
+supported under their original names. Update shell commands to `sp` and secret
+references to `sp://`. The installer accepts a signed app containing the older
+`2ndpass` helper when upgrading. Old command symlinks are not installed as aliases;
+remove an obsolete link if you no longer need it.
 
 The following deliberately retain their original names:
 

@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import Testing
 import MopCore
-@testable import MopKeychain
+@testable import MopLocalIdentity
 
 @Test func wireBlobIsOpenSSHEcdsaP256() throws {
     let x963 = P256.Signing.PrivateKey().publicKey.x963Representation

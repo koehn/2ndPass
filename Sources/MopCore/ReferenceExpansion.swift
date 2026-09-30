@@ -9,7 +9,7 @@ public enum ReferenceExpansion {
 
     static func resolve(_ token: String, value: (String) -> String?) throws -> SecretReference {
         guard let prefix = SecretReference.prefixes.first(where: { token.hasPrefix($0) }) else { throw MopError.invalidReference }
-        var output = "secondpass://"
+        var output = "sp://"
         let text = String(token.dropFirst(prefix.count))
         var cursor = text.startIndex
         while cursor < text.endIndex {

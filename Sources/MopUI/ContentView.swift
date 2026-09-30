@@ -1,3 +1,4 @@
+import MopLocalIdentity
 import SwiftUI
 import MopCore
 import MopAppSupport
@@ -48,11 +49,17 @@ struct ContentView: View {
                     NavigationLink(value: "recent-used") { Label("Recently Used", systemImage: "clock") }
                     Section("Vaults", isExpanded: $vaultsExpanded) {
                         ForEach(model.vaultList.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }) { vault in
-                            NavigationLink(value: "vault:" + vault.id) {
-                                Label(model.vaultLabel(vault), systemImage: model.vaultIcon(vault))
-                                    .lineLimit(1).accessibilityValue(model.vaultConnectionLabel(vault))
-                            }.tag("vault:" + vault.id)
-                            .contextMenu { Button("Vault Details…") { model.openVaultDetails(vault) }.disabled(model.busy) }
+                            switch vault {
+                            case .cloud(let row):
+                                NavigationLink(value: "vault:" + row.id) {
+                                    Label(model.vaultLabel(row), systemImage: model.vaultIcon(row))
+                                        .lineLimit(1).accessibilityValue(model.vaultConnectionLabel(row))
+                                }.tag("vault:" + row.id)
+                                .contextMenu { Button("Vault Details…") { model.openVaultDetails(row) }.disabled(model.busy) }
+                            case .local:
+                                NavigationLink(value: "vault:" + LocalVault.id) { Label("local", systemImage: "internaldrive") }
+                                    .tag("vault:" + LocalVault.id)
+                            }
                         }
                     }
                     NavigationLink(value: "archive") { Label("Archive", systemImage: "archivebox") }
@@ -128,13 +135,20 @@ struct ContentView: View {
         } detail: {
                 ScrollView {
                     if model.page == .recentlyDeleted { RecentlyDeletedDetail(model: model) }
+                    else if model.isLocalVaultSelected {
+                        if model.localCreatePresented {
+                            LocalCreateForm(model: model).padding()
+                        } else if let identity = model.selectedLocalIdentity {
+                            LocalIdentityDetailView(model: model, identity: identity).id(identity.id)
+                        } else {
+                            LocalVaultDetailHint()
+                        }
+                    }
                     else if let draft = model.itemDraft, draft.isNew, model.authenticated {
                         ItemDetailView(model: model, itemName: "").id(draft.id)
                     }
                     else if let item = model.selectedItem, model.authenticated { ItemDetailView(model: model, itemName: item).id(model.vault + ":" + item) }
-                    else if model.isLocalVaultSelected {
-                        LocalVaultDetailHint()
-                    } else {
+                    else {
                         ContentUnavailableView {
                             Label(model.cloudVaults.isEmpty ? "Welcome to 2ndPass" : model.authenticated ? "Select an item" : model.unlocking ? "Unlocking 2ndPass" : "2ndPass is locked", systemImage: "key.horizontal")
                         } description: {

@@ -9,7 +9,7 @@
 - iOS application and AutoFill extension build succeeded. Installed successfully
   on the connected iPhone and iPad without uninstalling either app.
 - Installed Mac app uses `MopApp` as its executable to coexist with the bundled
-  lowercase `2ndpass` CLI on case-insensitive filesystems, matching package.sh.
+  lowercase `sp` CLI on case-insensitive filesystems, matching package.sh.
 - Old application bundle retained at `.build/v6-app-before-v7/2ndPass.app`.
   No v6 vault, key, cache, cloud zone, or backup was deleted or migrated.
 

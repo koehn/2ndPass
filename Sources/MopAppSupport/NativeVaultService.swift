@@ -64,6 +64,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         self.openDevice = openDevice; self.deleteDevice = deleteDevice; self.authenticate = authenticate
     }
     public func cachedCatalog(vault: String) async throws -> VaultResult? {
+        try CloudVaultBoundary.requireCloud(vault)
         do { return try await execute(.catalog, vault: vault, offline: true) }
         catch MopError.vaultMissing { return nil }
     }
@@ -72,6 +73,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     /// Read the already verified session snapshot independently of the cloud
     /// operation queue. Only the requested field's item key is unwrapped.
     public func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult {
+        try CloudVaultBoundary.requireCloud(vault)
+        try CloudVaultBoundary.requireCloud(reference.vault)
         let token = control.generation
         let session = try control.localRead(vault: vault, name: reference.vault, token: token)
         let task = Task.detached { [self] in
@@ -103,6 +106,12 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
     public func execute(_ operation: VaultOperation, vault: String?, offline: Bool = false) async throws -> VaultResult {
+        try CloudVaultBoundary.requireCloud(vault)
+        switch operation {
+        case .create(let name, _, _), .rename(let name): try CloudVaultBoundary.validateName(name)
+        case .read(let ref), .delete(let ref), .write(let ref, _, _): try CloudVaultBoundary.requireCloud(ref.vault)
+        default: break
+        }
         if case .manage(.automaticEnrollment) = operation, !isAuthenticated { throw MopError.authentication }
         let token = control.generation
         let started = wallNow()

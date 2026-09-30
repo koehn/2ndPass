@@ -32,17 +32,17 @@ private actor CLIUsageStore: ItemUsageStoring {
     let usage = CLIUsageStore(), service = UsageReadService()
     let options = try VaultOptions.parse([])
     let store = CommandStore(options: options, service: service, usageStore: usage)
-    _ = try await store.read(SecretReference("secondpass://personal/login/password"))
+    _ = try await store.read(SecretReference("sp://personal/login/password"))
     #expect(await usage.count == 1)
-    _ = try await store.read(SecretReference("secondpass://personal/login/username"))
+    _ = try await store.read(SecretReference("sp://personal/login/username"))
     #expect(await usage.count == 1)
     let anotherCommand = CommandStore(options: options, service: service, usageStore: usage)
-    await #expect(throws: MopError.notFound) { try await anotherCommand.read(SecretReference("secondpass://personal/login/missing")) }
+    await #expect(throws: MopError.notFound) { try await anotherCommand.read(SecretReference("sp://personal/login/missing")) }
     #expect(await usage.count == 1)
 }
 @Test func cliUsagePersistenceFailureDoesNotFailRead() async throws {
     let usage = CLIUsageStore(fails: true)
     let store = CommandStore(options: try VaultOptions.parse([]), service: UsageReadService(), usageStore: usage)
-    #expect(try await store.read(SecretReference("secondpass://personal/login/password")) == SecretBytes(utf8: "value"))
+    #expect(try await store.read(SecretReference("sp://personal/login/password")) == SecretBytes(utf8: "value"))
     #expect(await usage.count == 1)
 }

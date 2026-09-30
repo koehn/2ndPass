@@ -1,23 +1,23 @@
 # Usage examples
 
-Use 2ndpass with command-line tools that accept credentials through environment
+Use sp with command-line tools that accept credentials through environment
 variables, stdin, files, or file descriptors. These examples use Bash or zsh.
 
-Install a signed, provisioned 2ndpass bundle using the [README](../README.md#build-and-provision) and make
-sure `2ndpass` is on your `PATH`. Start with an initialized vault and the relevant
+Install a signed, provisioned sp bundle using the [README](../README.md#build-and-provision) and make
+sure `sp` is on your `PATH`. Start with an initialized vault and the relevant
 third-party CLI installed. Each
-`2ndpass write` below prompts for a value; paste the actual credential at that prompt.
+`sp write` below prompts for a value; paste the actual credential at that prompt.
 On subsequent updates, add `--replace`. The named CloudKit vault must contain the referenced fields.
 Run these commands from a logged-in Mac; secret access requires Touch ID or your
 system password.
 
 | What the application accepts | Use |
 |---|---|
-| Environment variables | `2ndpass run -- COMMAND` |
-| A password on stdin | Pipe `2ndpass read` into the application |
+| Environment variables | `sp run -- COMMAND` |
+| A password on stdin | Pipe `sp read` into the application |
 | An open password file descriptor | Process substitution and `sshpass -d` |
-| A configuration file | `2ndpass inject --in-file ... --out-file ...` |
-| A key or other multiline text file | `2ndpass read --no-newline --out-file ...` |
+| A configuration file | `sp inject --in-file ... --out-file ...` |
+| A key or other multiline text file | `sp read --no-newline --out-file ...` |
 
 Secrets leave the vault's protection when deliberately delivered. `read` exposes
 stdout or a file; `inject` creates plaintext output; `run` gives plaintext
@@ -32,20 +32,20 @@ transformed output. These examples control delivery, not subsequent secret use.
 Store a GitHub token with the permissions your command needs:
 
 ```sh
-2ndpass write secondpass://personal/github/token
+sp write sp://personal/github/token
 ```
 
 Supply a reference just for the command:
 
 ```sh
-GH_TOKEN=secondpass://personal/github/token \
-  2ndpass run -- gh repo list --limit 10
+GH_TOKEN=sp://personal/github/token \
+  sp run -- gh repo list --limit 10
 ```
 
 GitHub CLI accepts [`GH_TOKEN`](https://cli.github.com/manual/gh_help_environment)
 for authentication. The invoking shell never receives the resolved token in its
 environment. It is available to `gh` and its descendants for their process
-lifetimes; 2ndpass does not revoke the credential when they exit. Exact occurrences
+lifetimes; sp does not revoke the credential when they exit. Exact occurrences
 printed to stdout/stderr are masked by default.
 
 ## Start a local application with several secrets
@@ -54,8 +54,8 @@ For a Node application that reads `PGUSER` and `PGPASSWORD` from its environment
 store the database fields:
 
 ```sh
-2ndpass write secondpass://development/database/username
-2ndpass write secondpass://development/database/password
+sp write sp://development/database/username
+sp write sp://development/database/password
 ```
 
 Save this as `app.env`:
@@ -65,14 +65,14 @@ APP_ENV=development
 PGHOST=localhost
 PGPORT=5432
 PGDATABASE=app
-PGUSER=secondpass://${APP_ENV}/database/username
-PGPASSWORD=secondpass://${APP_ENV}/database/password
+PGUSER=sp://${APP_ENV}/database/username
+PGPASSWORD=sp://${APP_ENV}/database/password
 ```
 
 From your application's directory, run its existing development script:
 
 ```sh
-2ndpass run --env-file app.env -- npm run dev
+sp run --env-file app.env -- npm run dev
 ```
 
 One authentication covers both fields. If either lookup fails, npm is not
@@ -80,7 +80,7 @@ launched. The reference file can be committed when it contains only references
 and non-sensitive settings; the plaintext database credentials are never written
 to it. They remain in the launched application's environment while it runs.
 
-To select staging, first store the corresponding fields under `secondpass://staging/...`
+To select staging, first store the corresponding fields under `sp://staging/...`
 and create `staging.env`:
 
 ```dotenv
@@ -89,10 +89,10 @@ PGHOST=staging-db.example.com
 ```
 
 ```sh
-2ndpass run --env-file app.env --env-file staging.env -- npm run dev
+sp run --env-file app.env --env-file staging.env -- npm run dev
 ```
 
-Later files override earlier files, then 2ndpass expands variables inside references
+Later files override earlier files, then sp expands variables inside references
 using the final environment. Thus both lookups select `staging`. The logical
 names `development` and `staging` select vaults, not additional access policies;
 configure each vault's membership separately when access must differ.
@@ -100,7 +100,7 @@ configure each vault's membership separately when access must differ.
 For a program that needs normal terminal detection, use:
 
 ```sh
-2ndpass run --no-masking --env-file app.env -- npm run dev
+sp run --no-masking --env-file app.env -- npm run dev
 ```
 
 This preserves direct terminal behavior but does not filter the program's output.
@@ -111,22 +111,22 @@ Store a registry access token, then replace `YOUR_DOCKER_USERNAME` below with yo
 Docker Hub username:
 
 ```sh
-2ndpass write secondpass://personal/docker/token
+sp write sp://personal/docker/token
 ```
 
 ```bash
 (
   set -o pipefail
-  2ndpass read secondpass://personal/docker/token --no-newline |
+  sp read sp://personal/docker/token --no-newline |
     docker login --username YOUR_DOCKER_USERNAME --password-stdin
 )
 ```
 
 Docker's [`--password-stdin`](https://docs.docker.com/reference/cli/docker/login/#provide-a-password-using-stdin---password-stdin)
 receives the token without placing it in the command's arguments or an exported
-variable. The subshell enables `pipefail` so a 2ndpass failure also makes the pipeline
+variable. The subshell enables `pipefail` so a sp failure also makes the pipeline
 fail. Pipeline commands start concurrently; this is not the resolve-before-launch
-behavior of `2ndpass run`.
+behavior of `sp run`.
 
 Docker can persist the credential in its configured credential store after login;
 the pipe only controls how it reaches Docker. See Docker's
@@ -137,14 +137,14 @@ the pipe only controls how it reaches Docker. See Docker's
 Store an npm token:
 
 ```sh
-2ndpass write secondpass://personal/npm/token
+sp write sp://personal/npm/token
 ```
 
 Save this as `npmrc.template` in your project:
 
 ```ini
 registry=https://registry.npmjs.org/
-//registry.npmjs.org/:_authToken={{ secondpass://personal/npm/token }}
+//registry.npmjs.org/:_authToken={{ sp://personal/npm/token }}
 ```
 
 The registry-qualified token setting follows npm's
@@ -154,9 +154,9 @@ and remove the generated file when the subshell exits:
 
 ```bash
 (
-  config_dir=$(mktemp -d "${TMPDIR:-/tmp}/2ndpass-npm.XXXXXXXX") || exit
+  config_dir=$(mktemp -d "${TMPDIR:-/tmp}/sp-npm.XXXXXXXX") || exit
   trap 'rm -rf "$config_dir"' EXIT
-  2ndpass inject --in-file npmrc.template \
+  sp inject --in-file npmrc.template \
     --out-file "$config_dir/npmrc" --file-mode 0600 || exit
   npm --userconfig "$config_dir/npmrc" whoami
 )
@@ -178,16 +178,16 @@ For a password-authenticated SSH profile already configured in `~/.ssh/config`,
 store its single-line password:
 
 ```sh
-2ndpass write secondpass://personal/sshprofile/password
+sp write sp://personal/sshprofile/password
 ```
 
 Use process substitution in Bash or zsh:
 
 ```bash
-sshpass -d 3 ssh sshprofile 3< <(2ndpass read secondpass://personal/sshprofile/password)
+sshpass -d 3 ssh sshprofile 3< <(sp read sp://personal/sshprofile/password)
 ```
 
-`<(2ndpass read ...)` supplies a readable stream, `3<` connects that stream to file
+`<(sp read ...)` supplies a readable stream, `3<` connects that stream to file
 descriptor 3 for this command, and `sshpass -d 3` reads the password from that
 descriptor. The space between `3<` and `<(` is intentional. This keeps the password
 out of command-line arguments and a long-lived `SSHPASS` environment variable,
@@ -196,15 +196,15 @@ the SSH session. The upstream
 [sshpass manual](https://sources.debian.org/src/sshpass/1.09-1/sshpass.1/)
 documents this inherited-descriptor interface and recommends pipe-based delivery.
 
-Leave `2ndpass read`'s default newline in place for this single-line password. Replace
+Leave `sp read`'s default newline in place for this single-line password. Replace
 `sshprofile` with your SSH host alias and use its normal host-key verification.
 `sshpass` still handles the password in memory; this is a delivery mechanism, not
 output masking. The redirection is scoped to this command rather than installed
 with a persistent `exec 3< ...` in your shell.
 
-Process substitution runs asynchronously: SSH can start before 2ndpass authentication
+Process substitution runs asynchronously: SSH can start before sp authentication
 finishes, and the command's exit status does not report the substitution's exit
-status. Cancelling 2ndpass supplies no password, but does not guarantee that SSH never
+status. Cancelling sp supplies no password, but does not guarantee that SSH never
 starts. Bash/zsh support this syntax; POSIX `sh` does not.
 
 ## Store and materialize a multiline SSH private key
@@ -212,20 +212,20 @@ starts. Bash/zsh support this syntax; POSIX `sh` does not.
 For an existing key file, preserve its bytes through stdin:
 
 ```sh
-2ndpass write secondpass://personal/deploy/private-key < "$HOME/.ssh/existing_deploy_key"
+sp write sp://personal/deploy/private-key < "$HOME/.ssh/existing_deploy_key"
 ```
 
 Export it to a new, owner-only file before connecting:
 
 ```sh
-2ndpass read secondpass://personal/deploy/private-key --no-newline \
+sp read sp://personal/deploy/private-key --no-newline \
   --out-file "$HOME/.ssh/secondpass_deploy_key" --file-mode 0600 &&
   ssh -i "$HOME/.ssh/secondpass_deploy_key" deploy@example.com
 ```
 
 The parent `.ssh` directory must already exist. `--no-newline` avoids adding a
 byte to the stored value, and `&&` prevents SSH from starting if the read fails.
-If the output file exists, 2ndpass refuses to replace it unless you explicitly add
+If the output file exists, sp refuses to replace it unless you explicitly add
 `--force`. The exported key remains on disk until you remove it; a passphrase on
 the key is still handled by SSH. This workflow stores UTF-8 key text and does not
 provide an SSH agent, generate keys, or convert their formats.
@@ -235,12 +235,12 @@ For account access, recovery, and trust errors, see
 
 ## Adapt an existing op workflow
 
-Use `secondpass://` references to fields explicitly stored in 2ndpass. There is no automatic
+Use `sp://` references to fields explicitly stored in sp. There is no automatic
 lookup in your 1Password account or Apple's Passwords app. The familiar `read`,
 `run`, and `inject` workflows above do not imply identical dotenv syntax or flags:
 
 - Expand variables only inside references, not in general dotenv values.
-- Use `{{ secondpass://... }}` delimiters in templates; bare references remain literal.
+- Use `{{ sp://... }}` delimiters in templates; bare references remain literal.
 - Use percent-encoded names, including `%20` for spaces.
 - Each reference selects its named encrypted vault. `run` and `inject` can use several vaults; `--vault NAME-OR-UUID` constrains the selection.
 

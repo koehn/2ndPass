@@ -1,7 +1,7 @@
 import Foundation
 
 public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConvertible {
-    static let prefixes = ["secondpass://", "mop://"]
+    static let prefixes = ["sp://", "mop://"]
 
     public let vault: String
     public let item: String
@@ -36,7 +36,7 @@ public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConve
             || [45, 46, 95, 126].contains(byte)
     }
 
-    private static func decode(_ value: String) throws -> String {
+    static func decode(_ value: String) throws -> String {
         let bytes = Array(value.utf8)
         var offset = 0
         while offset < bytes.count {
@@ -66,12 +66,12 @@ public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConve
     }
 
     public init(vault: String, relativePath: String) throws {
-        try self.init("secondpass://" + vault + "/" + relativePath)
+        try self.init("sp://" + vault + "/" + relativePath)
         guard self.relativePath == relativePath else { throw MopError.invalidReference }
     }
 
     public var description: String {
-        "secondpass://" + ([vault, item] + (section.map { [$0] } ?? []) + [field]).map(Self.encode).joined(separator: "/")
+        "sp://" + ([vault, item] + (section.map { [$0] } ?? []) + [field]).map(Self.encode).joined(separator: "/")
     }
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.description < rhs.description }

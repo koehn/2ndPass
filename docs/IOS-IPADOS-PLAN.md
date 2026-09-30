@@ -138,7 +138,7 @@ Never infer a security decision from a device's display name or icon.
 | Existing area | Planned change |
 | --- | --- |
 | `Package.swift` | Add mobile platform support and library products for app support/shared UI. Ensure mobile targets do not build CLI executables or desktop-only helpers. Verify the pinned zxcvbn dependency and dictionary resources in an installed mobile bundle. |
-| `MopAppSupport/VaultService.swift` | Keep typed operations, serialization, revision checks, and cancellation generations shared. Inject state location and platform identity configuration instead of mobile use of `~/.2ndpass` or environment overrides. |
+| `MopAppSupport/VaultService.swift` | Keep typed operations, serialization, revision checks, and cancellation generations shared. Inject state location and platform identity configuration instead of mobile use of `~/.sp` or environment overrides. |
 | `MopAppSupport/CLIClient.swift` | Move the subprocess adapter to a macOS-only target or conditionally compile it out of mobile builds. Mobile uses `NativeVaultService` directly. |
 | `MopApp/AppModel.swift` | Extract shared observable state and workflows into a library. Inject clipboard, lifecycle/activity, and file-presentation services; remove direct AppKit dependencies from shared state. Preserve separate operation and visibility generations. |
 | `MopApp` views | Move the root split view, item lists/cards, drafts, generator, strength, recently-deleted, settings, and management forms into one shared UI library. Thin build entry points and conditional scene modifiers must host the same root view. |

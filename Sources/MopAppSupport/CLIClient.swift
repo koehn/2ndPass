@@ -13,7 +13,7 @@ public struct CLIResult: Sendable {
         catch { throw CLIError.malformedResponse }
     }
     public var offlineDate: String? {
-        let prefix = "2ndpass: offline cache from "
+        let prefix = "sp: offline cache from "
         guard let line = diagnostic.split(separator: 10).first(where: { $0.starts(with: prefix.utf8) }) else { return nil }
         let date = String(decoding: line.dropFirst(prefix.utf8.count).prefix(20), as: UTF8.self)
         return ISO8601DateFormatter().date(from: date) == nil ? nil : date

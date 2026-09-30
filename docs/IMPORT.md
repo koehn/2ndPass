@@ -47,9 +47,9 @@ are not migrated. Create a v7 vault and import a supported source export.
 ## Command line
 
 ```sh
-2ndpass item import export.csv --vault personal --dry-run
-2ndpass item import export.1pux --vault personal --yes
-2ndpass item import export.json --vault personal --format bitwarden-json --dry-run --json
+sp item import export.csv --vault personal --dry-run
+sp item import export.1pux --vault personal --yes
+sp item import export.json --vault personal --format bitwarden-json --dry-run --json
 ```
 
 Formats: `auto`, `apple-csv`, `chrome-csv`, `bitwarden-csv`, `1password-csv`,
@@ -58,7 +58,7 @@ noninteractive import requires `--yes`. Reports include titles, record numbers,
 status, and warnings, but no field values. Warnings identify source field names, category names/IDs, structural property types, and attachment failures. Treat titles, filenames, and field names as personal information.
 Exit status 0 means success (including duplicates), 2 means records need attention,
 and 1 means import failed or its publication outcome is uncertain.
-`2ndpass vault import` still imports trusted encrypted 2ndPass checkpoints.
+`sp vault import` still imports trusted encrypted 2ndPass checkpoints.
 
 ## Handling export files
 
@@ -139,8 +139,8 @@ contains attachment metadata but no file bytes, so those files must be added
 separately. Exporting a file writes an unencrypted copy to the chosen destination.
 
 ```sh
-2ndpass item attachment add proof.pdf --vault personal --item "Account" --field proof
-2ndpass item attachment export secondpass://personal/Account/proof --output ./proof.pdf
+sp item attachment add proof.pdf --vault personal --item "Account" --field proof
+sp item attachment export sp://personal/Account/proof --output ./proof.pdf
 ```
 
 The CLI export refuses to overwrite an existing file and creates the destination

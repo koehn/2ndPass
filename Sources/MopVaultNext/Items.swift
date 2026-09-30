@@ -244,7 +244,7 @@ public extension VaultEngine {
     }
     static func rename(_ name: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
         guard vault.membership.role(of: device.identity) == .owner else { throw MopError.cloudPermission }
-        try VaultName.validate(name)
+        try CloudVaultBoundary.validateName(name)
         let old = try header(vault, operation: .content)
         let next = Revision.Header(requiredFeatures: old.requiredFeatures, format: old.format, vault: old.vault, name: name, generation: old.generation, parent: old.parent,
             epoch: old.epoch, membership: old.membership, operation: old.operation, acceptedInvitations: old.acceptedInvitations)

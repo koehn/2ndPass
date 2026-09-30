@@ -1,10 +1,10 @@
+import MopLocalIdentity
 import SwiftUI
 import MopCore
 import MopAppSupport
 
-/// Self-contained UI for the fixed device-local vault. Driven entirely by
-/// `LocalVaultService`; it never touches the cloud `VaultService`. Identities are
-/// shown by their public key only — the private half is in the Secure Enclave.
+/// List column for the device-local vault. Selection opens a separate public-only
+/// identity detail view; local identities never enter cloud item catalogs.
 struct LocalVaultView: View {
     @Bindable var model: AppModel
 
@@ -13,15 +13,16 @@ struct LocalVaultView: View {
             GroupBox {
                 VStack(alignment: .leading, spacing: 6) {
                     Label("Device-only vault", systemImage: "internaldrive")
-                    Text("Keys are created in this device's Secure Enclave. They cannot be exported, shared, synced, or moved to another device, and there is no backup or recovery. Only the public key is shown here.")
+                    Text(LocalIdentityWarning.loss)
                         .font(.callout).foregroundStyle(.secondary)
                 }
             }
             .tint(.secondary)
 
+            if !LocalIdentityStore.isAvailable { Text("Secure Enclave is unavailable. Identity creation is disabled; no software fallback is provided.").foregroundStyle(.orange) }
             if !model.localCreatePresented {
                 Button("New Identity…") { model.beginLocalCreate() }
-                    .disabled(model.localCreating || model.localLoading || model.localDeleteInProgress)
+                    .disabled(model.localCreating || model.localLoading || model.localDeleteInProgress || !LocalIdentityStore.isAvailable)
             }
 
             if model.localDeleteInProgress {
@@ -36,18 +37,32 @@ struct LocalVaultView: View {
                 ContentUnavailableView {
                     Label("No Identities", systemImage: "key")
                 } description: {
-                    Text("Create a non-exportable identity to use with SSH, git signing, or key agreement.")
+                    Text("Create an SSH, Git signing, or certificate identity. Create passkeys from a website’s registration flow.")
                 }
             } else {
-                List {
-                    ForEach(model.localIdentities) { identity in
-                        LocalIdentityRow(model: model, identity: identity)
+                List(model.displayedLocalIdentities, selection: $model.selectedLocalIdentityID) { identity in
+                    NavigationLink(value: identity.id) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "key.fill").foregroundStyle(Color.accentColor).frame(width: 22)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(identity.name).fontWeight(.medium)
+                                Text(identity.protocolType.rawValue).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }.padding(.vertical, 2)
+                    }
+                    .tag(identity.id)
+                    .contextMenu {
+                        Button("Copy Reference") { copyLocalPublicText(identity.reference.description) }
+                        Button("Copy Public Key") { copyLocalPublicText(identity.publicKeyText) }
+                        Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
                     }
                 }
-            }
-
-            if model.localCreatePresented {
-                LocalCreateForm(model: model)
+                .onChange(of: model.selectedLocalIdentityID) { _, id in
+                    if id != nil { model.cancelLocalCreate() }
+                }
+                if model.displayedLocalIdentities.isEmpty && !model.search.isEmpty {
+                    ContentUnavailableView.search(text: model.search)
+                }
             }
 
             Spacer()
@@ -59,61 +74,110 @@ struct LocalVaultView: View {
                 Button("Delete “" + identity.name + "”", role: .destructive) { model.confirmLocalDelete() }
             }
         } message: {
-            Text("The private key is in the Secure Enclave. Once deleted it cannot be recovered.")
+            Text(LocalIdentityWarning.deletion)
         }
     }
 }
 
-private struct LocalIdentityRow: View {
+private func copyLocalPublicText(_ text: String) {
+    #if os(macOS)
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    #else
+    UIPasteboard.general.string = text
+    #endif
+}
+
+struct LocalIdentityDetailView: View {
     @Bindable var model: AppModel
     let identity: LocalIdentity
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Image(systemName: "key.fill").foregroundStyle(Color.accentColor)
-                Text(identity.name).fontWeight(.medium)
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Label("local", systemImage: "internaldrive")
                 Spacer()
-                Text(identity.protocolType.rawValue).font(.caption).foregroundStyle(.secondary)
+                Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
+                    .disabled(model.localDeleteInProgress || model.localCreating)
             }
-            Text(LocalIdentityCatalog.publicKeyText(for: identity))
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .lineLimit(3).truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.vertical, 2)
-        .contextMenu {
-            Button("Copy Public Key") { copyPublicKey() }
-            Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
-        }
-    }
-
-    private func copyPublicKey() {
-        let key = LocalIdentityCatalog.publicKeyText(for: identity)
-        #if os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(key, forType: .string)
-        #else
-        UIPasteboard.general.string = key
-        #endif
+            Divider()
+            Text(identity.name).font(.title2.weight(.semibold))
+            GroupBox("Identity") {
+                VStack(alignment: .leading, spacing: 10) {
+                    LabeledContent("Reference", value: identity.reference.description).textSelection(.enabled)
+                    LabeledContent("Type", value: identity.protocolType.rawValue)
+                    LabeledContent("Algorithm", value: "P-256")
+                    LabeledContent("Created", value: identity.createdAt.formatted())
+                    LabeledContent("Authorization", value: identity.accessPolicy.rawValue)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("Device protection") {
+                VStack(alignment: .leading, spacing: 10) {
+                    LabeledContent("Private key", value: "Secure Enclave • Non-exportable")
+                    LabeledContent("Storage", value: "This device only")
+                    LabeledContent("Backup", value: "Not possible")
+                    Text(LocalIdentityWarning.loss).font(.callout).foregroundStyle(.secondary)
+                    Text(LocalIdentityWarning.redundancy(identity.protocolType)).font(.callout)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("Public key") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(identity.fingerprint).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                    Text(identity.publicKeyText).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                    HStack {
+                        Button("Copy Reference") { copyLocalPublicText(identity.reference.description) }
+                        Button("Copy Public Key") { copyLocalPublicText(identity.publicKeyText) }
+                        ShareLink("Share Public Key", item: identity.publicKeyText)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if identity.protocolType == .gitSigning {
+                GroupBox("Git signing setup") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(identity.gitSetup).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                        Button("Copy Setup Instructions") { copyLocalPublicText(identity.gitSetup) }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if case .passkey(let data) = identity.metadata {
+                GroupBox("Passkey") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        LabeledContent("Website", value: data.relyingParty)
+                        LabeledContent("User", value: data.userName)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if let certificates = try? identity.certificateInfo, !certificates.isEmpty {
+                GroupBox("Certificates") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(certificates.enumerated()), id: \.offset) { _, cert in
+                            LabeledContent("Subject", value: cert.subject)
+                            LabeledContent("Issuer", value: cert.issuer)
+                            LabeledContent("Valid from", value: cert.validFrom.formatted())
+                            LabeledContent("Valid until", value: cert.validUntil.formatted())
+                            Text(cert.expired ? "Expired" : "Attachment only; trust not validated").foregroundStyle(.secondary)
+                            Text(cert.extensions).textSelection(.enabled)
+                            Divider()
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }.padding().frame(maxWidth: .infinity, alignment: .topLeading)
     }
 }
 
-/// Shown in the detail column while the device-local vault is open but no item is
-/// selected. The local vault is a self-contained list; this just explains that.
 struct LocalVaultDetailHint: View {
     var body: some View {
         ContentUnavailableView {
-            Label("Device-local vault", systemImage: "internaldrive")
+            Label("Select an identity", systemImage: "key.horizontal")
         } description: {
-            Text("Identities live in the list. Their public keys are shown inline; use a row's menu to copy the key or delete the identity.")
+            Text("Choose an identity to view its details and public key.")
         }
         .padding(.top, 60)
     }
 }
 
-private struct LocalCreateForm: View {
+struct LocalCreateForm: View {
     @Bindable var model: AppModel
 
     var body: some View {
@@ -122,17 +186,20 @@ private struct LocalCreateForm: View {
                 TextField("Name (1-64 characters)", text: $model.localCreateName)
                     .textFieldStyle(.roundedBorder)
                 Picker("Protocol", selection: $model.localCreateProtocol) {
-                    ForEach(LocalIdentityProtocol.allCases, id: \.self) { protocolType in
+                    ForEach(LocalIdentityProtocol.creatable, id: \.self) { protocolType in
                         Text(protocolType.rawValue).tag(protocolType)
                     }
                 }
                 .pickerStyle(.menu)
+                Text(LocalIdentityWarning.loss).font(.callout)
+                Text(LocalIdentityWarning.redundancy(model.localCreateProtocol)).font(.callout)
+                Toggle("I understand that device loss permanently loses this identity", isOn: $model.localCreateAcknowledged)
                 HStack {
                     Spacer()
                     Button("Cancel") { model.cancelLocalCreate() }
                     Button("Create") { model.submitLocalCreate() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.localCreating || model.localCreateName.isEmpty)
+                        .disabled(model.localCreating || model.localCreateName.isEmpty || !model.localCreateAcknowledged)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

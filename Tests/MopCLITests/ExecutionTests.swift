@@ -44,14 +44,14 @@ import MopCore
         let (status, out, err) = try execute(["/bin/sh", "-c", "cat; printf 'secret-two' >&2; exit 42"],
                                            secrets: ["secret-one", "secret-two"], input: Data("secret-one\n".utf8))
         #expect(status >> 8 == 42)
-        #expect(out == Data("[concealed by 2ndpass]\n".utf8))
-        #expect(err == Data("[concealed by 2ndpass]".utf8))
+        #expect(out == Data("[concealed by sp]\n".utf8))
+        #expect(err == Data("[concealed by sp]".utf8))
     }
 
     @Test func largeConcurrentStreamsAndBinaryData() throws {
         let script = "import os,threading; data=b'abc-secret-xyz\\xff\\x00'*20000; t=threading.Thread(target=lambda: os.write(2,data)); t.start(); os.write(1,data); t.join()"
         let (status, out, err) = try execute(["/usr/bin/python3", "-c", script], secrets: ["secret"])
-        let expected = Data(Array(repeating: Array("abc-[concealed by 2ndpass]-xyz".utf8) + [0xff, 0], count: 20000).flatMap { $0 })
+        let expected = Data(Array(repeating: Array("abc-[concealed by sp]-xyz".utf8) + [0xff, 0], count: 20000).flatMap { $0 })
         #expect(status == 0)
         #expect(out == expected)
         #expect(err == expected)
@@ -74,7 +74,7 @@ import MopCore
         #expect(status == 0)
         #expect(out.elementsEqual(value))
         let (_, masked, _) = try execute(["/bin/sh", "-c", "printf '%s' \"$TOKEN\""], secrets: [value], environment: environment)
-        #expect(masked == Data("[concealed by 2ndpass]".utf8))
+        #expect(masked == Data("[concealed by sp]".utf8))
         #expect(throws: MopError.invalidProcess) { try EnvironmentBlock(["TOKEN": "a\0b"]) }
         #expect(throws: MopError.invalidProcess) { try EnvironmentBlock(["BAD=NAME": "value"]) }
     }

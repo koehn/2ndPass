@@ -1,3 +1,4 @@
+import MopLocalIdentity
 import Testing
 import Foundation
 import MopCore
@@ -33,27 +34,14 @@ import MopAppSupport
             protocolType: .genericEcdh,
             publicKey: p256Generator
         )
-        let catalog = LocalIdentityCatalog.build(identities: [signing, agreement])
-
+        let catalog = LocalIdentityCatalog(identities: [signing, agreement])
         #expect(catalog.vault == "local")
-        #expect(catalog.revision == LocalIdentityCatalog.revision)
-        #expect(catalog.canEdit == false)
-        #expect(catalog.items.count == 2)
-
-        for item in catalog.items {
-            #expect(item.type == .sshKey)
-            // The private key must never appear as a field.
-            #expect(!item.fields.contains { $0.path == "privateKey" || $0.type == .privateKey })
-            // The keychain UUID is carried for sign/delete resolution.
-            #expect(item.storageID != nil)
-            #expect(item.fields.contains { $0.path == "publicKey" && $0.type == .text })
-        }
-
-        let deploy = catalog.items[0]
-        #expect(deploy.storageID == signing.id.uuidString)
-        // A signing key shows the OpenSSH public line.
-        let publicKey = deploy.fields.first { $0.path == "publicKey" }
-        #expect(publicKey?.value?.hasPrefix("ecdsa-sha2-nistp256 ") == true)
+        #expect(catalog.kind == "device-local")
+        #expect(catalog.identities == [signing, agreement])
+        let json = String(decoding: try JSONEncoder().encode(catalog), as: UTF8.self)
+        #expect(!json.contains("opaqueKey"))
+        #expect(!json.contains("fields"))
+        #expect(signing.publicKeyText.hasPrefix("ecdsa-sha2-nistp256 "))
     }
 
     @Test func policyAllowsCoreAndBlocksForbidden() {
@@ -66,4 +54,16 @@ import MopAppSupport
             #expect((LocalVaultPolicy.disallowedReason(forbidden))?.isEmpty == false)
         }
     }
+}
+@Test func localReferencesAreRejectedBeforeCloudOrAuthentication() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let service = NativeVaultService(state: directory)
+    for operation: VaultOperation in [.catalog, .members, .sync, .export(directory), .manage(.devices), .deleteVault, .rename("other")] {
+        await #expect(throws: MopError.localOperationForbidden) { try await service.execute(operation, vault: "local", offline: false) }
+    }
+    await #expect(throws: MopError.localOperationForbidden) { try await service.execute(.create(name: "local"), vault: nil, offline: false) }
+    let ref = try SecretReference(vault: "local", relativePath: "test/password")
+    await #expect(throws: MopError.localOperationForbidden) { try await service.readLocal(ref, vault: UUID().uuidString) }
+    #expect(!FileManager.default.fileExists(atPath: directory.path))
+    #expect(service.authenticatedAt == nil)
 }

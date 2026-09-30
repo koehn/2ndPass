@@ -281,7 +281,7 @@ software fixtures do not substitute for platform evidence.
 
 ## Device removal lifecycle
 
-Settings on all Apple platforms and `2ndpass vault devices` share account-device
+Settings on all Apple platforms and `sp vault devices` share account-device
 management. Removal spans the private vaults locally enrolled on the managing
 device, with preflight last-owner checks and independently journaled publications.
 It is not an atomic account-wide CloudKit transaction and does not affect unknown

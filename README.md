@@ -51,7 +51,7 @@ Enclave keys are generated automatically, and you can save secrets immediately.
 The CLI equivalent is:
 
 ```sh
-2ndpass vault init personal
+sp vault init personal
 ```
 
 Recovery is optional. Until another device or hardware recovery is added, losing
@@ -107,11 +107,11 @@ The CLI equivalent is:
 
 ```sh
 # On the recovery device:
-2ndpass device request --recovery > recovery-request.json
+sp device request --recovery > recovery-request.json
 # On the owner device:
-2ndpass vault replace-recovery --vault personal recovery-request.json --fingerprint VERIFIED_REQUEST_FINGERPRINT
-2ndpass vault export --vault personal personal-backup.json
-2ndpass vault fingerprint --vault personal
+sp vault replace-recovery --vault personal recovery-request.json --fingerprint VERIFIED_REQUEST_FINGERPRINT
+sp vault export --vault personal personal-backup.json
+sp vault fingerprint --vault personal
 ```
 
 Retain the encrypted backup and independently recorded checkpoint. Recovery,
@@ -130,18 +130,18 @@ and cannot prevent another unlocked owner app from processing a request automati
 
 ```sh
 # New device (use the UUID shown by vault list):
-2ndpass vault enrollment request --vault VAULT_UUID --name 'My Mac'
+sp vault enrollment request --vault VAULT_UUID --name 'My Mac'
 # Existing owner device:
-2ndpass vault enrollment inbox --vault personal
+sp vault enrollment inbox --vault personal
 # New device: receive the invitation and send acceptance:
-2ndpass vault enrollment status --vault VAULT_UUID
+sp vault enrollment status --vault VAULT_UUID
 # After comparing both displays, confirm on the new device:
-2ndpass vault enrollment confirm --vault VAULT_UUID --code MATCHING_CODE
+sp vault enrollment confirm --vault VAULT_UUID --code MATCHING_CODE
 # Existing owner: refresh inbox and approve:
-2ndpass vault enrollment inbox --vault personal
-2ndpass vault enrollment approve --vault personal --request-id REQUEST_UUID --code MATCHING_CODE
+sp vault enrollment inbox --vault personal
+sp vault enrollment approve --vault personal --request-id REQUEST_UUID --code MATCHING_CODE
 # New device: finish enrollment:
-2ndpass vault enrollment status --vault VAULT_UUID
+sp vault enrollment status --vault VAULT_UUID
 ```
 
 `enrollment decline --request-id REQUEST_UUID` declines a request. On the new
@@ -157,13 +157,13 @@ For another account, or advanced manual enrollment:
 On the new device:
 
 ```sh
-2ndpass device request > device-request.json
+sp device request > device-request.json
 ```
 
 On an owner device, independently compare the request fingerprint:
 
 ```sh
-2ndpass vault invite --vault personal device-request.json --fingerprint REQUEST_FINGERPRINT --role editor > invitation.json
+sp vault invite --vault personal device-request.json --fingerprint REQUEST_FINGERPRINT --role editor > invitation.json
 ```
 
 Use `--role owner` only for another device on the existing owner account. Other accounts can be editors or viewers. The invitation's checkpoint and, for another account, private iCloud share URL are printed to stderr. Transfer them and compare the checkpoint independently.
@@ -171,23 +171,23 @@ Use `--role owner` only for another device on the existing owner account. Other 
 On the new device:
 
 ```sh
-2ndpass vault accept invitation.json --checkpoint VERIFIED_CHECKPOINT --share-url ICLOUD_SHARE_URL > acceptance.json
+sp vault accept invitation.json --checkpoint VERIFIED_CHECKPOINT --share-url ICLOUD_SHARE_URL > acceptance.json
 ```
 
 Omit `--share-url` for another device on the same account. Return acceptance to the owner:
 
 ```sh
-2ndpass vault approve --vault personal acceptance.json --fingerprint REQUEST_FINGERPRINT
-2ndpass vault members --vault personal
+sp vault approve --vault personal acceptance.json --fingerprint REQUEST_FINGERPRINT
+sp vault members --vault personal
 ```
 
 Refresh on the receiving device. Invitations expire after one day in the clients and bind the exact checkpoint. If another write wins before approval, issue a fresh invitation; do not overwrite the competing revision.
 
 ```sh
-2ndpass vault remove-device --vault personal DEVICE_UUID
-2ndpass vault remove-member --vault personal ACCOUNT_UUID
-2ndpass vault role --vault personal ACCOUNT_UUID viewer
-2ndpass vault reconcile-share --vault personal
+sp vault remove-device --vault personal DEVICE_UUID
+sp vault remove-member --vault personal ACCOUNT_UUID
+sp vault role --vault personal ACCOUNT_UUID viewer
+sp vault reconcile-share --vault personal
 ```
 
 Removal rotates keys and ciphertext for current contents. The final command retries CloudKit permissions after a roster change if its separate transport update failed. Copied passwords, prior ciphertext and old backups cannot be revoked.
@@ -195,23 +195,23 @@ Removal rotates keys and ciphertext for current contents. The final command retr
 ## Read, write, run and inject
 
 ```sh
-2ndpass write secondpass://personal/service/token          # hidden prompt or stdin
-2ndpass read secondpass://personal/service/token
-2ndpass list --vault personal --json
-2ndpass run --env-file .env -- command arguments
-2ndpass inject --in-file template.conf --out-file rendered.conf
-2ndpass item catalog --vault personal
-2ndpass item save --vault personal < edited-item.json
+sp write sp://personal/service/token          # hidden prompt or stdin
+sp read sp://personal/service/token
+sp list --vault personal --json
+sp run --env-file .env -- command arguments
+sp inject --in-file template.conf --out-file rendered.conf
+sp item catalog --vault personal
+sp item save --vault personal < edited-item.json
 ```
 
-References have the form `secondpass://vault/item/[section/]field`. Values are encrypted individually; listing opens the catalog only. Visible metadata such as usernames and websites is inside the encrypted catalog. Passwords, concealed fields and OTP seeds are omitted from catalog values. OTP reads return the current code. `item save` accepts an `ItemEdit` with the catalog revision, item name/type/ordered fields, `create`, and optionally `originalName`. A null field value preserves it; omitted fields are deleted. Stale edits fail.
+References have the form `sp://vault/item/[section/]field`. Values are encrypted individually; listing opens the catalog only. Visible metadata such as usernames and websites is inside the encrypted catalog. Passwords, concealed fields and OTP seeds are omitted from catalog values. OTP reads return the current code. `item save` accepts an `ItemEdit` with the catalog revision, item name/type/ordered fields, `create`, and optionally `originalName`. A null field value preserves it; omitted fields are deleted. Stale edits fail.
 
 `--vault NAME-OR-UUID` constrains selection. With multiple vaults, management commands require a selection. Names are not aliases; renaming changes references:
 
 ```sh
-2ndpass vault rename --vault VAULT_UUID new-name
-2ndpass vault sync --vault VAULT_UUID
-2ndpass read --offline secondpass://personal/service/token
+sp vault rename --vault VAULT_UUID new-name
+sp vault sync --vault VAULT_UUID
+sp read --offline sp://personal/service/token
 ```
 
 Offline access uses a previously verified encrypted checkpoint and is read-only. It cannot detect remote revocation or prove freshness. Observed account changes invalidate offline account bindings. Local state must never be synchronized: packaged app/CLI/AutoFill share a device-local app-group directory; the CLI permits `--state-directory` or `MOP_STATE_DIRECTORY` for explicit isolation.
@@ -231,7 +231,7 @@ control a child's use of plaintext. See [CLI boundaries](docs/SECURITY.md#cli-an
 Generate ordinary and recovery requests on the replacement owner device and a new separate recovery device. Compare both fingerprints. On the **currently enrolled recovery device**:
 
 ```sh
-2ndpass vault recover backup.json --checkpoint VERIFIED_BACKUP_CHECKPOINT \
+sp vault recover backup.json --checkpoint VERIFIED_BACKUP_CHECKPOINT \
   --owner-request new-owner.json --owner-fingerprint VERIFIED_OWNER_REQUEST \
   --recovery-request new-recovery.json --recovery-fingerprint VERIFIED_RECOVERY_REQUEST > recovered.json
 ```
@@ -239,7 +239,7 @@ Generate ordinary and recovery requests on the replacement owner device and a ne
 This verifies newer signed descendants when the account is still available, then replaces the old roster. On the replacement owner device, import the returned checkpoint using the independently transmitted new digest:
 
 ```sh
-2ndpass vault import recovered.json --checkpoint VERIFIED_NEW_CHECKPOINT
+sp vault import recovered.json --checkpoint VERIFIED_NEW_CHECKPOINT
 ```
 
 If account access is lost, use `--copy` on the recovery device signed into the new account. First generate that device's ordinary request for `--owner-request`. This creates a new vault UUID/root under the new account and preserves the source. Then enroll additional devices normally. No software recovery key is imported or exported.
@@ -249,7 +249,7 @@ If account access is lost, use `--copy` on the recovery device signed into the n
 Export returns an encrypted v7 checkpoint; record its digest independently. Import requires that digest and an already enrolled device. For a shared-database checkpoint, also supply `--shared-owner` with its actual zone owner record name. Import never creates or overwrites a cloud zone.
 
 ```sh
-2ndpass vault delete --vault VAULT_UUID --confirm VAULT_UUID
+sp vault delete --vault VAULT_UUID --confirm VAULT_UUID
 ```
 
 Deletion requires owner authorization, removes the cloud zone, and forgets its active registry entry. Existing local ciphertext and exported backups remain. Old-format data cannot be selected or deleted through v7 commands.
@@ -282,15 +282,15 @@ export MOP_CLOUD_ENVIRONMENT='Development' # Production for release builds
 scripts/package.sh
 scripts/install.sh dist/2ndPass.app
 open /Applications/2ndPass.app
-2ndpass vault list
+sp vault list
 ```
 
 The installer places the app at `/Applications/2ndPass.app` and links the CLI at
-`/usr/local/bin/2ndpass`. It requests administrator access only when needed for file
+`/usr/local/bin/sp`. It requests administrator access only when needed for file
 installation. Run the script as your normal user. Manpages and completions go under
 `/usr/local/share`; ensure `/usr/local/bin` is on your PATH. If an older installation
-at `~/.local/bin/2ndpass` takes precedence, remove that old symlink or place
-`/usr/local/bin` earlier in PATH; check with `command -v 2ndpass`. Existing vault state
+at `~/.local/bin/sp` takes precedence, remove that old symlink or place
+`/usr/local/bin` earlier in PATH; check with `command -v sp`. Existing vault state
 is preserved by the installer. For isolated test installs,
 set both `MOP_INSTALL_ROOT` (CLI/resources prefix) and `MOP_APPLICATIONS_DIR`.
 
@@ -303,7 +303,7 @@ Developer profiles/environments are distinct from production data.
 
 ## Platform checks
 
-`2ndpass-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VAULT-NEXT-VALIDATION.md) for live CloudKit/Enclave probes, modeled scenarios and checks still requiring separate physical devices/accounts. Do not treat software fixtures or simulator builds as hardware evidence.
+`sp-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VAULT-NEXT-VALIDATION.md) for live CloudKit/Enclave probes, modeled scenarios and checks still requiring separate physical devices/accounts. Do not treat software fixtures or simulator builds as hardware evidence.
 
 ## Remove a device or repeat enrollment testing
 
@@ -317,20 +317,20 @@ creates fresh device keys. The final owner device cannot be removed.
 CLI equivalents for repeatable testing:
 
 ```sh
-2ndpass vault devices
-2ndpass vault devices --remove DEVICE_UUID
+sp vault devices
+sp vault devices --remove DEVICE_UUID
 # On the removed device, detect revocation:
-2ndpass vault sync --vault VAULT_UUID
+sp vault sync --vault VAULT_UUID
 # Explicitly opt back in, then request enrollment:
-2ndpass vault enrollment reconnect
-2ndpass vault enrollment request --vault VAULT_UUID --name "Test iPad"
+sp vault enrollment reconnect
+sp vault enrollment request --vault VAULT_UUID --name "Test iPad"
 ```
 
 Keep another enrolled device unlocked to complete the new request.
 
 ## Import from another password manager
 
-Use **Import…** in the app, or `2ndpass item import FILE --vault personal --dry-run`
+Use **Import…** in the app, or `sp item import FILE --vault personal --dry-run`
 to preview a supported export. See [Importing password-manager data](docs/IMPORT.md)
 for supported formats, conflict handling, and migration limits.
 
@@ -350,3 +350,11 @@ just site-serve
 recipes. `just site-deploy-dry-run BUCKET` prints the deployment plan without making
 AWS calls. See the [website guide](website/README.md#deploy-to-s3) for HTTPS hosting
 and deployment configuration.
+
+### Device-local identities
+
+The vault named exactly `local` holds Secure Enclave SSH, Git signing, certificate,
+and device-bound passkey identities. Private keys never leave this device and cannot
+be synced, exported, backed up, or restored. Register independent credentials on
+another device before relying on them. See [local vault usage, passkey platform
+limitations, and acceptance requirements](docs/LOCAL-VAULT.md).

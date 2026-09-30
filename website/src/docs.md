@@ -44,10 +44,10 @@ export MOP_CLOUD_ENVIRONMENT='Development'
 just app-package
 just app-install
 open /Applications/2ndPass.app
-2ndpass --help
+sp --help
 ```
 
-The installer places the CLI at `/usr/local/bin/2ndpass`, pointing into the signed app. Keep the executable inside its bundle. `MOP_*` settings and internal identifiers retain their old names for compatibility; see the [branding notes](https://github.com/koehn/2ndPass/blob/main/docs/BRANDING.md).
+The installer places the CLI at `/usr/local/bin/sp`, pointing into the signed app. Keep the executable inside its bundle. `MOP_*` settings and internal identifiers retain their old names for compatibility; see the [branding notes](https://github.com/koehn/2ndPass/blob/main/docs/BRANDING.md).
 
 The [build README](https://github.com/koehn/2ndPass#build-and-provision), [CloudKit setup](https://github.com/koehn/2ndPass/blob/main/docs/CLOUDKIT.md), and [iPhone/iPad build guide](https://github.com/koehn/2ndPass/blob/main/docs/MOBILE.md) contain the full provisioning requirements. `just ios-build` checks the simulator and device builds; `just ios-archive` creates a signed archive when signing is configured.
 
@@ -60,8 +60,8 @@ Open 2ndPass and choose **Create a vault**. Name it, authenticate, and start add
 The CLI equivalent is:
 
 ```sh
-2ndpass vault init personal
-2ndpass vault list
+sp vault init personal
+sp vault list
 ```
 
 If an existing vault is discovered but this device is not enrolled, the app offers **Connect this device**. Unlock 2ndPass on an existing owner device to let it process the enrollment request. [Learn about this trust boundary](security.html#icloud).
@@ -83,8 +83,8 @@ Choose **Import…** from the Mac File menu or the app’s New menu. Select your
 Preview a batch before importing:
 
 ```sh
-2ndpass item import export.1pux --vault personal --dry-run
-2ndpass item import export.1pux --vault personal --yes
+sp item import export.1pux --vault personal --dry-run
+sp item import export.1pux --vault personal --yes
 ```
 
 Source exports contain **plaintext secrets**. Store them carefully, verify the import, then remove unwanted copies yourself. 2ndPass does not delete the source export. Passkeys and password history are not migrated. Check every warning before closing your old account. See the [complete import guide](https://github.com/koehn/2ndPass/blob/main/docs/IMPORT.md) for supported fields, limits, and attachment handling.
@@ -116,39 +116,39 @@ For missing suggestions, check the item’s website and field types, then refres
 A reference points to a field without containing its secret:
 
 ```text
-secondpass://vault/item/[section/]field
+sp://vault/item/[section/]field
 ```
 
-Use percent encoding for spaces and other special characters, for example `secondpass://personal/My%20Login/password`. Names are case-sensitive. Copying a reference from the app is the easiest way to get the correct spelling. Renaming items or vaults means updating references that use those names.
+Use percent encoding for spaces and other special characters, for example `sp://personal/My%20Login/password`. Names are case-sensitive. Copying a reference from the app is the easiest way to get the correct spelling. Renaming items or vaults means updating references that use those names.
 
 ```sh
 # Prompts for a hidden value; do not put the secret in the command line.
-2ndpass write secondpass://personal/github/token
+sp write sp://personal/github/token
 
 # Replace a value already stored at that reference.
-2ndpass write secondpass://personal/github/token --replace
+sp write sp://personal/github/token --replace
 
 # Prints the secret: choose where stdout goes carefully.
-2ndpass read secondpass://personal/github/token
+sp read sp://personal/github/token
 ```
 
-`mop://` references remain supported. The new scheme is `secondpass://`, with the word spelled out; URI schemes cannot begin with a number.
+`mop://` references remain supported. The new scheme is `sp://`, with the word spelled out; URI schemes cannot begin with a number.
 
 ## Runtime
 
 Give a child process a secret without putting the literal value in a checked-in environment file:
 
 ```sh
-GH_TOKEN=secondpass://personal/github/token \
-  2ndpass run -- gh repo list --limit 10
+GH_TOKEN=sp://personal/github/token \
+  sp run -- gh repo list --limit 10
 ```
 
 For a local application, create a `development` vault and store your credentials first:
 
 ```sh
-2ndpass vault init development
-2ndpass write secondpass://development/db/user
-2ndpass write secondpass://development/db/password
+sp vault init development
+sp write sp://development/db/user
+sp write sp://development/db/password
 ```
 
 Save a reference-only `app.env`:
@@ -156,14 +156,14 @@ Save a reference-only `app.env`:
 ```dotenv
 APP_ENV=development
 PGHOST=localhost
-PGUSER=secondpass://${APP_ENV}/db/user
-PGPASSWORD=secondpass://${APP_ENV}/db/password
+PGUSER=sp://${APP_ENV}/db/user
+PGPASSWORD=sp://${APP_ENV}/db/password
 ```
 
 Then launch your project:
 
 ```sh
-2ndpass run --env-file app.env -- npm run dev
+sp run --env-file app.env -- npm run dev
 ```
 
 All references must resolve before the command starts. The launched process and its children receive plaintext credentials in their environment; the invoking shell does not receive the resolved values. Later `--env-file` arguments override earlier ones. Variable expansion applies inside references, not arbitrary dotenv strings.
@@ -183,18 +183,18 @@ For software that needs a configuration file, write a template containing placeh
 
 ```ini
 registry=https://registry.npmjs.org/
-//registry.npmjs.org/:_authToken={{ secondpass://personal/npm/token }}
+//registry.npmjs.org/:_authToken={{ sp://personal/npm/token }}
 ```
 
 Store the npm token, then materialize the configuration only for the command:
 
 ```sh
-2ndpass write secondpass://personal/npm/token
+sp write sp://personal/npm/token
 
 (
-  config_dir=$(mktemp -d "${TMPDIR:-/tmp}/2ndpass-npm.XXXXXXXX") || exit
+  config_dir=$(mktemp -d "${TMPDIR:-/tmp}/sp-npm.XXXXXXXX") || exit
   trap 'rm -rf "$config_dir"' EXIT
-  2ndpass inject --in-file npmrc.template \
+  sp inject --in-file npmrc.template \
     --out-file "$config_dir/npmrc" --file-mode 0600 || exit
   npm --userconfig "$config_dir/npmrc" whoami
 )
@@ -208,12 +208,12 @@ The workflow will feel familiar, but **2ndPass is not a drop-in implementation o
 
 | Existing habit | 2ndPass approach |
 | --- | --- |
-| `op read` | Store/import the item, then use `2ndpass read secondpass://…` |
-| `op run` | Update references and use `2ndpass run --env-file FILE -- COMMAND` |
-| `op inject` | Use `{{ secondpass://… }}` placeholders with `2ndpass inject` |
+| `op read` | Store/import the item, then use `sp read sp://…` |
+| `op run` | Update references and use `sp run --env-file FILE -- COMMAND` |
+| `op inject` | Use `{{ sp://… }}` placeholders with `sp inject` |
 | A 1Password export | Review a 1PUX or CSV import into a selected vault |
 
-There is no automatic lookup in 1Password or Apple Passwords. Review flags, field paths, and dotenv behavior for each script. Do not blindly alias `op` to `2ndpass`. See [more integration recipes](https://github.com/koehn/2ndPass/blob/main/docs/EXAMPLES.md) for Docker, GitHub, npm, and SSH.
+There is no automatic lookup in 1Password or Apple Passwords. Review flags, field paths, and dotenv behavior for each script. Do not blindly alias `op` to `sp`. See [more integration recipes](https://github.com/koehn/2ndPass/blob/main/docs/EXAMPLES.md) for Docker, GitHub, npm, and SSH.
 
 ## Attachments
 
@@ -222,9 +222,9 @@ In the item editor, add an Attachment field and choose a file. The Document temp
 For an existing item:
 
 ```sh
-2ndpass item attachment add proof.pdf \
+sp item attachment add proof.pdf \
   --vault personal --item "Account" --field proof
-2ndpass item attachment export secondpass://personal/Account/proof \
+sp item attachment export sp://personal/Account/proof \
   --output ./proof.pdf
 ```
 
@@ -251,8 +251,8 @@ Add a separate hardware recovery device through **Settings → vault → Set up 
 Save an encrypted backup and independently record the trusted checkpoint:
 
 ```sh
-2ndpass vault export --vault personal personal-backup.json
-2ndpass vault fingerprint --vault personal
+sp vault export --vault personal personal-backup.json
+sp vault fingerprint --vault personal
 ```
 
 A backup is not a recovery key. Restoring requires surviving authorized hardware and the documented verification steps. Follow the [hardware recovery guide](https://github.com/koehn/2ndPass#hardware-recovery); a restored Apple Account alone cannot recreate device keys.
@@ -263,9 +263,9 @@ A backup is not a recovery key. Restoring requires surviving authorized hardware
 
 - **Signing error:** launch the provisioned app and use its bundled CLI through the installed symlink. An unsigned binary cannot access the vault. Keep identifiers and CloudKit environments consistent.
 - **Waiting for another device:** unlock 2ndPass on an enrolled owner device. Locked or suspended apps cannot grant access. Check connectivity and use Retry.
-- **Offline:** use `2ndpass read --offline secondpass://personal/item/password` for previously verified local data. Offline access is read-only and cannot learn about revocation or prove freshness.
+- **Offline:** use `sp read --offline sp://personal/item/password` for previously verified local data. Offline access is read-only and cannot learn about revocation or prove freshness.
 - **Conflicting edit:** keep the draft, refresh, and resolve the conflict. Do not assume your write overwrote another device’s changes.
-- **Uncertain write:** use `2ndpass vault sync --vault personal` to reconcile before retrying a mutation.
-- **Need a flag:** use `2ndpass --help`, `2ndpass COMMAND --help`, or `man 2ndpass`.
+- **Uncertain write:** use `sp vault sync --vault personal` to reconcile before retrying a mutation.
+- **Need a flag:** use `sp --help`, `sp COMMAND --help`, or `man sp`.
 
 Report reproducible problems in the [repository’s issue tracker](https://github.com/koehn/2ndPass/issues). Never include passwords, tokens, plaintext exports, or sensitive vault contents in a report.

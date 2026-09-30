@@ -8,19 +8,19 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-with tempfile.TemporaryDirectory(prefix="2ndpass-install-layout-") as directory:
+with tempfile.TemporaryDirectory(prefix="sp-install-layout-") as directory:
     temp = Path(directory)
     package = temp / "package"
     app = package / "2ndPass.app"
-    helper = app / "Contents/MacOS/2ndpass"
+    helper = app / "Contents/MacOS/sp"
     helper.parent.mkdir(parents=True)
     helper.write_text('#!/bin/sh\necho TEST.net.koehn.mop\n')
     helper.chmod(0o700)
     app.chmod(0o700)
     (app / "Contents/embedded.provisionprofile").write_text("fixture")
     (app / "valid-signature").touch()
-    resources = ["man/man1/2ndpass.1", "bash-completion/completions/2ndpass",
-                 "zsh/site-functions/_2ndpass", "fish/vendor_completions.d/2ndpass.fish"]
+    resources = ["man/man1/sp.1", "bash-completion/completions/sp",
+                 "zsh/site-functions/_sp", "fish/vendor_completions.d/sp.fish"]
     for resource in resources:
         path = package / "share" / resource
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,15 +41,23 @@ if [ "${FAIL_INSTALLED:-}" = "$3" ] && [ ! -f "$3/old-version" ]; then exit 8; f
         return subprocess.run(command, env=env | (extra or {}), capture_output=True, text=True)
     result = run()
     assert result.returncode == 0, result.stderr
+    assert not result.stderr, result.stderr
     installed = applications / "2ndPass.app"
-    link = prefix / "bin/2ndpass"
-    assert link.readlink() == installed / "Contents/MacOS/2ndpass"
+    link = prefix / "bin/sp"
+    assert link.readlink() == installed / "Contents/MacOS/sp"
     assert installed.stat().st_mode & 0o055 == 0o055
-    assert (installed / "Contents/MacOS/2ndpass").stat().st_mode & 0o055 == 0o055
-    assert not (prefix / "lib/2ndpass/2ndPass.app").exists()
+    assert (installed / "Contents/MacOS/sp").stat().st_mode & 0o055 == 0o055
+    assert not (prefix / "lib/sp/2ndPass.app").exists()
     for resource in resources:
         target = prefix / "share" / resource
         assert target.is_symlink() and target.read_text() == resource
+    # An existing signed app may still contain the previous CLI filename.
+    (installed / "Contents/MacOS/sp").rename(installed / "Contents/MacOS/2ndpass")
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr, result.stderr
+    assert (installed / "Contents/MacOS/sp").is_file()
+    assert not (installed / "Contents/MacOS/2ndpass").exists()
     (installed / "old-version").touch()
     result = run({"FAIL_INSTALLED": str(installed)})
     assert result.returncode != 0
@@ -65,7 +73,7 @@ if [ "${FAIL_INSTALLED:-}" = "$3" ] && [ ! -f "$3/old-version" ]; then exit 8; f
     link.symlink_to("/bin/echo")
     assert run().returncode == 7 and link.readlink() == Path("/bin/echo")
     link.unlink()
-    link.symlink_to(installed / "Contents/MacOS/2ndpass")
+    link.symlink_to(installed / "Contents/MacOS/sp")
     marker = installed / "valid-signature"
     marker.unlink()
     assert run().returncode != 0

@@ -173,13 +173,13 @@ From the repository root:
 ```sh
 swift test --disable-automatic-resolution --filter MopVaultNextTests
 swift build --target MopVaultNextCheck --disable-automatic-resolution
-swiftc -module-cache-path /tmp/2ndpass-next-module-cache \
-  prototypes/vault-next/enclave.swift -o /tmp/2ndpass-enclave-probe
-/tmp/2ndpass-enclave-probe
-/tmp/2ndpass-enclave-probe --deny
-/tmp/2ndpass-enclave-probe --preauthorize
-swiftc -parse-as-library -module-cache-path /tmp/2ndpass-next-module-cache \
-  prototypes/vault-next/cloud.swift -o /tmp/2ndpass-cloud-probe
+swiftc -module-cache-path /tmp/sp-next-module-cache \
+  prototypes/vault-next/enclave.swift -o /tmp/sp-enclave-probe
+/tmp/sp-enclave-probe
+/tmp/sp-enclave-probe --deny
+/tmp/sp-enclave-probe --preauthorize
+swiftc -parse-as-library -module-cache-path /tmp/sp-next-module-cache \
+  prototypes/vault-next/cloud.swift -o /tmp/sp-cloud-probe
 ```
 
 The default standalone Enclave probe tests hardware crypto without user-presence
@@ -205,7 +205,7 @@ disposable engine check are ephemeral; its test password is a fixed public value
 The cloud prototype takes `CONTAINER` followed by:
 
 - `inspect`: lists only probe zones.
-- `create`: creates a fresh `2ndpass-next-probe-UUID` zone and a `MopNextProbe` record
+- `create`: creates a fresh `sp-next-probe-UUID` zone and a `MopNextProbe` record
   with a disposable marker. This schema is Development-only probe data.
 - `race private|shared OWNER ZONE`: two competing conditional saves.
 - `barrier private|shared OWNER ZONE`: same-value CAS plus rejection of an old-version save.
@@ -231,7 +231,7 @@ Its updated live workflow has not been run.
 ## Retained disposable resources
 
 - CloudKit container `iCloud.com.koehn.mop`, **Development** zone
-  `2ndpass-next-probe-2F2A6619-0DE1-4961-9885-EF6299DC2C92`. Contains disposable marker
+  `sp-next-probe-2F2A6619-0DE1-4961-9885-EF6299DC2C92`. Contains disposable marker
   data and an owner-only share. No secrets, recipients from another account, or
   existing 2ndPass identity material were uploaded.
 - Device Keychain scope

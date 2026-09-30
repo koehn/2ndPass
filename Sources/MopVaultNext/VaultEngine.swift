@@ -7,6 +7,7 @@ import MopCore
 /// symmetric key is retained by this engine between operations.
 public enum VaultEngine {
     public static func create(name: String, owner: any DeviceOperations, recovery: DevicePublicKey? = nil, id: UUID = UUID()) throws -> VerifiedVault {
+        try CloudVaultBoundary.validateName(name)
         let membership = try Membership(accounts: [AccountMember(id: owner.identity.member, role: .owner, devices: [owner.identity])], recovery: recovery)
         let header = Revision.Header(format: "mop-vault-v7", vault: id, name: name, generation: 1, parent: nil,
                                      epoch: 1, membership: membership, operation: .create, acceptedInvitations: [])

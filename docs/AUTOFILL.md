@@ -137,3 +137,16 @@ dismiss during authentication, and verify nothing fills from the invalidated ses
 Check Return/Escape/arrow keys, VoiceOver, text sizing, contrast, no-results search,
 and confirmation before choosing an unrelated site. Test disabled/enabled provider
 states and publication failure independently from a successful vault save.
+
+## Device-bound passkeys in `local`
+
+The extension implements Secure Enclave ES256 WebAuthn registration and assertion,
+with user verification for every operation. Creation requires acknowledging permanent
+device loss and recommends registering another independent passkey on another device.
+The passkey remains device-bound; it is never synced or backed up. Only credentials
+matching the exact requested relying party and allowed credential IDs are offered.
+
+BE and BS are both zero. Apple has documented a credential-provider restriction
+requiring those flags to be true, so physical-device acceptance is not yet established.
+The implementation never lies about backups to bypass that restriction. See
+[the compatibility limitation and acceptance suite](LOCAL-VAULT.md#device-bound-passkeys).

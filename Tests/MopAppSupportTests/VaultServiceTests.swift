@@ -1,3 +1,4 @@
+import MopLocalIdentity
 import CryptoKit
 import Foundation
 import LocalAuthentication
@@ -175,7 +176,7 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
     let cloud = Server()
     let owner = Client(cloud, "a"), a2 = Client(cloud, "a"), b1 = Client(cloud, "b"), b2 = Client(cloud, "b"), recovery = Client(cloud, "a")
     let id = try await create(owner, recovery: recovery)
-    let reference = try SecretReference("secondpass://personal/login/password")
+    let reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "secret"), replace: false), vault: id)
     try await enroll(a2, owner: owner, vault: id, role: .owner)
     try await enroll(b1, owner: owner, vault: id, role: .editor)
@@ -218,7 +219,7 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
     #expect(owner.calls.withLock { $0 } > before)
     #expect(!owner.service.isAuthenticated)
     await #expect(throws: MopError.vaultConflict) { try await owner.service.execute(.save(edit), vault: id) }
-    let reference = try SecretReference("secondpass://personal/login/username")
+    let reference = try SecretReference("sp://personal/login/username")
     let changed = try await owner.service.execute(.write(reference, SecretBytes(utf8: "bob"), replace: true), vault: id).requireCatalog()
     #expect(changed.items[0].fields.first { $0.type == .username }?.value == "bob")
     await #expect(throws: MopError.notFound) { try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: owner.service) }
@@ -232,7 +233,7 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
 
 @Test func integratedUncertainWriteOfflineAccountInvalidationAndReopen() async throws {
     let cloud = Server(), owner = Client(cloud, "a"), recovery = Client(cloud, "a")
-    let id = try await create(owner, recovery: recovery), reference = try SecretReference("secondpass://personal/item/password")
+    let id = try await create(owner, recovery: recovery), reference = try SecretReference("sp://personal/item/password")
     await cloud.dropNext()
     await #expect(throws: MopError.cloudUncertain) { try await owner.service.execute(.write(reference, SecretBytes(utf8: "committed"), replace: false), vault: id) }
     owner.reopen()
@@ -285,7 +286,7 @@ private actor AuthenticationGate {
     #expect(try await owner.service.execute(.discover, vault: nil).vaults.isEmpty)
     let id = UUID().uuidString
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
-    let reference = try SecretReference("secondpass://personal/login/password")
+    let reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "hello"), replace: false), vault: id)
     let discovery = try await newDevice.service.execute(.discover, vault: nil)
     #expect(discovery.vaults.count == 1)
@@ -313,7 +314,7 @@ private actor AuthenticationGate {
     let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a")
     let id = UUID().uuidString
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
-    let reference = try SecretReference("secondpass://personal/login/password")
+    let reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "hello"), replace: false), vault: id)
     let request = try await newDevice.service.execute(.manage(.requestEnrollment(name: "New Mac")), vault: id)
     #expect(request.enrollments.count == 1)
@@ -341,7 +342,7 @@ private actor AuthenticationGate {
     _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "New Mac")), vault: id)
     _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
     let first = try await newDevice.service.execute(.manage(.checkEnrollment), vault: id).enrollments[0]
-    let reference = try SecretReference("secondpass://personal/login/password")
+    let reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "change"), replace: false), vault: id)
     await #expect(throws: MopError.vaultConflict) { try await owner.service.execute(.manage(.approveEnrollment(id: first.id, code: first.verificationCode!)), vault: id) }
     _ = try await owner.service.execute(.manage(.enrollmentInbox), vault: id)
@@ -446,7 +447,7 @@ private actor AuthenticationGate {
     let server = Server(), owner = Client(server, "a"), newDevice = Client(server, "a")
     let id = UUID().uuidString
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
-    let reference = try SecretReference("secondpass://personal/login/password")
+    let reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.write(reference, SecretBytes(utf8: "hello"), replace: false), vault: id)
     _ = try await newDevice.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: id)
     owner.service.lock()
@@ -470,7 +471,7 @@ private actor AuthenticationGate {
     let server = Server(), owner = Client(server, "a"), phone = Client(server, "a"), tablet = Client(server, "a")
     let id = UUID().uuidString
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
-    let reference = try SecretReference("secondpass://personal/large/password")
+    let reference = try SecretReference("sp://personal/large/password")
     let secret = SecretBytes(utf8: String(repeating: "x", count: 5 * 1024 * 1024))
     _ = try await owner.service.execute(.write(reference, secret, replace: false), vault: id)
     let address = try #require(await server.discover("a").first)
@@ -653,7 +654,7 @@ private actor AuthenticationGate {
     let item = VaultItem(name: "Proof", type: .document, fields: [.init(path: "file", type: .attachment, value: try file.encodedValue())])
     _ = try await writer.service.execute(.save(.init(revision: catalog.revision, item: item, create: true)), vault: id)
     try await enroll(reader, owner: writer, vault: id, role: .owner)
-    let reference = try SecretReference("secondpass://personal/Proof/file")
+    let reference = try SecretReference("sp://personal/Proof/file")
     reader.reopen(allowsAttachments: false, duringSync: true)
     _ = try await reader.service.execute(.catalog, vault: id)
     await #expect(throws: MopError.notFound) { try await reader.service.execute(.read(reference), vault: id) }
@@ -688,7 +689,7 @@ private actor AuthenticationGate {
     let server = Server(), owner = Client(server, "a")
     let id = UUID().uuidString
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
-    let reference = try SecretReference("secondpass://personal/login/password")
+    let reference = try SecretReference("sp://personal/login/password")
     let saved = try await owner.service.execute(.write(reference, SecretBytes(utf8: "first"), replace: false), vault: id)
     let before = try #require(saved.catalog?.items.first)
     #expect(before.metadata?.createdAt != nil)
@@ -704,7 +705,7 @@ private actor AuthenticationGate {
 
 @Test func unlockedLocalReadsNeverContactCloudOrAuthenticateAgain() async throws {
     let server = Server(), owner = Client(server, "a")
-    let id = UUID().uuidString, reference = try SecretReference("secondpass://personal/login/password")
+    let id = UUID().uuidString, reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
     _ = try await owner.service.execute(.write(reference, "secret", replace: false), vault: id)
     let requests = await server.readRequests, authentications = owner.calls.withLock { $0 }
@@ -724,7 +725,7 @@ private actor AuthenticationGate {
 
 @Test func localReadDoesNotWaitBehindCloudRefresh() async throws {
     let server = Server(), owner = Client(server, "a"), barrier = AuthenticationGate()
-    let id = UUID().uuidString, reference = try SecretReference("secondpass://personal/login/password")
+    let id = UUID().uuidString, reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
     _ = try await owner.service.execute(.write(reference, "secret", replace: false), vault: id)
     await server.setReadGate(barrier)
@@ -748,7 +749,7 @@ private actor AuthenticationGate {
 
 @Test func localReadSnapshotTracksCommittedEditsAndDeletion() async throws {
     let owner = Client(Server(), "a"), id = UUID().uuidString
-    let reference = try SecretReference("secondpass://personal/login/password")
+    let reference = try SecretReference("sp://personal/login/password")
     _ = try await owner.service.execute(.create(name: "personal"), vault: id)
     _ = try await owner.service.execute(.write(reference, "first", replace: false), vault: id)
     #expect(try await owner.service.readLocal(reference, vault: id).value == SecretBytes(utf8: "first"))

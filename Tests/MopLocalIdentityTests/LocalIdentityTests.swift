@@ -1,6 +1,8 @@
 import Foundation
 import Testing
+import CryptoKit
 import MopCore
+@testable import MopLocalIdentity
 
 @Test func localVaultNameIsFixedAndNotRenameable() {
     #expect(LocalVault.name == "local")
@@ -14,24 +16,24 @@ import MopCore
 
 @Test func identityRequiresConsistentAlgorithmAndProtocol() throws {
     let ssh = try LocalIdentity(name: "deploy", algorithm: .p256Signing, protocolType: .ssh,
-                                publicKey: Data(repeating: 1, count: 65))
+                                publicKey: P256.Signing.PrivateKey().publicKey.x963Representation)
     #expect(ssh.capabilities == [.signing, .authentication])
     #expect(ssh.protocolType == .ssh)
 
     let ecdh = try LocalIdentity(name: "agreement", algorithm: .p256KeyAgreement, protocolType: .genericEcdh,
-                                 publicKey: Data(repeating: 2, count: 65))
+                                 publicKey: P256.Signing.PrivateKey().publicKey.x963Representation)
     #expect(ecdh.capabilities == [.keyAgreement])
     #expect(!ecdh.protocolType.isSigning)
 
     // A signing protocol cannot be bound to a key-agreement key.
     #expect(throws: MopError.invalidLocalIdentity) {
         try LocalIdentity(name: "bad", algorithm: .p256KeyAgreement, protocolType: .ssh,
-                          publicKey: Data(repeating: 3, count: 65))
+                          publicKey: P256.Signing.PrivateKey().publicKey.x963Representation)
     }
     // A key-agreement protocol cannot be bound to a signing key.
     #expect(throws: MopError.invalidLocalIdentity) {
         try LocalIdentity(name: "bad", algorithm: .p256Signing, protocolType: .genericEcdh,
-                          publicKey: Data(repeating: 4, count: 65))
+                          publicKey: P256.Signing.PrivateKey().publicKey.x963Representation)
     }
 }
 
@@ -45,7 +47,7 @@ import MopCore
 
 @Test func identityOnlyPersistsPublicMaterial() throws {
     let identity = try LocalIdentity(name: "deploy", algorithm: .p256Signing, protocolType: .ssh,
-                                     publicKey: Data([0x04, 1, 2, 3]))
+                                     publicKey: P256.Signing.PrivateKey().publicKey.x963Representation)
     let encoded = String(decoding: try JSONEncoder().encode(identity), as: UTF8.self)
     // There is no field that can carry an exportable private key.
     #expect(!encoded.lowercased().contains("private"))

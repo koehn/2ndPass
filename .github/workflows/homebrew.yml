@@ -60,5 +60,5 @@ jobs:
           brew linkage --test koehn/mop-ci/secondpass
       - name: Exercise the installed CLI without authentication
         run: |
-          python3 scripts/smoke-test.py "$(brew --prefix secondpass)/bin/2ndpass"
-          python3 scripts/test-shell-support.py "$(brew --prefix secondpass)/bin/2ndpass" "$(brew --prefix secondpass)"
+          python3 scripts/smoke-test.py "$(brew --prefix secondpass)/bin/sp"
+          python3 scripts/test-shell-support.py "$(brew --prefix secondpass)/bin/sp" "$(brew --prefix secondpass)"

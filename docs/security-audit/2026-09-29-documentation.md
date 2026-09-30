@@ -152,7 +152,7 @@ was retained; unchanged applicable claims were not rewritten merely for style.
   `IMPORT.md`, `VALIDATION.md`, `RELEASING.md`, `ROADMAP.md`, `BRANDING.md`,
   `IOS-IPADOS-PLAN.md`, `ITEM-KEY-BENCHMARK-2026-09-27.md`,
   `REMOVAL-PROFILING-2026-09-27.md`
-- `docs/man/2ndpass.1`; historical banners in
+- `docs/man/sp.1`; historical banners in
   `docs/security-audit/2026-09-23.md` and `2026-09-24-review.md`; this report
 - `website/src/security.md`, `docs.md`, `faq.md`, `index.njk`
 - Comments only in `Sources/MopVaultNext/Enrollment.swift`, `Membership.swift`,

@@ -1,6 +1,6 @@
 # Releasing 2ndPass
 
-The public app name is **2ndPass**, its executable is `2ndpass`, and its domain is
+The public app name is **2ndPass**, its executable is `sp`, and its domain is
 `2ndpass.app`. The repository remains at `github.com/koehn/mop`.
 
 ## Signed application releases
@@ -8,7 +8,7 @@ The public app name is **2ndPass**, its executable is `2ndpass`, and its domain 
 Follow the [signed build instructions](../README.md#build-and-provision) and
 [mobile distribution guide](MOBILE.md). Packaging produces `dist/2ndPass.app`
 and shell resources. `scripts/install.sh` installs `/Applications/2ndPass.app`
-and `/usr/local/bin/2ndpass`.
+and `/usr/local/bin/sp`.
 
 Keep the existing bundle ID, Keychain groups, CloudKit container, and environment
 consistent across Mac/mobile builds and updates. The branding change does not

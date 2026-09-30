@@ -28,7 +28,7 @@ extension Item {
         }
         struct Export: AsyncParsableCommand {
             @OptionGroup var storage: VaultOptions
-            @Argument(help: "secondpass://vault/item/field reference.") var reference: String
+            @Argument(help: "sp://vault/item/field reference.") var reference: String
             @Option(help: "Destination file; must not already exist.", completion: .file()) var output: String
             func run() async throws {
                 let ref = try SecretReference(reference)

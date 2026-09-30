@@ -45,7 +45,7 @@ The production build checks local links, anchors, missing assets, and duplicate 
 
 Markdown pages begin with YAML front matter. Keep the table-of-contents IDs in sync
 with headings: `## First vault` becomes `#first-vault`. Markdown is not processed as
-a template, so CLI placeholders such as `{{ secondpass://… }}` remain literal.
+a template, so CLI placeholders such as `{{ sp://… }}` remain literal.
 Each page has an explicit `.html` URL to avoid relying on directory-index rewrites.
 Use root hosting for the public domain. Prefix uploads are useful for staging;
 canonical URLs, the sitemap, and the error page assume the domain root. Adapt those

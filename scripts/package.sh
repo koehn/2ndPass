@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 cd "$(dirname "$0")/.."
-product=2ndpass
+product=sp
 bundle_name=2ndPass
 bundle_id=${MOP_BUNDLE_ID:-com.koehn.mop}
 if [[ $# != 0 ]]; then echo "Usage: scripts/package.sh" >&2; exit 2; fi
@@ -37,7 +37,7 @@ cp "$MOP_PROVISION_PROFILE" "$app/Contents/embedded.provisionprofile"
 swift build -c release --product "$product"
 bin_dir=$(swift build -c release --show-bin-path)
 cp "$bin_dir/$product" "$app/Contents/MacOS/$product"
-if [[ "$product" == 2ndpass ]]; then
+if [[ "$product" == sp ]]; then
     swift build -c release --product MopApp
     cp "$bin_dir/MopApp" "$app/Contents/MacOS/MopApp"
     /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable MopApp' "$app/Contents/Info.plist"
@@ -50,7 +50,7 @@ if [[ "$product" == 2ndpass ]]; then
     /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string Mop.icns' "$app/Contents/Info.plist"
     # Sign the CLI helper with the same identity, CloudKit container, and Keychain group.
     codesign --force --sign "$MOP_SIGN_IDENTITY" --identifier "$bundle_id" --options runtime --timestamp \
-        --entitlements "$stage/entitlements.plist" "$app/Contents/MacOS/2ndpass"
+        --entitlements "$stage/entitlements.plist" "$app/Contents/MacOS/sp"
 fi
 # Build the native extension for both Mac architectures and sign it before the app.
 xcodebuild -project Apple/Mop.xcodeproj -scheme MopAutoFill -configuration Release \
@@ -79,15 +79,15 @@ codesign --verify --strict "$extension"
 codesign --force --sign "$MOP_SIGN_IDENTITY" --options runtime --timestamp \
     --entitlements "$stage/entitlements.plist" "$app"
 codesign --verify --strict "$app"
-if [[ "$product" == 2ndpass ]]; then
-    "$app/Contents/MacOS/2ndpass" device identity
+if [[ "$product" == sp ]]; then
+    "$app/Contents/MacOS/sp" device identity
     mkdir -p "$stage/share/man/man1" "$stage/share/bash-completion/completions" \
         "$stage/share/zsh/site-functions" "$stage/share/fish/vendor_completions.d"
-    cp docs/man/2ndpass.1 "$stage/share/man/man1/2ndpass.1"
-    "$app/Contents/MacOS/2ndpass" completion bash > "$stage/share/bash-completion/completions/2ndpass"
-    "$app/Contents/MacOS/2ndpass" completion zsh > "$stage/share/zsh/site-functions/_2ndpass"
-    "$app/Contents/MacOS/2ndpass" completion fish > "$stage/share/fish/vendor_completions.d/2ndpass.fish"
-    for resource in man/man1/2ndpass.1 bash-completion/completions/2ndpass zsh/site-functions/_2ndpass fish/vendor_completions.d/2ndpass.fish; do
+    cp docs/man/sp.1 "$stage/share/man/man1/sp.1"
+    "$app/Contents/MacOS/sp" completion bash > "$stage/share/bash-completion/completions/sp"
+    "$app/Contents/MacOS/sp" completion zsh > "$stage/share/zsh/site-functions/_sp"
+    "$app/Contents/MacOS/sp" completion fish > "$stage/share/fish/vendor_completions.d/sp.fish"
+    for resource in man/man1/sp.1 bash-completion/completions/sp zsh/site-functions/_sp fish/vendor_completions.d/sp.fish; do
         mkdir -p "dist/share/$(dirname "$resource")"
         chmod 644 "$stage/share/$resource"
         mv -f "$stage/share/$resource" "dist/share/$resource"

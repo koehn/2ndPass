@@ -21,7 +21,7 @@ enum Execute {
         }
     }
 
-    /// Replace 2ndpass, preserving its terminal, process group, signals and exit status.
+    /// Replace sp, preserving its terminal, process group, signals and exit status.
     /// Unlike execvp, never falls back to a shell for an executable text file.
     static func run(_ arguments: [String], environment: [String: SecretBytes]) throws -> Never {
         try validate(arguments)

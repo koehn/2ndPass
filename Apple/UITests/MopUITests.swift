@@ -96,8 +96,8 @@ import XCTest
         app.launch()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
-        let seed = app.descendants(matching: .any)["otp-code-secondpass://personal/Example%20Login/otp"].firstMatch
-        let url = app.descendants(matching: .any)["otp-code-secondpass://personal/Example%20Login/otp-url"].firstMatch
+        let seed = app.descendants(matching: .any)["otp-code-sp://personal/Example%20Login/otp"].firstMatch
+        let url = app.descendants(matching: .any)["otp-code-sp://personal/Example%20Login/otp-url"].firstMatch
         XCTAssertTrue(seed.waitForExistence(timeout: 5))
         XCTAssertTrue(url.waitForExistence(timeout: 5))
         let numeric = NSPredicate(format: "label MATCHES '[0-9]{6}'")
@@ -105,7 +105,7 @@ import XCTest
         expectation(for: numeric, evaluatedWith: url)
         waitForExpectations(timeout: 5)
         XCTAssertEqual(seed.label, url.label)
-        let timer = app.descendants(matching: .any)["otp-countdown-secondpass://personal/Example%20Login/otp-url"].firstMatch
+        let timer = app.descendants(matching: .any)["otp-countdown-sp://personal/Example%20Login/otp-url"].firstMatch
         XCTAssertTrue(timer.waitForExistence(timeout: 5))
         XCTAssertTrue(timer.label.hasPrefix("Code expires in "))
         let legacyActions = app.buttons["Actions for otp-legacy"]
@@ -424,6 +424,18 @@ extension MopUITests {
         app.launch()
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.waitForExistence(timeout: 10), app.debugDescription)
         return app
+    }
+    func testLocalVaultSelectionReplacesCloudItems() {
+        let app = launch()
+        let local = app.buttons["local"].firstMatch
+        XCTAssertTrue(local.waitForExistence(timeout: 5), app.debugDescription)
+        local.click()
+        XCTAssertTrue(app.staticTexts["Device-only vault"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.exists)
+        app.buttons["All Items"].click()
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.waitForExistence(timeout: 5))
+        local.click()
+        XCTAssertTrue(app.staticTexts["Device-only vault"].waitForExistence(timeout: 5))
     }
     private func edit(_ app: XCUIApplication) {
         app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.click()

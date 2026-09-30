@@ -24,7 +24,7 @@ extension Item {
             catch let code as ExitCode { throw code }
             catch {
                 let message = (error as? ImportFailure)?.errorDescription ?? (error as? MopError)?.errorDescription ?? "Import could not be completed."
-                IO.diagnostic("2ndpass: " + message + "\n")
+                IO.diagnostic("sp: " + message + "\n")
                 throw ExitCode(1)
             }
         }

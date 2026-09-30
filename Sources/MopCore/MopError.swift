@@ -34,6 +34,7 @@ public enum MopError: Error, LocalizedError, Equatable {
     case invalidIdentity
     case invalidRecovery
     case filePermissions
+    case unsupportedLocalIdentity
     case enclaveUnavailable
     case localOperationForbidden
     case localIdentityCapability
@@ -73,6 +74,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .notVaultMember, .deviceRemoved, .deviceRemovalPending: 13
         case .invalidIdentity, .invalidRecovery: 14
         case .filePermissions: 15
+        case .unsupportedLocalIdentity: 35
         case .enclaveUnavailable: 31
         case .localOperationForbidden: 32
         case .localIdentityCapability: 33
@@ -87,8 +89,8 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .lastOwnerDevice: "Add another owner device before removing this one. Every personal vault must retain an owner device."
         case .deviceRemoved: "This device was removed. Its local account access has been cleared. Choose Reconnect to add it again."
         case .identityPending: "This device has no usable enrolled hardware identity. Enroll it through an authorized owner device or use the separate recovery device."
-        case .vaultDeleteUncertain: "Vault deletion could not be confirmed. Local data was retained. Retry 2ndpass vault delete with the same UUID to reconcile."
-        case .vaultDeleteCleanup: "The cloud vault was deleted, but local cleanup failed. Retry 2ndpass vault delete with the same UUID to finish cleanup."
+        case .vaultDeleteUncertain: "Vault deletion could not be confirmed. Local data was retained. Retry sp vault delete with the same UUID to reconcile."
+        case .vaultDeleteCleanup: "The cloud vault was deleted, but local cleanup failed. Retry sp vault delete with the same UUID to finish cleanup."
         case .confirmationRequired: "Vault deletion requires the exact vault UUID and --confirm. Authentication is still required."
         case .operationCancelled: "Operation cancelled; no vault was deleted."
         case .invalidVaultName: "Invalid vault name; use 1–63 lowercase letters or digits separated by single hyphens."
@@ -101,13 +103,13 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .cloudQuota: "The iCloud storage quota is exceeded."
         case .cloudThrottled: "CloudKit is throttling requests. Retry later."
         case .cloudPermission: "CloudKit access was denied; verify provisioning and account permissions."
-        case .cloudUncertain: "The commit outcome is uncertain. Run 2ndpass vault sync online to reconcile before writing again."
+        case .cloudUncertain: "The commit outcome is uncertain. Run sp vault sync online to reconcile before writing again."
         case .offlineWrite: "This command requires online CloudKit access; offline writes are not supported."
         case .invalidOutput: "Invalid output options; use --out-file with --force or an octal --file-mode through 0777."
         case .outputExists: "Output file already exists; use --force to replace it."
-        case .invalidReference: "Invalid secret reference; use secondpass://vault/item/[section/]field with percent-encoded components."
+        case .invalidReference: "Invalid secret reference; use sp://vault/item/[section/]field with percent-encoded components."
         case .invalidEnvironment(let line): "Invalid literal dotenv assignment on line \(line)."
-        case .invalidTemplate: "Invalid or unterminated 2ndpass template placeholder."
+        case .invalidTemplate: "Invalid or unterminated sp template placeholder."
         case .authentication: "Authentication failed, was cancelled, or is unavailable. No further access was performed."
         case .notFound: "Secret not found."
         case .duplicate: "The requested secret, enrollment, or file already exists."
@@ -118,7 +120,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .invalidProcess: "Invalid command arguments or environment."
         case .executableNotFound: "Executable not found."
         case .launch: "Unable to execute the requested program."
-        case .vaultMissing: "Vault not found. Use 2ndpass vault init or select --vault NAME-OR-UUID."
+        case .vaultMissing: "Vault not found. Use sp vault init or select --vault NAME-OR-UUID."
         case .invalidVault: "Vault is invalid, unsupported, or failed integrity verification."
         case .vaultConflict: "Vault changed concurrently. Refresh and review the current values before submitting the change again."
         case .vaultUntrusted: "Vault checkpoint is not trusted in this local binding. Import an encrypted checkpoint with an independently verified digest. Never trust a digest obtained only from the suspect file."
@@ -126,8 +128,9 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .invalidIdentity: "Device identity or recipient key is invalid, unavailable, or does not match the expected fingerprint."
         case .invalidRecovery: "Hardware recovery identity or recovery request is invalid or does not belong to this vault."
         case .filePermissions: "Unsafe file type, permissions, or protected output path."
+        case .unsupportedLocalIdentity: "This development identity uses an unsupported record format. No key was changed. Use the previous development build to delete it explicitly after registering a replacement."
         case .enclaveUnavailable: "Secure Enclave hardware is not available to this process. No software fallback is provided."
-        case .localOperationForbidden: "That operation is not allowed on the device-local vault. It is device-only: no rename, share, export, backup, or recovery."
+        case .localOperationForbidden: "That operation is not allowed on the device-local vault. Only newly generated hardware-bound asymmetric identities are supported, not ordinary secrets or imported private keys. No rename, share, private export, backup, or recovery."
         case .localIdentityCapability: "That operation is not supported by this identity’s key type or capability."
         case .invalidLocalIdentity: "Invalid device-local identity: the name is empty, too long, or the algorithm and protocol do not match."
         }

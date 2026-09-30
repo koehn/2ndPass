@@ -8,19 +8,22 @@ prefix=${MOP_INSTALL_ROOT:-/usr/local}
 applications=${MOP_APPLICATIONS_DIR:-/Applications}
 app="$applications/2ndPass.app"
 bin_dir="$prefix/bin"
-lib_dir="$prefix/lib/2ndpass"
-target="$app/Contents/MacOS/2ndpass"
-link="$bin_dir/2ndpass"
-[[ -d "$source_app" && -f "$source_app/Contents/embedded.provisionprofile" && -f "$source_app/Contents/MacOS/2ndpass" ]] || { echo 'Run scripts/package.sh first.' >&2; exit 7; }
+lib_dir="$prefix/lib/sp"
+target="$app/Contents/MacOS/sp"
+link="$bin_dir/sp"
+[[ -d "$source_app" && -f "$source_app/Contents/embedded.provisionprofile" && -f "$source_app/Contents/MacOS/sp" ]] || { echo 'Run scripts/package.sh first.' >&2; exit 7; }
 codesign --verify --strict "$source_app"
-identity=$("$source_app/Contents/MacOS/2ndpass" device identity)
+identity=$("$source_app/Contents/MacOS/sp" device identity)
 source_share="$(dirname "$source_app")/share"
-resources=(man/man1/2ndpass.1 bash-completion/completions/2ndpass zsh/site-functions/_2ndpass fish/vendor_completions.d/2ndpass.fish)
+resources=(man/man1/sp.1 bash-completion/completions/sp zsh/site-functions/_sp fish/vendor_completions.d/sp.fish)
 # Refuse collisions before changing any installed file or requesting privileges.
 if [[ -e "$app" || -L "$app" ]]; then
-    [[ -d "$app" && ! -L "$app" && -x "$target" ]] || { echo 'Refusing to replace an unrelated application.' >&2; exit 7; }
+    # Authenticate an older installed helper before upgrading the app to sp.
+    installed_helper="$target"
+    if [[ ! -x "$installed_helper" ]]; then installed_helper="$app/Contents/MacOS/2ndpass"; fi
+    [[ -d "$app" && ! -L "$app" && -x "$installed_helper" ]] || { echo 'Refusing to replace an unrelated application.' >&2; exit 7; }
     codesign --verify --strict "$app"
-    [[ $("$target" device identity) == "$identity" ]] || { echo 'Installed app has a different signing identity.' >&2; exit 7; }
+    [[ $("$installed_helper" device identity) == "$identity" ]] || { echo 'Installed app has a different signing identity.' >&2; exit 7; }
 fi
 for resource in "${resources[@]}"; do
     [[ -f "$source_share/$resource" ]] || { echo 'Packaged manpage/completions missing. Run scripts/package.sh first.' >&2; exit 7; }
@@ -39,7 +42,7 @@ done
 if [[ -e "$link" || -L "$link" ]]; then
     [[ -L "$link" ]] || { echo 'Refusing to replace an unrelated executable.' >&2; exit 7; }
     previous=$(readlink "$link")
-    [[ "$previous" == "$target" || "$previous" == "$lib_dir/2ndPass.app/Contents/MacOS/2ndpass" || "$previous" == "$lib_dir/2ndpass" || "$previous" == "$HOME/Applications/2ndPass.app/Contents/MacOS/2ndpass" ]] || exit 7
+    [[ "$previous" == "$target" || "$previous" == "$lib_dir/2ndPass.app/Contents/MacOS/sp" || "$previous" == "$lib_dir/sp" || "$previous" == "$HOME/Applications/2ndPass.app/Contents/MacOS/sp" ]] || exit 7
 fi
 if [[ -e "$lib_dir" || -L "$lib_dir" ]]; then
     [[ ! -L "$lib_dir" && -f "$lib_dir/.mop-install" ]] || exit 7
@@ -87,6 +90,7 @@ if [[ -e "$app" ]]; then install_command mv "$app" "$stage/previous.app"; fi
 install_command mv "$stage/2ndPass.app" "$app"
 published=true
 codesign --verify --strict "$app"
+# The old helper was only for pre-upgrade verification; the new app contains sp.
 [[ $("$target" device identity) == "$identity" ]]
 for resource in "${resources[@]}"; do
     install_command ln -sfn "$lib_dir/share/$resource" "$prefix/share/$resource"
@@ -97,6 +101,6 @@ install_command ln -sfn "$target" "$link"
 installed=true
 echo "Installed application: $app"
 echo "Installed CLI: $link"
-echo "Manpage: $prefix/share/man/man1/2ndpass.1"
+echo "Manpage: $prefix/share/man/man1/sp.1"
 echo "Completions: $prefix/share/{bash-completion/completions,zsh/site-functions,fish/vendor_completions.d}"
 echo 'No shell startup files were modified. Ensure the CLI directory is on PATH.'

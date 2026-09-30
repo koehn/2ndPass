@@ -7,7 +7,7 @@ import MopVaultNext
 // Explicit hardware check. Only a unique disposable v6 key scope is accessed.
 do {
     guard CommandLine.arguments.dropFirst().elementsEqual(["--run"]) else {
-        print("Usage: 2ndpass-keychain-check --run\nCreates and retains a disposable device-only hardware identity; requires authentication.")
+        print("Usage: sp-keychain-check --run\nCreates and retains a disposable device-only hardware identity; requires authentication.")
         exit(0)
     }
     let scope = "mop-v7-keychain-check-" + UUID().uuidString, member = UUID()

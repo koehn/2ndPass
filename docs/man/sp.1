@@ -1,8 +1,8 @@
 .Dd September 29, 2026
-.Dt 2NDPASS 1
+.Dt SP 1
 .Os
 .Sh NAME
-.Nm 2ndpass
+.Nm sp
 .Nd use hardware-protected personal and shared CloudKit vaults
 .Sh SYNOPSIS
 .Nm
@@ -32,7 +32,7 @@ for complete arguments.
 Secret commands are read, write, list, delete, run, inject and item.
 Values are supplied by hidden prompt or stdin, never positional password
 arguments.
-References use secondpass://vault/item/[section/]field.
+References use sp://vault/item/[section/]field.
 .Pp
 Device request creates a public enrollment document; --recovery selects this
 device's separate hardware recovery identity.
@@ -150,14 +150,14 @@ Enrollment cancel stops the pending request.
 Neither command deletes vault contents or revokes access already granted.
 The app displays request status, expiry and the last successful iCloud check.
 .Sh DEVICE REMOVAL
-.Sy 2ndpass vault devices
+.Sy sp vault devices
 lists own-account devices across enrolled personal vaults.
-.Sy 2ndpass vault devices --remove UUID
+.Sy sp vault devices --remove UUID
 revokes a device across those vaults.
 The last owner device cannot be removed.
 The removed device clears its local access after observing the signed
 revocation.
-.Sy 2ndpass vault enrollment reconnect
+.Sy sp vault enrollment reconnect
 explicitly permits fresh-key enrollment after removal; follow it with
-.Sy 2ndpass vault enrollment request --vault UUID
+.Sy sp vault enrollment request --vault UUID
 while another owner device is unlocked.

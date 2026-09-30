@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import Testing
 import MopCore
-@testable import MopKeychain
+@testable import MopLocalIdentity
 
 private struct FakeBackend: SSHAgentBackend {
     var keys: [SSHAgentIdentity]

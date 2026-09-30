@@ -13,12 +13,12 @@ for development and non-secret CLI checks, not as a working vault installation.
 ```sh
 brew tap koehn/mop https://github.com/koehn/mop
 brew install --HEAD koehn/mop/secondpass
-2ndpass --help
-man 2ndpass
+sp --help
+man sp
 brew test koehn/mop/secondpass
 ```
 
-The formula name is `secondpass`; the executable is `2ndpass`. The existing GitHub
+The formula name is `secondpass`; the executable is `sp`. The existing GitHub
 repository and tap still use `mop`. `Formula/mop.rb` remains pinned to the historical
 0.3.0 release and does not track HEAD.
 

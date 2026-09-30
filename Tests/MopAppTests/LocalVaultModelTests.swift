@@ -1,3 +1,5 @@
+@testable import MopLocalIdentity
+import CryptoKit
 import Foundation
 import LocalAuthentication
 import Synchronization
@@ -26,7 +28,7 @@ private final class CloudOnlyService: VaultService, Sendable {
 
 @MainActor
 private func localModel(localService: (any LocalVaultServing)? = nil,
-                        authorizeLocal: @escaping (String) async throws -> LAContext = { _ in throw MopError.authentication }) -> (AppModel, CloudOnlyService) {
+                        authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { _, _, _, _ in throw MopError.authentication }) -> (AppModel, CloudOnlyService) {
     let service = CloudOnlyService()
     let defaults = UserDefaults(suiteName: "mop-local-vault-test-" + UUID().uuidString)!
     let model = AppModel(service: service, defaults: defaults, automaticTimer: false,
@@ -52,19 +54,35 @@ private final class FakeLocalService: LocalVaultServing {
     var events: [String] = []
     var deleted: [UUID] = []
     func list() throws -> [LocalIdentity] { events.append("list"); return [] }
-    func create(name: String, protocolType: LocalIdentityProtocol, context: LAContext) throws -> LocalIdentity {
+    func create(name: String, protocolType: LocalIdentityProtocol, authorization: LocalAuthorization) throws -> LocalIdentity {
         throw MopError.enclaveUnavailable
     }
-    func delete(id: UUID) throws { events.append("delete"); deleted.append(id) }
+    func delete(id: UUID, authorization: LocalAuthorization) throws { events.append("delete"); deleted.append(id) }
 }
 
 @MainActor struct LocalVaultModelTests {
-    @Test func vaultsIncludingLocalGuaranteesTheFixedLocalVault() {
-        let (model, _) = localModel()
-        let cloud = [VaultDescriptor(id: "cloud", name: "iCloud", format: "mop-vault-v7", enrolled: true)]
-        #expect(model.vaultsIncludingLocal(cloud).map(\.id) == ["cloud", LocalVault.id])
-        #expect(model.vaultsIncludingLocal([]).map(\.id) == [LocalVault.id])
-        #expect(model.vaultsIncludingLocal(model.vaultsIncludingLocal(cloud)).count == 2)
+    @Test func localRowsUseNamesAndSelectionResolvesOnlyInLocalVault() throws {
+        let (model, cloud) = localModel()
+        let key = P256.Signing.PrivateKey().publicKey.x963Representation
+        let zebra = try LocalIdentity(name: "Zebra", algorithm: .p256Signing, protocolType: .ssh, publicKey: key)
+        let alpha = try LocalIdentity(name: "Alpha", algorithm: .p256Signing, protocolType: .ssh, publicKey: key)
+        model.vault = LocalVault.id
+        model.localIdentities = [zebra, alpha]
+        #expect(model.displayedLocalIdentities.map(\.name) == ["Alpha", "Zebra"])
+        model.selectedLocalIdentityID = alpha.id
+        #expect(model.selectedLocalIdentity?.id == alpha.id)
+        model.search = "zeb"
+        #expect(model.displayedLocalIdentities.map(\.id) == [zebra.id])
+        model.vault = "cloud"
+        #expect(model.selectedLocalIdentity == nil)
+        model.vault = LocalVault.id
+        model.localIdentities = [zebra]
+        #expect(model.selectedLocalIdentityID == nil)
+        model.selectedLocalIdentityID = zebra.id
+        model.beginLocalCreate()
+        #expect(model.selectedLocalIdentityID == nil)
+        #expect(model.localCreatePresented)
+        #expect(cloud.recorded().isEmpty)
     }
 
     @Test func vaultListShowsLocalEvenWhenCloudVaultsAreReplaced() {
@@ -93,9 +111,34 @@ private final class FakeLocalService: LocalVaultServing {
         model.vaults = [VaultDescriptor(id: "cloud", name: "iCloud", format: "mop-vault-v7", enrolled: true)]
         model.vault = LocalVault.id
         #expect(model.isLocalVaultSelected)
-        #expect(model.selectedVaultDescriptor?.id == LocalVault.id)
+        #expect(model.selectedVaultDescriptor == nil)
+        #expect(model.vaultSelection == .local)
         #expect(model.vaultList.contains { $0.id == LocalVault.id })
         #expect(model.cloudVaults.count == 1)
+    }
+
+    @Test func switchingFromLocalToCloudUsesCloudCollection() {
+        let (model, _) = localModel()
+        model.vault = LocalVault.id
+        #expect(model.collection == .local)
+        model.vault = UUID().uuidString
+        #expect(model.collection == .vault(model.vault))
+        #expect(!model.isLocalVaultSelected)
+    }
+
+    @Test func selectingLocalThroughSidebarLoadsItsListWithoutCloudCalls() async throws {
+        let store = FakeLocalService()
+        let (model, cloud) = localModel(localService: store)
+        model.collection = .all
+        model.sidebarSelection = "vault:" + LocalVault.id
+        for _ in 0..<100 where model.localLoading { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(model.collection == .local)
+        #expect(model.sidebarSelection == "vault:" + LocalVault.id)
+        #expect(model.localReady)
+        #expect(store.events == ["list"])
+        #expect(cloud.recorded().isEmpty)
+        #expect(model.catalog == nil)
+        #expect(model.references.isEmpty)
     }
 
     @Test func forbiddenOperationsAreRejectedForLocal() {
@@ -116,7 +159,7 @@ private final class FakeLocalService: LocalVaultServing {
     @Test func cloudCollectionsDoNotKeepShowingLocalIdentities() {
         let (model, _) = localModel()
         for selection in ["all", "favorites", "archive", "recent-added", "recent-changed", "recent-used", "deleted"] {
-            model.collection = .vault(LocalVault.id)
+            model.collection = .local
             model.vault = LocalVault.id
             #expect(model.isLocalVaultSelected)
             model.sidebarSelection = selection
@@ -127,11 +170,13 @@ private final class FakeLocalService: LocalVaultServing {
 
     @Test func localDeletionRequiresSuccessfulAuthorization() async throws {
         let store = FakeLocalService()
-        let (model, _) = localModel(localService: store, authorizeLocal: { _ in
+        let (model, _) = localModel(localService: store, authorizeLocal: { _, ids, purposes, operations in
             store.events.append("authorize")
             throw MopError.authentication
         })
-        model.requestLocalDelete(UUID())
+        let identity = try LocalIdentity(name: "test", algorithm: .p256Signing, protocolType: .ssh, publicKey: P256.Signing.PrivateKey().publicKey.x963Representation)
+        model.localIdentities = [identity]
+        model.requestLocalDelete(identity.id)
         model.confirmLocalDelete()
         for _ in 0..<100 where model.localDeleteInProgress { try await Task.sleep(for: .milliseconds(10)) }
         #expect(!model.localDeleteInProgress)
@@ -142,11 +187,13 @@ private final class FakeLocalService: LocalVaultServing {
 
     @Test func localDeletionAuthorizesBeforeMutationAndRefresh() async throws {
         let store = FakeLocalService()
-        let (model, _) = localModel(localService: store, authorizeLocal: { _ in
+        let (model, _) = localModel(localService: store, authorizeLocal: { _, ids, purposes, operations in
             store.events.append("authorize")
-            return LAContext()
+            return LocalAuthorization(context: LAContext(), ids: ids, purposes: purposes, operations: operations)
         })
-        let id = UUID()
+        let identity = try LocalIdentity(name: "test", algorithm: .p256Signing, protocolType: .ssh, publicKey: P256.Signing.PrivateKey().publicKey.x963Representation)
+        let id = identity.id
+        model.localIdentities = [identity]
         model.requestLocalDelete(id)
         model.confirmLocalDelete()
         model.confirmLocalDelete() // A second confirmation must not duplicate deletion.

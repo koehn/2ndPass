@@ -1,3 +1,4 @@
+import MopLocalIdentity
 import SwiftUI
 import OSLog
 import MopCore
@@ -20,15 +21,18 @@ final class AppModel {
     var vaults: [VaultDescriptor] = []
     var vault = "" {
         didSet {
-            if case .vault = collection { collection = .vault(vault) }
+            switch collection {
+            case .vault, .local: collection = vault == LocalVault.id ? .local : .vault(vault)
+            default: break
+            }
             invalidateItemSearch()
         }
     }
     var collection: ItemCollection = .vault("") { didSet { invalidateItemSearch() } }
     // Convenience accessors for actions, backed by one collection state.
     var allVaults: Bool {
-        get { if case .vault = collection { return false }; return collection != .recentlyDeleted }
-        set { collection = newValue ? .all : .vault(vault) }
+        get { if case .vault = collection { return false }; return collection != .recentlyDeleted && collection != .local }
+        set { collection = newValue ? .all : (vault == LocalVault.id ? .local : .vault(vault)) }
     }
     var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch(); reloadUsage() } }
     var deletedCatalogs: [String: ItemCatalog] = [:] { didSet { invalidateDeletedSearch() } }
@@ -50,22 +54,41 @@ final class AppModel {
 
     // Device-local vault: fixed, Secure Enclave-backed, non-exportable. It has no
     // account, sync, or recovery and is independent of the cloud session state.
-    var localIdentities: [LocalIdentity] = []
+    var localIdentities: [LocalIdentity] = [] {
+        didSet {
+            if let id = selectedLocalIdentityID, !localIdentities.contains(where: { $0.id == id }) {
+                selectedLocalIdentityID = nil
+            }
+        }
+    }
+    var selectedLocalIdentityID: UUID?
+    var selectedLocalIdentity: LocalIdentity? {
+        guard isLocalVaultSelected else { return nil }
+        return localIdentities.first { $0.id == selectedLocalIdentityID }
+    }
+    var displayedLocalIdentities: [LocalIdentity] {
+        localIdentities.filter {
+            search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.protocolType.rawValue.localizedCaseInsensitiveContains(search)
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
     var localReady = false
     var localLoading = false
     var localError: String?
     var localCreating = false
     var localCreatePresented = false
+    var localCreateAcknowledged = false
+    @ObservationIgnored private var localAuthorization: LocalAuthorization?
     var localCreateName = ""
     var localCreateProtocol: LocalIdentityProtocol = .ssh
     var localDeleting: UUID?
     var localDeleteInProgress = false
     @ObservationIgnored private var localService: (any LocalVaultServing)?
-    @ObservationIgnored private let authorizeLocal: (String) async throws -> LAContext
-    var isLocalVaultSelected: Bool { collection == .vault(LocalVault.id) }
+    @ObservationIgnored private let authorizeLocal: (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization
+    var isLocalVaultSelected: Bool { collection == .local }
     /// The always-present local vault is a UI-level entry: it is shown in the sidebar
     /// but never appears in the cloud `vaults` list that account operations run against.
-    var vaultList: [VaultDescriptor] { vaultsIncludingLocal(vaults) }
+    var vaultList: [VaultPresentation] { vaults.map(VaultPresentation.cloud) + [.local] }
+    var vaultSelection: VaultSelection? { isLocalVaultSelected ? .local : (try? CloudVaultID(vault)).map(VaultSelection.cloud) }
     /// Cloud vaults only, so onboarding empty-states are not fooled by the always-present local vault.
     var cloudVaults: [VaultDescriptor] { vaults.filter { $0.id != LocalVault.id } }
     var cloudVaultsPresent: Bool { !cloudVaults.isEmpty }
@@ -269,7 +292,7 @@ final class AppModel {
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init,
          localService: (any LocalVaultServing)? = nil,
-         authorizeLocal: @escaping (String) async throws -> LAContext = { try await Authentication.authorizeAsync(reason: $0) }) {
+         authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { try await LocalAuthorization.authorizeAsync(reason: $0, ids: $1, purposes: $2, operations: $3) }) {
         self.localService = localService
         self.authorizeLocal = authorizeLocal
         self.lifecycle = lifecycle ?? SystemAppLifecycleMonitor()
@@ -388,9 +411,9 @@ final class AppModel {
         default: nil
         }
     }
-    var selectedVaultDescriptor: VaultDescriptor? { vault == LocalVault.id ? Self.localDescriptor : vaults.first { $0.id == vault } }
-    var canExportBackup: Bool { !allVaults && !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
-    var vaultName: String { catalog?.vault ?? references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "" }
+    var selectedVaultDescriptor: VaultDescriptor? { vaults.first { $0.id == vault } }
+    var canExportBackup: Bool { !isLocalVaultSelected && !allVaults && !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
+    var vaultName: String { isLocalVaultSelected ? LocalVault.name : (catalog?.vault ?? references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "") }
     var filtered: [SecretReference] {
         references.filter { search.isEmpty || $0.description.localizedCaseInsensitiveContains(search) }
     }
@@ -540,6 +563,7 @@ final class AppModel {
         showArchived = false; favoritesOnly = false
         allVaults = false; page = .secrets; vault = id
         if id == LocalVault.id {
+            collection = .local
             clearSelection()
             openLocalVault()
             return
@@ -639,7 +663,7 @@ final class AppModel {
                 localIdentities = try localStore().list()
                 localReady = true
             } catch {
-                localError = "Could not read the device-local vault. Its keys live in the Secure Enclave."
+                localError = (error as? MopError)?.errorDescription ?? "Could not read the device-local vault."
             }
         }
     }
@@ -647,7 +671,9 @@ final class AppModel {
     func beginLocalCreate() {
         guard !localCreating, !localDeleteInProgress else { return }
         localCreateName = ""
+        localCreateAcknowledged = false
         localCreateProtocol = .ssh
+        selectedLocalIdentityID = nil
         localCreatePresented = true
     }
 
@@ -659,21 +685,25 @@ final class AppModel {
     func submitLocalCreate() {
         let name = localCreateName
         let protocolType = localCreateProtocol
-        guard !localCreating, !name.isEmpty else { return }
+        guard !localCreating, !name.isEmpty, localCreateAcknowledged, LocalIdentityProtocol.creatable.contains(protocolType) else { return }
+        let securityToken = securityGeneration
         localCreating = true
         Task { @MainActor in
             defer { localCreating = false }
             do {
-                let context = try await authorizeLocal("create a device-local identity in the Secure Enclave")
-                defer { context.invalidate() }
-                _ = try localStore().create(name: name, protocolType: protocolType, context: context)
+                let context = try await authorizeLocal("create a device-local identity in the Secure Enclave", [], [protocolType], [.create])
+                defer { context.revoke(); localAuthorization = nil }
+                guard securityGeneration == securityToken else { throw MopError.authentication }
+                localAuthorization = context
+                let created = try localStore().create(name: name, protocolType: protocolType, authorization: context)
                 localIdentities = try localStore().list()
                 localReady = true
                 localError = nil
                 localCreatePresented = false
+                selectedLocalIdentityID = created.id
                 localCreateName = ""
             } catch {
-                localError = "Could not create the identity. The Secure Enclave requires biometric approval."
+                localError = (error as? MopError)?.errorDescription ?? "Could not create the identity."
             }
         }
     }
@@ -685,14 +715,18 @@ final class AppModel {
     func confirmLocalDelete() {
         guard let id = localDeleting, !localDeleteInProgress else { return }
         localDeleting = nil
+        let securityToken = securityGeneration
         localDeleteInProgress = true
         Task { @MainActor in
             defer { localDeleteInProgress = false }
             do {
-                let context = try await authorizeLocal("delete a device-local identity")
-                defer { context.invalidate() }
+                guard let identity = localIdentities.first(where: { $0.id == id }) else { throw MopError.notFound }
+                let context = try await authorizeLocal("delete a device-local identity", [id], [identity.protocolType], [.delete])
+                defer { context.revoke(); localAuthorization = nil }
+                guard securityGeneration == securityToken else { throw MopError.authentication }
+                localAuthorization = context
                 try Task.checkCancellation()
-                try localStore().delete(id: id)
+                try localStore().delete(id: id, authorization: context)
                 localIdentities = try localStore().list()
                 localError = nil
             } catch {
@@ -881,6 +915,7 @@ final class AppModel {
         catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
+        localAuthorization?.revoke(); localAuthorization = nil
         rememberSelection(); restoreLastSelection = true
         enrollmentGeneration += 1; enrollmentTask?.cancel(); enrollmentTask = nil; enrollmentWorking = false
         for id in submittedEnrollments { enrollmentProgress[id, default: EnrollmentProgress()].phase = .paused }
@@ -1019,10 +1054,6 @@ final class AppModel {
         guard !launchAttempted else { return }
         launchAttempted = true
         discover(autoUnlock: true)
-    }
-    static let localDescriptor = VaultDescriptor(id: LocalVault.id, name: LocalVault.name, format: "device-local", enrolled: true)
-    func vaultsIncludingLocal(_ rows: [VaultDescriptor]) -> [VaultDescriptor] {
-        rows.contains(where: { $0.id == LocalVault.id }) ? rows : rows + [Self.localDescriptor]
     }
     func discover(autoUnlock: Bool = false, selectedOnly: Bool = false) {
         guard !busy, allowTransition(.refresh) else { return }
@@ -1784,7 +1815,7 @@ final class AppModel {
         let rawName = vaults.first { $0.id == request.vault }?.name ?? "vault"
         let name = String(rawName.prefix(80).map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "-" })
         let date = wallNow().formatted(.iso8601.year().month().day().dateSeparator(.dash))
-        exportBackup(to: folder.appendingPathComponent("2ndpass-" + name + "-" + date + "-" + String(UUID().uuidString.prefix(8)) + ".mopfile"), vaultID: request.vault)
+        exportBackup(to: folder.appendingPathComponent("sp-" + name + "-" + date + "-" + String(UUID().uuidString.prefix(8)) + ".mopfile"), vaultID: request.vault)
     }
     func exportBackup(to url: URL, vaultID: String? = nil) {
         guard !busy, let id = vaultID ?? selectedVault, vaults.contains(where: { $0.id == id && $0.enrolled }) else { return }
@@ -1848,7 +1879,10 @@ extension AppModel {
     func openVaultDetails(_ target: VaultDescriptor?) { requestTransition(.details(target)) }
     func showSettingsCategory(_ category: SettingsCategory) { settingsCategory = category }
 
-    func refresh() { requestTransition(.refresh) }
+    func refresh() {
+        if isLocalVaultSelected { openLocalVault(); return }
+        requestTransition(.refresh)
+    }
 
     func cancelPendingTransition() {
         let completion = transitionCompletion

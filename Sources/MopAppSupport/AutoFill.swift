@@ -1,3 +1,4 @@
+import MopLocalIdentity
 @preconcurrency import AuthenticationServices
 import Foundation
 import CryptoKit
@@ -222,7 +223,8 @@ public actor AutoFillPublisher: AutoFillPublishing {
         else if publish != nil { self.enabled = { true } }
         else { self.enabled = { await ASCredentialIdentityStore.shared.state().isEnabled } }
         publishIdentities = publish ?? { entries in
-            try await ASCredentialIdentityStore.shared.replaceCredentialIdentities(entries.map(\.identity))
+            let passkeys = try LocalIdentityStore.open().list().compactMap(\.passkeySuggestion)
+            try await ASCredentialIdentityStore.shared.replaceCredentialIdentities(entries.map(\.identity) + passkeys)
         }
     }
     private func directory() throws -> URL { try indexDirectory ?? AutoFillStorage.directory() }

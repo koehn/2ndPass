@@ -112,12 +112,13 @@ public enum SSHAgentFraming {
     public static func handle(command: UInt8, payload: Data, backend: SSHAgentBackend) throws -> Data {
         switch command {
         case SSHAgentCommand.requestIdentities:
+            guard payload.isEmpty else { throw MopError.invalidLocalIdentity }
             return identitiesResponse(try backend.identities())
         case SSHAgentCommand.signRequest:
             var offset = 0
             let blob = try parseString(payload, &offset)
             let data = try parseString(payload, &offset)
-            _ = try parseUInt32(payload, &offset) // signature flags; ECDSA uses none
+            guard try parseUInt32(payload, &offset) == 0, offset == payload.count else { throw MopError.invalidLocalIdentity }
             let signature = try backend.sign(blob: blob, data: data)
             return signResponse(signature: try sshSignature(der: signature))
         case SSHAgentCommand.agentExtension:
@@ -228,7 +229,7 @@ public final class SSHAgent: @unchecked Sendable {
 
     /// Serve independent client connections until stopped. An instance is single-use.
     /// The accept loop owns the listener; each worker owns its accepted descriptor.
-    public func serve(socketPath: String, whileActive: @escaping () -> Bool = { true }) throws {
+    public func serve(socketPath: String, whileActive: @escaping () -> Bool = { true }, onReady: () -> Void = {}) throws {
         let canStart = lock.withLock {
             guard !started, !stopped else { return false }
             started = true
@@ -247,6 +248,7 @@ public final class SSHAgent: @unchecked Sendable {
         // descriptor while another thread is still inside accept on that descriptor.
         let flags = fcntl(fd, F_GETFL)
         guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else { throw MopError.inputOutput }
+        onReady()
         while !isStopped && whileActive() {
             var event = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = poll(&event, 1, 100)
@@ -270,11 +272,11 @@ public final class SSHAgent: @unchecked Sendable {
                 throw MopError.inputOutput
             }
             let registered = lock.withLock {
-                guard !stopped else { return false }
+                guard !stopped, clients.count < 32 else { return false }
                 clients.insert(client)
                 return true
             }
-            guard registered else { close(client); break }
+            guard registered else { close(client); continue }
             workers.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { workers.leave() }
@@ -327,22 +329,24 @@ public final class SSHAgent: @unchecked Sendable {
     private static func bindAndListen(_ path: String) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw MopError.inputOutput }
-        unlink(path)
+
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(path.utf8CString)
         let capacity = MemoryLayout.size(ofValue: address.sun_path)
-        memcpy(&address.sun_path, pathBytes, min(pathBytes.count, capacity))
+        guard pathBytes.count <= capacity, !path.utf8.contains(0) else { close(fd); throw MopError.inputOutput }
+        memcpy(&address.sun_path, pathBytes, pathBytes.count)
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard bound == 0, listen(fd, 16) == 0 else {
+        guard bound == 0 else { close(fd); throw MopError.inputOutput }
+        guard chmod(path, 0o600) == 0, listen(fd, 16) == 0 else {
+            unlink(path)
             close(fd)
             throw MopError.inputOutput
         }
-        fchmod(fd, 0o700)
         return fd
     }
 }

@@ -1,3 +1,4 @@
+import MopLocalIdentity
 import ArgumentParser
 import Foundation
 import MopCore
@@ -11,7 +12,7 @@ struct VaultOptions: ParsableArguments {
     var stateURL: URL { stateDirectory.map { URL(fileURLWithPath: $0) } ?? AppStorageLocation.defaultState }
     var selection: String? { vault }
     func validate() throws { if let vault, UUID(uuidString: vault) == nil { try VaultName.validate(vault) } }
-    func requireOnline() throws { guard !offline else { throw MopError.offlineWrite } }
+    func requireOnline() throws { try CloudVaultBoundary.requireCloud(vault); guard !offline else { throw MopError.offlineWrite } }
     func native() -> NativeVaultService { NativeVaultService(state: stateURL) }
     func execute(_ operation: VaultOperation, selection: String? = nil) async throws -> VaultResult {
         let service = native(); defer { service.lock() }
@@ -32,7 +33,9 @@ final class CommandStore: AsyncSecretStore {
     }
     func close() { service.lock() }
     func perform(_ operation: VaultOperation, reference: SecretReference? = nil) async throws -> VaultResult {
-        try await service.execute(operation, vault: options.vault ?? reference?.vault, offline: options.offline)
+        try CloudVaultBoundary.requireCloud(options.vault)
+        try CloudVaultBoundary.requireCloud(reference?.vault)
+        return try await service.execute(operation, vault: options.vault ?? reference?.vault, offline: options.offline)
     }
     func read(_ reference: SecretReference) async throws -> SecretBytes {
         let result = try await perform(.read(reference), reference: reference)
@@ -132,7 +135,7 @@ struct Vault: AsyncParsableCommand {
                 guard request.recovery, request.fingerprint == fingerprint else { throw MopError.invalidRecovery }
             }
             let id = storage.vault ?? UUID().uuidString
-            IO.diagnostic("2ndpass: creation UUID \(id); retain it to reconcile an interrupted submission.\n")
+            IO.diagnostic("sp: creation UUID \(id); retain it to reconcile an interrupted submission.\n")
             try emit(await storage.execute(.create(name: name, recovery: recoveryRequest.map { URL(fileURLWithPath: $0) }, fingerprint: fingerprint), selection: id))
         }
     }
@@ -141,11 +144,15 @@ struct Vault: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         @Flag var json = false
         func run() async throws {
-            let result = try await storage.execute(.discover)
-            if result.deviceRemoved { IO.diagnostic("This device was removed. Run 2ndpass vault enrollment reconnect to opt in before requesting enrollment again.\n") }
-        var rows = result.vaults
-        rows.append(VaultDescriptor(id: LocalVault.id, name: LocalVault.name, format: "device-local", enrolled: true))
-        if json { try IO.output(String(decoding: JSONEncoder().encode(rows), as: UTF8.self) + "\n") }
+            struct Row: Encodable { let id: String; let name: String?; let format: String; let kind: String }
+            var rows = [Row(id: LocalVault.id, name: LocalVault.name, format: "device-local", kind: "local")]
+            if storage.vault.map(LocalVault.isLocal) != true {
+                do {
+                    let result = try await storage.execute(.discover)
+                    rows += result.vaults.map { Row(id: $0.id, name: $0.name, format: $0.format, kind: "cloud") }
+                } catch { IO.diagnostic("Cloud vault discovery failed; local remains available: \(error)\n") }
+            }
+            if json { try IO.output(String(decoding: JSONEncoder().encode(rows), as: UTF8.self) + "\n") }
             else { for row in rows { try IO.output("\(row.name ?? "")\t\(row.id)\t\(row.format)\n") } }
         }
     }

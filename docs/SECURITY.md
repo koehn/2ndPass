@@ -481,7 +481,7 @@ retain or disclose it afterward.
 
 ## CLI and extension disclosure boundaries
 
-`2ndpass read` emits plaintext to stdout or the selected output file. `inject`
+`sp read` emits plaintext to stdout or the selected output file. `inject`
 emits a plaintext rendering to stdout or a generated file and inserts values
 literally, without destination-format escaping. `run` resolves references into
 the launched program's environment. The child, its dependencies and any
@@ -569,3 +569,36 @@ The principal implementation entry points are:
 
 The [vault architecture](VAULT-NEXT.md) describes enrollment, membership, recovery,
 and publication. [Vault v7](VAULT-V7.md) specifies the wire format.
+
+## The device-local `local` vault
+
+`local` is intentionally distinct from portable encrypted cloud vaults. Its
+asymmetric private keys are generated inside the Secure Enclave and never become
+exportable plaintext in application memory. The dedicated `MopLocalIdentity`
+module cannot call CloudKit or the cloud vault engine. Public DTOs contain no
+opaque references; non-synchronizable, device-only Keychain records hold those
+references. Cloud operations reject local selections before account discovery,
+authentication, or transport use. Normal sharing, export, recovery, and backup
+operate only on cloud schemas.
+
+A copied application directory or cloud compromise cannot reconstruct a local
+private identity on another device. Key references are not a recovery mechanism.
+Device loss or erasure permanently removes access; register independent SSH keys,
+passkeys, or certificates on other devices beforehand. 2ndPass cannot back up,
+escrow, or restore these keys. Imported private keys remain ordinary cloud-vault
+secrets and cannot be reclassified as local identities.
+
+Hardware isolation does not prevent operation-oracle abuse by malware controlling
+an unlocked authorized process. Authorization scopes limit identities, purposes,
+operations and lifetime; they do not attest a trustworthy endpoint. Inputs, public
+metadata, signatures and key-agreement results exist outside the enclave. ECDH
+results are symmetric secret material in normal memory, although the identity’s
+private asymmetric key stays inside the enclave. External review should cover
+session revocation races, cross-process deletion, Keychain accessibility and access
+groups, protocol parsing, relying-party binding, and same-device reference deletion.
+
+Device-bound WebAuthn responses always report BE=0/BS=0; having another independent
+passkey is not backup eligibility for the first credential. Apple credential-provider
+acceptance of these flags requires physical-device validation and may prevent use
+on current platforms. See [local vault operation and acceptance](LOCAL-VAULT.md).
+2ndPass is not FIPS certified and makes no blanket Apple-module certification claim.

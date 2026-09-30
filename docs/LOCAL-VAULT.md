@@ -1,84 +1,206 @@
-# Device-local vault (`local`)
+# The device-local `local` vault
 
-`local` is a fixed, device-only vault that holds non-exportable identities backed by the Secure Enclave. Unlike the synchronized v7 vaults, it has no account, no iCloud database, no CloudKit sync, no recovery, and no sharing. Its keys are generated in the Secure Enclave on the device, are referenceable by the app, CLI, and AutoFill on that device only, and can never be exported, copied, or moved to another device.
+`local` appears alongside cloud vaults, with a fixed name. It holds asymmetric
+identities whose private keys are generated in this device’s Secure Enclave. It
+cannot hold passwords, imported private keys, TOTP seeds, notes, or bearer tokens.
+It has no CloudKit account, sharing, normal vault export, backup, or recovery.
+Public keys, certificate requests, and certificates can be exported.
 
-The first identity use is OpenSSH: a device-local identity can answer an SSH agent's `SSH2_AGENTC_SIGN_REQUEST`, so `git push` and `ssh` work with a key whose private half never leaves the enclave.
+**Device loss, erasure, or replacement permanently loses these identities.**
+Register an independent credential on another device before relying on one.
+This is the redundancy model used with hardware security keys: two devices have
+two independently generated private keys. Registering another passkey does not
+back up or copy the first passkey.
 
-## Model
+## Usage
 
-The model lives in [MopCore/LocalIdentity.swift](../Sources/MopCore/LocalIdentity.swift) and is deliberately separate from the cloud catalog:
-
-- **`LocalVault`** — the fixed vault. `name == "local"`, `id == "local-vault"`, `isLocal == true`. `rename(to:)` always throws: the vault cannot be renamed.
-- **`LocalIdentityProtocol`** — what the identity is for: `ssh`, `git-signing`, `tls-client`, `x509`, `webauthn`, `jwt`, `api-signing`, `recovery`, `generic-signing`, `generic-ecdh`. `isSigning` is true for all except `generic-ecdh`.
-- **`LocalIdentityAlgorithm`** — the hardware key type. Only `p256-signing` (ECDSA, `isSigning`) and `p256-key-agreement` (ECDH) are accepted; there is no software algorithm. The protocol and algorithm must agree (a signing protocol needs a signing key and vice versa), or construction fails before any key is generated.
-- **`LocalIdentityCapabilities`** — a fixed, non-increasing option set: `.signing`/`.authentication` for `p256-signing`, `.keyAgreement` for `p256-key-agreement`.
-- **`LocalIdentity`** — `id`, `name` (1–64 chars, single-line, no NUL), `algorithm`, `protocolType`, `capabilities`, the x963 `publicKey` (never secret), `createdAt`, and non-sensitive `metadata` (e.g. an SSH comment). There is no private-key field by construction.
-
-## What `local` supports
-
-- **List** the device's identities and their public keys.
-- **Create** an identity for a protocol; the Secure Enclave generates the key and only the public half is stored alongside the identity record.
-- **Delete** a single identity.
-- **Public key** for an identity (OpenSSH line for signing identities, x963 otherwise).
-- **Sign** data with a signing identity (used by the SSH agent).
-- **SSH agent** — serve an in-process OpenSSH agent that signs for the device's identities.
-
-## What `local` does not support
-
-These are rejected by construction, not merely hidden in the UI:
-
-- **No export, backup, or recovery.** The private keys cannot be written out, so there is nothing to export, back up, or restore.
-- **No sharing or sync.** No account, no enrollment, no other device.
-- **No rename** of the vault or of an individual identity.
-- **No vault deletion.** `local` is part of the device; only individual identities can be deleted.
-- **Not a general secret store.** No passwords, TOTP seeds, API bearer tokens, symmetric keys, notes, arbitrary secrets, or imported PEM/PKCS#8/private keys. If it is not a non-exportable Secure Enclave key identity, it does not belong in `local`.
-
-The store in [MopKeychain/LocalIdentityStore.swift](../Sources/MopKeychain/LocalIdentityStore.swift) implements `list`, `read`, `publicKey`, `create`, `sign`, `deriveSharedSecret`, and `delete`. There is no export, no rename, and no `deleteVault` method at all.
-
-## CLI
-
-The command surface lives in [MopCLI/LocalCommands.swift](../Sources/MopCLI/LocalCommands.swift). `2ndpass vault list` includes the `local` row.
-
-```
-2ndpass local list [--json]                 # list identities and public keys
-2ndpass local create NAME [--protocol ...]  # create a non-exportable identity
-2ndpass local public-key ID_OR_NAME         # print the public key
-2ndpass local sign ID_OR_NAME [--file ..]   # sign stdin or a file (UTF-8)
-2ndpass local delete ID_OR_NAME [-y]        # delete an identity
-2ndpass ssh-agent -- COMMAND ...            # run COMMAND with a device-local SSH agent
+```sh
+sp vault list --vault local
+sp list --vault local
+sp item catalog --vault local
+sp item create --vault local --type ssh --name deploy --acknowledge-device-loss
+sp item public-key --vault local deploy
+sp ssh-agent --vault local --identity deploy -- ssh user@example.com
+sp item delete --vault local deploy
 ```
 
-`local create`, `local sign`, `local delete`, and `ssh-agent` require biometric/Touch ID authorization. `local list` and `local public-key` do not. `--protocol` accepts any `LocalIdentityProtocol` raw value (default `ssh`); the algorithm is derived from the protocol.
+Creation accepts `ssh`, `git-signing`, or `x509`. Interactive creation prints the
+loss/redundancy warning and requires acknowledgement; scripts must supply the
+acknowledgement flag. Passkeys are created through a website’s WebAuthn flow,
+not by manufacturing a generic key through the CLI. Generic signing and ECDH
+are internal consumers only; there is no arbitrary-data signing command.
 
-`ssh-agent` authorizes once, starts an in-process OpenSSH agent on a temporary socket, sets `SSH_AUTH_SOCK`, and runs the child. For example:
+The agent authorizes selected identities once per explicitly started session.
+It offers only SSH keys by default; `--purpose git-signing` selects Git identities.
+Repeat `--identity` to limit the identities offered. Authorization ends on expiry
+(12 hours maximum), stop, child exit, device lock/sleep, or detection of a deleted
+identity. Only SSH authentication payloads and Git SSHSIG payloads in the `git`
+namespace are accepted for their respective purposes. No destination binding,
+agent forwarding restrictions, or arbitrary `ssh-add -T` signing are promised.
 
+Sockets live in a fresh owner-only directory with mode 0600 on the socket. Startup
+uses explicit readiness/error reporting; 32 clients and 1 MiB frames bound socket
+resource use. Child commands retain terminal ownership. Foreground stop signals
+clean up the socket and directory.
+
+## Git SSH signing
+
+Create a `git-signing` identity. Save its public key (never a private key) and
+configure the repository:
+
+```sh
+sp item create --vault local --type git-signing --name git-key --acknowledge-device-loss
+sp item public-key --vault local git-key > git-key.pub
+git config gpg.format ssh
+git config user.signingKey "$PWD/git-key.pub"
+printf 'you@example.com %s\n' "$(cat git-key.pub)" > allowed_signers
+git config gpg.ssh.allowedSignersFile "$PWD/allowed_signers"
+sp ssh-agent --vault local --purpose git-signing --identity git-key -- git commit -S
+sp ssh-agent --vault local --purpose git-signing --identity git-key -- git tag -s v1 -m v1
+git verify-commit HEAD
+git verify-tag v1
 ```
-2ndpass ssh-agent -- git push
-2ndpass ssh-agent -- ssh deploy@host
+
+Alternatively, inline ECDSA public keys require Git’s `key::` prefix. Identity
+rows provide copyable setup commands. No global configuration is changed.
+See [Git configuration](https://git-scm.com/docs/git-config).
+
+## Device-bound passkeys
+
+Enable 2ndPass as a credential provider in system AutoFill settings. In a website’s
+passkey registration flow choose 2ndPass, acknowledge device loss, and authenticate.
+Register a second passkey on a different device as your independent recovery path.
+
+The provider implements standard ES256 WebAuthn registration (`fmt=none`, COSE EC2
+P-256) and assertion. It uses random 32-byte credential IDs, exact relying-party
+and allow-list matching, fresh user verification, and ECDSA over authenticator data
+plus the system-supplied client-data hash. Signature counters are unsupported and
+reported as zero. Both registration and assertion truthfully report **BE=0, BS=0**.
+No private-key import/export or proprietary passkey substitute is involved.
+
+**Platform acceptance remains unverified.** An
+[Apple engineer says credential-provider responses require both backup flags](https://developer.apple.com/forums/thread/745605).
+An independent passkey on another device does not make this credential backed up,
+so 2ndPass will not set those flags to work around a platform rejection. The
+implemented extension is an on-device compatibility probe as well as the intended
+registration/assertion path. No OS version is currently certified by this project
+as accepting the truthful device-bound responses. Test minimum supported and
+current physical-device OS versions before relying on it. Unsupported WebAuthn
+extensions, attestation formats, and algorithms are not advertised.
+
+Public credential suggestions go to Apple’s local credential identity store.
+Private keys and protocol metadata remain device-only in the Keychain. Cloud
+catalog refresh preserves local suggestions. If delivery fails, the record is
+retained: inspect and explicitly delete it in `local` after confirming it is not
+registered at the service. Never automatically destroy a potentially registered key.
+
+## Certificates
+
+```sh
+sp item create --vault local --type x509 --name client --acknowledge-device-loss
+sp item csr --vault local client --common-name Client --organization Example \
+  --dns client.example.com --email client@example.com --uri urn:example:client --ip 127.0.0.1 > client.csr
+sp item certificate attach --vault local client issued-chain.pem
+sp item certificate show --vault local client
+sp item certificate export --vault local client > public-chain.pem
 ```
 
-The agent answers `SSH2_AGENTC_REQUEST_IDENTITIES` and `SSH2_AGENTC_SIGN_REQUEST` for the device's signing identities and rejects unknown keys. Signing dispatch reuses the session's authorization context rather than re-prompting per signature.
+CSRs use SwiftASN1 DER construction and enclave ECDSA/SHA-256. Swift Certificates
+parses PEM/DER certificates. The leaf key must match the identity; renewal replaces
+only the public certificate chain. Attachment is **not trust-chain validation**.
+Validity, expiry, subject, issuer, and extensions are displayed. Arbitrary external
+TLS applications cannot consume these keys yet. Arrange reissuance or a separate
+authorized identity before device loss.
 
-## App support
+## Storage and authorization
 
-[MopAppSupport/LocalVaultService.swift](../Sources/MopAppSupport/LocalVaultService.swift) is the facade the UI and CLI build on. It is deliberately **not** a cloud `VaultService` — the local vault has no account, transport, or revision history.
+`MopLocalIdentity` depends on Core, Auth, Keychain, SwiftASN1, and Swift Certificates;
+it has no CloudKit or MopVaultNext dependency. `VaultPresentation.local` and
+`VaultSelection.local` never become cloud descriptors. Local catalogs contain
+`LocalIdentity` summaries, not ordinary `VaultItem` fields.
 
-- **`LocalIdentityCatalog.build(identities:)`** projects `[LocalIdentity]` into a read-only `ItemCatalog` where each item is an `.sshKey` carrying only the public key (OpenSSH line or x963) and the protocol/algorithm. No `privateKey` field is ever produced, and `storageID` carries the keychain UUID so detail/sign/delete resolve the exact Secure Enclave key. `canEdit` is `false`.
-- **`LocalVaultPolicy`** is a pure, store-free policy. It allows `list`, `create`, `deleteItem`, `publicKey`, `sign` and rejects `renameVault`, `renameItem`, `export`, `share`, `deleteVault`, returning a concise reason for each. This is unit-testable without a Secure Enclave.
-- **`LocalVaultService`** wraps `LocalIdentityStore` and enforces the policy; its forbidden-operation methods (`renameVault`, `renameItem`, `export`, `share`, `deleteVault`) always throw `.localOperationForbidden` so no caller can route them through the local vault.
+The version-2 record stores validated immutable identity properties, typed protocol
+metadata, and an internal opaque CryptoKit key representation in non-synchronizable
+`WhenUnlockedThisDeviceOnly` Data Protection Keychain storage. That opaque reference
+is never placed in public DTOs, CLI JSON, application files, or backup archives.
+Old unshipped records produce an explicit unsupported-version error. No existing
+identity is rotated or deleted: use its previous development build to register a
+replacement credential and explicitly remove the old record.
 
-## Security notes
+Keys use `SecureEnclave.P256.Signing.PrivateKey` or
+`SecureEnclave.P256.KeyAgreement.PrivateKey`, generated with `.privateKeyUsage` and
+`.userPresence`. All private-key operations use the enclave. Public keys, metadata,
+protocol messages, signatures, certificates, CSRs, and ECDH shared-secret results
+can exist in ordinary application memory. There is no software fallback.
 
-- Newly created keys require device-owner user presence for private-key operations, using the preauthorized session context. Identities created by earlier development builds without this access control retain their original protection. Create replacement identities and update the public keys trusted by your services before deleting those older identities; this update does not rotate existing keys automatically.
-- Deleting an identity in the GUI or CLI requires explicit device-owner authorization.
-- Keys are generated and used in the Secure Enclave via the Keychain; only the x963 public key is stored with the identity record. The private half is never readable by 2ndPass or any process.
-- Because there is no export path, the vault is safe to keep on a lost device only in the sense that its keys cannot be carried off; deleting the app or the identities removes the references.
-- There is no FIPS 140-3 Secure Enclave claim made here; verify that separately before relying on it.
-- Passkey/WebAuthn credential-provider exposure is not yet wired; `webauthn` identities are creatable and usable for signing but a system credential provider is a separate effort.
+Authorization is scoped to identity UUIDs, purpose, operation, and expiry. Creation,
+deletion, CSR generation, certificate attachment, and passkey use require fresh
+one-operation authorization. SSH/Git reuse a session context. Revocation invalidates
+the context; checks before and after signing reject late results. Key handles are
+operation-local. Same-device malware can still abuse an authorized operation path;
+hardware isolation does not make an unlocked endpoint trustworthy.
 
-## Verification
+macOS 15 and iOS 18 remain the deployment targets. Newer Secure Enclave ML-DSA/
+ML-KEM APIs exist in current SDKs (availability starts at OS 26 for those APIs);
+hardware availability is separate and they are not exposed in this implementation.
+See [Apple’s SecureEnclave APIs](https://developer.apple.com/documentation/cryptokit/secureenclave).
 
-- Unit-tested without hardware: the model (name validation, protocol/algorithm agreement), the SSH public-key encoding, the SSH agent framing/dispatch, the catalog projection (public-key-only, no private key), and the policy (allowed vs forbidden).
-- Requires a physical device (Secure Enclave): real key generation, `sign`, `deriveSharedSecret`, `delete`, and the SSH agent serving a live `ssh`/`git` session. The simulator has no Secure Enclave.
+2ndPass is **not FIPS certified**. No blanket Apple-module validation claim is made;
+certificates cover specific hardware, firmware, OS, and configurations. Consult
+[Apple’s certification scope](https://support.apple.com/en-sg/guide/certifications/apc3a7433eb89/web).
 
-See [security](SECURITY.md), [the CLI](../README.md), and [architecture](VAULT-NEXT.md) for the surrounding trust model.
+## Acceptance
+
+Automated protocol tests use disposable software fixtures and prove wire/DER
+interoperability only. Physical Secure Enclave tests are opt-in with
+`MOP_LOCAL_HARDWARE_TESTS=1` from a properly signed test host with the application
+Keychain access group. They create uniquely named disposable identities, never
+modify pre-existing ones, and require user presence. Unsigned `swift test` cannot
+establish hardware behavior.
+
+Still required on physical macOS 15/iOS 18 and current OS releases:
+
+- Generate, terminate the process, reopen, and compare public keys; authenticate to
+  a real SSH server and verify the interactive prompt/terminal works.
+- Verify user presence, cancellation, lock/sleep revocation, concurrent requests,
+  deletion during an operation, and refusal of late results.
+- Verify enclave signature and ECDH agreement; verify that copied references on a
+  second physical device cannot reconstruct the identity. Never archive real keys
+  or opaque references for this test; use disposable lab fixtures only.
+- Register and assert a passkey, inspect BE/BS/UP/UV, test allow-list and discoverable
+  flows, wrong RP, cancellation, dismissal, lock, restart, and suggestion refresh.
+  Capture the exact platform rejection if BE=0/BS=0 is rejected.
+- Register another independent passkey on another device; remove the first
+  disposable credential and confirm the second remains usable.
+- Verify missing hardware UI, repeated creation, certificate renewal/expiry,
+  irreversible deletion warnings, offline discovery, and loss acknowledgement.
+
+### Vault-qualified identity references
+
+Identity consumers select a vault independently of the key's purpose. Use a name
+with `--vault`, or an item reference containing both:
+
+```sh
+sp list --vault local
+sp item public-key --vault local deploy
+sp item public-key sp://local/deploy
+sp ssh-agent --vault local --identity deploy -- ssh user@example.com
+sp ssh-agent --identity sp://local/deploy -- ssh user@example.com
+sp ssh-agent --purpose git-signing --identity sp://local/git-key -- git commit -S
+sp item csr sp://local/client --common-name Client
+sp item certificate show sp://local/client
+sp item delete sp://local/deploy
+```
+
+The GUI provides **Copy Reference** in the identity detail panel and row menu.
+`sp list --vault local` (including `--json`) emits these item references. Names and
+vaults are percent-encoded, so `deploy key` becomes `sp://local/deploy%20key`.
+Item references contain two path components; existing secret-field references
+remain separate and contain an additional field component. Renaming an item changes
+its name-based reference.
+
+The agent requires `--vault` when enumerating a vault or selecting bare names/UUIDs.
+Repeat `--identity` to select multiple identities. A conflicting `--vault` and
+reference is an error. SSH, Git, and certificate operations in non-local vaults
+are not implemented yet; their selectors are accepted and routed to an explicit
+unsupported-backend error, without opening the local identity store.

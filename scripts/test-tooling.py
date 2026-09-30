@@ -11,15 +11,15 @@ import tempfile
 
 app = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/2ndPass.app').resolve()
 root = pathlib.Path(__file__).resolve().parent.parent
-with tempfile.TemporaryDirectory(prefix='2ndpass-install-test-') as directory:
+with tempfile.TemporaryDirectory(prefix='sp-install-test-') as directory:
     prefix = pathlib.Path(directory) / 'prefix'
     applications = pathlib.Path(directory) / 'Applications'
     environment = os.environ | {'MOP_INSTALL_ROOT': str(prefix), 'MOP_APPLICATIONS_DIR': str(applications)}
     command = [str(root / 'scripts/install.sh'), str(app)]
     subprocess.run(command, env=environment, check=True, capture_output=True)
-    link = prefix / 'bin/2ndpass'
+    link = prefix / 'bin/sp'
     assert link.is_symlink()
-    assert link.readlink() == applications / '2ndPass.app/Contents/MacOS/2ndpass'
+    assert link.readlink() == applications / '2ndPass.app/Contents/MacOS/sp'
     assert (applications / '2ndPass.app/Contents/embedded.provisionprofile').is_file()
     info = plistlib.loads((applications / '2ndPass.app/Contents/Info.plist').read_bytes())
     assert info['CFBundleExecutable'] == 'MopApp'
@@ -27,17 +27,17 @@ with tempfile.TemporaryDirectory(prefix='2ndpass-install-test-') as directory:
     resources_dir = applications / '2ndPass.app/Contents/Resources'
     assert (resources_dir / 'zxcvbn_zxcvbn.bundle').is_dir()
     assert (resources_dir / 'zxcvbn-LICENSE.txt').is_file()
-    direct = applications / '2ndPass.app/Contents/MacOS/2ndpass'
+    direct = applications / '2ndPass.app/Contents/MacOS/sp'
     identity = subprocess.check_output([str(direct), 'device', 'identity']).strip()
     assert identity
     assert subprocess.check_output([str(link), 'device', 'identity']).strip() == identity
     # A relative symlink chain must identify the same signed application too.
-    alias = prefix / 'bin/2ndpass-alias'
-    alias.symlink_to('2ndpass')
+    alias = prefix / 'bin/sp-alias'
+    alias.symlink_to('sp')
     assert subprocess.check_output([str(alias), 'device', 'identity']).strip() == identity
     assert subprocess.check_output([str(link), '--version']).strip() == b'0.7.0'
-    resources = ['man/man1/2ndpass.1', 'bash-completion/completions/2ndpass',
-                 'zsh/site-functions/_2ndpass', 'fish/vendor_completions.d/2ndpass.fish']
+    resources = ['man/man1/sp.1', 'bash-completion/completions/sp',
+                 'zsh/site-functions/_sp', 'fish/vendor_completions.d/sp.fish']
     for resource in resources:
         installed = prefix / 'share' / resource
         assert installed.is_symlink() and installed.is_file()
@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory(prefix='2ndpass-install-test-') as directory:
     info = plistlib.loads(info_path.read_bytes())
     info['CFBundleDisplayName'] = 'Tampered'
     info_path.write_bytes(plistlib.dumps(info))
-    rejected = subprocess.run([str(tampered / 'Contents/MacOS/2ndpass'), 'device', 'identity'], capture_output=True)
+    rejected = subprocess.run([str(tampered / 'Contents/MacOS/sp'), 'device', 'identity'], capture_output=True)
     # macOS may kill the process before our own signing check can return 8.
     assert rejected.returncode in (8, -signal.SIGKILL), (rejected.returncode, rejected.stderr)
     assert not rejected.stdout

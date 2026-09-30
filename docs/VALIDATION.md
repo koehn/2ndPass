@@ -10,7 +10,7 @@ software-key fallback is supported; existing user data must be preserved.
 ```sh
 swift test --disable-automatic-resolution
 swift build --disable-automatic-resolution
-python3 scripts/smoke-test.py "$(swift build --show-bin-path)/2ndpass"
+python3 scripts/smoke-test.py "$(swift build --show-bin-path)/sp"
 python3 scripts/test-signing-config.py
 python3 scripts/test-homebrew-release.py
 python3 scripts/test-install-layout.py
@@ -43,9 +43,9 @@ client or delete user data as part of validation.
 ```sh
 scripts/package.sh
 python3 scripts/test-tooling.py dist/2ndPass.app
-python3 scripts/test-shell-support.py dist/2ndPass.app/Contents/MacOS/2ndpass
+python3 scripts/test-shell-support.py dist/2ndPass.app/Contents/MacOS/sp
 MOP_LIVE_CLOUD_TEST=1 python3 scripts/test-hardware.py \
-  dist/2ndPass.app/Contents/MacOS/2ndpass
+  dist/2ndPass.app/Contents/MacOS/sp
 ```
 
 The live script creates a fresh v7 CloudKit vault and retains its local state.

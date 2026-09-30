@@ -272,7 +272,7 @@ private actor Barrier {
         let service = FakeService { _, _, _ in await barrier.wait(); var r = VaultResult(); r.value = "secret"; return r }
         service.authenticate()
         let model = model(service)
-        model.selected = try SecretReference("secondpass://personal/github/token")
+        model.selected = try SecretReference("sp://personal/github/token")
         model.read(copy: false); try await entered(barrier)
         model.deactivate(); model.activate(); await barrier.release(); try await finish(model)
         #expect(model.revealed == nil && service.isAuthenticated)
@@ -370,7 +370,7 @@ extension AppModelTests {
         }
         service.authenticate()
         let model = model(service); try model.applyCatalog(Self.catalog)
-        let reference = try SecretReference("secondpass://personal/github/extra")
+        let reference = try SecretReference("sp://personal/github/extra")
         model.write(reference: reference, value: "new", replace: false); try await finish(model)
         #expect(model.items == ["github"] && model.catalog?.revision == "r2")
     }
@@ -568,7 +568,7 @@ extension AppModelTests {
         ])
         try model.applyCatalog(ItemCatalog(vault: "personal", revision: "r1", items: [item]))
         model.authenticated = true; model.selectedItem = "login"
-        model.selected = try SecretReference("secondpass://personal/login/username")
+        model.selected = try SecretReference("sp://personal/login/username")
         model.delete()
         var changed = item
         changed.fields.removeFirst()
@@ -1076,7 +1076,7 @@ extension AppModelTests {
         refresh.withLock { $0 = true }; model.cloudChanged(); try await entered(barrier)
         #expect(model.refreshing && !model.busy)
         #expect(model.catalog?.revision == "old")
-        let result = try await service.execute(.read(SecretReference("secondpass://personal/github/password")), vault: id, offline: false)
+        let result = try await service.execute(.read(SecretReference("sp://personal/github/password")), vault: id, offline: false)
         #expect(result.value == "available")
         await barrier.release(); try await finish(model)
         #expect(model.catalog?.revision == "new" && model.selectedItem == "github")
@@ -1487,7 +1487,7 @@ extension AppModelTests {
         let service = FakeService { operation, vault, _ in
             guard case .export(let url) = operation else { Issue.record("Expected export"); return VaultResult() }
             #expect(vault == targetID)
-            #expect(url.lastPathComponent.hasPrefix("2ndpass-personal-"))
+            #expect(url.lastPathComponent.hasPrefix("sp-personal-"))
             return VaultResult()
         }
         let app = model(service)
@@ -1592,7 +1592,7 @@ extension AppModelTests {
         }
         service.authenticate()
         let app = model(service)
-        let reference = try SecretReference("secondpass://personal/github/token")
+        let reference = try SecretReference("sp://personal/github/token")
         var delivered = false
         app.loadAttachment(reference) { _ in delivered = true }
         try await entered(barrier)

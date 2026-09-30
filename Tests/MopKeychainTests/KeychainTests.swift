@@ -25,7 +25,7 @@ import MopCore
 @Test func legacyBackendRejectsSectionsBeforeKeychainAccess() throws {
     let store = KeychainStore(accessGroup: "unused-test-group", context: LAContext())
     defer { store.close() }
-    let reference = try SecretReference("secondpass://v/i/section/field")
+    let reference = try SecretReference("sp://v/i/section/field")
     #expect(throws: MopError.invalidReference) { try store.read(reference) }
     #expect(throws: MopError.invalidReference) { try store.write(reference, value: "unused", replace: false) }
     #expect(throws: MopError.invalidReference) { try store.delete(reference) }

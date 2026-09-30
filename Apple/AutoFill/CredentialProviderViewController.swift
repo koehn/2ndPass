@@ -3,8 +3,13 @@ import CloudKit
 import SwiftUI
 import MopAppSupport
 import MopCore
+import MopLocalIdentity
 
 @MainActor final class CredentialProviderViewController: ASCredentialProviderViewController {
+    private var passkeyAuthorization: LocalAuthorization?
+    private var passkeyRequest: ASPasskeyCredentialRequest?
+    private var passkeyParameters: ASPasskeyCredentialRequestParameters?
+    private var passkeyRegistration = false
     private var session: AutoFillRequestSession?
     private var task: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
@@ -20,7 +25,7 @@ import MopCore
     private let model = CredentialListModel()
 
     override func loadView() {
-        let content = CredentialListView(model: model, select: { [weak self] in self?.fill($0, field: $1) },
+        let content = CredentialRootView(model: model, passkeyPerform: { [weak self] in self?.performPasskey($0) }, select: { [weak self] in self?.fill($0, field: $1) },
                                          retry: { [weak self] in self?.retry() },
                                          chooseAnother: { [weak self] in self?.prepareList(kind: self?.model.kind) },
                                          cancel: { [weak self] in self?.cancel() })
@@ -82,7 +87,7 @@ import MopCore
         model.textInsertion = false; prepareList(kind: .oneTimeCode)
     }
     override func prepareCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier], requestParameters: ASPasskeyCredentialRequestParameters) {
-        prepareCredentialList(for: serviceIdentifiers)
+        showPasskeys(request: nil, parameters: requestParameters, registration: false)
     }
     #if os(iOS)
     override func prepareInterfaceForUserChoosingTextToInsert() {
@@ -144,12 +149,71 @@ import MopCore
         extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: ASExtensionError.userInteractionRequired.rawValue))
     }
     override func prepareInterfaceToProvideCredential(for credentialRequest: any ASCredentialRequest) {
+        if let request = credentialRequest as? ASPasskeyCredentialRequest {
+            showPasskeys(request: request, parameters: nil, registration: false); return
+        }
         guard let identity = AutoFillIdentity(identity: credentialRequest.credentialIdentity) else { identityNotFound(); return }
         prepare(identity)
     }
     override func prepareInterfaceToProvideCredential(for credentialIdentity: ASPasswordCredentialIdentity) {
         guard let identity = AutoFillIdentity(identity: credentialIdentity) else { identityNotFound(); return }
         prepare(identity)
+    }
+    override func prepareInterface(forPasskeyRegistration registrationRequest: any ASCredentialRequest) {
+        guard let request = registrationRequest as? ASPasskeyCredentialRequest else { identityNotFound(); return }
+        showPasskeys(request: request, parameters: nil, registration: true)
+    }
+    private func showPasskeys(request: ASPasskeyCredentialRequest?, parameters: ASPasskeyCredentialRequestParameters?, registration: Bool) {
+        stop()
+        passkeyRequest = request; passkeyParameters = parameters; passkeyRegistration = registration
+        guard let rp = parameters?.relyingPartyIdentifier ?? (request?.credentialIdentity as? ASPasskeyCredentialIdentity)?.relyingPartyIdentifier else { identityNotFound(); return }
+        model.passkeyRP = rp; model.passkeyRegistration = registration; model.loading = false; model.message = nil
+        do {
+            let allowed = parameters?.allowedCredentials ?? (request.flatMap { $0.credentialIdentity as? ASPasskeyCredentialIdentity }.map { [$0.credentialID] } ?? [])
+            model.passkeys = try LocalIdentityStore.open().list().filter { LocalWebAuthn.matches($0, relyingParty: rp, allowedCredentials: allowed) }
+            if !LocalIdentityStore.isAvailable { model.message = "Secure Enclave is unavailable on this device." }
+        } catch { model.message = String(describing: error) }
+        preferredContentSize = .init(width: 480, height: 480)
+    }
+    private func performPasskey(_ id: UUID?) {
+        guard !model.loading, let rp = model.passkeyRP, LocalIdentityStore.isAvailable else { return }
+        let request = passkeyRequest, parameters = passkeyParameters, registration = passkeyRegistration
+        let token = generation
+        model.loading = true; model.message = nil
+        task = Task {
+            var authorization: LocalAuthorization?
+            defer { authorization?.revoke(); if generation == token { passkeyAuthorization = nil; model.loading = false } }
+            do {
+                let store = try LocalIdentityStore.open()
+                let auth = try await LocalAuthorization.authorizeAsync(reason: registration ? "create a device-bound passkey for \(rp)" : "sign in to \(rp)", ids: id.map { [$0] } ?? [], purposes: [.webauthn], operations: registration ? [.create] : [.passkey])
+                authorization = auth
+                guard token == generation, !Task.isCancelled else { return }
+                passkeyAuthorization = auth
+                if registration {
+                    guard let request, let credential = request.credentialIdentity as? ASPasskeyCredentialIdentity else { throw MopError.invalidLocalIdentity }
+                    let identity = try store.registerPasskey(relyingParty: rp, userName: credential.userName, userHandle: credential.userHandle, clientDataHash: request.clientDataHash, supportedAlgorithms: request.supportedAlgorithms.map { Int($0.rawValue) }, authorization: auth)
+                    guard case .passkey(let metadata) = identity.metadata else { throw MopError.invalidLocalIdentity }
+                    let response = ASPasskeyRegistrationCredential(relyingParty: rp, clientDataHash: request.clientDataHash, credentialID: metadata.credentialID, attestationObject: try LocalWebAuthn.attestation(metadata: metadata, publicKey: identity.publicKey))
+                    guard token == generation, !Task.isCancelled, auth.isActive else { return }
+                    if let suggestion = identity.passkeySuggestion {
+                        try await ASCredentialIdentityStore.shared.saveCredentialIdentities([suggestion])
+                    }
+                    guard token == generation, !Task.isCancelled, auth.isActive else { return }
+                    // Keep the local record if the platform rejects delivery: never destroy a key
+                    // that a relying party may already have registered. It can be deleted in local.
+                    extensionContext.completeRegistrationRequest(using: response) { _ in }
+                } else {
+                    guard let id, let hash = parameters?.clientDataHash ?? request?.clientDataHash else { throw MopError.invalidLocalIdentity }
+                    let allowed = parameters?.allowedCredentials ?? (request.flatMap { $0.credentialIdentity as? ASPasskeyCredentialIdentity }.map { [$0.credentialID] } ?? [])
+                    let result = try store.assertPasskey(id: id, relyingParty: rp, allowedCredentials: allowed, clientDataHash: hash, authorization: auth)
+                    guard token == generation, !Task.isCancelled, auth.isActive else { return }
+                    extensionContext.completeAssertionRequest(using: ASPasskeyAssertionCredential(userHandle: result.metadata.userHandle, relyingParty: rp, signature: result.signature, clientDataHash: hash, authenticatorData: result.authenticatorData, credentialID: result.metadata.credentialID), completionHandler: nil)
+                }
+            } catch {
+                guard token == generation, !Task.isCancelled else { return }
+                model.message = "Passkey operation failed: \(error). Device-bound passkeys require the platform to accept BE=0 and BS=0."
+            }
+        }
     }
     private func prepare(_ identity: AutoFillIdentity) {
         stop(); retryIdentity = identity; pendingIdentity = identity
@@ -242,6 +306,8 @@ import MopCore
         model.entries = []; model.loading = false
     }
     private func stop() {
+        passkeyAuthorization?.revoke(); passkeyAuthorization = nil; passkeyRequest = nil; passkeyParameters = nil
+        model.passkeyRP = nil; model.passkeys = []
         generation += 1; task?.cancel(); task = nil; pendingIdentity = nil; pendingList = false; finish()
     }
     #if os(macOS)
@@ -254,7 +320,7 @@ import MopCore
     }
     #endif
     private func interrupt(_ reason: String = "AutoFill paused because the device locked, slept, or the request entered the background. Retry to authenticate again.") {
-        guard session != nil else { return }
+        guard session != nil || model.passkeyRP != nil else { return }
         stop(); model.message = reason; updatePreferredContentSize()
     }
     private func identityNotFound() {
@@ -267,6 +333,9 @@ import MopCore
 
 private enum CredentialField { case username, password, code }
 @MainActor @Observable private final class CredentialListModel {
+    var passkeyRP: String?
+    var passkeyRegistration = false
+    var passkeys: [LocalIdentity] = []
     var showsPicker = false
     var textInsertion = false
     var kind: AutoFillKind? = .password
@@ -274,6 +343,22 @@ private enum CredentialField { case username, password, code }
     var hosts: Set<String> = []
     var loading = true
     var message: String?
+}
+
+private struct CredentialRootView: View {
+    @Bindable var model: CredentialListModel
+    let passkeyPerform: (UUID?) -> Void
+    let select: (AutoFillIdentity, CredentialField?) -> Void
+    let retry: () -> Void
+    let chooseAnother: () -> Void
+    let cancel: () -> Void
+    var body: some View {
+        if let rp = model.passkeyRP {
+            LocalPasskeyPrompt(relyingParty: rp, registration: model.passkeyRegistration, identities: model.passkeys, busy: model.loading, message: model.message, perform: passkeyPerform, cancel: cancel)
+        } else {
+            CredentialListView(model: model, select: select, retry: retry, chooseAnother: chooseAnother, cancel: cancel)
+        }
+    }
 }
 
 private struct CredentialListView: View {

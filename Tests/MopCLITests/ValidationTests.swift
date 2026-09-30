@@ -4,6 +4,47 @@ import MopCore
 @testable import MopCLI
 
 @Suite struct ValidationTests {
+    @Test func agentReportsPurposeMismatchInsteadOfMissingSecret() throws {
+        try SSHAgent.validatePurpose(.ssh, requested: .ssh, reference: "sp://local/login")
+        try SSHAgent.validatePurpose(.gitSigning, requested: .gitSigning, reference: "sp://local/git-key")
+        do {
+            try SSHAgent.validatePurpose(.gitSigning, requested: .ssh, reference: "sp://local/git-key")
+            Issue.record("Git signing identity accepted for SSH authentication")
+        } catch {
+            let message = String(describing: error)
+            #expect(message.contains("sp://local/git-key"))
+            #expect(message.contains("--purpose git-signing"))
+            #expect(message.contains("cannot authenticate SSH"))
+        }
+        #expect(throws: (any Error).self) {
+            try SSHAgent.validatePurpose(.x509, requested: .ssh, reference: "sp://local/certificate")
+        }
+    }
+
+    @Test func identityReferencesAreVaultQualifiedAndRoundTripEscapedNames() throws {
+        let vaultID = UUID().uuidString
+        let uuidReference = try ItemReference("sp://" + vaultID + "/deploy")
+        #expect(try IdentitySelection(uuidReference.description, vault: vaultID).reference == uuidReference)
+        let reference = try ItemReference(vault: "work", name: "SSH / deploy #1")
+        #expect(reference.description == "sp://work/SSH%20%2F%20deploy%20%231")
+        #expect(try ItemReference(reference.description) == reference)
+        #expect(try IdentitySelection(reference.description, vault: nil).reference == reference)
+        #expect(try IdentitySelection("SSH / deploy #1", vault: "work").reference == reference)
+        #expect(throws: (any Error).self) { try IdentitySelection(reference.description, vault: "local") }
+        #expect(throws: (any Error).self) { try IdentitySelection("deploy", vault: nil) }
+        #expect(throws: (any Error).self) { try ItemReference("sp://local/deploy/private-key") }
+        #expect(throws: (any Error).self) { try ItemReference("sp://local/bad%ZZ") }
+        #expect(throws: (any Error).self) { try IdentitySelection.requireSupportedBackend("work") }
+        try IdentitySelection.requireSupportedBackend("local")
+    }
+
+    @Test func identityCommandsAcceptReferencesAndAgentVaultSelectors() throws {
+        #expect(try Mop.parseAsRoot(["item", "public-key", "sp://local/deploy"]) is Item.PublicKey)
+        #expect(try Mop.parseAsRoot(["item", "delete", "sp://work/deploy"]) is Item.DeleteIdentity)
+        #expect(try Mop.parseAsRoot(["ssh-agent", "--vault", "work", "--identity", "deploy"]) is SSHAgent)
+        #expect(try Mop.parseAsRoot(["ssh-agent", "--identity", "sp://local/deploy"]) is SSHAgent)
+    }
+
     @Test func packagingIdentityCommandRemainsAvailable() throws {
         let command = try Mop.parseAsRoot(["device", "identity"])
         #expect(command is Device.Identity)
@@ -11,7 +52,7 @@ import MopCore
 
     @Test func removedFileOptionIsAnUnknownArgument() throws {
         do {
-            _ = try Mop.parseAsRoot(["read", "secondpass://personal/mycloud/sshd", "--vault-file", "/sensitive-path"])
+            _ = try Mop.parseAsRoot(["read", "sp://personal/mycloud/sshd", "--vault-file", "/sensitive-path"])
             Issue.record("Legacy file configuration was accepted")
         } catch {
             #expect(Mop.knownValidationError(error) == nil)
@@ -74,13 +115,11 @@ import MopCore
 }
 
 @Test func localCommandsAreAvailable() throws {
-    #expect(try Mop.parseAsRoot(["local", "list"]) is Local.List)
-    #expect(try Mop.parseAsRoot(["local", "list", "--json"]) is Local.List)
-    #expect(try Mop.parseAsRoot(["local", "create", "deploy"]) is Local.Create)
-    #expect(try Mop.parseAsRoot(["local", "create", "deploy", "--protocol", "ssh"]) is Local.Create)
-    #expect(try Mop.parseAsRoot(["local", "public-key", "deploy"]) is Local.PublicKey)
-    #expect(try Mop.parseAsRoot(["local", "sign", "deploy"]) is Local.Sign)
-    #expect(try Mop.parseAsRoot(["local", "delete", "deploy"]) is Local.Delete)
+    #expect(try Mop.parseAsRoot(["list", "--vault", "local"]) is List)
+    #expect(try Mop.parseAsRoot(["item", "create", "--vault", "local", "--type", "ssh", "--name", "deploy", "--acknowledge-device-loss"]) is Item.Create)
+    #expect(try Mop.parseAsRoot(["item", "public-key", "--vault", "local", "deploy"]) is Item.PublicKey)
+    #expect(try Mop.parseAsRoot(["item", "delete", "--vault", "local", "deploy"]) is Item.DeleteIdentity)
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["local", "sign", "deploy"]) }
 }
 
 @Test func localCreateRejectsInvalidProtocolAndName() {

@@ -106,7 +106,7 @@ public enum SigningIdentity {
               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
               let main = plist["CFBundleExecutable"] as? String,
               !main.contains("/"),
-              main == resolved.lastPathComponent || (main == "MopApp" && ["2ndpass", "mop"].contains(resolved.lastPathComponent)) else { return nil }
+              main == resolved.lastPathComponent || (main == "MopApp" && ["sp", "mop"].contains(resolved.lastPathComponent)) else { return nil }
         // Validate the enclosing seal for both main executables and CLI helpers;
         // checking only the running Mach-O does not validate its bundle metadata.
         var enclosing: SecStaticCode?

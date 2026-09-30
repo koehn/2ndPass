@@ -33,7 +33,7 @@
 				<key>ProvidesOneTimeCodes</key>
 				<true/>
 				<key>ProvidesPasskeys</key>
-				<false/>
+				<true/>
 				<key>ProvidesPasswords</key>
 				<true/>
 				<key>ProvidesTextToInsert</key>
