@@ -5,7 +5,7 @@
       "models": {
         "mtplx-qwen38-27b-optimized-quality": {
           "limit": {
-            "context": 65536,
+            "context": 131072,
             "output": 16384
           }
         }

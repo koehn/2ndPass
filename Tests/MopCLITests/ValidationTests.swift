@@ -72,3 +72,23 @@ import MopCore
     #expect(try Mop.parseAsRoot(["item", "import", "export.1pux", "--vault", "personal", "--yes"]) is Item.Import)
     #expect(throws: (any Error).self) { try Mop.parseAsRoot(["item", "import", "export.csv", "--vault", "personal", "--offline"]) }
 }
+
+@Test func localCommandsAreAvailable() throws {
+    #expect(try Mop.parseAsRoot(["local", "list"]) is Local.List)
+    #expect(try Mop.parseAsRoot(["local", "list", "--json"]) is Local.List)
+    #expect(try Mop.parseAsRoot(["local", "create", "deploy"]) is Local.Create)
+    #expect(try Mop.parseAsRoot(["local", "create", "deploy", "--protocol", "ssh"]) is Local.Create)
+    #expect(try Mop.parseAsRoot(["local", "public-key", "deploy"]) is Local.PublicKey)
+    #expect(try Mop.parseAsRoot(["local", "sign", "deploy"]) is Local.Sign)
+    #expect(try Mop.parseAsRoot(["local", "delete", "deploy"]) is Local.Delete)
+}
+
+@Test func localCreateRejectsInvalidProtocolAndName() {
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["local", "create", "deploy", "--protocol", "not-a-protocol"]) }
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["local", "create", "bad\nname"]) }
+}
+
+@Test func sshAgentCommandIsAvailable() throws {
+    #expect(try Mop.parseAsRoot(["ssh-agent"]) is SSHAgent)
+    #expect(try Mop.parseAsRoot(["ssh-agent", "--", "ssh", "user@example.com"]) is SSHAgent)
+}

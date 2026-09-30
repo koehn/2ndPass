@@ -39,5 +39,6 @@ let package = Package(
         .executableTarget(name: "MopKeychainCheck", dependencies: ["MopCore", "MopKeychain", "MopAuth", "MopVaultNext"]),
         .testTarget(name: "MopCLITests", dependencies: ["MopCLI", "MopCore"]),
         .testTarget(name: "MopCoreTests", dependencies: ["MopCore"]),
+        .testTarget(name: "MopKeychainTests", dependencies: ["MopKeychain", "MopCore"], exclude: ["KeychainTests.swift"]),
     ]
 )

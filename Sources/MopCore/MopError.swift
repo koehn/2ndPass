@@ -34,6 +34,10 @@ public enum MopError: Error, LocalizedError, Equatable {
     case invalidIdentity
     case invalidRecovery
     case filePermissions
+    case enclaveUnavailable
+    case localOperationForbidden
+    case localIdentityCapability
+    case invalidLocalIdentity
 
     public var exitCode: Int32 {
         switch self {
@@ -69,6 +73,10 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .notVaultMember, .deviceRemoved, .deviceRemovalPending: 13
         case .invalidIdentity, .invalidRecovery: 14
         case .filePermissions: 15
+        case .enclaveUnavailable: 31
+        case .localOperationForbidden: 32
+        case .localIdentityCapability: 33
+        case .invalidLocalIdentity: 34
         }
     }
 
@@ -118,6 +126,10 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .invalidIdentity: "Device identity or recipient key is invalid, unavailable, or does not match the expected fingerprint."
         case .invalidRecovery: "Hardware recovery identity or recovery request is invalid or does not belong to this vault."
         case .filePermissions: "Unsafe file type, permissions, or protected output path."
+        case .enclaveUnavailable: "Secure Enclave hardware is not available to this process. No software fallback is provided."
+        case .localOperationForbidden: "That operation is not allowed on the device-local vault. It is device-only: no rename, share, export, backup, or recovery."
+        case .localIdentityCapability: "That operation is not supported by this identity’s key type or capability."
+        case .invalidLocalIdentity: "Invalid device-local identity: the name is empty, too long, or the algorithm and protocol do not match."
         }
     }
 }

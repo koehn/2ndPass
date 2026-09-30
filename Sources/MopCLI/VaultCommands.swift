@@ -143,8 +143,9 @@ struct Vault: AsyncParsableCommand {
         func run() async throws {
             let result = try await storage.execute(.discover)
             if result.deviceRemoved { IO.diagnostic("This device was removed. Run 2ndpass vault enrollment reconnect to opt in before requesting enrollment again.\n") }
-            let rows = result.vaults
-            if json { try IO.output(String(decoding: JSONEncoder().encode(rows), as: UTF8.self) + "\n") }
+        var rows = result.vaults
+        rows.append(VaultDescriptor(id: LocalVault.id, name: LocalVault.name, format: "device-local", enrolled: true))
+        if json { try IO.output(String(decoding: JSONEncoder().encode(rows), as: UTF8.self) + "\n") }
             else { for row in rows { try IO.output("\(row.name ?? "")\t\(row.id)\t\(row.format)\n") } }
         }
     }

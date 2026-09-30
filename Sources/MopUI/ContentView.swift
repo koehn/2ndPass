@@ -47,7 +47,7 @@ struct ContentView: View {
                     NavigationLink(value: "recent-changed") { Label("Recently Changed", systemImage: "pencil.circle") }
                     NavigationLink(value: "recent-used") { Label("Recently Used", systemImage: "clock") }
                     Section("Vaults", isExpanded: $vaultsExpanded) {
-                        ForEach(model.vaults.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }) { vault in
+                        ForEach(model.vaultList.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }) { vault in
                             NavigationLink(value: "vault:" + vault.id) {
                                 Label(model.vaultLabel(vault), systemImage: model.vaultIcon(vault))
                                     .lineLimit(1).accessibilityValue(model.vaultConnectionLabel(vault))
@@ -68,7 +68,9 @@ struct ContentView: View {
                     ItemSearchBar(model: model)
                     SearchSummary(model: model)
 
-                    if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
+                    if model.isLocalVaultSelected {
+                        LocalVaultView(model: model)
+                    } else if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
                         ContentUnavailableView {
                             Label("Connect this device", systemImage: model.vaultIcon(descriptor))
                         } description: {
@@ -130,11 +132,13 @@ struct ContentView: View {
                         ItemDetailView(model: model, itemName: "").id(draft.id)
                     }
                     else if let item = model.selectedItem, model.authenticated { ItemDetailView(model: model, itemName: item).id(model.vault + ":" + item) }
-                    else {
+                    else if model.isLocalVaultSelected {
+                        LocalVaultDetailHint()
+                    } else {
                         ContentUnavailableView {
-                            Label(model.vaults.isEmpty ? "Welcome to 2ndPass" : model.authenticated ? "Select an item" : model.unlocking ? "Unlocking 2ndPass" : "2ndPass is locked", systemImage: "key.horizontal")
+                            Label(model.cloudVaults.isEmpty ? "Welcome to 2ndPass" : model.authenticated ? "Select an item" : model.unlocking ? "Unlocking 2ndPass" : "2ndPass is locked", systemImage: "key.horizontal")
                         } description: {
-                            Text(model.vaults.isEmpty ? "Create a vault, or refresh to find vaults in your iCloud account." : model.authenticated ? "Choose an item to view its details." : "Unlock 2ndPass to access your connected vaults.")
+                            Text(model.cloudVaults.isEmpty ? "Create a vault, or refresh to find vaults in your iCloud account." : model.authenticated ? "Choose an item to view its details." : "Unlock 2ndPass to access your connected vaults.")
                         } actions: {
                             if model.unlocking {
                                 ProgressView("Unlocking 2ndPass…")
@@ -143,7 +147,7 @@ struct ContentView: View {
                                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                                     .disabled(!model.canUnlock)
                             }
-                            if model.vaults.isEmpty {
+                            if model.cloudVaults.isEmpty {
                                 Button("Create vault…") { model.presentSheet(.createVault) }.disabled(model.offline || model.busy)
                             }
                         }.padding(.top, 60)
@@ -215,7 +219,7 @@ struct ContentView: View {
     }
     private var sessionContent: some View {
         Group {
-            if !model.authenticated && !model.vaults.isEmpty {
+            if !model.authenticated && model.cloudVaultsPresent && !model.isLocalVaultSelected {
                 LockedView(model: model)
             } else {
                 navigation

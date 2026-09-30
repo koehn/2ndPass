@@ -23,6 +23,23 @@ import MopCore
         return (status, try Data(contentsOf: outURL), try Data(contentsOf: errURL))
     }
 
+    @Test func agentChildStaysInParentProcessGroup() throws {
+        let status = try SSHAgent.runChild(
+            ["/usr/bin/python3", "-c", "import os,sys; sys.exit(0 if os.getpgrp() == int(sys.argv[1]) else 42)", String(getpgrp())],
+            environment: ["PATH": "/usr/bin:/bin"])
+        #expect(status == 0)
+    }
+
+    @Test func agentChildEnvironmentStatusAndLookup() throws {
+        #expect(try SSHAgent.runChild(["sh", "-c", "test \"$SSH_AUTH_SOCK\" = /tmp/test-agent.sock && exit 37"],
+                                     environment: ["PATH": "/bin", "SSH_AUTH_SOCK": "/tmp/test-agent.sock"]) == 37)
+        #expect(try SSHAgent.runChild(["/bin/sh", "-c", "kill -TERM $$"], environment: [:]) == 128 + SIGTERM)
+        #expect(throws: MopError.executableNotFound) {
+            try SSHAgent.runChild(["mop-no-such-executable"], environment: ["PATH": "/bin"])
+        }
+        #expect(throws: MopError.invalidProcess) { try SSHAgent.runChild([], environment: [:]) }
+    }
+
     @Test func maskedStreamsAndStdin() throws {
         let (status, out, err) = try execute(["/bin/sh", "-c", "cat; printf 'secret-two' >&2; exit 42"],
                                            secrets: ["secret-one", "secret-two"], input: Data("secret-one\n".utf8))

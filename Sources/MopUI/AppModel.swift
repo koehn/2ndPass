@@ -2,6 +2,8 @@ import SwiftUI
 import OSLog
 import MopCore
 import MopAppSupport
+import MopAuth
+import LocalAuthentication
 import MopVaultNext
 
 enum AppPage: String, CaseIterable { case secrets = "Secrets", recentlyDeleted = "Recently Deleted" }
@@ -45,6 +47,28 @@ final class AppModel {
     var selectedItem: String? { didSet { rememberSelection() } }
     var catalog: ItemCatalog? { didSet { invalidateItemSearch() } }
     var references: [SecretReference] = []
+
+    // Device-local vault: fixed, Secure Enclave-backed, non-exportable. It has no
+    // account, sync, or recovery and is independent of the cloud session state.
+    var localIdentities: [LocalIdentity] = []
+    var localReady = false
+    var localLoading = false
+    var localError: String?
+    var localCreating = false
+    var localCreatePresented = false
+    var localCreateName = ""
+    var localCreateProtocol: LocalIdentityProtocol = .ssh
+    var localDeleting: UUID?
+    var localDeleteInProgress = false
+    @ObservationIgnored private var localService: (any LocalVaultServing)?
+    @ObservationIgnored private let authorizeLocal: (String) async throws -> LAContext
+    var isLocalVaultSelected: Bool { collection == .vault(LocalVault.id) }
+    /// The always-present local vault is a UI-level entry: it is shown in the sidebar
+    /// but never appears in the cloud `vaults` list that account operations run against.
+    var vaultList: [VaultDescriptor] { vaultsIncludingLocal(vaults) }
+    /// Cloud vaults only, so onboarding empty-states are not fooled by the always-present local vault.
+    var cloudVaults: [VaultDescriptor] { vaults.filter { $0.id != LocalVault.id } }
+    var cloudVaultsPresent: Bool { !cloudVaults.isEmpty }
     var selected: SecretReference?
     var importAfterCreation = false
     var importing = false
@@ -243,7 +267,11 @@ final class AppModel {
          documents: any DocumentAccessing = SystemDocumentAccess(),
          usageStore: any ItemUsageStoring = ItemUsageStore(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init) {
+         automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init,
+         localService: (any LocalVaultServing)? = nil,
+         authorizeLocal: @escaping (String) async throws -> LAContext = { try await Authentication.authorizeAsync(reason: $0) }) {
+        self.localService = localService
+        self.authorizeLocal = authorizeLocal
         self.lifecycle = lifecycle ?? SystemAppLifecycleMonitor()
         self.wallNow = wallNow; retentionDate = wallNow()
         self.service = service
@@ -360,7 +388,7 @@ final class AppModel {
         default: nil
         }
     }
-    var selectedVaultDescriptor: VaultDescriptor? { vaults.first { $0.id == vault } }
+    var selectedVaultDescriptor: VaultDescriptor? { vault == LocalVault.id ? Self.localDescriptor : vaults.first { $0.id == vault } }
     var canExportBackup: Bool { !allVaults && !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
     var vaultName: String { catalog?.vault ?? references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "" }
     var filtered: [SecretReference] {
@@ -511,6 +539,11 @@ final class AppModel {
         guard !busy, allowTransition(.vault(id)) else { return }
         showArchived = false; favoritesOnly = false
         allVaults = false; page = .secrets; vault = id
+        if id == LocalVault.id {
+            clearSelection()
+            openLocalVault()
+            return
+        }
         changedVault()
         if vaults.first(where: { $0.id == id })?.enrolled == false { sheet = .enrollDevice; return }
         scheduleAutomaticUnlock()
@@ -587,6 +620,87 @@ final class AppModel {
         if !vault.isEmpty { catalogs[vault] = catalog }
         passwordQualities = [:]
     }
+    // MARK: - Device-local vault
+
+    private func localStore() throws -> any LocalVaultServing {
+        if let localService { return localService }
+        let service = try LocalVaultService()
+        localService = service
+        return service
+    }
+
+    /// Load the device's local identities. Listing requires no authentication; the
+    /// public keys are not secret.
+    func openLocalVault() {
+        localLoading = true; localError = nil
+        Task { @MainActor in
+            defer { localLoading = false }
+            do {
+                localIdentities = try localStore().list()
+                localReady = true
+            } catch {
+                localError = "Could not read the device-local vault. Its keys live in the Secure Enclave."
+            }
+        }
+    }
+
+    func beginLocalCreate() {
+        guard !localCreating, !localDeleteInProgress else { return }
+        localCreateName = ""
+        localCreateProtocol = .ssh
+        localCreatePresented = true
+    }
+
+    func cancelLocalCreate() {
+        localCreatePresented = false
+        localCreateName = ""
+    }
+
+    func submitLocalCreate() {
+        let name = localCreateName
+        let protocolType = localCreateProtocol
+        guard !localCreating, !name.isEmpty else { return }
+        localCreating = true
+        Task { @MainActor in
+            defer { localCreating = false }
+            do {
+                let context = try await authorizeLocal("create a device-local identity in the Secure Enclave")
+                defer { context.invalidate() }
+                _ = try localStore().create(name: name, protocolType: protocolType, context: context)
+                localIdentities = try localStore().list()
+                localReady = true
+                localError = nil
+                localCreatePresented = false
+                localCreateName = ""
+            } catch {
+                localError = "Could not create the identity. The Secure Enclave requires biometric approval."
+            }
+        }
+    }
+
+    func requestLocalDelete(_ id: UUID) {
+        guard !localDeleteInProgress, !localCreating else { return }
+        localDeleting = id
+    }
+    func confirmLocalDelete() {
+        guard let id = localDeleting, !localDeleteInProgress else { return }
+        localDeleting = nil
+        localDeleteInProgress = true
+        Task { @MainActor in
+            defer { localDeleteInProgress = false }
+            do {
+                let context = try await authorizeLocal("delete a device-local identity")
+                defer { context.invalidate() }
+                try Task.checkCancellation()
+                try localStore().delete(id: id)
+                localIdentities = try localStore().list()
+                localError = nil
+            } catch {
+                localError = "Could not delete the identity."
+            }
+        }
+    }
+
     var itemCreationVaults: [VaultDescriptor] {
         vaults.filter { $0.supported && $0.enrolled && catalogs[$0.id] != nil && catalogs[$0.id]?.canEdit != false }
             .sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
@@ -803,11 +917,13 @@ final class AppModel {
     }
     var hasConnectedVaults: Bool { !requestedVaultIDs.isEmpty }
     func vaultIcon(_ descriptor: VaultDescriptor) -> String {
+        if descriptor.id == LocalVault.id { return "internaldrive" }
         if !descriptor.supported { return "exclamationmark.triangle" }
         if !descriptor.enrolled { return "externaldrive.badge.plus" }
         return authenticated && catalogs[descriptor.id] != nil ? "lock.open" : "lock.rectangle"
     }
     func vaultConnectionLabel(_ descriptor: VaultDescriptor) -> String {
+        if descriptor.id == LocalVault.id { return "Device-only · Secure Enclave" }
         if !descriptor.supported { return "Unsupported vault" }
         if !descriptor.enrolled { return "Not connected to this device" }
         return authenticated && catalogs[descriptor.id] != nil ? "Unlocked" : "Locked"
@@ -904,6 +1020,10 @@ final class AppModel {
         launchAttempted = true
         discover(autoUnlock: true)
     }
+    static let localDescriptor = VaultDescriptor(id: LocalVault.id, name: LocalVault.name, format: "device-local", enrolled: true)
+    func vaultsIncludingLocal(_ rows: [VaultDescriptor]) -> [VaultDescriptor] {
+        rows.contains(where: { $0.id == LocalVault.id }) ? rows : rows + [Self.localDescriptor]
+    }
     func discover(autoUnlock: Bool = false, selectedOnly: Bool = false) {
         guard !busy, allowTransition(.refresh) else { return }
         let refreshContents = authenticated
@@ -920,7 +1040,7 @@ final class AppModel {
             // Use the repository's account-scoped default, never an arbitrary vault.
             if self.vault.isEmpty {
                 if let id = result.defaultVault, ids.contains(id) { self.vault = id }
-            } else if !ids.contains(self.vault) {
+            } else if self.vault != LocalVault.id && !ids.contains(self.vault) {
                 self.vault = ""; self.lock(reason: .accessFailure)
                 if rows.isEmpty { self.sheet = .createVault }
                 else if !rows.contains(where: { $0.supported && $0.enrolled }) { self.sheet = .enrollDevice }
@@ -1553,7 +1673,7 @@ final class AppModel {
                 let available = Set(discovery.vaults.map(\.id))
                 guard requested.allSatisfy({ available.contains($0) }) else {
                     vaults = discovery.vaults
-                    if !available.contains(vault) { vault = "" }
+                    if vault != LocalVault.id && !available.contains(vault) { vault = "" }
                     lock()
                     if vaults.isEmpty { sheet = .createVault }
                     return
@@ -1621,6 +1741,7 @@ final class AppModel {
     }
     func renameVault(to name: String, target: VaultDescriptor? = nil) {
         guard !offline, let target = target ?? selectedVaultDescriptor else { return }
+        guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.renameVault) ?? ""; return }
         let id = target.id, requestID = sheetRequest?.id
         perform { token in
             let result = try await self.service.execute(.rename(name), vault: id, offline: false)
@@ -1638,6 +1759,7 @@ final class AppModel {
     }
 
     func deleteVault(target: VaultDescriptor, confirmation: String) {
+        guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.deleteVault) ?? ""; return }
         guard !offline, !busy, confirmation == (target.name ?? target.id) else { return }
         conceal(); clearClipboard(); catalog = nil; references = []; selected = nil; selectedItem = nil; authenticated = false
         perform { token in
@@ -1654,6 +1776,7 @@ final class AppModel {
 
     func chooseExportBackup(target: VaultDescriptor? = nil) {
         guard !busy, let target = target ?? selectedVaultDescriptor, target.enrolled else { return }
+        guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.export) ?? ""; return }
         documentRequest = DocumentRequest(vault: target.id, generation: securityGeneration)
     }
     func completeBackupSelection(folder: URL, request: DocumentRequest) {

@@ -16,7 +16,15 @@ struct VaultDetailsView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text(target.name ?? "Unnamed vault").font(.title2).bold()
             Text(model.vaultConnectionLabel(target)).foregroundStyle(.secondary)
-            if model.authenticated && target.enrolled {
+            if target.id == LocalVault.id {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Device-only vault", systemImage: "internaldrive")
+                        Text("This vault is fixed to this device. Its keys live in the Secure Enclave and cannot be renamed, exported, shared, backed up, or deleted as a vault. Create and delete individual identities from the vault list.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            } else if model.authenticated && target.enrolled {
                 GroupBox("Vault") {
                     VStack(alignment: .leading, spacing: 12) {
                         Button("Rename Vault…") { model.presentSheet(.renameVault, target: target) }
