@@ -211,7 +211,7 @@ import MopLocalIdentity
                 }
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
-                model.message = "Passkey operation failed: \(error). Device-bound passkeys require the platform to accept BE=0 and BS=0."
+                model.message = "Passkey operation failed: \(error)."
             }
         }
     }

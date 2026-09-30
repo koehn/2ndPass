@@ -7,8 +7,10 @@ import Security
 /// supplies the validated RP ID and clientDataHash; we never accept a URL from UI.
 public enum LocalWebAuthn {
     public static func authenticatorData(relyingParty: String) -> Data {
-        // UP + UV. BE=0, BS=0. A zero counter means counters are unsupported.
-        Data(SHA256.hash(data: Data(relyingParty.utf8))) + Data([0x05, 0, 0, 0, 0])
+        // UP + UV + BE + BS for platform compatibility. These advertised backup
+        // flags do not reflect the device-local key's actual nonrecoverability.
+        // A zero counter means counters are unsupported.
+        Data(SHA256.hash(data: Data(relyingParty.utf8))) + Data([0x1d, 0, 0, 0, 0])
     }
     public static func registrationData(metadata: PasskeyMetadata, publicKey: Data) throws -> Data {
         _ = try P256.Signing.PublicKey(x963Representation: publicKey)
