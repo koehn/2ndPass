@@ -112,13 +112,10 @@ import MopLocalIdentity
                     model.message = "No suggestions are available. Open 2ndPass, unlock it, then choose Settings → AutoFill → Refresh Suggestions."
                     updatePreferredContentSize(); return
                 }
-                let session = beginSession()
-                let choices = try await session.choices(for: identities)
-                guard token == generation, !Task.isCancelled else { return }
-                model.entries = choices.sorted { ($0.identity.website, $0.identity.username, $0.vaultName, $0.itemName, $0.id) < ($1.identity.website, $1.identity.username, $1.vaultName, $1.itemName, $1.id) }
+                // Browsing uses only published metadata. Start authentication and its
+                // timeout when a credential is selected, never while listing accounts.
+                model.entries = identities.sorted { ($0.website, $0.username, $0.id) < ($1.website, $1.username, $1.id) }
                 model.loading = false
-                if session.unavailableVaults > 0 { model.message = "Some vaults are unavailable. Open and unlock 2ndPass to refresh them. Available accounts are listed below." }
-                else if choices.isEmpty { model.message = "These suggestions are no longer available. Refresh Suggestions in 2ndPass’s AutoFill settings." }
                 updatePreferredContentSize()
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
@@ -339,7 +336,7 @@ private enum CredentialField { case username, password, code }
     var showsPicker = false
     var textInsertion = false
     var kind: AutoFillKind? = .password
-    var entries: [AutoFillChoice] = []
+    var entries: [AutoFillIdentity] = []
     var hosts: Set<String> = []
     var loading = true
     var message: String?
@@ -370,22 +367,22 @@ private struct CredentialListView: View {
     @State private var search = ""
     @State private var showsOtherAccounts = false
     @State private var selection: String?
-    @State private var unrelated: AutoFillChoice?
+    @State private var unrelated: AutoFillIdentity?
     @State private var insertionField: CredentialField?
     @FocusState private var searchFocused: Bool
-    private var filtered: [AutoFillChoice] {
-        model.entries.filter { search.isEmpty || [$0.identity.website, $0.identity.username, $0.itemName, $0.vaultName].contains { $0.localizedCaseInsensitiveContains(search) } }
+    private var filtered: [AutoFillIdentity] {
+        model.entries.filter { search.isEmpty || [$0.website, $0.username].contains { $0.localizedCaseInsensitiveContains(search) } }
     }
-    private var ordered: [AutoFillChoice] {
+    private var ordered: [AutoFillIdentity] {
         matching + (model.hosts.isEmpty || showsOtherAccounts ? other : [])
     }
-    private var matching: [AutoFillChoice] { filtered.filter { model.hosts.contains($0.identity.website) } }
-    private var other: [AutoFillChoice] { filtered.filter { !model.hosts.contains($0.identity.website) } }
+    private var matching: [AutoFillIdentity] { filtered.filter { model.hosts.contains($0.website) } }
+    private var other: [AutoFillIdentity] { filtered.filter { !model.hosts.contains($0.website) } }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack { Text("2ndPass AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel).keyboardShortcut(.cancelAction) }
             if !model.hosts.isEmpty { Text("Filling for " + model.hosts.sorted().joined(separator: ", ")).font(.callout) }
-            if model.loading { ProgressView("Authenticating for AutoFill…") }
+            if model.loading { ProgressView(model.showsPicker && model.entries.isEmpty ? "Loading accounts…" : "Authenticating for AutoFill…") }
             if let message = model.message {
                 Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
                 HStack {
@@ -394,12 +391,12 @@ private struct CredentialListView: View {
                 }
             }
             if model.showsPicker && !model.entries.isEmpty {
-                TextField("Search accounts, websites, or vaults", text: $search).textFieldStyle(.roundedBorder).focused($searchFocused)
+                TextField("Search usernames or websites", text: $search).textFieldStyle(.roundedBorder).focused($searchFocused)
                     .onSubmit { fillSelected() }
                     .onKeyPress(.downArrow) { moveSelection(1); return .handled }
                     .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
                 if !model.hosts.isEmpty {
-                    if !model.entries.contains(where: { model.hosts.contains($0.identity.website) }) {
+                    if !model.entries.contains(where: { model.hosts.contains($0.website) }) {
                         Text("No accounts match this website exactly.").foregroundStyle(.secondary)
                     }
                     Button(showsOtherAccounts ? "Hide other accounts" : "Show other accounts") {
@@ -433,23 +430,22 @@ private struct CredentialListView: View {
         }
         .onChange(of: search) { _, _ in selection = ordered.first?.id }
         .confirmationDialog("Use this account for another website?", isPresented: Binding(get: { unrelated != nil }, set: { if !$0 { unrelated = nil } }), titleVisibility: .visible) {
-            if let unrelated { Button("Fill Account") { select(unrelated.identity, insertionField); self.unrelated = nil } }
+            if let unrelated { Button("Fill Account") { select(unrelated, insertionField); self.unrelated = nil } }
             Button("Cancel", role: .cancel) { unrelated = nil }
         } message: {
-            if let unrelated { Text("The requested site is \(model.hosts.sorted().joined(separator: ", ")). This account is for \(unrelated.identity.website): \(unrelated.identity.username) — \(unrelated.itemName), \(unrelated.vaultName).") }
+            if let unrelated { Text("The requested site is \(model.hosts.sorted().joined(separator: ", ")). This account is for \(unrelated.website): \(unrelated.username).") }
         }
     }
-    @ViewBuilder private func section(_ title: String, entries: [AutoFillChoice]) -> some View {
+    @ViewBuilder private func section(_ title: String, entries: [AutoFillIdentity]) -> some View {
         if !entries.isEmpty {
             Section(title) {
                 ForEach(entries) { entry in
                     VStack(alignment: .leading, spacing: 5) {
-                        Text(entry.itemName).font(.headline)
-                        Text(entry.identity.website + " · " + entry.identity.username)
-                        Text(entry.vaultName).font(.caption).foregroundStyle(.secondary)
+                        Text(entry.username).font(.headline)
+                        Text(entry.website).foregroundStyle(.secondary)
                         if model.textInsertion {
                             HStack {
-                                if entry.identity.kind == .oneTimeCode { Button("Code") { choose(entry, field: .code) } }
+                                if entry.kind == .oneTimeCode { Button("Code") { choose(entry, field: .code) } }
                                 else {
                                     Button("Username") { choose(entry, field: .username) }
                                     Button("Password") { choose(entry, field: .password) }
@@ -464,14 +460,14 @@ private struct CredentialListView: View {
             }
         }
     }
-    private func choose(_ entry: AutoFillChoice, field: CredentialField? = nil) {
+    private func choose(_ entry: AutoFillIdentity, field: CredentialField? = nil) {
         guard !model.loading else { return }
-        if !model.hosts.isEmpty && !model.hosts.contains(entry.identity.website) { insertionField = field; unrelated = entry }
-        else { select(entry.identity, field) }
+        if !model.hosts.isEmpty && !model.hosts.contains(entry.website) { insertionField = field; unrelated = entry }
+        else { select(entry, field) }
     }
     private func fillSelected() {
         guard let entry = ordered.first(where: { $0.id == selection }) else { return }
-        choose(entry, field: model.textInsertion ? (entry.identity.kind == .oneTimeCode ? .code : .password) : nil)
+        choose(entry, field: model.textInsertion ? (entry.kind == .oneTimeCode ? .code : .password) : nil)
     }
     private func moveSelection(_ offset: Int) {
         guard !ordered.isEmpty else { return }

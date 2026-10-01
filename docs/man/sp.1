@@ -34,11 +34,8 @@ Values are supplied by hidden prompt or stdin, never positional password
 arguments.
 References use sp://vault/item/[section/]field.
 .Pp
-Device request creates a public enrollment document; --recovery selects this
-device's separate hardware recovery identity.
-Vault init creates a vault on this device without recovery by default.
-Optional --recovery-request and --fingerprint must be supplied together.
-Use replace-recovery to add hardware recovery later.
+Device request creates a public enrollment document.
+Vault init inherits the account's configured offline recovery authority.
 .Pp
 Vault invite, accept and approve exchange public documents, independently
 compared fingerprints/checkpoints and (for other accounts) a private iCloud
@@ -53,11 +50,12 @@ replaying edits.
 Export writes an encrypted checkpoint; import requires independent checkpoint
 evidence and an already enrolled device.
 .Pp
-Vault recover runs on the enrolled hardware recovery device with a verified
-backup and replacement public requests. --copy creates a new UUID/root under
-the current account, preserving the source.
-Losing every authorized and recovery device makes recovery impossible even
-with a backup.
+Vault recovery generate exports an offline copy; activate requires re-import
+and the displayed public fingerprint. Status reports account-wide coverage.
+Open provides same-account read-only recovery; --complete rotates access.
+Resume continues incomplete lifecycle changes; revoke removes the offline key.
+Keep both offline copies until replacement finishes. This does not restore
+Apple Account access or missing cloud data.
 .Pp
 Vault delete requires --vault UUID --confirm UUID.
 It deletes the cloud zone; existing local ciphertext and exported backups
@@ -108,12 +106,9 @@ may obtain membership if an unlocked owner processes the exchange.
 .Pp
 Secure Enclave resists extraction and portability of device private keys, not
 malicious use on an unlocked endpoint.
-Recovery requires surviving enrolled or recovery hardware and accessible
-ciphertext.
-Apple Account recovery alone cannot recreate device keys; no vendor-held
-recovery master key exists.
-This reduces remote recovery attack surface but increases permanent-data-loss
-risk.
+Offline recovery requires the recovery copy, access to the same Apple Account,
+and accessible cloud ciphertext. The copy cannot recover Apple Account access.
+Anyone with the private recovery secret and copied ciphertext can decrypt it.
 .Pp
 2ndPass is not independently audited.
 Signed revisions detect unauthorized changes and rollback relative to intact

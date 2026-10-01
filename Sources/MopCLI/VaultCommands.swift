@@ -68,7 +68,7 @@ private func emit(_ result: VaultResult) throws {
 private func readFile(_ path: String) throws -> Data { try LocalFile.read(URL(fileURLWithPath: path), limit: 24 * 1024 * 1024) }
 
 struct Vault: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal and shared vaults.", subcommands: [Devices.self, Enrollment.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Export.self, Fingerprint.self, Members.self, Invite.self, Accept.self, Approve.self, RemoveMember.self, RemoveDevice.self, Role.self, Recovery.self, ReplaceRecovery.self, ReconcileShare.self, Import.self, DeleteVault.self])
+    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal and shared vaults.", subcommands: [Devices.self, Enrollment.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Export.self, Fingerprint.self, Members.self, Invite.self, Accept.self, Approve.self, RemoveMember.self, RemoveDevice.self, Role.self, Recovery.self, ReconcileShare.self, Import.self, DeleteVault.self])
     struct Devices: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "List or remove devices across enrolled personal vaults.")
         @OptionGroup var storage: VaultOptions
@@ -119,24 +119,15 @@ struct Vault: AsyncParsableCommand {
         }
     }
     struct Initialize: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(commandName: "init", abstract: "Create a vault on this device. Hardware recovery is optional.")
+        static let configuration = CommandConfiguration(commandName: "init", abstract: "Create a vault on this device. Offline recovery is optional.")
         @OptionGroup var storage: VaultOptions
         @Argument var name: String
-        @Option(completion: .file()) var recoveryRequest: String?
-        @Option(help: "Independently verified fingerprint of the recovery device request.") var fingerprint: String?
-        func validate() throws {
-            try VaultName.validate(name)
-            guard (recoveryRequest == nil) == (fingerprint == nil) else { throw MopError.invalidRecovery }
-        }
+        func validate() throws { try VaultName.validate(name) }
         func run() async throws {
             try storage.requireOnline()
-            if let recoveryRequest {
-                let request = try ExchangeFile.decode(DeviceRequest.self, from: readFile(recoveryRequest)); try request.validate()
-                guard request.recovery, request.fingerprint == fingerprint else { throw MopError.invalidRecovery }
-            }
             let id = storage.vault ?? UUID().uuidString
             IO.diagnostic("sp: creation UUID \(id); retain it to reconcile an interrupted submission.\n")
-            try emit(await storage.execute(.create(name: name, recovery: recoveryRequest.map { URL(fileURLWithPath: $0) }, fingerprint: fingerprint), selection: id))
+            try emit(await storage.execute(.create(name: name), selection: id))
         }
     }
     struct ListVaults: AsyncParsableCommand {
@@ -233,27 +224,80 @@ struct Vault: AsyncParsableCommand {
             try emit(await storage.execute(.manage(.role(id, role))))
         }
     }
-    struct ReplaceRecovery: AsyncParsableCommand {
-        @OptionGroup var storage: VaultOptions
-        @Argument(completion: .file()) var request: String
-        @Option var fingerprint: String
-        func run() async throws { try emit(await storage.execute(.manage(.replaceRecovery(request: readFile(request), fingerprint: fingerprint)))) }
-    }
     struct Recovery: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(commandName: "recover", abstract: "Run on the enrolled recovery device. Verify backup and replacement request fingerprints independently.")
-        @OptionGroup var storage: VaultOptions
-        @Argument(completion: .file()) var backup: String
-        @Option var checkpoint: String
-        @Option(completion: .file()) var ownerRequest: String
-        @Option var ownerFingerprint: String
-        @Option(completion: .file()) var recoveryRequest: String
-        @Option var recoveryFingerprint: String
-        @Flag(help: "Create a new vault under the current account, retaining the source. Owner request must belong to this device.") var copy = false
-        func run() async throws {
-            let owner = try readFile(ownerRequest), recovery = try readFile(recoveryRequest)
-            guard try ExchangeFile.decode(DeviceRequest.self, from: owner).fingerprint == ownerFingerprint,
-                  try ExchangeFile.decode(DeviceRequest.self, from: recovery).fingerprint == recoveryFingerprint else { throw MopError.invalidIdentity }
-            try emit(await storage.execute(.manage(.recoverHardware(backup: LocalFile.read(URL(fileURLWithPath: backup), limit: VerifiedVault.maximumBackupSize), checkpoint: checkpoint, owner: owner, recovery: recovery, copy: copy))))
+        static let configuration = CommandConfiguration(commandName: "recovery", abstract: "Manage the account's offline recovery key or recover after device loss.", subcommands: [Generate.self, Activate.self, Status.self, Resume.self, Revoke.self, Open.self])
+        struct Generate: AsyncParsableCommand {
+            @OptionGroup var storage: VaultOptions
+            @Option(help: "New recovery file path. Store offline; existing files are never replaced.", completion: .file()) var output: String
+            func run() async throws {
+                try storage.requireOnline()
+                let result = try await storage.execute(.manage(.recoveryGenerate))
+                guard let file = result.recoveryFile else { throw MopError.invalidRecovery }
+                try file.withFoundationData { try LocalFile.write($0, to: URL(fileURLWithPath: output)) }
+                try IO.output("Saved recovery copy. Public fingerprint: " + (result.recoveryFingerprint ?? "") + "\nRe-import with recovery activate before relying on it.\n")
+            }
+        }
+        struct Activate: AsyncParsableCommand {
+            @OptionGroup var storage: VaultOptions
+            @Option(completion: .file()) var file: String
+            @Option(help: "Public fingerprint displayed when the copy was generated.") var fingerprint: String
+            func run() async throws {
+                try storage.requireOnline()
+                try emit(await storage.execute(.manage(.recoveryActivate(copy: Recovery.read(file), fingerprint: fingerprint))))
+            }
+        }
+        struct Status: AsyncParsableCommand {
+            @OptionGroup var storage: VaultOptions
+            func run() async throws {
+                try storage.requireOnline()
+                let result = try await storage.execute(.manage(.recoveryStatus))
+                if let configuration = result.recoveryConfiguration { try IO.output(String(decoding: JSONEncoder().encode(configuration), as: UTF8.self) + "\n") }
+            }
+        }
+        struct Resume: AsyncParsableCommand {
+            @OptionGroup var storage: VaultOptions
+            func run() async throws { try storage.requireOnline(); try emit(await storage.execute(.manage(.recoveryResume))) }
+        }
+        struct Revoke: AsyncParsableCommand {
+            @OptionGroup var storage: VaultOptions
+            func run() async throws { try storage.requireOnline(); try emit(await storage.execute(.manage(.recoveryRevoke))) }
+        }
+        struct Open: AsyncParsableCommand {
+            @OptionGroup var storage: VaultOptions
+            @Option(help: "Offline recovery file or paper-code file.", completion: .file()) var file: String
+            @Option(help: "Read a relative field path without completing recovery.") var read: String?
+            @Option(help: "Write a recovered field or attachment to a new file.", completion: .file()) var output: String?
+            @Flag(help: "Complete recovery and rotate access for selected or all matching vaults.") var complete = false
+            func validate() throws { guard !(complete && read != nil), output == nil || read != nil else { throw MopError.invalidProcess } }
+            func run() async throws {
+                try storage.requireOnline()
+                let service = storage.native(); defer { service.lock() }
+                let opened = try await service.execute(.manage(.recoveryOpen(copy: Recovery.read(file))), vault: nil)
+                let selected = opened.vaults.filter { storage.vault == nil || $0.id == storage.vault || $0.name == storage.vault }
+                guard !selected.isEmpty, read == nil || selected.count == 1 else { throw MopError.ambiguousVault }
+                for vault in selected {
+                    guard let id = UUID(uuidString: vault.id) else { throw MopError.invalidVault }
+                    if let read {
+                        let result = try await service.execute(.manage(.recoveryRead(id, read)), vault: nil)
+                        let value = result.value ?? result.recoveredAttachment.map { SecretBytes(copying: $0.data) }
+                        guard let value else { throw MopError.notFound }
+                        if let output { try value.withFoundationData { try LocalFile.write($0, to: URL(fileURLWithPath: output)) } }
+                        else { try value.write(descriptor: STDOUT_FILENO) }
+                    } else if complete {
+                        try emit(await service.execute(.manage(.recoveryComplete(id)), vault: nil))
+                    } else {
+                        try IO.output(vault.id + " " + (vault.name ?? vault.id) + " (read-only; existing devices and accounts keep access)\n")
+                        let result = try await service.execute(.manage(.recoveryCatalog(id)), vault: nil)
+                        for item in result.catalog?.items ?? [] { for field in item.fields { try IO.output(SecretReference.encode(item.name) + "/" + field.path + "\n") } }
+                    }
+                }
+                for status in opened.recoveryVaults where status.issue != nil { IO.diagnostic(status.id.uuidString + ": " + status.issue! + "\n") }
+            }
+        }
+        private static func read(_ path: String) throws -> SecretBytes {
+            var bytes = try LocalFile.read(URL(fileURLWithPath: path), limit: 8192)
+            defer { SecretBytes.wipe(&bytes) }
+            return SecretBytes(copying: bytes)
         }
     }
     struct ReconcileShare: AsyncParsableCommand {

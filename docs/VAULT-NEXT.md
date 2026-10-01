@@ -6,11 +6,6 @@ signed, parent-linked revisions published by a conditional CloudKit head update.
 Each vault occupies a CloudKit zone, privately owned until shared through CKShare.
 One owner account administers the vault; other accounts are editors or viewers.
 
-A vault starts with one owner device. Hardware recovery is optional and can be
-configured later. There is no portable recovery private key or software device-key
-fallback. Without a surviving authorized device or configured recovery device,
-access is lost.
-
 See [Vault v7](VAULT-V7.md) for the wire format, [security and key management](SECURITY.md)
 for the trust boundaries, and the [validation record](V7-VALIDATION-2026-09-27.md)
 for measured results and remaining acceptance work.
@@ -99,19 +94,6 @@ and verification through a trusted device or phone number. Optional
 this against phishing. 2ndPass uses the operating system's authenticated iCloud
 session; it does not collect the Apple Account password or verification code.
 
-The native CloudKit channel also requires application code signing, provisioning
-and container entitlements, in the authenticated user's private database. Account
-credentials alone do not authorize arbitrary enrollment writes. An attacker able
-to operate an authorized client in that Apple environment and access the private
-2ndPass container may request admission; an unlocked, online owner processing the
-exchange may grant it. Protect the entire access path, including trusted devices
-and recovery channels. This deliberate reuse of Apple's authentication avoids an
-additional ordinary same-account comparison ceremony. 2ndPass does not directly
-query Apple's iCloud Keychain trust circle. Account security keys are distinct
-from 2ndPass's hardware vault recovery device. See the
-[composed trust model](SECURITY.md#composed-apple--2ndpass-trust-model), including
-the platform-specific sandbox and shared Keychain boundaries.
-
 **Unfinished sharing design:** cross-account vault sharing is not yet implemented
 as a supported feature. Preliminary code would share the mailbox's zone, so
 account-private mailbox isolation must be addressed when completing sharing.
@@ -179,45 +161,30 @@ service. A server fork or withheld newer state cannot be globally detected by an
 isolated client. Cached old state remains readable offline.
 
 ## Recovery
+The account-wide offline recovery authority is distinct from ordinary device
+membership. A verified offline copy adds its public agreement and signing keys to
+all owned vaults. New vaults inherit the configured authority. The
+`offline-recovery-1` required feature prevents older clients from dropping it.
 
-When recovery is configured, use a separate hardware recovery device with its own device-generated Enclave
-P-256 encryption and signing keys. The recovery slot contains only its public
-keys. Enroll it with the same independent fingerprint verification as a normal
-device, but give it explicit recovery authority instead of ordinary member roles.
-Keep that device secure and available offline. Private key representations are
-not portable backups. There is no recovery seed/private-key file and no software
-private-key provider in the shipping vault module.
+The `mop-account-recovery-v1` private CloudKit zone stores public configuration,
+conditional-update versions, operation progress, and reserved encrypted genesis
+records. Vault creation reserves its exact genesis before upload, fencing it
+against key lifecycle changes. An interrupted reservation can be resumed without
+the creating device. Each vault publishes membership and rotated data atomically;
+account-wide replacement is resumable, not a cross-zone transaction.
 
-A hardware recovery device can decrypt an accessible snapshot and sign a recovery
-transition, enrolling a replacement owner device and replacing the recovery
-recipient. Rotate every retained item/catalog key and remove all old devices.
-Proof of possession establishes the signing key, not hardware attestation or
-physical separation. 2ndPass cannot cryptographically prove that the recovery key
-was generated on a different physical device through these APIs; the operator
-must keep an independently verified recovery device. Multiple keys on one Mac
-are not protection against losing that Mac.
+Fresh-device recovery trusts authenticated private CloudKit for initial identity
+and freshness, validates the available signed chain and account binding, then
+opens the catalog using the offline key. Read-only access uses transient key
+handles; it does not enroll the device or publish to AutoFill. Completion rotates
+all retained data and adds the recovering device while preserving existing devices, accounts, and roles.
+Missing attachment data leaves recovery incomplete and healthy fields readable.
+The offline authority is retained after recovery.
 
-Losing one device: approve a replacement from an existing owner device and revoke
-the lost one. Losing a viewer/editor's devices: ask the owner to enroll another.
-Losing all ordinary owner devices: use the separate hardware recovery device,
-independent checkpoint, and accessible encrypted backup/cloud snapshot. Losing a
-recovery device while an owner device survives: enroll a replacement recovery
-device and rotate every key.
-
-Losing Apple Account access: a hardware key does not restore CloudKit transport
-access. With an accessible encrypted backup and a surviving authorized recovery
-device, create a recovered vault in a new account/zone with a new UUID/root,
-rotate keys, and reinvite members. Never overwrite/delete the original vault.
-The pure recovery engine can decrypt an accessible verified backup without the
-source account. The shipping recovery command is online: it authenticates the
-destination account and publishes the new vault there.
-
-Losing **every authorized and recovery device** makes decryption impossible,
-even with the encrypted backup, Apple Account access, or support intervention.
-There is no vendor-held recovery master key: reduced remote recovery attack
-surface comes with increased permanent-data-loss risk. Without an accessible snapshot,
-hardware keys alone cannot recreate data. There is no support backdoor or
-portable recovery exception.
+Replacement/revocation rotates data one vault at a time. Retain both offline copies
+until all vaults complete; signed membership is authoritative over progress
+metadata. A copy of old ciphertext remains decryptable with its original key.
+Apple Account recovery and backup restoration are separate and outside SALE-1.
 
 ## Format, signatures, and publication
 
@@ -288,11 +255,3 @@ It is not an atomic account-wide CloudKit transaction and does not affect unknow
 vaults. Signed membership accumulates retired device UUIDs; membership and recovery
 revisions preserve that set. Automatic or manual acceptance cannot reuse a retired
 UUID. An explicit reconnect generates a new identity.
-
-A verified revocation writes a durable account-local removal marker before deleting
-the ordinary device Keychain record or caches. Cleanup is retryable; app/extension
-operations and registry writes refuse the removed account. Checkpoint cleanup takes
-per-vault leases and preserves lock inodes. Exported backups and separately scoped
-hardware recovery keys are outside this cleanup. The marker remains until an explicit
-Reconnect action. An attacker retaining authorized access to the private 2ndPass container may
-still enroll fresh keys when an unlocked owner processes the exchange.

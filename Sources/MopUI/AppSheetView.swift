@@ -27,12 +27,12 @@ struct AppSheetView: View {
                 if (try? VaultName.validate(creationName)) == nil {
                     Text("Use letters, numbers, and hyphens for the vault name.").font(.caption).foregroundStyle(.secondary)
                 }
-                Text("2ndPass will create this device’s protected keys automatically. You can start saving passwords immediately and add other devices or hardware recovery later.")
+                Text("2ndPass will create this device’s protected keys automatically. You can start saving passwords immediately and add other devices or offline recovery later.")
                 Text("Until you add another device or recovery, losing this device means losing access to your vault.").font(.caption)
                 Divider()
                 DisclosureGroup("More Options") {
                 Button("Connect to an existing vault…") { dismissOrConfirm(next: .enrollDevice) }
-                Button("Set up this device for recovery…") { dismissOrConfirm(next: .setupRecovery) }
+                Button("Set up an offline recovery key…") { dismissOrConfirm(next: .setupRecovery) }
                 Button("Recover an existing vault…") { dismissOrConfirm(next: .recover) }
                 }
             case .enrollDevice:
@@ -40,6 +40,8 @@ struct AppSheetView: View {
                     Text("This device was removed").font(.title2)
                     Text(model.removalCleanupPending ? "Local cleanup could not finish. Reconnect will retry cleanup before adding this device again." : "Its local account access has been cleared. Reconnect only if you want to add this device again.")
                     Button("Reconnect") { model.reconnectDevice() }
+                    Button("Recover with Offline Copy…") { dismissOrConfirm(next: .recover) }
+                        .disabled(model.removalCleanupPending)
                 } else {
                 Text(connectTitle).font(.title2)
                 Text("2ndPass connects automatically through your Apple Account. Keep 2ndPass unlocked on another device until setup finishes.")
@@ -60,12 +62,9 @@ struct AppSheetView: View {
                 Text("Ask the other person to open 2ndPass and choose Connect to an existing vault. Choose what they may do, exchange the invitation, then approve their response.")
                 SharingView(model: model, setup: false, flow: .share, target: request.target, controls: controls)
             case .setupRecovery:
-                Text("Optional hardware recovery").font(.title2)
-                Text("On a separate device, create a recovery request. On your owner device, import that request to add recovery to existing secrets. Keep encrypted backups as well as the recovery device.")
-                SharingView(model: model, setup: request.target == nil, flow: .recovery, target: request.target, controls: controls)
+                OfflineRecoveryView(model: model, recovering: false)
             case .recover:
-                Text("Hardware recovery").font(.title2)
-                SharingView(model: model, setup: false, recoveryMode: true, target: request.target, controls: controls)
+                OfflineRecoveryView(model: model, recovering: true)
             case .renameVault:
                 Text("Rename vault").font(.title2)
                 Text("Update scripts and references after renaming. The old name is not retained.")
@@ -94,7 +93,7 @@ struct AppSheetView: View {
                     Button(title) { controls.secondarySubmit?() }.disabled(model.busy)
                 }
                 Spacer()
-                Button(submitted || [.enrollDevice, .addDevice].contains(kind) ? "Close" : "Cancel") { dismissOrConfirm() }
+                Button(submitted || [.enrollDevice, .addDevice, .setupRecovery, .recover, .shareAccount].contains(kind) ? "Close" : "Cancel") { dismissOrConfirm() }
                     .keyboardShortcut(.cancelAction)
                 if kind == .createVault {
                     Button("Create Vault") { submitted = true; model.createVault(name: creationName) }

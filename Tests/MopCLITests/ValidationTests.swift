@@ -88,7 +88,7 @@ import MopCore
 }
 
 @Test func deviceRequestsAndSharingCommandsAreAvailable() throws {
-    #expect(try Mop.parseAsRoot(["device", "request", "--recovery"]) is Device.Request)
+    #expect(try Mop.parseAsRoot(["device", "request"]) is Device.Request)
     #expect(try Mop.parseAsRoot(["vault", "members"]) is Vault.Members)
     #expect(try Mop.parseAsRoot(["vault", "remove-device", UUID().uuidString]) is Vault.RemoveDevice)
 }

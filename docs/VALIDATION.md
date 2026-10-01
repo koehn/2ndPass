@@ -2,8 +2,8 @@
 
 The supported format is `mop-vault-v7`. Read the current [validation record](V7-VALIDATION-2026-09-27.md)
 for concrete results, retained test resources and unperformed physical checks.
-Recovery is optional; configuring hardware recovery uses a separate recovery device. No old-format migration or
-software-key fallback is supported; existing user data must be preserved.
+Offline recovery is optional. See [SALE-1 validation](OFFLINE-RECOVERY.md). No old-format migration or
+software device-key fallback is supported; existing user data must be preserved.
 
 ## Automated checks
 
@@ -49,9 +49,7 @@ MOP_LIVE_CLOUD_TEST=1 python3 scripts/test-hardware.py \
 ```
 
 The live script creates a fresh v7 CloudKit vault and retains its local state.
-Use dedicated test Apple Accounts and Development CloudKit. To include optional
-recovery, pass --recovery-request and --fingerprint together, using a separate
-hardware device and independently verified fingerprint. State-directory isolation does not isolate device Keychain identities.
+Use dedicated test Apple Accounts and Development CloudKit. State-directory isolation does not isolate device Keychain identities.
 Do not delete an identity as test-vault cleanup. The updated script has not yet
 completed a live v7 run.
 
@@ -60,13 +58,13 @@ completed a live v7 run.
 Follow the full matrix in [the validation record](VAULT-NEXT-VALIDATION.md#required-remaining-physical-acceptance).
 Use two actual accounts with multiple devices, including signed Mac and iOS builds.
 Test invitations, participant identity binding, editor/viewer CloudKit permissions,
-removal, shared-database CAS conflicts, hardware recovery and new-account recovery.
+removal, shared-database CAS conflicts, same-account offline recovery.
 Check cancellation, screen lock, protected-data loss, app/CLI/AutoFill routing,
 offline reads, account changes, exports and interrupted publication.
 
 Development signing is sufficient for hardware checks. Production distribution
 is separate: deploy the v7 schema and run disposable creation, sharing, reading,
-editing, export and hardware recovery checks with distribution-signed builds.
+editing, export and offline recovery checks with distribution-signed builds.
 Verify entitlements on the installed artifacts. No mocked or simulator test
 substitutes for the physical and cross-account acceptance. Do not release until
 these gates pass. Cross-account sharing is not yet implemented as a supported
@@ -75,3 +73,18 @@ when completing sharing, then validate with disposable accounts: a writable shar
 induce owner enrollment through the mailbox. Existing per-address model mailboxes
 do not establish this server-side isolation. Independent professional security
 review remains outstanding; protocol and implementation require separate review.
+
+## SALE-1 verification status — 2026-09-30
+
+The full Swift suite passed 514 tests outside the filesystem sandbox. A later
+focused run passed 48 vault-engine tests and five recovery integration tests after
+final ancestry-verification and copy-handling refinements. The macOS build passed.
+The iOS Simulator build-for-testing passed for the app, AutoFill, and tests before
+those final refinements; a final retry was blocked by sandbox access to simulator
+services and compiler caches.
+
+CLI smoke execution was not started because automatic approval review exhausted
+its usage limit. The changed Python scripts passed syntax parsing. Production
+CloudKit schema deployment, signed physical-device recovery with the same Apple
+Account, and independent cryptographic review remain pending. No production data
+or real Keychain identity was changed by this implementation session.

@@ -138,8 +138,6 @@ was retained; unchanged applicable claims were not rewritten merely for style.
   Structural validation cannot prove that an authorized writer used fresh entropy.
 - Exercise rollback/fork/withholding, restored local trust state, interrupted
   filesystem writes, uncertain cloud commits and cross-account permission changes.
-- Exercise full hardware recovery, including replacement recovery and new-account
-  copies with independent checkpoint evidence and attachment backups.
 - Review plaintext lifetime, UI/framework copies, AutoFill metadata/destinations,
   CLI child environments/masking and supply-chain/signing-key compromise. Protocol
   correctness and implementation correctness require separate assurance.

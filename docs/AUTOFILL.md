@@ -5,8 +5,7 @@
 unlock 2ndPass. Each authenticated catalog refresh publishes login websites,
 usernames and opaque password/code credential identifiers to 2ndPass's Apple credential identity
 store. 2ndPass also writes the same metadata fields plus credential kind to a shared local index;
-the extension reads that index, then authenticates before showing encrypted account
-labels in its picker. It does not depend on Apple returning its stored suggestions to the extension.
+the extension displays cached usernames and websites in its picker without authentication. It does not depend on Apple returning its stored suggestions to the extension.
 Only undeleted Login items with a usable username and valid HTTP(S) website are
 indexed. Edit Item → Use for AutoFill provides explicit username, password, and
 verification-code field choices. Choices are encrypted catalog metadata; missing
@@ -32,17 +31,18 @@ whose catalogs still need refreshing. Files use private permissions and iOS data
 
 All no-interaction password and code requests return `userInteractionRequired`
 before opening a vault. A selected suggestion authenticates in the presented
-extension. Opening 2ndPass’s picker also authenticates, then loads item and vault names
-from verified encrypted catalogs into memory. One fresh request session authorizes
-one fill for at most 60 seconds. It never reuses the containing app’s authentication
+extension. Opening and searching 2ndPass’s picker does not open any vault or start
+an authentication session. Item and vault names remain encrypted and are not shown.
+Selecting a credential starts a fresh request session that authorizes one fill for
+at most 60 seconds. The containing app may be locked or terminated. It never reuses the containing app’s authentication
 or a prior fill. Dismissal, cancellation, backgrounding, account changes, failures,
-and expiry release the session and clear labels. System authentication presentation
+and expiry release the session. System authentication presentation
 does not itself count as leaving the request.
 
 The picker groups exact normalized-host matches under For This Website, with Other
-Accounts below. Search includes decrypted item/vault names. Arrow keys select, Return
+Accounts below. Search uses cached usernames and websites. Arrow keys select, Return
 fills, and Escape cancels. Choosing an unrelated account requires confirmation that
-names both sites. Empty searches and unavailable vaults have explicit explanations.
+names both sites. Empty searches and failed credential resolution have explicit explanations.
 Errors offer Retry and Choose Another Account; setup instructions point to 2ndPass’s
 AutoFill settings without relying on an unsupported extension-to-app launch route.
 
@@ -59,8 +59,9 @@ The app, CLI, and extension share device-local App Group `MopV7` checkpoints and
 non-synchronizable hardware key namespace. Account changes invalidate offline access
 and clear suggestions. Removed/stale suggestions cannot bypass catalog resolution.
 Offline filling uses the last verified catalog and cannot establish remote freshness.
-The system suggestions still reveal websites and usernames before authentication;
-item/vault names are visible only inside the authenticated picker.
+System suggestions and the picker reveal websites and usernames before authentication;
+item/vault names remain encrypted. Identical website/username pairs in separate
+vaults appear as separate entries without decrypted labels.
 
 This version fills existing passwords and verification codes. Passkeys, saving new
 credentials, and generating passwords inside AutoFill are not implemented. Disabling
@@ -109,11 +110,13 @@ an iPhone/iPad and Mac to check:
   a recent app unlock or code fill. Cancel the prompt and verify nothing fills.
 - Open the code picker and verify only code accounts appear, with working search.
 - Fill codes before and after a TOTP rollover and compare with 2ndPass’s current code.
-- Open the picker with 2ndPass locked or terminated; authenticate before names appear. Verify identical website/username accounts are distinguishable by item and vault.
+- Open and search the picker with 2ndPass locked or terminated; verify usernames
+  and websites appear without authentication. Select an account, authenticate in
+  the extension, and verify it fills without opening or unlocking the containing app.
 - Select a password suggestion and verify 2ndPass requires authentication before filling.
   Repeat immediately after an app unlock and after a successful fill. Cancel and
   confirm neither username nor password is filled. Choose “2ndPass…” and verify its
-  picker authenticates once, then fills without a second prompt within that request.
+  picker lists accounts without a prompt, then authenticates once when filling.
 - Cancel system authentication and confirm no fields are filled; then retry.
 - On iOS, long-press a text field and choose AutoFill → Passwords. Verify 2ndPass
   appears, its list can be searched, and Username/Password/Code inserts only the
@@ -132,8 +135,9 @@ does not modify vaults, secrets, device keys, or trust checkpoints. Other vaults
 suggestions return as their catalogs are refreshed. Filesystem permission and
 access failures remain errors and are not bypassed as part of cache repair.
 
-Additional acceptance: wait 60 seconds before choosing, switch apps during selection,
-dismiss during authentication, and verify nothing fills from the invalidated session.
+Additional acceptance: browse for more than 60 seconds before choosing and verify
+a fresh authentication session starts on selection. Switch apps or dismiss during
+authentication and verify nothing fills from the invalidated session.
 Check Return/Escape/arrow keys, VoiceOver, text sizing, contrast, no-results search,
 and confirmation before choosing an unrelated site. Test disabled/enabled provider
 states and publication failure independently from a successful vault save.

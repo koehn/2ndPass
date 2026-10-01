@@ -39,11 +39,11 @@ run(['completion'], code=2, output=b'')
 run(['completion', 'unsupported'], code=2, output=b'')
 for command in ("read", "write", "list", "delete", "run", "inject", "vault", "device", "completion"):
     run([command, "--help"])
-for command in ("fingerprint", "rename", "delete", "list", "sync", "import", "export", "members", "invite", "accept", "approve", "remove-device", "remove-member", "role", "recover", "replace-recovery", "reconcile-share"):
+for command in ("fingerprint", "rename", "delete", "list", "sync", "import", "export", "members", "invite", "accept", "approve", "remove-device", "remove-member", "role", "recovery", "reconcile-share"):
     run(["vault", command, "--help"])
 run(["device", "request", "--help"])
 run(["vault", "init", "personal", "--recovery-file", "/unused"], code=2, output=b"")
-run(["vault", "init", "Invalid", "--recovery-request", "/unused", "--fingerprint", "a" * 64], code=23, output=b"")
+run(["vault", "init", "Invalid"], code=23, output=b"")
 run(["vault", "rename", "Invalid", "--vault", "personal"], code=23, output=b"")
 run(["vault", "rename", "private", "--vault", "personal", "--offline"], code=2, output=b"")
 run(["vault", "delete", "--vault", "personal", "--confirm", "personal"], code=2, output=b"")

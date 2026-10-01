@@ -67,7 +67,7 @@ private func address(_ vault: VerifiedVault, account: String = "account-a", shar
 }
 
 @Test func twoAccountConditionalWritesPreserveOneWinnerAndRejectRollback() async throws {
-    let owner = try TestDevice(), editor = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), editor = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     let root = try VaultEngine.create(name: "shared", owner: owner, recovery: recovery.identity)
     let invitation = try VaultEngine.invite(member: editor.identity.member, role: .editor, to: root, owner: owner, expires: Date().addingTimeInterval(300))
     let acceptance = try Acceptance(invitation: invitation, expectedCheckpoint: root.digest, device: editor)
@@ -95,7 +95,7 @@ private func address(_ vault: VerifiedVault, account: String = "account-a", shar
 }
 
 @Test func droppedAcknowledgementReconcilesAfterRelaunchWithoutReplay() async throws {
-    let owner = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     let root = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     let transport = MemoryRevisionTransport(root), storage = MemoryVerifiedState()
     let coordinator = try PublicationCoordinator(address: address(root), checkpoint: root, transport: transport, storage: storage)
@@ -111,7 +111,7 @@ private func address(_ vault: VerifiedVault, account: String = "account-a", shar
 }
 
 @Test func unchangedHeadKeepsUncertainJournalAndAnotherWinnerResolvesIt() async throws {
-    let owner = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     let root = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     let transport = MemoryRevisionTransport(root), storage = MemoryVerifiedState()
     let a = try PublicationCoordinator(address: address(root), checkpoint: root, transport: transport, storage: storage)
@@ -129,7 +129,7 @@ private func address(_ vault: VerifiedVault, account: String = "account-a", shar
 }
 
 @Test func interruptedStagingAndOfflineWritesDoNotPublish() async throws {
-    let owner = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     let root = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     let transport = MemoryRevisionTransport(root), storage = MemoryVerifiedState()
     let coordinator = try PublicationCoordinator(address: address(root), checkpoint: root, transport: transport, storage: storage)
@@ -160,7 +160,7 @@ private func address(_ vault: VerifiedVault, account: String = "account-a", shar
 }
 
 @Test func explicitVersionBarrierResolvesAnUnchangedUncertainHead() async throws {
-    let owner = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     let root = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     let transport = MemoryRevisionTransport(root), storage = MemoryVerifiedState()
     let coordinator = try PublicationCoordinator(address: address(root), checkpoint: root, transport: transport, storage: storage)

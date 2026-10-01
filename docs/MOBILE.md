@@ -45,18 +45,12 @@ replace the CLI packaging workflow.
 
 ## Files and interrupted creation
 
-Recovery-key and backup export use a native folder picker followed by an exclusive
-write with a unique filename. Existing files are never overwritten. A provider
-that cannot support the required safe file operations returns an error; choose a
-different writable folder. 2ndPass does not fall back to an overwrite-capable export.
-Recovery imports use coordinated, security-scoped access and a bounded private
-copy, which is removed when the recovery form closes.
-
-Creating a vault authenticates and creates this device’s protected keys. Hardware
-recovery is optional; there is no recovery-key export gate. A dismissible checklist
-offers another device, hardware recovery, and AutoFill after creation. An uncertain
-cloud creation retains the same UUID for reconciliation rather than creating a
-second vault.
+Encrypted backup export uses the existing folder picker and exclusive writer.
+Offline recovery offers a native file exporter with a fingerprint-specific
+filename and explicit printing. Keep both copies during replacement; never
+replace the only old copy before every vault completes. Recovery imports use
+security-scoped access and an 8 KiB limit, without retaining an application file.
+Imported material and displayed code are discarded when the form closes or locks.
 
 Connect This Device lists the available vaults for explicit selection and reports
 progress separately for each. Closing the screen continues submitted requests
@@ -145,8 +139,7 @@ account:
 
 - Face ID, Touch ID on supported hardware, passcode fallback,
   cancellation, changed biometric enrollment, and pending authentication at lock.
-- Explicit hardware device enrollment, independent recovery evidence, v7
-  backup recovery, ownership-change key rotation, concurrent edits, and account changes.
+- Explicit hardware device enrollment, offline recovery, ownership-change key rotation, concurrent edits, and account changes.
 - Verified offline reads, automatic fallback on disconnection and refresh on reconnection, Recently Deleted,
   and confirmation that remote changes cannot erase previously obtained offline data.
 - App-switcher privacy, device lock, protected-data loss, suspension, clipboard
@@ -191,7 +184,9 @@ Suggestions requires an unlocked session. Publication failures do not undo a sav
 vault edit. Edit Item → Use for AutoFill chooses the username, password, or optional
 verification-code field without renaming existing fields. Mappings stay encrypted.
 
-The picker authenticates before showing item and vault names. One request session
+The picker shows cached usernames and websites without authentication; item and
+vault names remain encrypted. Selecting a credential starts an independent
+authentication session even with the main app locked or terminated. That session
 can fill once and lasts at most 60 seconds; backgrounding, dismissal, cancellation,
 or completion clears it. Passwords and OTP seeds are never shown in the picker.
 See [AutoFill](AUTOFILL.md) for metadata privacy and signed-device acceptance.

@@ -2,13 +2,6 @@
 
 # Next vault: implementation and validation status
 
-**Onboarding update:** Recovery is optional. A vault starts with one owner device
-and no recovery recipient. An authorized owner can add hardware recovery later,
-including access to existing secrets. Without a surviving authorized device or
-configured recovery device, access is lost. iCloud discovery is an untrusted
-enrollment hint, never device approval. No format compatibility layer is used.
-
-
 2026-09-25. Read [the architecture proposal](VAULT-NEXT.md) first. The coordinated
 v6 application cutover is implemented: GUI, CLI, AutoFill and background refresh
 use the new access model. This is **not release acceptance**: cross-account
@@ -20,9 +13,9 @@ CloudKit sharing and signed iOS hardware behavior remain unverified.
 | --- | --- | --- |
 | Inspection/design | Inspected key providers, synchronization and access paths; proposal preceded production changes; Apple documentation and SDK checked | Independent security review |
 | Platform prototype | Actual host Enclave HPKE/signing, user-presence denial, authentication, invalidation observations, signed Keychain reload, live Development CAS and owner-only share | Second Apple Account, participant identity mapping/permissions/CAS, signed iPhone/iPad and actual AutoFill extension |
-| New format/access model | Strict v6, encrypted typed catalog and records, per-device envelopes, hardware recovery, signed membership, durable journal, CloudKit adapter, account-bound registry, initial publication and checkpoint import | Physical interruption/power-loss and shared-database acceptance |
-| Two accounts/multiple devices | Public service integration tests model two accounts/four devices, enrollment, removal, recovery, account invalidation, conflicts and dropped acknowledgements; separate hardware pairs exercised on one Mac | Actual multiple accounts and physical devices; models do not prove platform behavior |
-| Sharing UI/CLI | Device requests, invitation/acceptance/approval, roles, removal, recovery, checkpoint import and permission reconciliation; app/CLI/AutoFill cut over together | Signed end-to-end workflows and UI accessibility/device acceptance |
+| New format/access model | Strict v6, encrypted typed catalog and records, per-device envelopes, signed membership, durable journal, CloudKit adapter, account-bound registry, initial publication and checkpoint import | Physical interruption/power-loss and shared-database acceptance |
+| Two accounts/multiple devices | Public service integration tests model two accounts/four devices, enrollment, removal, account invalidation, conflicts and dropped acknowledgements; separate hardware pairs exercised on one Mac | Actual multiple accounts and physical devices; models do not prove platform behavior |
+| Sharing UI/CLI | Device requests, invitation/acceptance/approval, roles, removal, checkpoint import and permission reconciliation; app/CLI/AutoFill cut over together | Signed end-to-end workflows and UI accessibility/device acceptance |
 | Documentation | Current README, security explanation, CloudKit model, GUI guidance and manpage rewritten | Record external acceptance before release |
 
 The old software-key vault and CloudKit targets are removed from the package and
@@ -44,10 +37,14 @@ plaintext private values. An account groups a person's approved devices and
 their role. Signing into the same Apple Account is not itself device approval.
 
 Every password has a separate random encryption key. The vault stores a small
-encrypted copy of that key for each approved device and any configured hardware
-recovery device. Reading the catalog opens its key only. Reading one password opens
+encrypted copy of that key for each approved device. Reading the catalog opens its key only. Reading one password opens
 that password's key; it does not unlock a vault-wide key that can decrypt every
 password. The new engine retains no symmetric keys between calls.
+
+Removing a device or member creates fresh keys and ciphertext for every current
+secret, and future revisions omit removed recipients. This cannot erase old
+copies of passwords, ciphertext, or keys. Offline devices cannot learn about a
+removal until they reconnect.
 
 The unwrapped password key and password **do** enter application memory. AES,
 HPKE's derived state, Swift/Foundation data, and plaintext are not promised to
@@ -55,16 +52,6 @@ remain inside the Enclave. 2ndPass and commands receiving a password can read it
 Owned temporary buffers are wiped where practical; framework copies and strings
 cannot be comprehensively erased. Authorized malicious code can ask the hardware
 to perform permitted operations and copy their results.
-
-Removing a device or member creates fresh keys and ciphertext for every current
-secret, and future revisions omit removed recipients. This cannot erase old
-copies of passwords, ciphertext, or keys. Offline devices cannot learn about a
-removal until they reconnect. Recovery is hardware-only, as explicitly selected by the user. Keep a separate
-recovery device and an encrypted backup with an independently recorded checkpoint.
-No v6 software recovery private key is generated, stored, imported, or exported.
-If every authorized and recovery device is lost, the vault cannot be recovered,
-even with the encrypted backup and restored Apple Account access. The initial
-experimental portable recovery provider was removed after this decision.
 
 ## Actual host and cloud results
 
@@ -84,7 +71,7 @@ tested host and build, not all supported operating systems.
 | Device-owner preauthorization then interaction disabled | HPKE and signing passed. |
 | `LAContext.invalidate()` with an already-used signing handle | **Signing still succeeded.** Invalidation alone is not established as revoking that handle. |
 | New HPKE recipient using existing agreement handle after invalidation | Refused: `CryptoTokenKit`, code `-2`. This difference is observed behavior, not a portable guarantee. |
-| New `EnclaveDevice` and v6 engine in signed bundle | Create/write/invite/approve/read, removal and recovery passed using real hardware key pairs on this Mac. |
+| New `EnclaveDevice` and v6 engine in signed bundle | Create/write/invite/approve/read, removal passed using real hardware key pairs on this Mac. |
 | Explicit `EnclaveDevice.close()` | Subsequent key use refused by the provider. It clears both handles and context in addition to invalidating the context. |
 | Device Keychain creation and fresh-process reopen | Passed with matching public fingerprint and hardware signing after authentication; non-synchronizable `WhenUnlockedThisDeviceOnly` storage. |
 | CloudKit Development private database CAS race | Exactly one winner, one conflict, server winner verified. |
@@ -129,28 +116,6 @@ typed catalog evolved after those initial engine probes; the current format is
 covered by automated tests and builds, not a fresh completed hardware run.
 
 Coverage includes:
-
-- Two account identities/four device identities, grant/regrant restrictions,
-  current-secret access, single-device removal, whole-member removal and rotation.
-- Viewer/editor permissions, owner authority, rejection of self-promotion,
-  cross-vault substitution, incorrect checkpoint, changed canonical encoding.
-- Wrong device fingerprint, invitation expiry, replay, and stale-checkpoint
-  acceptance rejection.
-- Catalog-only listing and on-demand unwrapping of exactly the catalog and the
-  requested secret; closed provider refusal.
-- Encrypted-backup checkpoint, recovery-device replacement, lost-device recovery and
-  new-account copy with new UUID/root while retaining the source.
-- A recovery device on the same account has explicit recovery authority without
-  automatically gaining ordinary owner/editor write membership.
-- Two competing writers, rollback rejection, interrupted staging, dropped
-  acknowledgements across coordinator recreation, and no implicit write replay.
-- Unchanged uncertain head stays pending; a competing winner or explicit
-  conditional version barrier resolves it.
-- Cache scope separates container, environment, account, database and owner;
-  shared addresses reject the default-owner alias.
-- Actual filesystem journal reload, exclusive lease contention between two open
-  stores, rejection of symlinks/insecure directories, and corrupt-state refusal
-  without replacing the last valid checkpoint.
 
 Cryptographic model tests use software test keys and in-memory cloud transports.
 The public-service integration tests exercise the actual registry, journal and
@@ -220,14 +185,6 @@ Commands refuse ordinary 2ndPass zone names and provide no delete command. Bound
 manual executions to 120 seconds; an interrupted cloud call may still complete.
 Keep the printed probe locator and inspect it before repeating a mutation.
 
-`service-engine` additionally exercises the public application service, using a
-fresh local registry and separate recovery request. It requires interactive
-hardware authentication; the attempted run did not complete authentication.
-The v6 CLI hardware smoke script supports creation without recovery or an optional
-independently verified recovery request, and checks the executable version before
-creating a test vault.
-Its updated live workflow has not been run.
-
 ## Retained disposable resources
 
 - CloudKit container `iCloud.com.koehn.mop`, **Development** zone
@@ -246,7 +203,7 @@ Its updated live workflow has not been run.
   keys. No share or additional participant was created.
 - Incomplete public-service probe state:
   `/private/var/folders/x9/w7yj_l9s64x5vlgkfmmmxbl00000gn/T/mop-v6-native-probe-6EE8E2C1-8030-43A7-8330-060F4D75B5DC`.
-  Contains scoped registry/account-binding state; no completed recovery request
+  Contains scoped registry/account-binding state; no completed enrollment request
   or vault was produced.
 - Temporary signed bundles: `/tmp/MopNextProbe.app` and
   `/tmp/MopNextKeyProbe.app`. No private signing key was exported.
@@ -267,21 +224,13 @@ missing permissions never fall back to another account's cached state.
 On signed Mac and iPhone/iPad builds, test biometric/passcode cancellation,
 screen lock, protected-data loss, backgrounding, bounded session reuse, cross-
 process app/CLI/AutoFill access, and opaque-representation failure on a different
-device. Verify replacement-device enrollment, all-device loss, offline recovery
-with backup, and lost-account recovery into a fresh account without deleting the
-original. Inspect actual caches and exports for accidental key/plaintext storage.
+device. Verify replacement-device enrollment and account-binding failures. Inspect actual caches and exports for accidental key/plaintext storage.
 
 These checks could not be performed in this session: only one signed-in CloudKit
 account and this host's Enclave were exercised. Do not substitute model results
 for them or describe the feature as release-validated.
 
-## Optional recovery and guided onboarding follow-up
-
-The unreleased v6 schema now permits an absent recovery recipient. Tests cover
-first-device creation and writing, adding recovery to existing contents, later
-hardware recovery, account-scoped discovery without authentication or trust,
-own-device versus other-account invitation restrictions, startup routing, and
-cloud discovery failure without a false empty-account prompt.
+## Guided onboarding follow-up
 
 The full host suite passed 165 tests; CLI smoke passed 99 checks. iOS Simulator
 build-for-testing passed for the app, AutoFill extension and test bundle. No
@@ -438,8 +387,7 @@ automatic enrollment requests. Verified revocation persists a removal marker
 before deleting the ordinary device identity's Keychain record and managed
 account caches. Cleanup preserves lock inodes, takes checkpoint leases, and
 retries after failure. Registry writes and ordinary operations honor the marker;
-explicit reconnect clears it after cleanup and creates fresh keys. Recovery
-identities and exported backups are retained.
+explicit reconnect clears it after cleanup and creates fresh keys. User-exported backups are retained.
 
 Validation:
 - 185 Swift tests passed (23 vault, 32 core, 13 CLI, 73 app, 44 app support).

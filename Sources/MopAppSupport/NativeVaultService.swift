@@ -68,6 +68,10 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         do { return try await execute(.catalog, vault: vault, offline: true) }
         catch MopError.vaultMissing { return nil }
     }
+    public func endRecoverySession() {
+        recoverySession.withLock { session in session?.keys.values.forEach { $0.close() }; session = nil }
+        generatedRecovery.withLock { $0 = nil }
+    }
     public func lock() { control.lock() }
     deinit { control.lock(); if let accountObserver { NotificationCenter.default.removeObserver(accountObserver) } }
     /// Read the already verified session snapshot independently of the cloud
@@ -108,7 +112,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     public func execute(_ operation: VaultOperation, vault: String?, offline: Bool = false) async throws -> VaultResult {
         try CloudVaultBoundary.requireCloud(vault)
         switch operation {
-        case .create(let name, _, _), .rename(let name): try CloudVaultBoundary.validateName(name)
+        case .create(let name), .rename(let name): try CloudVaultBoundary.validateName(name)
         case .read(let ref), .delete(let ref), .write(let ref, _, _): try CloudVaultBoundary.requireCloud(ref.vault)
         default: break
         }
@@ -141,6 +145,10 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 progressState.withLock { $0 = nil }
                 await gate.leave(vault: catalogVault); return result
             } catch {
+                if Task.isCancelled {
+                    recoverySession.withLock { session in session?.keys.values.forEach { $0.close() }; session = nil }
+                    generatedRecovery.withLock { $0 = nil }
+                }
                 progressState.withLock { $0 = nil }
                 let needsCleanup = removedRegistry.withLock { $0 != nil }
                 if needsCleanup { control.lock() }
@@ -164,6 +172,9 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
     private func clearRemovedAccount(_ registry: NextRegistry) async throws {
+        // An interrupted recovery may already have enrolled this key in iCloud.
+        // Keep it until recovery finalization releases the removal barrier.
+        if try registry.hasPendingRecovery() { return }
         // The durable marker blocks every process before deletion begins.
         do {
             try deleteDevice(registry.container + "/" + registry.environment + "/device", registry.member)
@@ -191,6 +202,340 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             return context
         } catch { await authorizationGate.leave(); throw error }
     }
+    private struct RecoverySession {
+        let token: Int
+        let scope: RecoveryScope
+        var keys: [String: OfflineRecoveryKey] = [:]
+        var vaults: [UUID: (VaultAddress, VerifiedVault)] = [:]
+    }
+    private let recoverySession = Mutex<RecoverySession?>(nil)
+    private let generatedRecovery = Mutex<(Int, DevicePublicKey)?>(nil)
+
+    private func runRecovery(_ action: VaultManagement, registry: NextRegistry, transport: any VaultTransport, token: Int) async throws -> VaultResult? {
+        switch action {
+        case .recoveryTestReset, .recoveryEligibility, .recoveryGenerate, .recoveryStatus, .recoveryRevoke, .recoveryResume, .recoveryActivate,
+             .recoveryOpen, .recoveryCatalog, .recoveryRead, .recoveryComplete: break
+        default: return nil
+        }
+        let scope = try RecoveryScope(container: registry.container, environment: registry.environment, account: registry.account)
+        var result = VaultResult(); result.recoveryScope = scope
+        func register(_ key: OfflineRecoveryKey) throws {
+            try control.register({ key.close() }, token: token)
+        }
+        func closeDevice(_ key: any DeviceOperations) {
+            if let enclave = key as? EnclaveDevice { enclave.releaseHandles() } else { key.close() }
+        }
+        func owner() async throws -> any DeviceOperations {
+            let context = try await authorizedContext(token: token)
+            try control.check(token)
+            return try openDevice(registry.container + "/" + registry.environment + "/device", registry.member, context, true)
+        }
+        func sessionVault(_ id: UUID) throws -> (VaultAddress, VerifiedVault, OfflineRecoveryKey) {
+            try control.check(token)
+            return try recoverySession.withLock { session in
+                guard let session, session.token == token, session.scope == scope,
+                      let (address, vault) = session.vaults[id], let identity = vault.membership.offlineRecovery,
+                      let key = session.keys[identity.fingerprint] else { throw MopError.invalidRecovery }
+                return (address, vault, key)
+            }
+        }
+        func hasAccess(to vault: VerifiedVault) async throws -> Bool {
+            let context = try await authorizedContext(token: token)
+            let device: any DeviceOperations
+            do { device = try openDevice(registry.container + "/" + registry.environment + "/device", registry.member, context, false) }
+            catch MopError.invalidIdentity { return false }
+            defer { closeDevice(device) }
+            guard vault.membership.role(of: device.identity) != nil else { return false }
+            _ = try VaultEngine.catalog(in: vault, device: device)
+            return true
+        }
+        switch action {
+        case .recoveryTestReset(let copy):
+            reportProgress("Verifying your offline copy before resetting this device…")
+            let context = try await authorizedContext(token: token)
+            let device = try openDevice(registry.container + "/" + registry.environment + "/device", registry.member, context, false)
+            defer { closeDevice(device) }
+            let key = try OfflineRecoveryKey(document: copy, scope: scope)
+            defer { key.close() }
+            try register(key)
+            let record = try await transport.recoveryConfiguration(scope: scope)
+            guard !record.configuration.incomplete, record.configuration.active == key.identity,
+                  try registry.entries().allSatisfy({ $0.address.database == .private }) else { throw MopError.invalidRecovery }
+            let addresses = try await transport.discover().filter { $0.database == .private }
+            guard !addresses.isEmpty else { throw MopError.vaultMissing }
+            let verificationCache = FileManager.default.temporaryDirectory.appendingPathComponent("mop-recovery-reset-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: verificationCache) }
+            var heads: [(VaultAddress, String)] = []
+            for (index, address) in addresses.enumerated() {
+                try control.check(token)
+                reportProgress("Testing recovery: vault \(index + 1) of \(addresses.count)…", fraction: Double(index) / Double(addresses.count))
+                var vault = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+                guard vault.membership.role(of: device.identity) == .owner,
+                      vault.membership.offlineRecovery == key.identity else { throw MopError.invalidRecovery }
+                vault = try await AttachmentDownloads(state: verificationCache, address: address).load(vault, digests: vault.attachmentDigests, transport: transport, offline: false)
+                // Validate a complete recovery, including retained records and blobs,
+                // entirely in memory. Never publish this trial revision.
+                _ = try VaultEngine.recover(vault, using: key, owner: device.identity)
+                heads.append((address, vault.digest))
+            }
+            guard try await transport.recoveryConfiguration(scope: scope).version == record.version,
+                  Set(try await transport.discover().filter { $0.database == .private }.map(\.vault)) == Set(addresses.map(\.vault)) else { throw MopError.vaultConflict }
+            for (address, digest) in heads {
+                guard try await transport.head(at: address).digest == digest else { throw MopError.vaultConflict }
+            }
+            try control.check(token)
+            // Use the durable removal barrier and existing drained cleanup path.
+            // The barrier prevents automatic enrollment even after a restart.
+            try registry.setRemoved(true)
+            removedRegistry.withLock { $0 = registry }
+            throw MopError.deviceRemoved
+        case .recoveryEligibility:
+            reportProgress("Checking this device’s vault access…")
+            let addresses = try await transport.discover().filter { $0.database == .private }
+            for address in addresses {
+                try control.check(token)
+                let vault = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+                if try await hasAccess(to: vault), !(try registry.recoveryPending(vault.id)) {
+                    result.vaults.append(VaultDescriptor(id: vault.id.uuidString, name: vault.name, format: "mop-vault-v7", enrolled: true))
+                } else { result.recoveryNeeded = true }
+            }
+            result.message = addresses.isEmpty ? "No iCloud vaults were found for this Apple Account." :
+                (result.recoveryNeeded ? "Use your offline copy to open vaults this device cannot access." : "This device can already open your vaults. 2ndPass is working correctly, and recovery isn’t needed.")
+            return result
+        case .recoveryGenerate:
+            _ = try await authorizedContext(token: token)
+            let key = try OfflineRecoveryKey(scope: scope); defer { key.close() }; try register(key)
+            generatedRecovery.withLock { $0 = (token, key.identity) }
+            result.recoveryCode = try key.code(); result.recoveryFile = try key.export(); result.recoveryFingerprint = key.identity.fingerprint
+            result.message = "Save an offline copy, then re-enter or re-import it to activate recovery."
+            return result
+        case .recoveryStatus:
+            reportProgress("Discovering vaults for coverage checks…")
+            var configuration = try await transport.recoveryConfiguration(scope: scope).configuration
+            let expected = configuration.operation == nil ? configuration.active : configuration.target
+            var statuses: [RecoveryVaultStatus] = []
+            let addresses = try await transport.discover().filter { $0.database == .private }
+            for (index, address) in addresses.enumerated() {
+                reportProgress("Checking coverage: vault \(index + 1) of \(addresses.count)…", fraction: Double(index) / Double(addresses.count))
+                try control.check(token)
+                do {
+                    let vault = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+                    result.vaults.append(VaultDescriptor(id: vault.id.uuidString, name: vault.name, format: "mop-vault-v7", enrolled: false))
+                    statuses.append(RecoveryVaultStatus(id: address.vault, fingerprint: vault.membership.offlineRecovery?.fingerprint,
+                        complete: vault.membership.offlineRecovery == expected,
+                        issue: vault.membership.offlineRecovery == expected ? nil : "Coverage differs from the account configuration. Resume to reconcile."))
+                } catch {
+                    statuses.append(RecoveryVaultStatus(id: address.vault, fingerprint: nil, complete: false, issue: "Coverage could not be verified."))
+                }
+            }
+            configuration.vaults = statuses; result.recoveryVaults = statuses
+            result.recoveryConfiguration = configuration
+            if configuration.incomplete || statuses.contains(where: { !$0.complete }) {
+                result.message = "Recovery coverage is incomplete. Keep both offline copies until replacement finishes."
+            } else { result.message = configuration.active == nil ? "No offline recovery key is configured." : (statuses.isEmpty ? "No owned iCloud vaults were found." : "Offline recovery is enabled for \(statuses.count == 1 ? "your iCloud vault" : "all \(statuses.count) of your discovered iCloud vaults").") }
+            return result
+        case .recoveryOpen(let copy):
+            _ = try await authorizedContext(token: token)
+            let key = try OfflineRecoveryKey(document: copy, scope: scope); try register(key)
+            var retained = false
+            defer { if !retained { key.close() } }
+            var configuration = try await transport.recoveryConfiguration(scope: scope).configuration
+            if configuration.pendingCreation != nil, configuration.active == key.identity {
+                try await transport.finishRecoveryCreation(scope: scope, using: key.identity)
+                configuration = try await transport.recoveryConfiguration(scope: scope).configuration
+            }
+            var found: [UUID: (VaultAddress, VerifiedVault)] = [:]
+            for address in try await transport.discover() where address.database == .private {
+                try control.check(token)
+                do {
+                    let vault = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+                    if try await hasAccess(to: vault), !(try registry.recoveryPending(vault.id)) { continue }
+                    guard vault.membership.offlineRecovery == key.identity else {
+                        result.recoveryVaults.append(RecoveryVaultStatus(id: address.vault, fingerprint: vault.membership.offlineRecovery?.fingerprint, complete: false, issue: "Use the offline copy matching this vault's fingerprint.")); continue
+                    }
+                    _ = try VaultEngine.catalog(in: vault, device: key)
+                    found[vault.id] = (address, vault)
+                    result.vaults.append(VaultDescriptor(id: vault.id.uuidString, name: vault.name, format: "mop-vault-v7", enrolled: false))
+                    result.recoveryVaults.append(RecoveryVaultStatus(id: vault.id, fingerprint: key.identity.fingerprint, complete: false))
+                } catch {
+                    result.recoveryVaults.append(RecoveryVaultStatus(id: address.vault, fingerprint: nil, complete: false, issue: "Vault could not be verified or opened."))
+                }
+            }
+            guard !found.isEmpty else { key.close(); throw MopError.invalidRecovery }
+            try control.check(token)
+            recoverySession.withLock { session in
+                if session?.token != token || session?.scope != scope { session = RecoverySession(token: token, scope: scope) }
+                session!.keys[key.identity.fingerprint]?.close()
+                session!.keys[key.identity.fingerprint] = key
+                session!.vaults.merge(found) { _, new in new }
+            }
+            retained = true
+            result.recoveryConfiguration = configuration; result.recoveryReadOnly = true
+            result.message = "Read-only recovery access opened. Existing devices and accounts keep access. Complete recovery for each vault."
+            return result
+        case .recoveryCatalog(let id):
+            let (_, vault, key) = try sessionVault(id)
+            result.catalog = try VaultEngine.catalog(in: vault, device: key)
+            result.recoveryReadOnly = true
+            return result
+        case .recoveryRead(let id, let reference):
+            let (address, snapshot, key) = try sessionVault(id)
+            var vault = snapshot
+            if let digest = try vault.attachmentDigest(for: reference, device: key) {
+                vault = try await AttachmentDownloads(state: state, address: address).load(vault, digests: [digest], transport: transport, offline: false)
+            }
+            result.value = try VaultEngine.read(reference, in: vault, device: key)
+            let parsed = try SecretReference(vault: vault.name, relativePath: reference)
+            let path = [parsed.section, parsed.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
+            let catalog = try VaultEngine.catalog(in: vault, device: key)
+            if catalog.items.first(where: { $0.name == parsed.item })?.fields.first(where: { $0.path == path })?.type == .attachment {
+                result.recoveredAttachment = try Attachment.decode(String(decoding: result.value!, as: UTF8.self))
+                result.value = nil
+            }
+            result.recoveryReadOnly = true; result.valueIsConcealed = true
+            return result
+        case .recoveryComplete(let id):
+            let (address, _, key) = try sessionVault(id)
+            var current = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+            guard current.membership.offlineRecovery == key.identity else { throw MopError.invalidRecovery }
+            let alreadyCommitted = try await hasAccess(to: current)
+            guard try !alreadyCommitted || registry.recoveryPending(id) else { throw MopError.invalidRecovery }
+            let downloads = AttachmentDownloads(state: state, address: address)
+            do { current = try await downloads.load(current, digests: current.attachmentDigests, transport: transport, offline: false) }
+            catch {
+                result.recoveryReadOnly = true
+                result.recoveryVaults = [RecoveryVaultStatus(id: id, fingerprint: key.identity.fingerprint, complete: false, issue: "Attachment data is unavailable. Read-only access remains; existing devices and accounts keep access.")]
+                result.message = result.recoveryVaults[0].issue!
+                return result
+            }
+            var device = try await owner()
+            if (current.membership.removedDevices ?? []).contains(device.identity.device) {
+                closeDevice(device)
+                try deleteDevice(registry.container + "/" + registry.environment + "/device", registry.member)
+                device = try await owner()
+            }
+            defer { closeDevice(device) }
+            let next = try alreadyCommitted ? current : VaultEngine.recover(current, using: key, owner: device.identity)
+            let entry = NextEntry(address: address, checkpoint: current.bytes, digest: current.digest, name: current.name, submitted: true, ready: false)
+            let storage = try registry.storage(entry)
+            let pin = try storage.load(binding: address.binding).map { try VerifiedVault(checkpoint: $0.snapshot, independentlyVerifiedDigest: $0.verifiedDigest) } ?? current
+            let coordinator = try PublicationCoordinator(address: address, checkpoint: pin, transport: transport, storage: storage)
+            _ = try await coordinator.refresh(reconcileUnchangedPending: true)
+            guard await coordinator.offlineSnapshot().0.digest == current.digest else { throw MopError.vaultConflict }
+            try control.check(token)
+            try registry.setRecoveryPending(true, vault: id)
+            if !alreadyCommitted { try await coordinator.publish(next) }
+            try downloads.cache(next)
+            let inbox = try await transport.enrollment(at: address)
+            try await transport.saveEnrollment(EnrollmentMailbox(), version: inbox.version, at: address)
+            try control.check(token)
+            try registry.setRemoved(false)
+            try registry.put(NextEntry(address: address, checkpoint: next.bytes, digest: next.digest, name: next.name, submitted: true, ready: true))
+            try registry.setRecoveryPending(false, vault: id)
+            recoverySession.withLock { $0?.vaults[id] = (address, next) }
+            result.recoveryVaults = [RecoveryVaultStatus(id: id, fingerprint: key.identity.fingerprint, complete: true)]
+            result.message = "Vault recovered onto this device. Existing devices, accounts, and sharing retain access."
+            return result
+        default: break
+        }
+        // Lifecycle changes require ordinary owner authority for every affected
+        // vault. Recovery first restores that authority on a replacement device.
+        reportProgress("Preparing recovery configuration…")
+        let device = try await owner(); defer { closeDevice(device) }
+        if case .recoveryResume = action { try await transport.finishRecoveryCreation(scope: scope, using: device.identity) }
+        var record = try await transport.recoveryConfiguration(scope: scope)
+        var configuration = record.configuration
+        guard configuration.pendingCreation == nil else { throw MopError.vaultConflict }
+        let target: DevicePublicKey?
+        switch action {
+        case .recoveryActivate(let copy, let fingerprint):
+            reportProgress("Verifying your recovery copy…")
+            let verified = try OfflineRecoveryKey(document: copy, scope: scope); defer { verified.close() }
+            guard verified.identity.fingerprint == fingerprint else { throw MopError.invalidRecovery }
+            // CLI can verify an exported copy across process boundaries using its
+            // separately displayed public fingerprint. App-generated state adds
+            // a same-session equality check when available.
+            try generatedRecovery.withLock { pending in
+                if let pending, pending.0 == token { guard pending.1 == verified.identity else { throw MopError.invalidRecovery } }
+            }
+            target = verified.identity
+        case .recoveryRevoke: target = nil
+        case .recoveryResume:
+            if !configuration.incomplete, configuration.active == nil { result.recoveryConfiguration = configuration; return result }
+            target = configuration.operation == nil ? configuration.active : configuration.target
+        default: throw MopError.invalidProcess
+        }
+        if configuration.incomplete {
+            guard target == configuration.target else { throw MopError.vaultConflict }
+        } else {
+            let addresses = try await transport.discover().filter { $0.database == .private }
+            for (index, address) in addresses.enumerated() {
+                reportProgress("Verifying owner access: vault \(index + 1) of \(addresses.count)…", fraction: Double(index) / Double(addresses.count))
+                let vault = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+                guard vault.membership.role(of: device.identity) == .owner else { throw MopError.cloudPermission }
+            }
+            configuration.target = target; configuration.operation = UUID()
+            configuration.vaults = addresses.map { RecoveryVaultStatus(id: $0.vault, fingerprint: nil, complete: false) }
+            try await transport.saveRecoveryConfiguration(configuration, version: record.version)
+            record = try await transport.recoveryConfiguration(scope: scope)
+        }
+        let operation = configuration.operation
+        let addresses = try await transport.discover().filter { $0.database == .private }
+        for (index, address) in addresses.enumerated() {
+            reportProgress("Updating recovery: vault \(index + 1) of \(addresses.count)…", fraction: Double(index) / Double(addresses.count))
+            try control.check(token)
+            record = try await transport.recoveryConfiguration(scope: scope)
+            guard record.configuration.operation == operation, record.configuration.target == target else { throw MopError.vaultConflict }
+            configuration = record.configuration
+            var status = RecoveryVaultStatus(id: address.vault, fingerprint: nil, complete: false)
+            do {
+                var vault = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+                result.vaults.append(VaultDescriptor(id: vault.id.uuidString, name: vault.name, format: "mop-vault-v7", enrolled: false))
+                status.fingerprint = vault.membership.offlineRecovery?.fingerprint
+                guard vault.membership.role(of: device.identity) == .owner else { throw MopError.cloudPermission }
+                if vault.membership.offlineRecovery != target {
+                    let downloads = AttachmentDownloads(state: state, address: address)
+                    if vault.membership.offlineRecovery != nil {
+                        reportProgress("Loading attachments: vault \(index + 1) of \(addresses.count)…", fraction: Double(index) / Double(addresses.count))
+                        vault = try await downloads.load(vault, digests: vault.attachmentDigests, transport: transport, offline: false)
+                    }
+                    let entry = NextEntry(address: address, checkpoint: vault.bytes, digest: vault.digest, name: vault.name, submitted: true, ready: true)
+                    let storage = try registry.storage(entry)
+                    let pin = try storage.load(binding: address.binding).map { try VerifiedVault(checkpoint: $0.snapshot, independentlyVerifiedDigest: $0.verifiedDigest) } ?? vault
+                    let coordinator = try PublicationCoordinator(address: address, checkpoint: pin, transport: transport, storage: storage)
+                    _ = try await coordinator.refresh(reconcileUnchangedPending: true)
+                    let refreshed = await coordinator.offlineSnapshot().0
+                    guard refreshed.digest == vault.digest else { throw MopError.vaultConflict }
+                    reportProgress("Updating encryption: vault \(index + 1) of \(addresses.count)…", fraction: Double(index) / Double(addresses.count))
+                    let next = try VaultEngine.setOfflineRecovery(target, in: vault, owner: device)
+                    reportProgress("Saving to iCloud: vault \(index + 1) of \(addresses.count)…", fraction: Double(index) / Double(addresses.count))
+                    try control.check(token); try await coordinator.publish(next)
+                    try downloads.cache(next)
+                    status.fingerprint = target?.fingerprint
+                }
+                status.complete = true
+            } catch {
+                try control.check(token)
+                status.issue = "Not completed: " + ((error as? MopError)?.errorDescription ?? "iCloud or attachment data unavailable. Retry to resume.")
+            }
+            configuration.vaults.removeAll { $0.id == address.vault }; configuration.vaults.append(status)
+            try await transport.saveRecoveryConfiguration(configuration, version: record.version)
+        }
+        reportProgress("Confirming recovery coverage with iCloud…")
+        record = try await transport.recoveryConfiguration(scope: scope); configuration = record.configuration
+        guard configuration.operation == operation else { throw MopError.vaultConflict }
+        let finalAddresses = try await transport.discover().filter { $0.database == .private }
+        let complete = Set(configuration.vaults.filter(\.complete).map(\.id))
+        if Set(finalAddresses.map(\.vault)).isSubset(of: complete) {
+            configuration.active = target; configuration.target = nil; configuration.operation = nil
+            try await transport.saveRecoveryConfiguration(configuration, version: record.version)
+            generatedRecovery.withLock { $0 = nil }
+        }
+        result.recoveryConfiguration = configuration; result.recoveryVaults = configuration.vaults
+        result.message = configuration.incomplete ? "Recovery coverage is incomplete. Keep both offline copies and resume after resolving unavailable vaults." : "Recovery settings updated for all your owned iCloud vaults."
+        return result
+    }
+
     private func run(_ operation: VaultOperation, selection: String?, offline: Bool, token: Int) async throws -> VaultResult {
         if offline && !operation.allowsCachedRead {
             if case .discover = operation {} else { throw MopError.offlineWrite }
@@ -209,6 +554,8 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         try control.check(token)
         let registry = try NextRegistry(state: state, container: config.container, environment: config.environment, account: account)
         var result = VaultResult(); result.usingCache = offline; result.usageScope = registry.member.uuidString
+        if case .manage(let action) = operation, !offline,
+           let recovery = try await runRecovery(action, registry: registry, transport: transport, token: token) { return recovery }
         if try registry.removed() {
             if case .catalog = operation {
                 removedRegistry.withLock { $0 = registry }
@@ -323,14 +670,14 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             else { device.close() }
         }
         let scope = config.container + "/" + config.environment
-        func device(recovery: Bool = false, member: UUID? = nil, create: Bool = false) throws -> any DeviceOperations {
+        func device(member: UUID? = nil, create: Bool = false) throws -> any DeviceOperations {
             try control.check(token)
             guard try !registry.removed() else { throw MopError.deviceRemoved }
-            return try openDevice(scope + (recovery ? "/recovery" : "/device"), member ?? registry.member, context, create)
+            return try openDevice(scope + "/device", member ?? registry.member, context, create)
         }
-        func checkedRequest(_ bytes: Data, fingerprint: String, recovery: Bool) throws -> DeviceRequest {
+        func checkedRequest(_ bytes: Data, fingerprint: String) throws -> DeviceRequest {
             let request = try ExchangeFile.decode(DeviceRequest.self, from: bytes); try request.validate()
-            guard request.fingerprint == fingerprint, request.recovery == recovery,
+            guard request.fingerprint == fingerprint,
                   request.container == config.container, request.environment == config.environment else { throw MopError.invalidIdentity }
             return request
         }
@@ -338,9 +685,9 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
             return try LocalFile.read(url, limit: 24 * 1024 * 1024)
         }
-        if case .manage(.deviceRequest(let recovery)) = operation {
-            let key = try device(recovery: recovery, create: true); defer { close(key) }
-            let request = try DeviceRequest(container: config.container, environment: config.environment, account: account, recovery: recovery, device: key)
+        if case .manage(.deviceRequest) = operation {
+            let key = try device(create: true); defer { close(key) }
+            let request = try DeviceRequest(container: config.container, environment: config.environment, account: account, device: key)
             result.document = try ExchangeFile.encode(request)
             result.message = "Request fingerprint: \(request.fingerprint)\nAccount: \(request.device.member)\nDevice: \(request.device.device)\nCompare the request fingerprint through a trusted channel. Private keys remain on this device."
             return result
@@ -393,7 +740,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 if restart || local == nil || local!.request.expires <= Date() {
                     guard let name = enrollmentName else { throw MopError.invalidIdentity }
                     let previous = local.map { ($0.superseded ?? []) + [$0.id] } ?? []
-                    let request = try DeviceRequest(container: config.container, environment: config.environment, account: account, recovery: false, device: key)
+                    let request = try DeviceRequest(container: config.container, environment: config.environment, account: account, device: key)
                     local = EnrollmentExchange(request: try EnrollmentRequest(vault: id, request: request, name: name, device: key))
                     local!.superseded = Array(previous.suffix(32))
                     try registry.saveEnrollment(local!)
@@ -499,7 +846,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             let packet = try ExchangeFile.decode(InvitationPacket.self, from: bytes)
             try packet.request.validate()
             guard packet.request.account == account, packet.request.container == config.container,
-                  packet.request.environment == config.environment, !packet.request.recovery else { throw MopError.invalidIdentity }
+                  packet.request.environment == config.environment else { throw MopError.invalidIdentity }
             let key = try device(); defer { close(key) }
             guard key.identity == packet.request.device else { throw MopError.invalidIdentity }
             let root = try VerifiedVault(checkpoint: packet.checkpoint, independentlyVerifiedDigest: checkpoint)
@@ -526,28 +873,31 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             result.message = "Return this acceptance to the owner. Access begins only after owner approval; refresh afterward."
             return result
         }
-        if case .create(let name, let recoveryFile, let fingerprint) = operation {
-            let recovery: DeviceRequest?
-            if let recoveryFile, let fingerprint {
-                recovery = try checkedRequest(readDocument(recoveryFile), fingerprint: fingerprint, recovery: true)
-            } else {
-                guard recoveryFile == nil, fingerprint == nil else { throw MopError.invalidRecovery }
-                recovery = nil
-            }
+        if case .create(let name) = operation {
+            let recoveryScope = try RecoveryScope(container: config.container, environment: config.environment, account: account)
+            let configuration = try await transport.recoveryConfiguration(scope: recoveryScope).configuration
+            guard configuration.operation == nil else { throw MopError.vaultConflict }
             let owner = try device(create: true); defer { close(owner) }
-            guard recovery?.device.device != owner.identity.device else { throw MopError.invalidRecovery }
             let id = selection.flatMap(UUID.init(uuidString:)) ?? UUID()
             var entry: NextEntry
             if let pending = try registry.entries().first(where: { $0.address.vault == id }) { entry = pending }
             else {
                 guard !(try registry.entries().contains { $0.name == name }) else { throw MopError.duplicate }
-                let root = try VaultEngine.create(name: name, owner: owner, recovery: recovery?.device, id: id)
+                let root = try VaultEngine.create(name: name, owner: owner, recovery: configuration.active, id: id)
                 let address = try VaultAddress(container: config.container, environment: config.environment, account: account, database: .private, owner: CKCurrentUserDefaultName, vault: id)
                 entry = NextEntry(address: address, checkpoint: root.bytes, digest: root.digest, name: name, submitted: false, ready: false)
                 try registry.put(entry)
             }
             let root = try VerifiedVault(checkpoint: entry.checkpoint, independentlyVerifiedDigest: entry.digest)
             guard root.membership.role(of: owner.identity) == .owner else { throw MopError.cloudPermission }
+            let reservation = try await transport.recoveryConfiguration(scope: recoveryScope)
+            guard reservation.configuration.operation == nil, root.membership.offlineRecovery == reservation.configuration.active else { throw MopError.vaultConflict }
+            if let pending = reservation.configuration.pendingCreation {
+                guard pending == root.bytes else { throw MopError.vaultConflict }
+            } else {
+                var next = reservation.configuration; next.pendingCreation = root.bytes
+                try await transport.saveRecoveryConfiguration(next, version: reservation.version)
+            }
             let storage = try registry.storage(entry)
             if !entry.submitted {
                 entry.submitted = true; try registry.put(entry)
@@ -560,50 +910,9 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             _ = try await coordinator.refresh()
             let current = await coordinator.offlineSnapshot().0
             entry.ready = true; try registry.put(entry)
+            try await transport.finishRecoveryCreation(scope: recoveryScope, using: owner.identity)
             result.catalog = try VaultEngine.catalog(in: current, device: owner)
-            result.message = "Vault created: \(id)\nCheckpoint: \(current.digest)\nAdd another device or optional hardware recovery in Vault settings."
-            return result
-        }
-        if case .manage(.recoverHardware(let backup, let checkpoint, let ownerBytes, let recoveryBytes, let copy)) = operation {
-            let source = try VerifiedVault.restoreBackup(backup, independentlyVerifiedDigest: checkpoint)
-            let ownerRequest = try ExchangeFile.decode(DeviceRequest.self, from: ownerBytes); try ownerRequest.validate()
-            let nextRecovery = try ExchangeFile.decode(DeviceRequest.self, from: recoveryBytes); try nextRecovery.validate()
-            guard !ownerRequest.recovery, nextRecovery.recovery,
-                  [ownerRequest, nextRecovery].allSatisfy({ $0.container == config.container && $0.environment == config.environment }) else { throw MopError.invalidRecovery }
-            guard let recoveryIdentity = source.membership.recovery else { throw MopError.invalidRecovery }
-            let recovery = try device(recovery: true, member: recoveryIdentity.member); defer { close(recovery) }
-            guard recovery.identity == source.membership.recovery else { throw MopError.invalidRecovery }
-            if copy {
-                let owner = try device(create: true); defer { close(owner) }
-                guard owner.identity == ownerRequest.device else { throw MopError.invalidIdentity }
-                let root = try VaultEngine.recoverCopy(source, using: recovery, name: source.name, owner: owner, replacementRecovery: nextRecovery.device)
-                let address = try VaultAddress(container: config.container, environment: config.environment, account: account, database: .private, owner: CKCurrentUserDefaultName, vault: root.id)
-                var entry = NextEntry(address: address, checkpoint: root.bytes, digest: root.digest, name: root.name, submitted: true, ready: false)
-                try registry.put(entry); try control.check(token)
-                try await transport.initialize(root, at: address)
-                entry.ready = true; try registry.put(entry)
-                try AttachmentDownloads(state: state, address: address).cache(root)
-                result.document = try root.backup()
-                result.message = "Recovered into new vault \(root.id). Source retained. Checkpoint: \(root.digest)"
-            } else {
-                guard source.membership.accounts.first(where: { $0.role == .owner })?.id == registry.member else { throw MopError.cloudAccount }
-                let address = try VaultAddress(container: config.container, environment: config.environment, account: account, database: .private, owner: CKCurrentUserDefaultName, vault: source.id)
-                let entry = NextEntry(address: address, checkpoint: source.bytes, digest: source.digest, name: source.name, submitted: true, ready: true)
-                if !(try registry.entries().contains { $0.address.vault == source.id }) { try registry.put(entry) }
-                let storage = try registry.storage(entry)
-                let coordinator = try PublicationCoordinator(address: address, checkpoint: source, transport: transport, storage: storage)
-                _ = try await coordinator.refresh()
-                var current = await coordinator.offlineSnapshot().0
-                let downloads = AttachmentDownloads(state: state, address: address)
-                try downloads.cache(source)
-                current = try await downloads.load(current, digests: current.attachmentDigests, transport: transport, offline: false)
-                let next = try VaultEngine.recover(current, using: recovery, owner: ownerRequest.device, replacementRecovery: nextRecovery.device)
-                try control.check(token); try await coordinator.publish(next)
-                try await transport.reconcileShare(next.membership, at: address)
-                try downloads.cache(next)
-                result.document = try next.backup()
-                result.message = "Recovered owner device; old devices and members removed. Checkpoint: \(next.digest)"
-            }
+            result.message = "Vault created: \(id)\nCheckpoint: \(current.digest)\nAdd another device or offline recovery in Vault settings."
             return result
         }
         var entry = try registry.select(selection)
@@ -635,11 +944,6 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             case .manage(.removeMember), .manage(.removeDevice):
                 reportProgress("Preparing encrypted files…")
                 needed = current.attachmentDigests
-            case .manage(.replaceRecovery):
-                if current.membership.recovery != nil {
-                    reportProgress("Preparing encrypted files…")
-                    needed = current.attachmentDigests
-                }
             case .sync:
                 if !offline && (attachmentSyncOverride ?? AttachmentDownloadSettings.duringSync) { needed = current.attachmentDigests }
             default: break
@@ -804,7 +1108,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     isCurrent: $0 == key.identity)
             }
             result.members = current.membership.accounts.flatMap { member in member.devices.map { VaultMemberRecord(id: $0.device.uuidString, role: "\(member.role.rawValue) · account \(member.id) · \($0.fingerprint)") } }
-            if let recovery = current.membership.recovery { result.members.append(VaultMemberRecord(id: recovery.device.uuidString, role: "hardware recovery · \(recovery.fingerprint)")) }
+            if let recovery = current.membership.offlineRecovery { result.members.append(VaultMemberRecord(id: recovery.device.uuidString, role: "offline recovery · \(recovery.fingerprint)")) }
         case .rename(let name):
             guard !(try registry.entries().contains { $0.name == name && $0.address != entry.address }) else { throw MopError.duplicate }
             proposal = try VaultEngine.rename(name, in: current, device: key)
@@ -825,7 +1129,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             case .trust(let fingerprint):
                 guard fingerprint == current.digest else { throw MopError.vaultUntrusted }; result.message = "Checkpoint matches the verified vault."
             case .invite(let bytes, let fingerprint, let role), .inviteAccount(let bytes, let fingerprint, let role):
-                let request = try checkedRequest(bytes, fingerprint: fingerprint, recovery: false)
+                let request = try checkedRequest(bytes, fingerprint: fingerprint)
                 if case .inviteAccount = action {
                     guard request.account != account, role != .owner else { throw MopError.invalidIdentity }
                 }
@@ -837,14 +1141,14 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                     result.message += "\nShare URL: \(url.absoluteString)"
                 }
             case .inviteOwnDevice(let bytes, let fingerprint):
-                let request = try checkedRequest(bytes, fingerprint: fingerprint, recovery: false)
+                let request = try checkedRequest(bytes, fingerprint: fingerprint)
                 guard request.account == account else { throw MopError.invalidIdentity }
                 let invitation = try VaultEngine.invite(member: request.device.member, role: .owner, to: current, owner: key, expires: Date().addingTimeInterval(86400))
                 result.document = try ExchangeFile.encode(InvitationPacket(request: request, invitation: invitation, address: entry.address, checkpoint: current.bytes))
                 result.message = "Invitation checkpoint: \(current.digest)\nCompare this checkpoint on your new device, then import its acceptance here."
             case .approve(let bytes, let fingerprint):
                 let packet = try ExchangeFile.decode(AcceptancePacket.self, from: bytes)
-                let request = try checkedRequest(ExchangeFile.encode(packet.invitation.request), fingerprint: fingerprint, recovery: false)
+                let request = try checkedRequest(ExchangeFile.encode(packet.invitation.request), fingerprint: fingerprint)
                 guard request.device == packet.acceptance.device, packet.invitation.invitation.nonce == packet.acceptance.invitation.nonce else { throw MopError.invalidIdentity }
                 proposal = try VaultEngine.approve(packet.acceptance, expectedDeviceFingerprint: request.device.fingerprint, in: current, owner: key)
                 reconcile = true
@@ -856,9 +1160,6 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
                 }
                 reconcile = true
             case .role(let id, let role): proposal = try VaultEngine.setRole(role, member: id, in: current, owner: key); reconcile = true
-            case .replaceRecovery(let bytes, let fingerprint):
-                let request = try checkedRequest(bytes, fingerprint: fingerprint, recovery: true)
-                proposal = try VaultEngine.replaceRecovery(with: request.device, in: current, owner: key)
             case .reconcileShare:
                 guard current.membership.role(of: key.identity) == .owner else { throw MopError.cloudPermission }
                 try await transport.reconcileShare(current.membership, at: entry.address)

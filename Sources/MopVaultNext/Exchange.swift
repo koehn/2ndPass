@@ -13,21 +13,21 @@ public struct DeviceRequest: Codable, Sendable {
     public let container: String
     public let environment: String
     public let account: String
-    public let recovery: Bool
+    let recovery: Bool
     public let device: DevicePublicKey
     public let signature: Data
     private struct Statement: Encodable {
         let domain = "mop-v7-device-request"
         let container: String; let environment: String; let account: String; let recovery: Bool; let device: DevicePublicKey
     }
-    public init(container: String, environment: String, account: String, recovery: Bool, device: any DeviceOperations) throws {
-        self.container = container; self.environment = environment; self.account = account; self.recovery = recovery; self.device = device.identity
-        signature = try device.sign(Codec.encode(Statement(container: container, environment: environment, account: account, recovery: recovery, device: device.identity)))
+    public init(container: String, environment: String, account: String, device: any DeviceOperations) throws {
+        self.container = container; self.environment = environment; self.account = account; self.recovery = false; self.device = device.identity
+        signature = try device.sign(Codec.encode(Statement(container: container, environment: environment, account: account, recovery: false, device: device.identity)))
         try validate()
     }
     public func validate() throws {
         try device.validate()
-        guard !account.isEmpty, account != "__defaultOwner__", ["Development", "Production"].contains(environment),
+        guard !recovery, !account.isEmpty, account != "__defaultOwner__", ["Development", "Production"].contains(environment),
               device.member == AccountScope.member(container: container, environment: environment, account: account),
               device.verifies(signature, message: try Codec.encode(Statement(container: container, environment: environment, account: account, recovery: recovery, device: device))) else { throw MopError.invalidIdentity }
     }

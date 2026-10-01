@@ -41,7 +41,7 @@ struct AutoFillSettingsView: View {
             } else {
                 Button("Unlock to Refresh Suggestions") { model.unlock() }.disabled(!model.canUnlock)
             }
-            Text("Websites and usernames appear in system suggestions. Item and vault names stay encrypted until you authenticate in 2ndPass’s picker. Each AutoFill request requires authentication.").font(.caption)
+            Text("Websites and usernames appear in system suggestions and the account picker without authentication. Item and vault names stay encrypted. Filling a credential requires authentication, even when 2ndPass is locked or closed.").font(.caption)
             Text("2ndPass fills saved passwords and verification codes. Passkeys, saving new logins, and generating passwords inside AutoFill are not supported.").font(.caption).foregroundStyle(.secondary)
         }
         .task {

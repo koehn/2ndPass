@@ -9,6 +9,7 @@ Each vault uses a custom zone `mop-v7-UUID`. Old zones are never discovered, mig
 | `MopV7Attachment` | `attachment-` + SHA-256 of encrypted attachment bytes | `payload`: Asset (application encrypted) |
 | `MopV7Revision` | SHA-256 of exact canonical revision bytes | `payload`: Asset (already application encrypted/signed) |
 | `MopV7Enrollment` | `enrollment` | `payload`: Asset (bounded public enrollment mailbox) |
+| `MopRecoveryConfiguration` | `configuration`, in the private `mop-account-recovery-v1` zone | `payload`: Bytes (public configuration/progress and optional signed encrypted creation reservation; no private keys) |
 | `MopV7Head` | `head` | `digest`: String; `operation`: String (fresh UUID, also for a same-digest fence) |
 
 System fields supply change tags. Upload the immutable asset first, then conditionally save the head using `CKModifyRecordsOperation`, `.ifServerRecordUnchanged`, and `isAtomic = true`. A same-zone head operation is not atomic with prior uploads or participant permission changes. Never infer success/failure solely from a timed-out response.
@@ -117,3 +118,17 @@ synced or exported implicitly. Backups explicitly bundle all referenced blobs.
 Deploy `MopV7Attachment.payload` (Asset) to Production as part of the release.
 This code change does not deploy the CloudKit schema. Orphan/history blobs remain
 until a future reachability-aware collector or complete zone deletion.
+
+## Offline recovery rollout
+
+Deploy `MopRecoveryConfiguration.payload` (Bytes) to Production before distributing
+this version. It requires no query indexes: the adapter fetches it by record ID
+and conditionally saves using system change tags. The private account recovery
+zone is never shared or included in vault discovery. Creation uses this record
+even before a recovery key is configured, to fence concurrent lifecycle changes.
+A missing production schema is an error, never permission to create an unprotected
+vault. This implementation has not deployed the schema.
+
+Fresh-device recovery trusts authenticated private CloudKit for initial provenance
+and freshness, verifies signed ancestry, and checks offline-key possession. It
+does not restore Apple Account access. See [the recovery protocol](OFFLINE-RECOVERY.md).

@@ -54,7 +54,7 @@ Passwords are concealed until requested, revealed values hide again after a time
 
 CloudKit provides transport and storage through your Apple Account. There is no separate 2ndPass-hosted vault service. Secret contents are encrypted by 2ndPass before upload; iCloud carries the ciphertext and encrypted key material.
 
-Apple protects account sign-in with [two-factor authentication](https://support.apple.com/en-us/102660), enabled by default for most accounts: a new device requires the account password and verification through a trusted device or phone number. Optional [Security Keys for Apple Account](https://support.apple.com/en-us/102637) add protection against phishing. 2ndPass uses the system's authenticated iCloud session and never asks for your Apple Account password or verification code. These account security keys are separate from 2ndPass's vault recovery hardware.
+Apple protects account sign-in with [two-factor authentication](https://support.apple.com/en-us/102660), enabled by default for most accounts: a new device requires the account password and verification through a trusted device or phone number. Optional [Security Keys for Apple Account](https://support.apple.com/en-us/102637) add protection against phishing. 2ndPass uses the system's authenticated iCloud session and never asks for your Apple Account password or verification code. These account security keys are separate from 2ndPass's offline recovery copy.
 
 **Apple and 2ndPass provide different layers of the trust model.** Apple authenticates the iCloud environment; code signing, provisioning and CloudKit entitlements restrict native client access to the 2ndPass container and its private per-user database. A new device creates its own Secure Enclave identity, submits a signed request through that namespace, and receives item-key envelopes only after an enrolled owner device publishes a signed membership grant. See Apple's [container access](https://developer.apple.com/documentation/cloudkit/ckcontainer) and [private database](https://developer.apple.com/documentation/cloudkit/ckcontainer/privateclouddatabase) documentation.
 
@@ -81,11 +81,18 @@ the [design review](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md#
 
 ## Recovery
 
-A separate hardware recovery device is optional. Set it up while you still have a working owner device, compare its fingerprint independently, and store it separately. An encrypted backup preserves data; it is not a substitute for surviving authorized hardware.
+Generate and verify an offline recovery copy before losing access to your devices.
+On a replacement device, sign into the same Apple Account and import the copy or
+enter its code. Read-only recovery can open healthy data while unavailable
+attachments postpone completion. Complete each vault to rotate encryption and
+remove previous device access. Keep both copies during key replacement until
+coverage is complete.
 
-**If every authorized device and every configured recovery device is lost, the vault is unrecoverable.** Restoring an Apple Account or downloading a backup does not recreate Secure Enclave private keys. There is no vendor-held recovery master key. This reduces remote recovery attack surface but increases permanent-data-loss risk; it is a security/availability tradeoff.
-
-Follow the [recovery guide](docs.html#recovery), including checkpoint verification. Separate-device recovery acceptance remains outstanding; do not make an untested recovery path your only plan.
+The private recovery secret and copied ciphertext suffice for offline decryption;
+protect the copy separately from your devices. It cannot restore Apple Account
+access or missing cloud data. Account-loss recovery requires a separately exported
+backup; backup restoration is outside this feature. Physical-device acceptance
+and cryptographic review remain pending.
 
 ## Local
 
@@ -111,7 +118,7 @@ Treat those outputs as credentials. Removing a temporary file is ordinary deleti
 3. Use distinct, generated passwords. Enable service-level multi-factor authentication where available.
 4. Keep references in project files and actual secrets out of source control. Review programs before handing them credentials.
 5. Verify imports and their warnings. Remove unwanted plaintext exports and check where they may have been backed up.
-6. Maintain separate recovery hardware and encrypted backups. Record trusted checkpoints independently and test the documented recovery process.
+6. Keep an offline recovery copy separate from your devices and test same-account recovery. Keep both copies until key replacement finishes. Backups address missing cloud data and account loss separately.
 7. Verify a recipient’s identity before approving access. Rotate service credentials when revocation must also invalidate copied passwords.
 
 ## Status

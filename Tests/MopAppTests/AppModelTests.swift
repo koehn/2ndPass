@@ -288,7 +288,7 @@ private actor Barrier {
         let service = FakeService { _, _, _ in throw MopError.cloudUncertain }
         let model = model(service)
         let old = model.vault
-        model.createVault(name: "personal", recovery: URL(fileURLWithPath: "/tmp/unused.key"), fingerprint: String(repeating: "a", count: 64))
+        model.createVault(name: "personal")
         try await finish(model)
         #expect(model.vault != old && model.vaults.contains { $0.id == model.vault })
         #expect(model.catalog == nil && model.error == MopError.cloudUncertain.errorDescription)
@@ -864,7 +864,7 @@ extension AppModelTests {
         let model = model(service)
         model.unlock()
         try await finish(model)
-        #expect(model.error?.contains("separate hardware recovery device") == true)
+        #expect(model.error?.contains("offline recovery copy") == true)
         #expect(model.error?.contains("Older vault formats are unsupported") == true)
         #expect(model.error?.contains("mop vault trust") == false)
         #expect(!model.authenticated)
@@ -1454,6 +1454,15 @@ extension AppModelTests {
         #expect(app.pendingTransition == nil)
         app.search = ""
         #expect(app.listSelection == selection)
+    }
+    @Test func recoveryTestResetRoutesToRecoveryAndPausesEnrollment() throws {
+        let service = FakeService(), app = try editingModel(service)
+        app.sheetRequest = SheetRequest(kind: .setupRecovery, inSettings: true, target: nil)
+        app.showRecoveryTestReset()
+        #expect(app.deviceRemoved && app.enrollmentPaused)
+        #expect(app.vaults.isEmpty && app.enrollmentSelection.isEmpty)
+        #expect(app.sheetRequest?.kind == .recover && app.sheetRequest?.inSettings == true)
+        #expect(!app.canStartEnrollment)
     }
     @Test func settingsCategoriesDoNotChangeVaultOrDraft() throws {
         let service = FakeService(), app = try editingModel(service)

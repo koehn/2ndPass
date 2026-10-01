@@ -44,6 +44,17 @@ private final class TestHardware: @unchecked Sendable {
     }
 }
 private actor Server {
+    var recovery: [String: (RecoveryConfiguration, Int)] = [:]
+    func recoveryConfiguration(_ scope: RecoveryScope) -> RecoveryConfigurationRecord {
+        let value = recovery[scope.account]
+        return RecoveryConfigurationRecord(configuration: value?.0 ?? RecoveryConfiguration(scope: scope), version: value.map { Data(String($0.1).utf8) })
+    }
+    func saveRecoveryConfiguration(_ configuration: RecoveryConfiguration, _ version: Data?) throws {
+        let old = recovery[configuration.scope.account]
+        guard version == old.map({ Data(String($0.1).utf8) }) else { throw MopError.vaultConflict }
+        recovery[configuration.scope.account] = (configuration, (old?.1 ?? 0) + 1)
+    }
+
     var readRequests = 0
     var headGates: [UUID: AuthenticationGate] = [:]
     func setHeadGate(_ gate: AuthenticationGate, for id: UUID) { headGates[id] = gate }
@@ -57,6 +68,8 @@ private actor Server {
     struct State { var head: String; var version: Int; var revisions: [String: Data] }
     var vaults: [UUID: State] = [:]
     var attachments: [UUID: [String: Data]] = [:]
+    func takeAttachments(_ id: UUID) -> [String: Data] { let saved = attachments[id] ?? [:]; attachments[id] = [:]; return saved }
+    func restoreAttachments(_ data: [String: Data], _ id: UUID) { attachments[id] = data }
     var attachmentReads = 0
     func attachment(_ digest: String, _ id: UUID) throws -> Data {
         attachmentReads += 1
@@ -69,7 +82,10 @@ private actor Server {
         let saved = inboxes[address.binding]
         return EnrollmentInbox(mailbox: saved?.0 ?? EnrollmentMailbox(), version: saved.map { Data(String($0.1).utf8) })
     }
+    var failEnrollmentSave = false
+    func failNextEnrollmentSave() { failEnrollmentSave = true }
     func saveEnrollment(_ value: EnrollmentMailbox, _ version: Data?, _ address: VaultAddress) throws {
+        if failEnrollmentSave { failEnrollmentSave = false; throw MopError.cloudUnavailable }
         guard enrollment(address).version == version else { throw MopError.vaultConflict }
         // Exercise the same serialization and size boundary as CloudKit.
         let persisted = try EnrollmentMailbox.decode(value.encoded())
@@ -106,6 +122,8 @@ private actor Server {
 }
 private struct Transport: VaultTransport {
     let server: Server, accountID: String
+    func recoveryConfiguration(scope: RecoveryScope) async throws -> RecoveryConfigurationRecord { await server.recoveryConfiguration(scope) }
+    func saveRecoveryConfiguration(_ configuration: RecoveryConfiguration, version: Data?) async throws { try await server.saveRecoveryConfiguration(configuration, version) }
     func attachment(_ digest: String, at address: VaultAddress) async throws -> Data { await server.recordReadRequest(); return try await server.attachment(digest, address.vault) }
     func uploadAttachment(_ bytes: Data, digest: String, at address: VaultAddress) async throws { await server.uploadAttachment(bytes, digest, address.vault) }
     func enrollment(at address: VaultAddress) async throws -> EnrollmentInbox { await server.enrollment(address) }
@@ -138,6 +156,7 @@ private final class Client {
     let calls = Counter()
     let server: Server, account: String
     var service: NativeVaultService!
+    var recoveryCopy: SecretBytes?
     init(_ server: Server, _ account: String) {
         self.server = server; self.account = account
         reopen()
@@ -150,18 +169,18 @@ private final class Client {
             })
     }
     deinit { try? FileManager.default.removeItem(at: state) }
-    func request(_ recovery: Bool = false) async throws -> (Data, DeviceRequest) {
-        let result = try await service.execute(.manage(.deviceRequest(recovery: recovery)), vault: nil)
+    func request() async throws -> (Data, DeviceRequest) {
+        let result = try await service.execute(.manage(.deviceRequest), vault: nil)
         let bytes = try #require(result.document)
         return (bytes, try ExchangeFile.decode(DeviceRequest.self, from: bytes))
     }
 }
 private func create(_ owner: Client, recovery: Client) async throws -> String {
-    let (bytes, request) = try await recovery.request(true)
-    try FileManager.default.createDirectory(at: owner.state, withIntermediateDirectories: true)
-    let file = owner.state.appendingPathComponent("recovery-request.json"); try bytes.write(to: file)
+    let generated = try await owner.service.execute(.manage(.recoveryGenerate), vault: nil)
+    recovery.recoveryCopy = generated.recoveryFile
+    _ = try await owner.service.execute(.manage(.recoveryActivate(copy: #require(generated.recoveryFile), fingerprint: #require(generated.recoveryFingerprint))), vault: nil)
     let id = UUID().uuidString
-    _ = try await owner.service.execute(.create(name: "personal", recovery: file, fingerprint: request.fingerprint), vault: id)
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
     return id
 }
 private func enroll(_ client: Client, owner: Client, vault: String, role: MemberRole) async throws {
@@ -172,7 +191,7 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
     _ = try await owner.service.execute(.manage(.approve(packet: #require(accepted.document), fingerprint: info.fingerprint)), vault: vault)
 }
 
-@Test func integratedTwoAccountsFourDevicesRemovalAndHardwareRecoveryModel() async throws {
+@Test func integratedTwoAccountsFourDevicesRemovalAndOfflineRecoveryModel() async throws {
     let cloud = Server()
     let owner = Client(cloud, "a"), a2 = Client(cloud, "a"), b1 = Client(cloud, "b"), b2 = Client(cloud, "b"), recovery = Client(cloud, "a")
     let id = try await create(owner, recovery: recovery)
@@ -188,18 +207,15 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
     #expect(try await b2.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "secret"))
     _ = try await owner.service.execute(.manage(.removeMember(b1Request.device.member)), vault: id)
     await #expect(throws: MopError.deviceRemoved) { try await b2.service.execute(.read(reference), vault: id) }
-    let backup = FileManager.default.temporaryDirectory.appendingPathComponent("mop-v7-backup-test-" + UUID().uuidString + ".json")
-    defer { try? FileManager.default.removeItem(at: backup) }
-    _ = try await owner.service.execute(.export(backup), vault: id)
-    let checkpoint = try await owner.service.execute(.manage(.fingerprint), vault: id).message
-    let replacement = Client(cloud, "a"), nextRecovery = Client(cloud, "a")
-    let ownerRequest = try await replacement.request().0, recoveryRequest = try await nextRecovery.request(true).0
-    let recovered = try await recovery.service.execute(.manage(.recoverHardware(backup: Data(contentsOf: backup), checkpoint: checkpoint,
-        owner: ownerRequest, recovery: recoveryRequest, copy: false)), vault: nil)
-    let bytes = try #require(recovered.document)
-    _ = try await replacement.service.execute(.manage(.importCheckpoint(document: bytes, fingerprint: Codec.digest(bytes), sharedOwner: nil)), vault: nil)
+    owner.service.lock(); a2.service.lock(); recovery.service.lock()
+    let replacement = Client(cloud, "a")
+    let opened = try await replacement.service.execute(.manage(.recoveryOpen(copy: #require(recovery.recoveryCopy))), vault: nil)
+    #expect(opened.recoveryReadOnly)
+    #expect(try await replacement.service.execute(.manage(.recoveryRead(UUID(uuidString: id)!, "login/password")), vault: nil).value == SecretBytes(utf8: "secret"))
+    let recovered = try await replacement.service.execute(.manage(.recoveryComplete(UUID(uuidString: id)!)), vault: nil)
+    #expect(recovered.recoveryVaults.first?.complete == true)
     #expect(try await replacement.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "secret"))
-    await #expect(throws: MopError.deviceRemoved) { try await owner.service.execute(.read(reference), vault: id) }
+
 }
 
 @Test func integratedTypedCatalogAutoFillAndConflicts() async throws {
@@ -213,10 +229,16 @@ private func enroll(_ client: Client, owner: Client, vault: String, role: Member
     #expect(saved.items[0].autoFill == item.autoFill)
     #expect(saved.items[0].fields.first { $0.type == .password }?.value == nil)
     let entry = try #require(AutoFillEntry.entries(catalog: saved, vaultID: id).first)
+    // Simulate a terminated containing app: discard its service and authenticate
+    // through a fresh extension service using only persisted state and device keys.
+    owner.service.lock()
+    owner.service = nil
+    owner.reopen(allowsAttachments: false)
+    #expect(!owner.service.isAuthenticated)
     let before = owner.calls.withLock { $0 }
     let credential = try await AutoFillAccess.credential(recordIdentifier: entry.recordIdentifier, service: owner.service)
     #expect(credential.user == "alice" && credential.password == "secret")
-    #expect(owner.calls.withLock { $0 } > before)
+    #expect(owner.calls.withLock { $0 } == before + 1)
     #expect(!owner.service.isAuthenticated)
     await #expect(throws: MopError.vaultConflict) { try await owner.service.execute(.save(edit), vault: id) }
     let reference = try SecretReference("sp://personal/login/username")
@@ -273,7 +295,7 @@ private actor AuthenticationGate {
     }, authenticate: { callback in
         let context = LAContext(); try callback(context); await gate.wait(); return context
     })
-    let task = Task { try await service.execute(.manage(.deviceRequest(recovery: false)), vault: nil) }
+    let task = Task { try await service.execute(.manage(.deviceRequest), vault: nil) }
     while !(await gate.entered) { await Task.yield() }
     service.lock(); await gate.release()
     await #expect(throws: MopError.authentication) { try await task.value }
@@ -305,9 +327,10 @@ private actor AuthenticationGate {
     try await enroll(newDevice, owner: owner, vault: id, role: .owner)
     #expect(try await newDevice.service.execute(.read(reference), vault: id).value == SecretBytes(utf8: "hello"))
     let recovery = Client(server, "a")
-    let (recoveryRequest, recoveryInfo) = try await recovery.request(true)
-    _ = try await owner.service.execute(.manage(.replaceRecovery(request: recoveryRequest, fingerprint: recoveryInfo.fingerprint)), vault: id)
-    #expect(try await owner.service.execute(.members, vault: id).members.contains { $0.role.hasPrefix("hardware recovery") })
+    let generated = try await owner.service.execute(.manage(.recoveryGenerate), vault: nil)
+    _ = try await owner.service.execute(.manage(.recoveryActivate(copy: #require(generated.recoveryFile), fingerprint: #require(generated.recoveryFingerprint))), vault: nil)
+    #expect(try await owner.service.execute(.members, vault: id).members.contains { $0.role.hasPrefix("offline recovery") })
+
 }
 
 @Test func cloudEnrollmentNeedsOwnerApprovalAndSurvivesReopening() async throws {
@@ -765,7 +788,7 @@ private actor AuthenticationGate {
     let server = Server()
     let primary = Client(server, "a"), secondary = Client(server, "a")
     let id = UUID().uuidString
-    _ = try await primary.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id)
+    _ = try await primary.service.execute(.create(name: "personal"), vault: id)
     try await enroll(secondary, owner: primary, vault: id, role: .owner)
     _ = try await secondary.service.execute(.catalog, vault: id)
     _ = try await primary.service.execute(.deleteVault, vault: id)
@@ -779,7 +802,7 @@ private actor AuthenticationGate {
 @Test func discoveryRetainsVaultWhenHeadStillExists() async throws {
     let server = Server(), id = UUID()
     let client = Client(server, "a")
-    _ = try await client.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id.uuidString)
+    _ = try await client.service.execute(.create(name: "personal"), vault: id.uuidString)
     await server.hide(id)
     #expect(try await client.service.execute(.discover, vault: nil).vaults.map(\.id) == [id.uuidString])
     #expect(try await client.service.execute(.catalog, vault: id.uuidString).catalog != nil)
@@ -789,7 +812,7 @@ private actor AuthenticationGate {
 func discoveryFailureDoesNotForgetVault(error: MopError) async throws {
     let server = Server(), id = UUID()
     let client = Client(server, "a")
-    _ = try await client.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id.uuidString)
+    _ = try await client.service.execute(.create(name: "personal"), vault: id.uuidString)
     await server.hide(id)
     await server.failHead(error)
     await #expect(throws: error) { try await client.service.execute(.discover, vault: nil) }
@@ -800,8 +823,8 @@ func discoveryFailureDoesNotForgetVault(error: MopError) async throws {
 @Test func distinctCatalogsReachCloudConcurrentlyAndShareAuthentication() async throws {
     let server = Server(), client = Client(server, "a")
     let first = UUID(), second = UUID()
-    _ = try await client.service.execute(.create(name: "first", recovery: nil, fingerprint: nil), vault: first.uuidString)
-    _ = try await client.service.execute(.create(name: "second", recovery: nil, fingerprint: nil), vault: second.uuidString)
+    _ = try await client.service.execute(.create(name: "first"), vault: first.uuidString)
+    _ = try await client.service.execute(.create(name: "second"), vault: second.uuidString)
     client.service.lock()
     let authBefore = client.calls.withLock { $0 }
     let firstGate = AuthenticationGate(), secondGate = AuthenticationGate()
@@ -825,7 +848,7 @@ func discoveryFailureDoesNotForgetVault(error: MopError) async throws {
 
 @Test func cachedUnlockSkipsCloudHeadAndStillChecksAccountBinding() async throws {
     let server = Server(), client = Client(server, "a"), id = UUID().uuidString
-    _ = try await client.service.execute(.create(name: "personal", recovery: nil, fingerprint: nil), vault: id)
+    _ = try await client.service.execute(.create(name: "personal"), vault: id)
     _ = try await client.service.execute(.catalog, vault: id)
     client.service.lock()
     await server.failHead(.cloudUnavailable)
@@ -839,4 +862,250 @@ func discoveryFailureDoesNotForgetVault(error: MopError) async throws {
 @Test func cachedUnlockWithoutLocalVaultRequestsOnlineFallback() async throws {
     let client = Client(Server(), "a")
     #expect(try await client.service.cachedCatalog(vault: UUID().uuidString) == nil)
+}
+
+@Test func offlineRecoveryReplacementResumesAfterInitiatingDeviceIsLost() async throws {
+    let cloud = Server()
+    let initial = Client(cloud, "a"), copyHolder = Client(cloud, "a")
+    let first = try await create(initial, recovery: copyHolder)
+    let second = UUID().uuidString
+    _ = try await initial.service.execute(.create(name: "second"), vault: second)
+    _ = try await initial.service.execute(.write(SecretReference("sp://personal/login/password"), "one", replace: false), vault: first)
+    _ = try await initial.service.execute(.write(SecretReference("sp://second/login/password"), "two", replace: false), vault: second)
+    let next = try await initial.service.execute(.manage(.recoveryGenerate), vault: nil)
+    await cloud.rejectPublication(after: 0)
+    let partial = try await initial.service.execute(.manage(.recoveryActivate(copy: #require(next.recoveryFile), fingerprint: #require(next.recoveryFingerprint))), vault: nil)
+    #expect(partial.recoveryConfiguration?.incomplete == true)
+    #expect(partial.recoveryVaults.contains { $0.complete })
+    #expect(partial.recoveryVaults.contains { !$0.complete })
+    await #expect(throws: MopError.vaultConflict) { try await initial.service.execute(.create(name: "blocked"), vault: UUID().uuidString) }
+    initial.service.lock(); copyHolder.service.lock()
+    let fresh = Client(cloud, "a")
+    _ = try await fresh.service.execute(.manage(.recoveryOpen(copy: #require(copyHolder.recoveryCopy))), vault: nil)
+    _ = try await fresh.service.execute(.manage(.recoveryOpen(copy: #require(next.recoveryFile))), vault: nil)
+    for id in [first, second] {
+        let result = try await fresh.service.execute(.manage(.recoveryComplete(UUID(uuidString: id)!)), vault: nil)
+        #expect(result.recoveryVaults.first?.complete == true)
+    }
+    let resumed = try await fresh.service.execute(.manage(.recoveryResume), vault: nil)
+    #expect(resumed.recoveryConfiguration?.incomplete == false)
+    #expect(resumed.recoveryConfiguration?.active?.fingerprint == next.recoveryFingerprint)
+    #expect(try await fresh.service.execute(.read(SecretReference("sp://personal/login/password")), vault: first).value == "one")
+    let oldCopy = Client(cloud, "a")
+    await #expect(throws: MopError.invalidRecovery) { try await oldCopy.service.execute(.manage(.recoveryOpen(copy: #require(copyHolder.recoveryCopy))), vault: nil) }
+    let revoked = try await fresh.service.execute(.manage(.recoveryRevoke), vault: nil)
+    #expect(revoked.recoveryConfiguration?.incomplete == false)
+    #expect(revoked.recoveryConfiguration?.active == nil)
+}
+
+@Test func offlineRecoveryMissingAttachmentKeepsHealthyDataReadableAndLockClosesKeys() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), holder = Client(cloud, "a")
+    let id = try await create(owner, recovery: holder), vaultID = UUID(uuidString: id)!
+    _ = try await owner.service.execute(.write(SecretReference("sp://personal/login/password"), "healthy", replace: false), vault: id)
+    let catalog = try #require(try await owner.service.execute(.catalog, vault: id).catalog)
+    let attachment = try Attachment(fileName: "proof.bin", data: Data([0, 128, 255]))
+    let item = VaultItem(name: "proof", type: .document, fields: [ItemField(path: "file", type: .attachment, value: try attachment.encodedValue())])
+    _ = try await owner.service.execute(.save(ItemEdit(revision: catalog.revision, item: item, create: true)), vault: id)
+    let saved = await cloud.takeAttachments(vaultID)
+    owner.service.lock(); holder.service.lock()
+    let fresh = Client(cloud, "a")
+    _ = try await fresh.service.execute(.manage(.recoveryOpen(copy: #require(holder.recoveryCopy))), vault: nil)
+    let incomplete = try await fresh.service.execute(.manage(.recoveryComplete(vaultID)), vault: nil)
+    #expect(incomplete.recoveryReadOnly && incomplete.recoveryVaults.first?.complete == false)
+    #expect(try await fresh.service.execute(.manage(.recoveryRead(vaultID, "login/password")), vault: nil).value == "healthy")
+    await #expect(throws: (any Error).self) { try await fresh.service.execute(.write(SecretReference("sp://personal/login/password"), "bad", replace: true), vault: id) }
+    fresh.service.lock()
+    await #expect(throws: MopError.invalidRecovery) { try await fresh.service.execute(.manage(.recoveryRead(vaultID, "login/password")), vault: nil) }
+    _ = try await fresh.service.execute(.manage(.recoveryOpen(copy: #require(holder.recoveryCopy))), vault: nil)
+    await cloud.restoreAttachments(saved, vaultID)
+    let read = try await fresh.service.execute(.manage(.recoveryRead(vaultID, "proof/file")), vault: nil)
+    #expect(read.recoveredAttachment == attachment)
+    #expect(try await fresh.service.execute(.manage(.recoveryComplete(vaultID)), vault: nil).recoveryVaults.first?.complete == true)
+    let wrong = Client(cloud, "b")
+    await #expect(throws: MopError.invalidRecovery) { try await wrong.service.execute(.manage(.recoveryOpen(copy: #require(holder.recoveryCopy))), vault: nil) }
+}
+
+@Test func offlineRecoveryCopyMustMatchBeforeActivationAndCreationCanResume() async throws {
+    let cloud = Server(), owner = Client(cloud, "a")
+    let first = try await owner.service.execute(.manage(.recoveryGenerate), vault: nil)
+    let second = try await owner.service.execute(.manage(.recoveryGenerate), vault: nil)
+    await #expect(throws: MopError.invalidRecovery) {
+        try await owner.service.execute(.manage(.recoveryActivate(copy: #require(first.recoveryFile), fingerprint: #require(first.recoveryFingerprint))), vault: nil)
+    }
+    _ = try await owner.service.execute(.manage(.recoveryActivate(copy: #require(second.recoveryFile), fingerprint: #require(second.recoveryFingerprint))), vault: nil)
+    let scope = try RecoveryScope(container: "iCloud.test", environment: "Development", account: "a")
+    let transport = Transport(server: cloud, accountID: "a")
+    let record = try await transport.recoveryConfiguration(scope: scope)
+    let key = TestHandle(Material(scope.member), unwraps: Counter())
+    let root = try VaultEngine.create(name: "reserved", owner: key, recovery: record.configuration.active)
+    var pending = record.configuration; pending.pendingCreation = root.bytes
+    try await transport.saveRecoveryConfiguration(pending, version: record.version)
+    owner.service.lock()
+    let fresh = Client(cloud, "a")
+    await #expect(throws: MopError.invalidRecovery) {
+        try await fresh.service.execute(.manage(.recoveryOpen(copy: #require(first.recoveryFile))), vault: nil)
+    }
+    #expect(try await transport.recoveryConfiguration(scope: scope).configuration.pendingCreation != nil)
+    let impostorRoot = try VaultEngine.create(name: "different", owner: key, recovery: record.configuration.active, id: root.id)
+    try await transport.initialize(impostorRoot, at: VaultAddress(container: scope.container, environment: scope.environment, account: scope.account, database: .private, owner: "__defaultOwner__", vault: root.id))
+    await #expect(throws: MopError.vaultUntrusted) { try await transport.finishRecoveryCreation(scope: scope, using: key.identity) }
+    await cloud.delete(root.id)
+    let opened = try await fresh.service.execute(.manage(.recoveryOpen(copy: #require(second.recoveryFile))), vault: nil)
+    #expect(opened.vaults.contains { $0.id == root.id.uuidString })
+    #expect(try await transport.recoveryConfiguration(scope: scope).configuration.pendingCreation == nil)
+}
+
+@Test func offlineRecoveryStatusChecksActualMembershipAndResumeRepairsCoverage() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), holder = Client(cloud, "a")
+    let id = try await create(owner, recovery: holder)
+    let scope = try RecoveryScope(container: "iCloud.test", environment: "Development", account: "a")
+    let transport = Transport(server: cloud, accountID: "a")
+    let address = try #require(try await transport.discover().first { $0.vault.uuidString == id })
+    let vault = try await VerifiedVault.bootstrapRecovery(at: address, transport: transport)
+    let handle = try owner.hardware.open("iCloud.test/Development/device", scope.member, LAContext(), false)
+    defer { handle.close() }
+    let changed = try VaultEngine.setOfflineRecovery(nil, in: vault, owner: handle)
+    let head = try await transport.head(at: address)
+    try await transport.upload(changed.bytes, digest: changed.digest, at: address)
+    try await transport.publish(changed.digest, expectedVersion: head.version, at: address)
+    let status = try await owner.service.execute(.manage(.recoveryStatus), vault: nil)
+    #expect(status.recoveryVaults.first?.complete == false)
+    let repaired = try await owner.service.execute(.manage(.recoveryResume), vault: nil)
+    #expect(repaired.recoveryVaults.first?.complete == true)
+}
+
+@Test func offlineRecoveryEligibilityUsesDeviceDecryptionAndClosingKeepsOrdinaryAccess() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), fresh = Client(cloud, "a")
+    _ = try await owner.service.execute(.create(name: "personal"), vault: nil)
+    let copy = try await owner.service.execute(.manage(.recoveryGenerate), vault: nil)
+    let file = try #require(copy.recoveryFile)
+    _ = try await owner.service.execute(.manage(.recoveryActivate(copy: file, fingerprint: #require(copy.recoveryFingerprint))), vault: nil)
+    #expect(try await !owner.service.execute(.manage(.recoveryEligibility), vault: nil).recoveryNeeded)
+    await #expect(throws: MopError.invalidRecovery) {
+        try await owner.service.execute(.manage(.recoveryOpen(copy: file)), vault: nil)
+    }
+    let authorization = owner.service.authenticatedAt
+    owner.service.endRecoverySession()
+    #expect(authorization != nil)
+    #expect(owner.service.authenticatedAt == authorization)
+    #expect(try await fresh.service.execute(.manage(.recoveryEligibility), vault: nil).recoveryNeeded)
+    let opened = try await fresh.service.execute(.manage(.recoveryOpen(copy: file)), vault: nil)
+    let id = try #require(opened.vaults.first.flatMap { UUID(uuidString: $0.id) })
+    fresh.service.endRecoverySession()
+    await #expect(throws: MopError.invalidRecovery) {
+        try await fresh.service.execute(.manage(.recoveryCatalog(id)), vault: nil)
+    }
+}
+
+@Test func offlineRecoveryTestResetPreservesCloudAndRecoversOnSameDevice() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), holder = Client(cloud, "a")
+    let id = try await create(owner, recovery: holder), uuid = try #require(UUID(uuidString: id))
+    let reference = try SecretReference("sp://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, "retained", replace: false), vault: id)
+    let copy = try #require(holder.recoveryCopy)
+    let transport = Transport(server: cloud, accountID: "a")
+    let address = try #require(try await transport.discover().first)
+    let before = try await transport.head(at: address)
+    await #expect(throws: MopError.invalidRecovery) {
+        try await owner.service.execute(.manage(.recoveryTestReset(copy: "invalid")), vault: nil)
+    }
+    #expect(try await owner.service.execute(.read(reference), vault: id).value == "retained")
+    await #expect(throws: MopError.deviceRemoved) {
+        try await owner.service.execute(.manage(.recoveryTestReset(copy: copy)), vault: nil)
+    }
+    #expect(try await transport.head(at: address).digest == before.digest)
+    #expect(owner.service.authenticatedAt == nil)
+    let registry = try NextRegistry(state: owner.state, container: "iCloud.test", environment: "Development", account: "a")
+    #expect(try registry.entries().isEmpty)
+    #expect(try registry.removed())
+    #expect(throws: MopError.invalidIdentity) {
+        try owner.hardware.open("iCloud.test/Development/device", registry.member, LAContext(), false)
+    }
+    owner.reopen()
+    #expect(try await owner.service.execute(.discover, vault: nil).deviceRemoved)
+    #expect(try await owner.service.execute(.manage(.recoveryEligibility), vault: nil).recoveryNeeded)
+    _ = try await owner.service.execute(.manage(.recoveryOpen(copy: copy)), vault: nil)
+    #expect(try await owner.service.execute(.manage(.recoveryRead(uuid, "login/password")), vault: nil).value == "retained")
+    #expect(try await owner.service.execute(.manage(.recoveryComplete(uuid)), vault: nil).recoveryVaults.first?.complete == true)
+    #expect(try await owner.service.execute(.read(reference), vault: id).value == "retained")
+    #expect(try !registry.removed())
+    owner.service.lock()
+    owner.reopen()
+    let eligibility = try await owner.service.execute(.manage(.recoveryEligibility), vault: nil)
+    #expect(!eligibility.recoveryNeeded)
+    #expect(eligibility.vaults.contains { $0.id == id && $0.enrolled && $0.name == "personal" })
+    await #expect(throws: MopError.invalidRecovery) {
+        try await owner.service.execute(.manage(.recoveryOpen(copy: copy)), vault: nil)
+    }
+}
+
+@Test func offlineRecoveryTestResetRejectsMissingCloudAttachmentsWithoutDeletingKeys() async throws {
+    let cloud = Server(), owner = Client(cloud, "a"), holder = Client(cloud, "a")
+    let id = try await create(owner, recovery: holder), uuid = try #require(UUID(uuidString: id))
+    let catalog = try #require(try await owner.service.execute(.catalog, vault: id).catalog)
+    let attachment = try Attachment(fileName: "test.bin", data: Data([1, 2, 3]))
+    let item = VaultItem(name: "document", type: .document, fields: [ItemField(path: "file", type: .attachment, value: try attachment.encodedValue())])
+    _ = try await owner.service.execute(.save(ItemEdit(revision: catalog.revision, item: item, create: true)), vault: id)
+    _ = await cloud.takeAttachments(uuid)
+    // Local cached blobs must not hide missing cloud data before a reset.
+    let registry = try NextRegistry(state: owner.state, container: "iCloud.test", environment: "Development", account: "a")
+    await #expect(throws: (any Error).self) {
+        try await owner.service.execute(.manage(.recoveryTestReset(copy: #require(holder.recoveryCopy))), vault: nil)
+    }
+    #expect(try !registry.removed())
+    let key = try owner.hardware.open("iCloud.test/Development/device", registry.member, LAContext(), false)
+    key.close()
+}
+
+@Test(arguments: [false, true], [false, true])
+func offlineRecoveryFinalizationResumesAfterCloudCommit(lostAcknowledgement: Bool, restart: Bool) async throws {
+    let server = Server(), owner = Client(server, "a"), holder = Client(server, "a")
+    let id = try await create(owner, recovery: holder), uuid = try #require(UUID(uuidString: id))
+    let reference = try SecretReference("sp://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, "retained", replace: false), vault: id)
+    let fresh = Client(server, "a")
+    let registry = try NextRegistry(state: fresh.state, container: "iCloud.test", environment: "Development", account: "a")
+    // Exercise a recovery following device removal/reset as well as a restart.
+    try registry.setRemoved(true)
+    let copy = try #require(holder.recoveryCopy)
+    _ = try await fresh.service.execute(.manage(.recoveryOpen(copy: copy)), vault: nil)
+    if lostAcknowledgement { await server.dropNext() }
+    else { await server.failNextEnrollmentSave() }
+    await #expect(throws: (any Error).self) {
+        try await fresh.service.execute(.manage(.recoveryComplete(uuid)), vault: nil)
+    }
+    let committed = try await server.head(uuid).digest
+    #expect(try registry.recoveryPending(uuid))
+    if restart {
+        fresh.service.lock(); fresh.reopen()
+        _ = try await fresh.service.execute(.discover, vault: nil)
+        #expect(try await fresh.service.execute(.manage(.recoveryEligibility), vault: nil).recoveryNeeded)
+        _ = try await fresh.service.execute(.manage(.recoveryOpen(copy: copy)), vault: nil)
+    }
+    let result = try await fresh.service.execute(.manage(.recoveryComplete(uuid)), vault: nil)
+    #expect(result.recoveryVaults.first?.complete == true)
+    #expect(try await server.head(uuid).digest == committed)
+    #expect(try !registry.recoveryPending(uuid))
+    #expect(try !registry.removed())
+    fresh.service.lock(); fresh.reopen()
+    #expect(try await fresh.service.execute(.read(reference), vault: id).value == "retained")
+}
+
+@Test func offlineRecoveryPreservesOtherDevicesAndAccounts() async throws {
+    let server = Server(), owner = Client(server, "a"), holder = Client(server, "a")
+    let second = Client(server, "a"), collaborator = Client(server, "b"), fresh = Client(server, "a")
+    let id = try await create(owner, recovery: holder), uuid = try #require(UUID(uuidString: id))
+    try await enroll(second, owner: owner, vault: id, role: .owner)
+    try await enroll(collaborator, owner: owner, vault: id, role: .editor)
+    let reference = try SecretReference("sp://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, "before", replace: false), vault: id)
+    _ = try await fresh.service.execute(.manage(.recoveryOpen(copy: #require(holder.recoveryCopy))), vault: nil)
+    _ = try await fresh.service.execute(.manage(.recoveryComplete(uuid)), vault: nil)
+    _ = try await fresh.service.execute(.write(reference, "after", replace: true), vault: id)
+    for client in [owner, second, collaborator] {
+        client.service.lock()
+        #expect(try await client.service.execute(.read(reference), vault: id).value == "after")
+    }
+    _ = try await collaborator.service.execute(.write(reference, "collaborator-write", replace: true), vault: id)
+    #expect(try await fresh.service.execute(.read(reference), vault: id).value == "collaborator-write")
 }

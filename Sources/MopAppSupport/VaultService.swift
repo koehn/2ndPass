@@ -24,7 +24,7 @@ public enum VaultManagement: Sendable {
     case requestEnrollment(name: String), restartEnrollment(name: String), cancelEnrollment, checkEnrollment, enrollmentInbox, automaticEnrollment, confirmEnrollment(code: String)
     case approveEnrollment(id: UUID, code: String), rejectEnrollment(id: UUID)
     case fingerprint, trust(fingerprint: String)
-    case deviceRequest(recovery: Bool)
+    case deviceRequest
     case inviteOwnDevice(request: Data, fingerprint: String)
     case inviteAccount(request: Data, fingerprint: String, role: MemberRole)
     case invite(request: Data, fingerprint: String, role: MemberRole)
@@ -32,8 +32,11 @@ public enum VaultManagement: Sendable {
     case approve(packet: Data, fingerprint: String)
     case devices, removeAccountDevice(UUID), reconnect
     case removeMember(UUID), removeDevice(UUID), role(UUID, MemberRole)
-    case replaceRecovery(request: Data, fingerprint: String)
-    case recoverHardware(backup: Data, checkpoint: String, owner: Data, recovery: Data, copy: Bool)
+    case recoveryEligibility, recoveryGenerate, recoveryStatus, recoveryRevoke, recoveryResume
+    case recoveryTestReset(copy: SecretBytes)
+    case recoveryActivate(copy: SecretBytes, fingerprint: String)
+    case recoveryOpen(copy: SecretBytes)
+    case recoveryCatalog(UUID), recoveryRead(UUID, String), recoveryComplete(UUID)
     case reconcileShare
     case importCheckpoint(document: Data, fingerprint: String, sharedOwner: String?)
 }
@@ -44,7 +47,7 @@ public enum VaultOperation: Sendable {
     case write(SecretReference, SecretBytes, replace: Bool), delete(SecretReference)
     case recentlyDeleted, trashItem(name: String, revision: String), restoreItem(id: UUID, revision: String)
     case members, manage(VaultManagement), sync
-    case create(name: String, recovery: URL? = nil, fingerprint: String? = nil)
+    case create(name: String)
     case rename(String), deleteVault, export(URL)
 }
 extension VaultOperation {
@@ -56,6 +59,15 @@ extension VaultOperation {
     }
 }
 public struct VaultResult: Sendable {
+    public var recoveryConfiguration: RecoveryConfiguration?
+    public var recoveryScope: RecoveryScope?
+    public var recoveryFingerprint: String?
+    public var recoveryCode: SecretBytes?
+    public var recoveryFile: SecretBytes?
+    public var recoveryVaults: [RecoveryVaultStatus] = []
+    public var recoveryNeeded = false
+    public var recoveryReadOnly = false
+    public var recoveredAttachment: Attachment?
     public var usageScope: String?
     public var usageVault: String?
     public var usageIdentity: ItemUsageIdentity?
@@ -92,6 +104,7 @@ public protocol VaultService: Sendable {
     var authenticatedAt: TimeInterval? { get }
     var operationProgress: String? { get }
     var operationFraction: Double? { get }
+    func endRecoverySession()
     func lock()
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult
     func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult
@@ -100,6 +113,7 @@ public protocol VaultService: Sendable {
 }
 
 public extension VaultService {
+    func endRecoverySession() {}
     func cachedCatalog(vault: String) async throws -> VaultResult? { nil }
     var operationProgress: String? { nil }
     var operationFraction: Double? { nil }

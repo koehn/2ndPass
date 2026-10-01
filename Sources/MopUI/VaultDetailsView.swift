@@ -22,7 +22,6 @@ struct VaultDetailsView: View {
                         Button("Rename Vault…") { model.presentSheet(.renameVault, target: target) }
                         Button("Export Encrypted Backup…") { model.chooseExportBackup(target: target) }
                         Button("Share with Another Person…") { model.presentSheet(.shareAccount, target: target) }
-                        Button("Set Up or Replace Hardware Recovery…") { model.presentSheet(.setupRecovery, target: target) }
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.disabled(model.busy || model.offline)
                 if developerTools {

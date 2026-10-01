@@ -5,9 +5,9 @@ import MopCore
 /// Includes the owner and database scope: a shared-zone UUID alone is not an
 /// address. Account is the local authenticated account, not the vault owner.
 public struct VaultAddress: Codable, Equatable, Sendable {
-    public enum Namespace: String, Codable, Sendable { case user, probe }
+    public enum Namespace: String, Codable, Sendable { case user, probe, recovery }
     public let namespace: Namespace
-    public var zoneName: String { (namespace == .user ? "mop-v7-" : "mop-v7-probe-") + vault.uuidString }
+    public var zoneName: String { if namespace == .recovery { return "mop-account-recovery-v1" }; return (namespace == .user ? "mop-v7-" : "mop-v7-probe-") + vault.uuidString }
     static func discoveredVault(in zoneName: String) -> UUID? {
         guard zoneName.hasPrefix("mop-v7-") else { return nil }
         return UUID(uuidString: String(zoneName.dropFirst(7)))
@@ -52,6 +52,9 @@ public protocol RevisionTransport: Sendable {
 }
 
 public protocol VaultTransport: RevisionTransport {
+    func recoveryConfiguration(scope: RecoveryScope) async throws -> RecoveryConfigurationRecord
+    func saveRecoveryConfiguration(_ configuration: RecoveryConfiguration, version: Data?) async throws
+
     func enrollment(at address: VaultAddress) async throws -> EnrollmentInbox
     func saveEnrollment(_ mailbox: EnrollmentMailbox, version: Data?, at address: VaultAddress) async throws
     func discover() async throws -> [VaultAddress]
@@ -203,5 +206,14 @@ public actor PublicationCoordinator {
         // If persisting confirmation fails, disk still holds the pending journal.
         do { try save(proposal, pending: nil) }
         catch { throw MopError.cloudUncertain }
+    }
+}
+
+public extension VaultTransport {
+    func recoveryConfiguration(scope: RecoveryScope) async throws -> RecoveryConfigurationRecord {
+        throw MopError.cloudUnavailable
+    }
+    func saveRecoveryConfiguration(_ configuration: RecoveryConfiguration, version: Data?) async throws {
+        throw MopError.cloudUnavailable
     }
 }

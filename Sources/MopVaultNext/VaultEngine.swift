@@ -8,7 +8,7 @@ import MopCore
 public enum VaultEngine {
     public static func create(name: String, owner: any DeviceOperations, recovery: DevicePublicKey? = nil, id: UUID = UUID()) throws -> VerifiedVault {
         try CloudVaultBoundary.validateName(name)
-        let membership = try Membership(accounts: [AccountMember(id: owner.identity.member, role: .owner, devices: [owner.identity])], recovery: recovery)
+        let membership = try Membership(accounts: [AccountMember(id: owner.identity.member, role: .owner, devices: [owner.identity])], offlineRecovery: recovery)
         let header = Revision.Header(format: "mop-vault-v7", vault: id, name: name, generation: 1, parent: nil,
                                      epoch: 1, membership: membership, operation: .create, acceptedInvitations: [])
         let revision = try Revision.seal(header: header, references: [:], records: [:], signer: owner)
@@ -20,7 +20,7 @@ public enum VaultEngine {
         return try vault.revision.references(device: device).keys.sorted()
     }
     private static func authorizeRead(_ vault: VerifiedVault, _ device: any DeviceOperations) throws {
-        guard vault.membership.role(of: device.identity) != nil || vault.membership.recovery == device.identity else { throw MopError.notVaultMember }
+        guard vault.membership.role(of: device.identity) != nil || vault.membership.offlineRecovery == device.identity else { throw MopError.notVaultMember }
     }
     public static func read(_ reference: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> SecretBytes {
         try authorizeRead(vault, device)
@@ -118,7 +118,7 @@ public enum VaultEngine {
             guard old.role == invitation.role else { throw MopError.cloudPermission }
             accounts[index] = AccountMember(id: old.id, role: old.role, devices: old.devices.contains(acceptance.device) ? old.devices : old.devices + [acceptance.device])
         } else { accounts.append(AccountMember(id: invitation.member, role: invitation.role, devices: [acceptance.device])) }
-        let membership = try Membership(accounts: accounts, recovery: vault.membership.recovery, removedDevices: vault.membership.removedDevices)
+        let membership = try Membership(accounts: accounts, offlineRecovery: vault.membership.offlineRecovery, removedDevices: vault.membership.removedDevices)
         return try change(membership, in: vault, signer: owner, operation: .membership,
                           invitations: vault.revision.header.acceptedInvitations + [invitation.nonce])
     }
@@ -130,12 +130,12 @@ public enum VaultEngine {
             let remaining = account.devices.filter { $0.device != id }
             return remaining.isEmpty ? nil : AccountMember(id: account.id, role: account.role, devices: remaining)
         }
-        return try change(Membership(accounts: accounts, recovery: vault.membership.recovery, removedDevices: Array(Set((vault.membership.removedDevices ?? []) + [id])).sorted { $0.uuidString < $1.uuidString }), in: vault, signer: owner, operation: .membership, progress: progress)
+        return try change(Membership(accounts: accounts, offlineRecovery: vault.membership.offlineRecovery, removedDevices: Array(Set((vault.membership.removedDevices ?? []) + [id])).sorted { $0.uuidString < $1.uuidString }), in: vault, signer: owner, operation: .membership, progress: progress)
     }
     public static func remove(member id: UUID, from vault: VerifiedVault, owner: any DeviceOperations) throws -> VerifiedVault {
         guard vault.membership.role(of: owner.identity) == .owner, id != vault.membership.owner,
               vault.membership.accounts.contains(where: { $0.id == id }) else { throw MopError.cloudPermission }
-        return try change(Membership(accounts: vault.membership.accounts.filter { $0.id != id }, recovery: vault.membership.recovery, removedDevices: Array(Set((vault.membership.removedDevices ?? []) + vault.membership.devices.filter { $0.member == id }.map(\.device))).sorted { $0.uuidString < $1.uuidString }),
+        return try change(Membership(accounts: vault.membership.accounts.filter { $0.id != id }, offlineRecovery: vault.membership.offlineRecovery, removedDevices: Array(Set((vault.membership.removedDevices ?? []) + vault.membership.devices.filter { $0.member == id }.map(\.device))).sorted { $0.uuidString < $1.uuidString }),
                           in: vault, signer: owner, operation: .membership)
     }
     public static func setRole(_ role: MemberRole, member: UUID, in vault: VerifiedVault, owner: any DeviceOperations) throws -> VerifiedVault {
@@ -144,47 +144,24 @@ public enum VaultEngine {
         let accounts = vault.membership.accounts.map { account in
             AccountMember(id: account.id, role: account.id == member ? role : account.role, devices: account.devices)
         }
-        return try change(Membership(accounts: accounts, recovery: vault.membership.recovery, removedDevices: vault.membership.removedDevices), in: vault, signer: owner, operation: .membership)
+        return try change(Membership(accounts: accounts, offlineRecovery: vault.membership.offlineRecovery, removedDevices: vault.membership.removedDevices), in: vault, signer: owner, operation: .membership)
     }
-    public static func replaceRecovery(with recovery: DevicePublicKey, in vault: VerifiedVault, owner: any DeviceOperations) throws -> VerifiedVault {
-        guard recovery.encryption != vault.membership.recovery?.encryption, recovery.signing != vault.membership.recovery?.signing else { throw MopError.invalidRecovery }
+    public static func setOfflineRecovery(_ recovery: DevicePublicKey?, in vault: VerifiedVault, owner: any DeviceOperations) throws -> VerifiedVault {
         guard vault.membership.role(of: owner.identity) == .owner else { throw MopError.cloudPermission }
-        return try change(Membership(accounts: vault.membership.accounts, recovery: recovery, removedDevices: vault.membership.removedDevices), in: vault, signer: owner, operation: .membership)
-    }
-    public static func recover(_ vault: VerifiedVault, using recovery: any DeviceOperations, owner: DevicePublicKey,
-                               replacementRecovery: DevicePublicKey) throws -> VerifiedVault {
-        guard recovery.identity == vault.membership.recovery, replacementRecovery.encryption != recovery.identity.encryption, replacementRecovery.signing != recovery.identity.signing else { throw MopError.invalidRecovery }
-        // In-place recovery retains the transport owner account. Lost-account
-        // recovery must create a separate new vault/zone with a new trust root.
-        guard owner.member == vault.membership.owner else { throw MopError.cloudPermission }
-        return try change(Membership(accounts: [AccountMember(id: owner.member, role: .owner, devices: [owner])], recovery: replacementRecovery, removedDevices: Array(Set((vault.membership.removedDevices ?? []) + vault.membership.devices.filter { $0 != owner }.map(\.device))).sorted { $0.uuidString < $1.uuidString }),
-                          in: vault, signer: recovery, operation: .recovery)
-    }
-    /// Recreates contents in another account without modifying/deleting the source.
-    public static func recoverCopy(_ vault: VerifiedVault, using recovery: any DeviceOperations, name: String,
-                                   owner: any DeviceOperations, replacementRecovery: DevicePublicKey) throws -> VerifiedVault {
-        guard recovery.identity == vault.membership.recovery, replacementRecovery.encryption != recovery.identity.encryption,
-              replacementRecovery.signing != recovery.identity.signing else { throw MopError.invalidRecovery }
-        let root = try create(name: name, owner: owner, recovery: replacementRecovery)
-        let payload = try vault.revision.payload(device: recovery)
-        var references: [String: String] = [:], records: [String: SealedObject] = [:], keys: [String: ItemKey] = [:]
-        let paths = Dictionary(uniqueKeysWithValues: payload.references.map { ($0.value, $0.key) })
-        for (oldItem, oldKey) in vault.revision.itemKeys {
-            try Task.checkCancellation()
-            let sourceKey = try oldKey.unwrap(vault: vault.id, item: oldItem, device: recovery)
-            let item = UUID().uuidString, key = SymmetricKey(size: .bits256)
-            keys[item] = try ItemKey.wrap(key, vault: root.id, item: item, generation: 1, recipients: root.membership.recipients)
-            for (oldID, record) in vault.revision.records where record.itemID == oldItem {
-                var bytes = try record.open(using: sourceKey, authenticating: Codec.encode(FieldContext(vault: vault.id, item: oldItem, generation: oldKey.generation, field: oldID)))
-                defer { SecretBytes.wipe(&bytes) }
-                let id = UUID().uuidString
-                records[id] = try SealedObject.field(bytes, key: key, vault: root.id, item: item, generation: 1, id: id)
-                references[paths[oldID]!] = id
-            }
+        if let old = vault.membership.offlineRecovery, let recovery, old != recovery {
+            guard old.encryption != recovery.encryption, old.signing != recovery.signing else { throw MopError.invalidRecovery }
         }
-        let revision = try Revision.seal(header: root.revision.header, references: references, records: records, itemKeys: keys, items: payload.items, signer: owner)
-        try revision.verifyGenesis()
-        return try VerifiedVault(revision: revision, bytes: revision.encoded())
+        return try change(Membership(accounts: vault.membership.accounts, offlineRecovery: recovery, removedDevices: vault.membership.removedDevices), in: vault, signer: owner, operation: .membership)
+    }
+    public static func recover(_ vault: VerifiedVault, using recovery: any DeviceOperations, owner: DevicePublicKey) throws -> VerifiedVault {
+        guard recovery.identity == vault.membership.offlineRecovery, owner.member == vault.membership.owner else { throw MopError.invalidRecovery }
+        let accounts = vault.membership.accounts.map { account in
+            guard account.id == owner.member else { return account }
+            return AccountMember(id: account.id, role: account.role,
+                devices: account.devices.contains(owner) ? account.devices : account.devices + [owner])
+        }
+        return try change(Membership(accounts: accounts, offlineRecovery: recovery.identity,
+            removedDevices: vault.membership.removedDevices), in: vault, signer: recovery, operation: .recovery)
     }
     private static func change(_ membership: Membership, in vault: VerifiedVault, signer: any DeviceOperations,
                                operation: RevisionOperation, invitations: [UUID]? = nil,

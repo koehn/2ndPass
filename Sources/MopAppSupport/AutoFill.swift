@@ -102,7 +102,8 @@ public struct AutoFillEntry: Equatable, Sendable {
 }
 
 /// This projection deliberately cannot encode a secret, item title or reference.
-public struct AutoFillIdentity: Codable, Equatable, Sendable {
+public struct AutoFillIdentity: Codable, Equatable, Identifiable, Sendable {
+    public var id: String { recordIdentifier }
     public let website: String
     public let username: String
     public let recordIdentifier: String

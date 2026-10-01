@@ -169,9 +169,9 @@ struct ContentView: View {
                     if model.showsSetupChecklist {
                         GroupBox("Finish setting up 2ndPass") {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("Add another connected device or hardware recovery so losing this device does not mean losing access.")
+                                Text("Add another connected device or offline recovery so losing this device does not mean losing access.")
                                 Button("Connect Another Device…") { model.presentSheet(.addDevice) }
-                                Button("Set Up Hardware Recovery…") { model.presentSheet(.setupRecovery) }
+                                Button("Set Up Offline Recovery…") { showSettings(.recovery) }
                                 Button("Set Up AutoFill…") { showSettings(.autoFill) }
                                 Button("Later") { model.showsSetupChecklist = false }
                             }

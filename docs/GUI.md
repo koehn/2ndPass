@@ -39,13 +39,6 @@ entitlement-protected private CloudKit access; credentials alone do not grant
 container writes. See [the threat model](SECURITY.md#automatic-same-account-enrollment)
 for automatic admission risks when that access path is compromised.
 
-**Set up or replace hardware recovery** can be used after secrets are saved.
-Generate the recovery request on a separate device and import it on an owner
-device. This grants recovery access to existing contents. Adding recovery does
-not change passwords; replacing recovery rotates current encryption keys.
-Advanced access management retains member/device removal, role changes,
-checkpoint import and cloud permission reconciliation.
-
 ## Items and sessions
 
 The existing item editor supports typed fields, renaming, password-strength metadata, concealed values, TOTP, trash/restore and encrypted backup export. Catalog browsing opens its own key; revealing a password opens that item's key. Values passed to an edit are plaintext inside 2ndPass. The catalog stores concealed fields without values.
@@ -80,9 +73,8 @@ Cached browsing cannot establish remote freshness or revocation. Local checkpoin
 
 ## Recovery
 
-**Recover an existing vault** is also available from creation on a device with no local vaults. On the enrolled recovery device, import the encrypted backup, verify its checkpoint, and paste independently verified replacement owner/recovery requests. Return the resulting encrypted checkpoint to the replacement owner and use **Import trusted checkpoint**. Lost-account recovery creates a new UUID/root under the current account and retains the source; the replacement owner request must belong to the recovery device's ordinary identity under that new account.
-
-If all authorized and recovery device keys are gone, neither a backup nor account restoration is sufficient. Keep the recovery device separate. [Validation](VAULT-NEXT-VALIDATION.md) lists remaining physical acceptance, including second-account sharing and actual iOS/AutoFill hardware.
+Open **Settings → Recovery → Setup and Verification** to generate and verify a copy. See
+[offline recovery after device loss](#offline-recovery-after-device-loss) below.
 
 ## Enrollment status and restarting
 
@@ -105,9 +97,6 @@ remain serialized. Device notices identify the connected device and vault and of
 Removal explains last-owner limits and reports confirmed progress if a later vault
 fails. Removing this device remains explicit and requires Reconnect to join again.
 
-After creation, a dismissible checklist offers another device, hardware recovery,
-and AutoFill setup. Sharing/recovery remain separate tasks under More Options.
-
 ## Remove and reconnect a device
 
 On Mac, iPhone, or iPad, open **Settings → Devices**. The list
@@ -122,13 +111,6 @@ the removed device's key envelopes. The device's retired UUID cannot be reused
 for enrollment. Multi-vault publication is not atomic; retry after an error to
 finish any remaining vaults. Completed removals are safe to retry.
 
-When the removed device next refreshes online, it verifies the revocation, deletes
-its ordinary device identity's local Keychain record, and clears local catalog/
-checkpoint caches, pending enrollment records, and AutoFill suggestions. A small
-account-scoped removal marker and lock/binding metadata remain so relaunching
-does not enroll again. Cleanup failures are retried before reconnecting.
-Explicitly exported backups and separate hardware recovery identities are retained.
-
 The removed device shows **This device was removed** and a **Reconnect** button.
 Only that action opts it back in. Connection then uses fresh hardware keys and
 the normal automatic same-account flow. An offline device cannot learn about
@@ -141,12 +123,6 @@ and iPad. Security, AutoFill, Devices, and Advanced are separate categories. 2nd
 remembers the last category. Security offers inactivity presets and a custom
 minute value. Opening Settings neither selects a vault nor authenticates.
 Devices loads protected information only while unlocked.
-
-Use **Vault Details** in the toolbar or a vault’s context menu for rename,
-backup, sharing, hardware recovery, and deletion. Details appears in the main
-pane and returns to the previously selected item. Checkpoints, membership, and
-advanced access operations are under Security Details. Leaving a modified item
-uses the same Save Changes, Discard Changes, or Cancel decision as navigation.
 
 Action sheets capture their vault when opened. Their action buttons stay below
 scrolling content; errors appear with the form. Cancel or Escape asks before
@@ -183,3 +159,49 @@ activity during checking and cloud publication. Once the service confirms the
 result, the banner shows the import summary until dismissed. An uncertain cloud
 commit is shown as pending confirmation, with guidance to refresh before retrying.
 Locking clears the retained report and prevents a late result from repopulating it.
+
+## Offline recovery after device loss
+
+Set up recovery before losing access to your devices:
+
+1. Unlock 2ndPass and open **Settings → Recovery → Set Up or Verify Recovery…**.
+2. Select **Generate a New Recovery Copy**.
+3. Choose **Save Recovery File…** or **Print Recovery Copy…**, or write down the
+   displayed code. Store your copy offline, separate from your devices and iCloud.
+4. Use **Import Recovery File…** to load the saved file, or re-enter your
+   written copy in **Recovery code**.
+5. Select **Verify Copy and Activate**, then **Check Coverage**. If any vault is
+   unfinished, select **Resume Incomplete Changes** until every vault is complete.
+
+Recovery applies to all your owned iCloud vaults, regardless of the selected vault.
+
+On a replacement device, sign into the same Apple Account. Open
+**Settings → Recovery → Recover Vault Access…** (or choose recovery during
+onboarding), then import the copy or enter its code. Read-only recovery can open healthy data while unavailable
+attachments postpone completion. Complete each vault to rotate encryption and
+remove previous device access. Keep both copies during key replacement until
+coverage is complete.
+
+The private recovery secret and copied ciphertext suffice for offline decryption;
+protect the copy separately from your devices. It cannot restore Apple Account
+access or missing cloud data. Account-loss recovery requires a separately exported
+backup; backup restoration is outside this feature. Physical-device acceptance
+and cryptographic review remain pending.
+
+The recovery dialog first checks this device’s existing key. If it can already
+open your vaults, the dialog confirms that access is working and disables recovery.
+Closing setup or recovery clears the offline copy from the session without locking
+the app. Explicit locking and normal security locking still clear recovery access.
+
+### Test recovery without a spare device
+
+In **Settings → Recovery → Set Up or Verify Recovery…**, expand **Test recovery
+on this device**. Import your saved offline copy, then choose **Reset This Device
+for Recovery Testing…**. After confirmation and successful verification, the app
+clears this device's iCloud vault keys and cached iCloud data and opens recovery.
+Local-only vaults and the vaults stored in iCloud remain intact. You must re-enter your offline copy to regain access.
+
+For both the removed-device test and the single-device reset, follow the
+[recovery testing procedure](OFFLINE-RECOVERY.md#testing-with-your-existing-devices).
+Keep other enrolled apps locked or closed. Completing recovery preserves their
+existing access.

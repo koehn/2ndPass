@@ -120,6 +120,52 @@ public final class CloudRevisionTransport: VaultTransport, @unchecked Sendable {
             database(address).add(operation)
         }
     }
+    private func recoveryAddress(_ scope: RecoveryScope) throws -> VaultAddress {
+        try VaultAddress(container: scope.container, environment: scope.environment, account: scope.account,
+                         database: .private, owner: CKCurrentUserDefaultName, vault: scope.member, namespace: .recovery)
+    }
+    public func recoveryConfiguration(scope: RecoveryScope) async throws -> RecoveryConfigurationRecord {
+        let address = try recoveryAddress(scope)
+        try await check(address)
+        let record: CKRecord
+        do { record = try await fetch("configuration", address) }
+        catch MopError.vaultMissing { return RecoveryConfigurationRecord(configuration: RecoveryConfiguration(scope: scope), version: nil) }
+        guard record.recordType == "MopRecoveryConfiguration", let bytes = record["payload"] as? Data,
+              bytes.count <= 1024 * 1024 else { throw MopError.invalidRecovery }
+        let configuration = try JSONDecoder().decode(RecoveryConfiguration.self, from: bytes)
+        guard configuration.scope == scope else { throw MopError.cloudAccount }
+        try configuration.validate()
+        let coder = NSKeyedArchiver(requiringSecureCoding: true)
+        record.encodeSystemFields(with: coder); coder.finishEncoding()
+        try await check(address)
+        return RecoveryConfigurationRecord(configuration: configuration, version: coder.encodedData)
+    }
+    public func saveRecoveryConfiguration(_ configuration: RecoveryConfiguration, version: Data?) async throws {
+        try configuration.validate()
+        let address = try recoveryAddress(configuration.scope)
+        try await check(address)
+        let record: CKRecord
+        if let version {
+            let decoder = try NSKeyedUnarchiver(forReadingFrom: version); decoder.requiresSecureCoding = true
+            defer { decoder.finishDecoding() }
+            guard let restored = CKRecord(coder: decoder), restored.recordID == id("configuration", address),
+                  restored.recordType == "MopRecoveryConfiguration" else { throw MopError.invalidRecovery }
+            record = restored
+        } else {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let operation = CKModifyRecordZonesOperation(recordZonesToSave: [CKRecordZone(zoneID: zone(address))])
+                configure(operation)
+                operation.modifyRecordZonesResultBlock = { result in continuation.resume(with: result.mapError(Self.map)) }
+                database(address).add(operation)
+            }
+            record = CKRecord(recordType: "MopRecoveryConfiguration", recordID: id("configuration", address))
+        }
+        let data = try Codec.encode(configuration)
+        guard data.count <= 1024 * 1024 else { throw MopError.invalidRecovery }
+        record["payload"] = data as CKRecordValue
+        try await save(record, address)
+        try await check(address)
+    }
     public func enrollment(at address: VaultAddress) async throws -> EnrollmentInbox {
         try await check(address)
         guard address.database == .private, address.namespace == .user else { throw MopError.cloudPermission }

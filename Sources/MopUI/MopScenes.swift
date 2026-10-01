@@ -72,10 +72,10 @@ private struct MopCommands: Commands {
 }
 
 enum SettingsCategory: String, CaseIterable, Identifiable {
-    case security = "Security", autoFill = "AutoFill", devices = "Devices", advanced = "Advanced"
+    case security = "Security", autoFill = "AutoFill", devices = "Devices", recovery = "Recovery", advanced = "Advanced"
     var id: String { rawValue }
     var symbol: String {
-        switch self { case .security: "lock.shield"; case .autoFill: "key"; case .devices: "rectangle.connected.to.line.below"; case .advanced: "gearshape.2" }
+        switch self { case .security: "lock.shield"; case .autoFill: "key"; case .devices: "rectangle.connected.to.line.below"; case .recovery: "key.horizontal"; case .advanced: "gearshape.2" }
     }
 }
 
@@ -158,6 +158,18 @@ struct SessionSettings: View {
                         Stepper("\(model.autoLockMinutes) minutes", value: $model.autoLockMinutes, in: 1...60)
                     }
                     Text("Activity in 2ndPass keeps your session open. Switching apps conceals secrets. Security locking clears unsaved edits immediately.").font(.callout)
+                }
+            case .recovery:
+                Section("Setup and Verification") {
+                    Text("Prepare an offline copy before losing your devices. Generate and verify a copy, check coverage across your owned iCloud vaults, or manage an existing key.").font(.callout)
+                    Button("Set Up or Verify Recovery…") { model.presentSheet(.setupRecovery, inSettings: true) }
+                        .disabled(model.busy || model.offline)
+                }
+                Section("Recover Vault Access") {
+                    Text("If your previously connected devices are unavailable, use your saved recovery file or code to restore vault access. You must be signed into the same Apple Account.").font(.callout)
+                    Button("Recover Vault Access…") { model.presentSheet(.recover, inSettings: true) }
+                        .disabled(model.busy || model.offline)
+                    Text("The recovery copy cannot restore Apple Account sign-in or missing iCloud data.").font(.caption)
                 }
             case .autoFill: AutoFillSettingsView(model: model)
             case .devices:

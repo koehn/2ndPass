@@ -27,8 +27,7 @@ public struct KeyEnvelope: Codable, Equatable, Sendable {
         let ciphertext = try key.withUnsafeBytes { try sender.seal($0) }
         return Self(encapsulatedKey: sender.encapsulatedKey, ciphertext: ciphertext)
     }
-    // Generic solely to use Apple's HPKE protocol. The shipping provider uses
-    // Enclave keys for both ordinary access and recovery. Software keys are tests only.
+    // Apple's HPKE protocol supports Enclave device keys and the scoped offline recovery key.
     func open<K: HPKEDiffieHellmanPrivateKey>(using key: K, context: Data) throws -> SymmetricKey {
         guard encapsulatedKey.count == 65, ciphertext.count == 48 else { throw MopError.invalidVault }
         var recipient = try HPKE.Recipient(privateKey: key, ciphersuite: .P256_SHA256_AES_GCM_256,

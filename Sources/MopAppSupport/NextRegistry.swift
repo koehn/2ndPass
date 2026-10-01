@@ -55,6 +55,22 @@ struct NextRegistry {
             try write([NextEntry](), "vaults.json")
         }
     }
+    // Survives publication timeouts and process restarts, including a removal barrier.
+    func hasPendingRecovery() throws -> Bool {
+        try cache.locked {
+            for name in try FileManager.default.contentsOfDirectory(atPath: cache.directory.path)
+                where name.hasPrefix("recovery-") && name.hasSuffix(".json") {
+                if try read(name, as: Bool.self) == true { return true }
+            }
+            return false
+        }
+    }
+    func recoveryPending(_ vault: UUID) throws -> Bool {
+        try cache.locked { try read("recovery-" + vault.uuidString + ".json", as: Bool.self) ?? false }
+    }
+    func setRecoveryPending(_ pending: Bool, vault: UUID) throws {
+        try cache.locked { try write(pending, "recovery-" + vault.uuidString + ".json") }
+    }
     func enrollment(_ vault: UUID) throws -> EnrollmentExchange? {
         try cache.locked { try read("enrollment-" + vault.uuidString + ".json", as: EnrollmentExchange.self) }
     }

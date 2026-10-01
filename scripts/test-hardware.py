@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in live v7 device-identity checks. Requires interactive authentication approvals.
 Creates a disposable CloudKit vault; retains local state and encrypted checkpoints.
-Uses or creates a device-local hardware identity; optionally accepts a separate recovery device request.
+Uses or creates an ordinary device-local hardware identity.
 See docs/VALIDATION.md. Never reads an existing vault.
 """
 import argparse
@@ -15,11 +15,7 @@ import uuid
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('cli', nargs='?', default='dist/2ndPass.app/Contents/MacOS/sp')
-parser.add_argument('--recovery-request', type=Path)
-parser.add_argument('--fingerprint', help='Independently verified recovery request fingerprint')
 options = parser.parse_args()
-if (options.recovery_request is None) != (options.fingerprint is None):
-    parser.error("Supply both --recovery-request and --fingerprint, or neither.")
 cli = str(Path(options.cli).resolve())
 if subprocess.check_output([cli, '--version'], text=True).strip() != '0.7.0':
     raise SystemExit('This check requires the v7 (0.7.0) executable; no old-format probe will run.')
@@ -53,8 +49,6 @@ def command(label, args, data=b'', extra=None, code=0):
     return result
 
 initialization = ['vault', 'init', vault_name]
-if options.recovery_request is not None:
-    initialization += ['--recovery-request', str(options.recovery_request.resolve()), '--fingerprint', options.fingerprint]
 command('Initialize disposable vault', initialization)
 command('Write sectioned multiline field', ['write', ref_a], first)
 command('Write second field', ['write', ref_b], second)

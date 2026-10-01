@@ -55,7 +55,6 @@ The [build README](https://github.com/koehn/2ndPass#build-and-provision), [Cloud
 
 For the technical design, read the [vault protocol](vault.html) and its [validation record](vault-validation.html).
 
-Open 2ndPass and choose **Create a vault**. Name it, authenticate, and start adding items. Device keys are generated automatically. One device is enough to begin; a recovery device is optional and can be added later.
 
 The CLI equivalent is:
 
@@ -66,7 +65,6 @@ sp vault list
 
 If an existing vault is discovered but this device is not enrolled, the app offers **Connect this device**. Unlock 2ndPass on an existing owner device to let it process the enrollment request. [Learn about this trust boundary](security.html#icloud).
 
-Without another enrolled device or configured hardware recovery, losing the first device means losing access. Make a recovery plan early.
 
 ## Import
 
@@ -246,7 +244,6 @@ vulnerability. See the [enrollment and sharing commands](https://github.com/koeh
 
 ## Recovery
 
-Add a separate hardware recovery device through **Settings → vault → Set up or replace hardware recovery**. Create the recovery request on that device, import it on an owner device, and compare its fingerprint independently. Keep the recovery device separate from daily-use hardware.
 
 Save an encrypted backup and independently record the trusted checkpoint:
 
@@ -255,9 +252,6 @@ sp vault export --vault personal personal-backup.json
 sp vault fingerprint --vault personal
 ```
 
-A backup is not a recovery key. Restoring requires surviving authorized hardware and the documented verification steps. Follow the [hardware recovery guide](https://github.com/koehn/2ndPass#hardware-recovery); a restored Apple Account alone cannot recreate device keys.
-
-**Losing every authorized device and every configured recovery device makes the vault unrecoverable.** Check the remaining physical recovery acceptance work before relying on it as your only recovery route.
 
 ## Troubleshooting
 
@@ -269,3 +263,63 @@ A backup is not a recovery key. Restoring requires surviving authorized hardware
 - **Need a flag:** use `sp --help`, `sp COMMAND --help`, or `man sp`.
 
 Report reproducible problems in the [repository’s issue tracker](https://github.com/koehn/2ndPass/issues). Never include passwords, tokens, plaintext exports, or sensitive vault contents in a report.
+
+## Offline recovery after device loss
+
+Set up recovery before losing access to your devices:
+
+1. Unlock 2ndPass and open **Settings → Recovery → Set Up or Verify Recovery…**.
+2. Select **Generate a New Recovery Copy**.
+3. Choose **Save Recovery File…** or **Print Recovery Copy…**, or write down the
+   displayed code. Store your copy offline, separate from your devices and iCloud.
+4. Use **Import Recovery File…** to load the saved file, or re-enter your
+   written copy in **Recovery code**.
+5. Select **Verify Copy and Activate**, then **Check Coverage**. If any vault is
+   unfinished, select **Resume Incomplete Changes** until every vault is complete.
+
+Recovery applies to all your owned iCloud vaults, regardless of the selected vault.
+
+On a replacement device, sign into the same Apple Account. Open
+**Settings → Recovery → Recover Vault Access…** (or choose recovery during
+onboarding), then import the copy or enter its code. Read-only recovery can open healthy data while unavailable
+attachments postpone completion. Complete each vault to rotate encryption and
+remove previous device access. Keep both copies during key replacement until
+coverage is complete.
+
+The private recovery secret and copied ciphertext suffice for offline decryption;
+protect the copy separately from your devices. It cannot restore Apple Account
+access or missing cloud data. Account-loss recovery requires a separately exported
+backup; backup restoration is outside this feature. Physical-device acceptance
+and cryptographic review remain pending.
+
+The recovery dialog first checks this device’s existing key. If it can already
+open your vaults, the dialog confirms that access is working and disables recovery.
+Closing setup or recovery clears the offline copy from the session without locking
+the app. Explicit locking and normal security locking still clear recovery access.
+
+### Test recovery using your existing devices
+
+Save and verify your offline copy first. Keep it outside the app. Quit or lock
+2ndPass on all other enrolled devices during the test, and stay signed into the
+same Apple Account. Completing recovery preserves existing device and account access.
+
+**With another owner device available:** Remove the test device in
+**Settings → Devices**. Open the test device online so it clears its old access.
+Choose **Recover with Offline Copy…** on the removed-device screen, import your
+file or enter your code, browse the recovered data, and complete each vault.
+Do not choose Reconnect during the test.
+
+**With only one device available:** Open **Settings → Recovery → Set Up or Verify
+Recovery…**, expand **Test recovery on this device**, and import your saved copy.
+Select **Reset This Device for Recovery Testing…** and confirm. The app verifies
+recovery for all owned vaults and their cloud attachments before clearing local
+iCloud vault keys, cloud checkpoints, and cached iCloud data. Local-only vaults
+and their keys remain unchanged. It preserves iCloud data and blocks
+automatic enrollment. Enter your copy again in the recovery dialog, check your
+data, then complete each vault. This cannot be undone; you need the offline copy
+to regain access. If verification fails, device keys remain intact.
+
+After either test, verify normal reads and writes, lock and restart the app, and
+verify access without entering the offline copy. Repeat with the other copy
+format to test both file and paper recovery. Reinstalling alone does not reliably
+clear device keys. A simulator does not validate physical Secure Enclave behavior.

@@ -26,7 +26,7 @@ import MopCore
 }
 
 @Test func typedItemEditsAndRemovalPreserveOnlyCurrentEncryptedFields() throws {
-    let owner = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     let item = VaultItem(name: "login", type: .login, fields: [ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "password", type: .password, value: "secret")])
     vault = try VaultEngine.saveItem(ItemEdit(revision: vault.digest, item: item, create: true), in: vault, device: owner)
@@ -47,25 +47,25 @@ import MopCore
 }
 
 @Test func recoveryRotationCannotReuseTheRetiredPrivateKeysUnderNewIDs() throws {
-    let owner = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     let vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     let relabeled = try DevicePublicKey(member: UUID(), encryption: recovery.identity.encryption, signing: recovery.identity.signing)
-    #expect(throws: MopError.invalidRecovery) { try VaultEngine.replaceRecovery(with: relabeled, in: vault, owner: owner) }
+    #expect(throws: MopError.invalidRecovery) { try VaultEngine.setOfflineRecovery(relabeled, in: vault, owner: owner) }
 }
 
 @Test func vaultWithoutRecoveryCanAddItAfterSavingSecrets() throws {
-    let owner = try TestDevice(), recovery = try TestDevice(), replacement = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member), replacement = try TestDevice(member: owner.identity.member)
     var vault = try VaultEngine.create(name: "personal", owner: owner)
-    #expect(vault.membership.recovery == nil)
+    #expect(vault.membership.offlineRecovery == nil)
     vault = try VaultEngine.write("login/password", value: SecretBytes(utf8: "existing-secret"), in: vault, device: owner)
     #expect(throws: MopError.notVaultMember) { try VaultEngine.read("login/password", in: vault, device: recovery) }
-    #expect(throws: MopError.invalidRecovery) { try VaultEngine.recover(vault, using: recovery, owner: owner.identity, replacementRecovery: replacement.identity) }
+    #expect(throws: MopError.invalidRecovery) { try VaultEngine.recover(vault, using: recovery, owner: owner.identity) }
     let old = vault
-    vault = try VaultEngine.replaceRecovery(with: recovery.identity, in: vault, owner: owner)
-    #expect(vault.membership.recovery == recovery.identity)
+    vault = try VaultEngine.setOfflineRecovery(recovery.identity, in: vault, owner: owner)
+    #expect(vault.membership.offlineRecovery == recovery.identity)
     #expect(vault.revision.records.keys.sorted() == old.revision.records.keys.sorted())
     #expect(try VaultEngine.read("login/password", in: vault, device: recovery) == SecretBytes(utf8: "existing-secret"))
-    let recovered = try VaultEngine.recover(vault, using: recovery, owner: owner.identity, replacementRecovery: replacement.identity)
+    let recovered = try VaultEngine.recover(vault, using: recovery, owner: owner.identity)
     #expect(try VaultEngine.read("login/password", in: recovered, device: owner) == SecretBytes(utf8: "existing-secret"))
 }
 
@@ -84,7 +84,7 @@ import MopCore
     let key = try TestDevice(member: member), owner = try TestDevice(member: member)
     let vault = try VaultEngine.create(name: "personal", owner: owner)
     let address = try VaultAddress(container: "iCloud.test", environment: "Development", account: "a", database: .private, owner: "__defaultOwner__", vault: vault.id)
-    let device = try DeviceRequest(container: address.container, environment: address.environment, account: address.account, recovery: false, device: key)
+    let device = try DeviceRequest(container: address.container, environment: address.environment, account: address.account, device: key)
     let request = try EnrollmentRequest(vault: vault.id, request: device, name: "Mac", device: key)
     try request.validate(at: address)
     #expect(throws: MopError.invalidIdentity) { try request.validate(at: address, now: request.expires) }
@@ -183,7 +183,7 @@ import MopCore
 }
 
 @Test func attachmentsSurviveEditsTrashCheckpointAndRecovery() throws {
-    let owner = try TestDevice(), recovery = try TestDevice(), replacement = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member), replacement = try TestDevice(member: owner.identity.member)
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     // Upgrade a vault that already requires the extended item model.
     var first = VaultItem(name: "First", type: .secureNote, fields: [.init(path: "note", value: "secret")])
@@ -192,7 +192,7 @@ import MopCore
     let attachment = try Attachment(fileName: "binary.dat", data: Data([0, 128, 255, 13, 10]))
     let item = VaultItem(name: "File", type: .document, fields: [.init(path: "file", type: .attachment, value: try attachment.encodedValue())])
     vault = try VaultEngine.importItems([item], revision: vault.digest, in: vault, device: owner)
-    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "item-model-1"])
+    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "item-model-1", "offline-recovery-1"])
     var downgradedHeader = try VaultEngine.header(vault, operation: .content)
     downgradedHeader.requiredFeatures = ["item-model-1"]
     let downgrade = try Revision.seal(header: downgradedHeader,
@@ -207,7 +207,7 @@ import MopCore
     vault = try VaultEngine.restoreItem(id: trashed.deletion!.id, revision: vault.digest, in: vault, device: owner)
     let checkpoint = try vault.backup()
     vault = try VerifiedVault.restoreBackup(checkpoint, independentlyVerifiedDigest: vault.digest)
-    vault = try VaultEngine.recover(vault, using: recovery, owner: owner.identity, replacementRecovery: replacement.identity)
+    vault = try VaultEngine.recover(vault, using: recovery, owner: owner.identity)
     let value = try VaultEngine.read("Renamed/file", in: vault, device: owner)
     #expect(try Attachment.decode(String(decoding: value, as: UTF8.self)) == attachment)
     #expect(throws: AttachmentFailure.invalid) {
@@ -215,7 +215,7 @@ import MopCore
     }
     vault = try VaultEngine.write("Renamed/file", value: nil, in: vault, device: owner)
     #expect(throws: MopError.notFound) { try VaultEngine.read("Renamed/file", in: vault, device: owner) }
-    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "item-model-1"])
+    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "item-model-1", "offline-recovery-1"])
 }
 
 @Test func attachmentBatchExceedsOldCapacityWithoutGrowingRevision() throws {

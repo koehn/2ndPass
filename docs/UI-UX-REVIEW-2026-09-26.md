@@ -194,9 +194,6 @@ Evidence: `docs/AUTOFILL.md:Storage and refresh`, credential-provider entry poin
 
 Sharing/recovery uses a Step picker, generic Continue, JSON import/paste, account/device UUID input, a zone-owner field, and full fingerprint entry. These are valid protocol operations but a difficult consumer interface. Recovery presents multiple requests and fingerprints at once. Continue is not gated on most required inputs. File chooser cancellation is caught as an error.
 
-Provide distinct guided flows for Share a Vault, Join a Shared Vault, Add Recovery Device, and Recover a Vault. Show the person/device, permissions, and next action; validate imported files immediately and name them. Keep independent fingerprint verification and explicit cross-account approval. Use grouped readable codes or file presentation without weakening verification. Show progress and Back/Cancel with clear action-specific buttons. Treat file chooser cancellation as cancellation.
-
-Evidence: `SharingView.swift:38–102`, `SharingView.swift:112–135`. Manual cross-account and hardware-recovery operations remain necessary in v6; they are not all obsolete.
 
 ### 24. P2 — Make backups and deletion native and legible
 

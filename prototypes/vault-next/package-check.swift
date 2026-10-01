@@ -23,13 +23,8 @@ import Security
             try LocalFile.privateDirectory(state)
             let service = NativeVaultService(state: state)
             defer { service.lock() }
-            let recoveryResult = try await service.execute(.manage(.deviceRequest(recovery: true)), vault: nil)
-            guard let requestBytes = recoveryResult.document else { throw MopError.invalidRecovery }
-            let request = try ExchangeFile.decode(DeviceRequest.self, from: requestBytes)
-            let requestFile = state.appendingPathComponent("public-recovery-request.json")
-            try LocalFile.write(requestBytes, to: requestFile)
             let id = UUID().uuidString
-            let created = try await service.execute(.create(name: "disposable-native-probe", recovery: requestFile, fingerprint: request.fingerprint), vault: id)
+            let created = try await service.execute(.create(name: "disposable-native-probe"), vault: id)
             let catalog = try created.requireCatalog()
             let item = VaultItem(name: "login", type: .login, fields: [ItemField(path: "username", type: .username, value: "probe-user"), ItemField(path: "website", type: .website, value: "https://example.test"), ItemField(path: "password", type: .password, value: "disposable-public-test-password")])
             let saved = try await service.execute(.save(ItemEdit(revision: catalog.revision, item: item, create: true)), vault: id)
@@ -41,7 +36,7 @@ import Security
             print("PASS: public NativeVaultService hardware requests, creation, typed item save, concealed catalog, read, lock, reauthentication and offline read")
             print("Retained Development zone mop-v7-\(id); state \(state.path). Only the fixed public test password was stored.")
             print("Device-only v6 Keychain identities retained; no existing vault or old-format identity accessed.")
-            print("NOT TESTED: separate physical recovery device, second Apple Account, or extension process")
+            print("NOT TESTED: offline recovery, second Apple Account, or extension process")
             return
         }
         let context = try Authentication.authorize(reason: "test disposable Mop v6 hardware credentials")
@@ -179,9 +174,7 @@ import Security
         let owner = try EnclaveDevice(member: UUID(), context: context)
         let member = try EnclaveDevice(member: UUID(), context: context)
         defer { owner.close(); member.close() }
-        let recovery = try EnclaveDevice(member: owner.identity.member, context: context)
-        defer { recovery.close() }
-        var vault = try VaultEngine.create(name: "hardware-probe", owner: owner, recovery: recovery.identity)
+        var vault = try VaultEngine.create(name: "hardware-probe", owner: owner)
         vault = try VaultEngine.write("probe/password", value: SecretBytes(utf8: "disposable-test-password"), in: vault, device: owner)
         let invite = try VaultEngine.invite(member: member.identity.member, role: .editor, to: vault, owner: owner, expires: Date().addingTimeInterval(300))
         let acceptance = try Acceptance(invitation: invite, expectedCheckpoint: vault.digest, device: member)
@@ -193,18 +186,6 @@ import Security
             _ = try VaultEngine.read("probe/password", in: vault, device: member)
             throw MopError.invalidVault
         } catch MopError.notVaultMember { print("PASS: removed recipient denied current revision") }
-        let replacement = try EnclaveDevice(member: owner.identity.member, context: context)
-        defer { replacement.close() }
-        let nextRecovery = try EnclaveDevice(member: owner.identity.member, context: context)
-        defer { nextRecovery.close() }
-        vault = try VaultEngine.recover(vault, using: recovery, owner: replacement.identity, replacementRecovery: nextRecovery.identity)
-        guard try VaultEngine.read("probe/password", in: vault, device: replacement) == SecretBytes(utf8: "disposable-test-password") else { throw MopError.invalidVault }
-        print("PASS: hardware recovery rotates to replacement hardware owner and recovery keys")
-        replacement.close()
-        do {
-            _ = try VaultEngine.read("probe/password", in: vault, device: replacement)
-            throw MopError.invalidVault
-        } catch MopError.authentication { print("PASS: closed production provider rejects further key use") }
         print("NOT TESTED: multiple physical devices, multiple Apple Accounts, or CloudKit sharing")
     }
     static func main() async {

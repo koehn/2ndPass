@@ -136,6 +136,7 @@ struct Revision: Codable, Sendable {
             }
         }
         var features = Set(header.requiredFeatures ?? [])
+        if header.membership.offlineRecovery != nil { features.insert("offline-recovery-1") }
         if records.count > 4096 || items.contains(where: \.requiresExtendedModel) { features.insert("item-model-1") }
         if items.contains(where: { $0.type == .document || $0.fields.contains(where: { $0.type == .attachment }) }) { features.insert("attachments-1") }
         if items.contains(where: { $0.fields.contains(where: { $0.type.isCompound }) }) { features.insert("compound-fields-1") }
@@ -175,9 +176,10 @@ struct Revision: Codable, Sendable {
     func validateStructure() throws {
         if let features = header.requiredFeatures {
             guard !features.isEmpty, features == Set(features).sorted(),
-                  Set(features).isSubset(of: ["item-model-1", "attachments-1", "compound-fields-1", "attachment-blobs-1"]),
+                  Set(features).isSubset(of: ["item-model-1", "attachments-1", "compound-fields-1", "attachment-blobs-1", "offline-recovery-1"]),
                   (!(features.contains("attachments-1") || features.contains("compound-fields-1")) || features.contains("item-model-1")) else { throw MopError.invalidVault }
         }
+        guard header.membership.offlineRecovery == nil || header.requiredFeatures?.contains("offline-recovery-1") == true else { throw MopError.invalidVault }
         guard header.format == "mop-vault-v7", header.generation > 0, header.epoch > 0,
               (header.generation == 1) == (header.parent == nil),
               (header.generation == 1) == (header.operation == .create),
@@ -239,8 +241,18 @@ struct Revision: Codable, Sendable {
             if header.operation == .membership {
                 guard role == .owner, header.membership.owner == parent.header.membership.owner else { throw MopError.cloudPermission }
             } else {
-                guard signer == parent.header.membership.recovery,
-                      header.membership.owner == parent.header.membership.owner else { throw MopError.cloudPermission }
+                guard signer == parent.header.membership.offlineRecovery,
+                      header.membership.offlineRecovery == parent.header.membership.offlineRecovery,
+                      header.membership.owner == parent.header.membership.owner,
+                      header.membership.removedDevices == parent.header.membership.removedDevices,
+                      header.membership.accounts.count == parent.header.membership.accounts.count,
+                      header.membership.devices.count <= parent.header.membership.devices.count + 1 else { throw MopError.cloudPermission }
+                for old in parent.header.membership.accounts {
+                    guard let updated = header.membership.accounts.first(where: { $0.id == old.id }),
+                          updated.role == old.role,
+                          old.devices.allSatisfy({ updated.devices.contains($0) }),
+                          old.id == parent.header.membership.owner || updated == old else { throw MopError.cloudPermission }
+                }
             }
             guard Set(header.membership.removedDevices ?? []).isSuperset(of: parent.header.membership.removedDevices ?? []) else { throw MopError.invalidVault }
             guard parent.header.epoch < UInt64.max, header.epoch == parent.header.epoch + 1,

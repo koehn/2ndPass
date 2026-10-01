@@ -38,8 +38,7 @@ serialized into the revision. Backups include ciphertext blobs and use
 - Role-only changes preserve item key material entirely.
 - Removal, replacement of an existing recovery recipient, and in-place recovery
   advance every item-key generation and re-encrypt all retained fields, including
-  recently deleted items and attachments, under fresh keys. Recovery copies use
-  a fresh vault, item IDs, field IDs, and keys.
+  recently deleted items and attachments, under fresh keys. Recovery retains the vault UUID and offline authority.
 - Item keys exist only within operation-local scopes. No shared plaintext key
   cache or vault master key is introduced. Temporary plaintext is wiped where
   practical; Swift/CryptoKit do not guarantee erasure of all copies.
@@ -59,7 +58,8 @@ Downloads and hardware operations remain sequential. UI progress reports items,
 then encrypted-file uploads and revision publication.
 
 Cloud zones use `mop-v7-UUID` and record types `MopV7Revision`, `MopV7Attachment`,
-`MopV7Head`, and `MopV7Enrollment`. Probe zones are Development-only and excluded
+`MopV7Head`, and `MopV7Enrollment`. Account-wide offline recovery additionally uses
+`MopRecoveryConfiguration` in a separate private account zone. Probe zones are Development-only and excluded
 from discovery. Account bindings, enrollment domains, Keychain services, local
 state and AutoFill storage/identifiers use v7 namespaces. Application identifiers,
 CloudKit container and entitlements are unchanged. An explicitly opened old

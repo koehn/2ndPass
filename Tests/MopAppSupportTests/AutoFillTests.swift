@@ -367,13 +367,19 @@ private final class PickerService: VaultService, Sendable {
         return result
     }
 }
-@MainActor @Test func autoFillPickerAuthenticatesOnceForLabelsAndOneFill() async throws {
+@MainActor @Test func autoFillCachedPickerDefersAuthenticationUntilOneFill() async throws {
     let service = PickerService()
     let identity = AutoFillIdentity(entry: try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: UUID().uuidString).first))
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try AutoFillIndex(directory: root).update { _ in [identity] }
+    // A newly opened index needs neither a running app nor an authenticated service.
+    let choices = try AutoFillIndex(directory: root).load()
+    #expect(choices == [identity])
+    #expect(choices.first?.username == "alice")
+    #expect(choices.first?.website == "example.com")
+    #expect(service.state.withLock { $0.prompts == 0 && $0.reads == 0 && !$0.authenticated })
     let session = AutoFillRequestSession(service: service)
-    let choices = try await session.choices(for: [identity])
-    #expect(choices.first?.vaultName == "private-vault")
-    #expect(service.state.withLock { $0.prompts == 1 && $0.reads == 0 })
     let credential = try await session.password(identity)
     #expect(credential.password == "password")
     #expect(service.state.withLock { $0.prompts == 1 && $0.reads == 1 && !$0.authenticated })
@@ -384,12 +390,11 @@ private final class PickerService: VaultService, Sendable {
     let clock = Clock(), service = PickerService()
     let identity = AutoFillIdentity(entry: try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: UUID().uuidString).first))
     let session = AutoFillRequestSession(service: service, now: { clock.time })
-    _ = try await session.choices(for: [identity])
     clock.time = 60
     await #expect(throws: AutoFillSessionError.expired) { try await session.password(identity) }
     #expect(service.state.withLock { $0.reads == 0 && !$0.authenticated })
     let dismissed = AutoFillRequestSession(service: service)
-    _ = try await dismissed.choices(for: [identity]); dismissed.end()
+    dismissed.end()
     await #expect(throws: AutoFillSessionError.ended) { try await dismissed.password(identity) }
     #expect(service.state.withLock { $0.reads == 0 })
 }
@@ -448,7 +453,6 @@ private actor DeliveredUsageStore: ItemUsageStoring {
     let service = PickerService(), store = DeliveredUsageStore()
     let identity = AutoFillIdentity(entry: try #require(AutoFillEntry.entries(catalog: service.catalog, vaultID: UUID().uuidString).first))
     let session = AutoFillRequestSession(service: service, usageStore: store)
-    _ = try await session.choices(for: [identity])
     #expect(await store.writes == 0)
     _ = try await session.password(identity)
     #expect(await store.writes == 0)

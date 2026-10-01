@@ -5,7 +5,7 @@ import MopCore
 @testable import MopVaultNext
 
 private func fixture() throws -> (VerifiedVault, VaultAddress, URL) {
-    let vault = try VaultEngine.create(name: "disk", owner: TestDevice(), recovery: TestDevice().identity)
+    let vault = try VaultEngine.create(name: "disk", owner: TestDevice())
     let address = try VaultAddress(container: "iCloud.example.mop", environment: "Development", account: "a",
                                    database: .private, owner: "owner", vault: vault.id)
     return (vault, address, FileManager.default.temporaryDirectory.appendingPathComponent("mop-v7-state-test-" + UUID().uuidString))

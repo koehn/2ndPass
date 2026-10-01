@@ -49,7 +49,7 @@ struct SSHAgentPeer {
         var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
         // Checks the audit token's PID version, including exec/PID reuse.
         guard proc_pidpath_audittoken(&token, &buffer, UInt32(buffer.count)) > 0 else { throw MopError.authentication }
-        return String(cString: buffer)
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     func validate(root: SSHAgentProcess?) throws {

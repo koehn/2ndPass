@@ -39,7 +39,7 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
 @Test func twoAccountsFourDevicesEnrollmentRemovalAndRecovery() throws {
     let a1 = try TestDevice(), a2 = try TestDevice(member: a1.identity.member)
     let b1 = try TestDevice(), b2 = try TestDevice(member: b1.identity.member)
-    let recovery = try TestDevice()
+    let recovery = try TestDevice(member: a1.identity.member)
     var vault = try VaultEngine.create(name: "shared", owner: a1, recovery: recovery.identity)
     #expect(vault.membership.accounts.count == 1)
     vault = try VaultEngine.write("service/password", value: SecretBytes(copying: Data("first".utf8)), in: vault, device: a1)
@@ -66,16 +66,17 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
     #expect(try text(VaultEngine.read("service/password", in: vault, device: a1)) == "new")
     vault = try VaultEngine.remove(member: b2.identity.member, from: vault, owner: a1)
     #expect(throws: MopError.notVaultMember) { try VaultEngine.read("service/password", in: vault, device: b2) }
-    let replacement = try TestDevice(member: a1.identity.member), nextRecovery = try TestDevice()
-    vault = try VaultEngine.recover(vault, using: recovery, owner: replacement.identity, replacementRecovery: nextRecovery.identity)
-    #expect(vault.membership.devices == [replacement.identity])
+    let replacement = try TestDevice(member: a1.identity.member), nextRecovery = try TestDevice(member: a1.identity.member)
+    vault = try VaultEngine.recover(vault, using: recovery, owner: replacement.identity)
+    #expect(vault.membership.devices.contains(replacement.identity))
+    #expect(vault.membership.devices.contains(a1.identity))
     #expect(try text(VaultEngine.read("service/password", in: vault, device: replacement)) == "new")
-    #expect(throws: MopError.notVaultMember) { try VaultEngine.read("service/password", in: vault, device: a1) }
-    #expect(throws: MopError.notVaultMember) { try VaultEngine.read("service/password", in: vault, device: recovery) }
+    #expect(try text(VaultEngine.read("service/password", in: vault, device: a1)) == "new")
+    #expect(try text(VaultEngine.read("service/password", in: vault, device: recovery)) == "new")
 }
 
 @Test func rolesAndFreshAccountRecovery() throws {
-    let owner = try TestDevice(), viewer = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), viewer = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     vault = try VaultEngine.write("login/password", value: SecretBytes(copying: Data("secret".utf8)), in: vault, device: owner)
     vault = try add(viewer, role: .viewer, to: vault, owner: owner)
@@ -86,16 +87,12 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
     vault = try VaultEngine.setRole(.editor, member: viewer.identity.member, in: vault, owner: owner)
     vault = try VaultEngine.write("login/password", value: SecretBytes(copying: Data("edited".utf8)), in: vault, device: viewer)
     let newOwner = try TestDevice(), newRecovery = try TestDevice()
-    #expect(throws: MopError.cloudPermission) { try VaultEngine.recover(vault, using: recovery, owner: newOwner.identity, replacementRecovery: newRecovery.identity) }
-    let restored = try VaultEngine.recoverCopy(vault, using: recovery, name: "recovered", owner: newOwner, replacementRecovery: newRecovery.identity)
-    #expect(restored.id != vault.id)
-    #expect(restored.generation == 1 && restored.parent == nil)
-    #expect(try text(VaultEngine.read("login/password", in: restored, device: newOwner)) == "edited")
-    #expect(try text(VaultEngine.read("login/password", in: vault, device: owner)) == "edited")
+    #expect(throws: MopError.invalidRecovery) { try VaultEngine.recover(vault, using: recovery, owner: newOwner.identity) }
+
 }
 
 @Test func invitationExpiryFingerprintAndReplay() throws {
-    let owner = try TestDevice(), next = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), next = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     let vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     let now = Date(timeIntervalSince1970: 1_000)
     let invitation = try VaultEngine.invite(member: next.identity.member, role: .viewer, to: vault, owner: owner, now: now, expires: now.addingTimeInterval(100))
@@ -110,7 +107,7 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
 }
 
 @Test func catalogAndRequestedSecretOnlyAreUnwrapped() throws {
-    let owner = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     for i in 0..<3 { vault = try VaultEngine.write("item\(i)/password", value: SecretBytes(copying: Data("value\(i)".utf8)), in: vault, device: owner) }
     owner.unwrappedContexts = []
@@ -126,11 +123,11 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
 }
 
 @Test func signedSelfPromotionAndCrossVaultSubstitutionFail() throws {
-    let owner = try TestDevice(), editor = try TestDevice(), recovery = try TestDevice()
+    let owner = try TestDevice(), editor = try TestDevice(), recovery = try TestDevice(member: owner.identity.member)
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     vault = try add(editor, role: .editor, to: vault, owner: owner)
-    let malicious = try Membership(accounts: [AccountMember(id: editor.identity.member, role: .owner, devices: [editor.identity])], recovery: recovery.identity)
-    let header = Revision.Header(format: "mop-vault-v7", vault: vault.id, name: vault.name, generation: vault.generation + 1,
+    let malicious = try Membership(accounts: [AccountMember(id: editor.identity.member, role: .owner, devices: [editor.identity])])
+    let header = Revision.Header(requiredFeatures: vault.revision.header.requiredFeatures, format: "mop-vault-v7", vault: vault.id, name: vault.name, generation: vault.generation + 1,
         parent: vault.digest, epoch: vault.revision.header.epoch + 1, membership: malicious, operation: .membership,
         acceptedInvitations: vault.revision.header.acceptedInvitations)
     let forged = try Revision.seal(header: header, references: [:], records: [:], signer: editor)
@@ -144,13 +141,13 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
     #expect(throws: MopError.invalidVault) { try Revision.decode(altered) }
 }
 
-@Test func backupCheckpointAndHardwareRecoveryRotation() throws {
-    let owner = try TestDevice(), recovery = try TestDevice(), replacement = try TestDevice()
+@Test func backupCheckpointAndOfflineRecoveryRotation() throws {
+    let owner = try TestDevice(), recovery = try TestDevice(member: owner.identity.member), replacement = try TestDevice(member: owner.identity.member)
     var vault = try VaultEngine.create(name: "personal", owner: owner, recovery: recovery.identity)
     vault = try VaultEngine.write("item/password", value: SecretBytes(copying: Data("value".utf8)), in: vault, device: owner)
     let imported = try VerifiedVault(checkpoint: vault.bytes, independentlyVerifiedDigest: vault.digest)
     #expect(try text(VaultEngine.read("item/password", in: imported, device: recovery)) == "value")
-    let rotated = try VaultEngine.replaceRecovery(with: replacement.identity, in: vault, owner: owner)
+    let rotated = try VaultEngine.setOfflineRecovery(replacement.identity, in: vault, owner: owner)
     #expect(throws: MopError.notVaultMember) { try VaultEngine.read("item/password", in: rotated, device: recovery) }
     #expect(try text(VaultEngine.read("item/password", in: rotated, device: replacement)) == "value")
     #expect(Set(vault.revision.records.keys).isDisjoint(with: rotated.revision.records.keys))
@@ -164,6 +161,7 @@ private func add(_ device: TestDevice, role: MemberRole, to vault: VerifiedVault
         try VaultEngine.write("item/password", value: SecretBytes(utf8: "value"), in: vault, device: recovery)
     }
     let replacement = try TestDevice(member: owner.identity.member), nextRecovery = try TestDevice(member: owner.identity.member)
-    let restored = try VaultEngine.recover(vault, using: recovery, owner: replacement.identity, replacementRecovery: nextRecovery.identity)
-    #expect(restored.membership.devices == [replacement.identity])
+    let restored = try VaultEngine.recover(vault, using: recovery, owner: replacement.identity)
+    #expect(restored.membership.devices.contains(replacement.identity))
+    #expect(restored.membership.devices.contains(owner.identity))
 }

@@ -48,7 +48,7 @@ Secret references use `sp://`, spelled out because a URI scheme cannot start wit
 
 2ndPass joins two daily workflows: filling a password in an app, and supplying a credential to a command. Native Apple apps and AutoFill handle the first; references, environment injection, and configuration templates handle the second.
 
-Each device has its own Secure Enclave private key. iCloud carries encrypted vault data using your Apple Account, without a separate 2ndPass-hosted vault service. Those choices come with real tradeoffs: Apple-only platforms, an Apple platform and provisioned private-container trust boundary during device enrollment, and hardware-based recovery. Read the [security explanation](security.html) before deciding whether they fit your needs.
+Each device has its own Secure Enclave private key. iCloud carries encrypted vault data using your Apple Account, without a separate 2ndPass-hosted vault service. Those choices come with real tradeoffs: Apple-only platforms, an Apple platform and provisioned private-container trust boundary during device enrollment, and an offline master recovery copy. Read the [security explanation](security.html) before deciding whether they fit your needs.
 
 ## Op
 
@@ -96,4 +96,18 @@ Previously verified cached data can be read offline. Writes need connectivity. A
 
 2ndPass is a development preview. An independent security audit and several physical-device acceptance checks are still outstanding. Evaluate it alongside your current password manager, verify imported records, and establish recovery before depending on it.
 
-If you lose every authorized device and every configured recovery device, there is no password reset that restores the vault. Start with the [documentation](docs.html) and [validation notes](security.html#status).
+
+## Offline recovery after device loss
+
+Generate and verify an offline recovery copy before losing access to your devices.
+On a replacement device, sign into the same Apple Account and import the copy or
+enter its code. Read-only recovery can open healthy data while unavailable
+attachments postpone completion. Complete each vault to rotate encryption and
+remove previous device access. Keep both copies during key replacement until
+coverage is complete.
+
+The private recovery secret and copied ciphertext suffice for offline decryption;
+protect the copy separately from your devices. It cannot restore Apple Account
+access or missing cloud data. Account-loss recovery requires a separately exported
+backup; backup restoration is outside this feature. Physical-device acceptance
+and cryptographic review remain pending.

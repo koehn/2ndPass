@@ -1039,7 +1039,7 @@ final class AppModel {
                     // Framework errors may contain arbitrary diagnostics. Only
                     // domain errors have user-safe messages.
                     if error as? MopError == .vaultUntrusted {
-                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Repair access from an authorized owner device or use the separate hardware recovery device. Older vault formats are unsupported."
+                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Repair access from an authorized owner device or use your offline recovery copy. Older vault formats are unsupported."
                     } else {
                         self.error = (error as? MopError)?.errorDescription ?? (error as? ImportFailure)?.errorDescription ?? (error as? AttachmentFailure)?.errorDescription ?? (error as? CompoundFieldFailure)?.errorDescription ?? "The operation could not be completed."
                     }
@@ -1391,6 +1391,12 @@ final class AppModel {
         deviceRemoved = true; vaults = []; vault = ""; devices = []; cloudEnrollments = []
         error = nil; sheet = .enrollDevice
         enrollmentPaused = true
+    }
+    func showRecoveryTestReset(pending: Bool = false) {
+        let inSettings = sheetRequest?.inSettings ?? false
+        showDeviceRemoved(pending: pending)
+        sheetRequest = SheetRequest(kind: .recover, inSettings: inSettings, target: nil)
+        if pending { error = "The device reset needs to finish local cleanup. Restart 2ndPass before continuing recovery." }
     }
     func reconnectDevice() {
         perform { token in
@@ -1749,7 +1755,7 @@ final class AppModel {
         }
     }
     var showsSetupChecklist = false
-    func createVault(name: String, recovery: URL? = nil, fingerprint: String? = nil) {
+    func createVault(name: String) {
         guard !offline, !busy else { return }
         restoreLastSelection = false
         conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; members = []; authenticated = false
@@ -1758,7 +1764,7 @@ final class AppModel {
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
             self.allVaults = false; self.vault = id; self.vaults.append(VaultDescriptor(id: id, name: name, format: "mop-vault-v7", enrolled: true))
             self.status = "Creating vault \(id) · retain this UUID if publication is interrupted"
-            let result = try await self.service.execute(.create(name: name, recovery: recovery, fingerprint: fingerprint), vault: id, offline: false)
+            let result = try await self.service.execute(.create(name: name), vault: id, offline: false)
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
             try await self.unlockContents(token, refresh: false)
@@ -1823,7 +1829,7 @@ final class AppModel {
             _ = try await self.service.execute(.export(url), vault: id, offline: false)
             guard self.current(token) else { return }
             self.lastBackupURL = url; self.lastBackupVaultID = id
-            self.notice = "Encrypted backup exported. Keep your hardware recovery device separately."
+            self.notice = "Encrypted backup exported. Keep your offline recovery copy separately."
         }
     }
 

@@ -269,7 +269,7 @@ device or phone number. It is the default for most accounts. Optional
 [account security keys](https://support.apple.com/en-us/102637) add phishing
 protection. 2ndPass uses the OS-authenticated iCloud session, without collecting
 Apple Account credentials. These controls protect the enrollment channel; they
-are separate from vault unlock and the optional hardware recovery device.
+are separate from vault unlock and the offline recovery key.
 A compromised authenticated session or trusted device can still undermine that
 channel, so account recovery and trusted-device security matter too.
 
@@ -415,7 +415,7 @@ honest client that verifies its own removal persists a removal marker, deletes
 its ordinary Keychain identity, releases handles and clears managed account
 caches. The marker survives relaunch and blocks normal account operations.
 Explicit **Reconnect** completes cleanup and clears it so fresh device keys can
-be created. Recovery identities and user-exported backups are preserved. Cloud
+be created. Public offline-recovery configuration and user-exported copies are preserved. Cloud
 errors alone do not authorize identity deletion.
 
 The Settings device-removal action covers personal vaults enrolled on the
@@ -435,33 +435,48 @@ are not stored in the vault cache; visible catalog metadata can remain in UI
 memory during use.
 
 ## Recovery and backups
+Offline recovery is optional and account-wide for owned cloud vaults. The app
+generates a random 256-bit secret, derives separate P-256 agreement and signing
+keys with versioned HKDF-SHA256 labels and account-scope binding, and requires
+re-entry or re-import before activation. The file and grouped paper code include
+an error-detection checksum, not a password or additional encryption factor.
 
-Recovery is optional: a new vault starts with one owner device and no recovery
-recipient. An authorized owner can add a hardware recovery identity later,
-including access to existing records. Recovery keys use the hardware provider;
-there is no portable seed or software recovery private-key file.
+The secret and derived private keys are never persisted by the application except
+through explicit user export. They exist in memory during the visible ceremony
+or a recovery session. Locking, backgrounding, cancellation, and account changes
+invalidate handles. Controllable buffers are wiped; Swift strings, CryptoKit, OS
+file dialogs, printing, and other framework-owned copies cannot be guaranteed
+wiped. The recovery client and its operating system must be trusted.
 
-A recovery device is a powerful recipient, able to decrypt records and authorize
-recovery. It does not automatically acquire ordinary owner/editor membership.
-Keep it physically separate from ordinary devices, and keep encrypted backups
-with independent checkpoint evidence. A second identity on the same physical
-machine does not provide protection against losing that machine.
+Anyone possessing both the offline secret and copied ciphertext can decrypt it
+without signing into iCloud. Account binding prevents accidental or unauthorized
+cross-account application recovery; it is not a second cryptographic factor.
+One offline copy therefore exposes every vault covered by that authority. Keep
+it physically separate from daily-use devices and avoid synchronized storage.
 
-Same-account recovery uses a recovery signature to replace the ordinary roster
-and configure replacement recovery authority. Lost-account recovery verifies a
-backup and decrypts/re-encrypts its records one at a time into a new vault UUID
-and root under another account, preserving the source. Backup verification needs
-trusted checkpoint evidence; signatures alone do not identify an arbitrary
-backup's initial root as yours.
+A fresh installation must first sign into the same Apple Account. Apple may
+require its own trusted-phone-number or account recovery process; this code
+cannot satisfy those requirements. Recovery then relies on accessible live
+CloudKit data. Account loss requires a separately exported backup and is outside
+this feature, as is backup restoration.
 
-If all authorized ordinary and configured recovery device keys are lost, the
-vault is unrecoverable. Restoring an Apple Account or possessing ciphertext
-backups does not recreate those device-bound private keys. There is no vendor-held
-recovery master key. This reduces remote recovery attack surface but increases
-permanent-data-loss risk; it is a security/availability tradeoff. Surviving
-viewer/editor hardware may retain decryption access without authority to enroll
-replacement owners. Recovery also requires accessible ciphertext and trusted
-checkpoint evidence, not just hardware.
+Fresh-device bootstrap trusts authenticated private CloudKit for provenance and
+freshness while validating account scope, signed vault structure/transitions,
+recovery authority and decryption. Encryption to a public key alone does not
+prove provenance. Without a surviving checkpoint this path does not independently
+detect server rollback, omission, or denial of service.
+
+Read-only recovery access does not revoke previous devices. Completion adds the recovering device while preserving all existing devices,
+accounts, and roles and rotates retained item, catalog, and attachment encryption.
+Unavailable attachments postpone completion while healthy data remains readable.
+The offline key remains valid until explicitly replaced or revoked.
+
+Account-wide replacement/revocation is resumable across per-vault atomic commits.
+Keep both offline copies until completion; incomplete coverage is reported. New
+vault creation is fenced during lifecycle changes. Removal cannot retract copied
+plaintext, old ciphertext, or exported backups. Physical-platform recovery
+acceptance and independent cryptographic review remain required before relying
+on the feature as the only recovery route.
 
 ## Metadata and intentional disclosure
 
@@ -533,18 +548,17 @@ inspection but does not substitute for professional review.
 | An attacker replays an enrollment request | Scope, expiry, acceptance checks, consumed nonces and retired UUIDs | A fresh identity can be admitted if the attacker still has authorized access to the private container. |
 | A removed person keeps old data | Rotation excludes them from current and later encrypted revisions | Copies and unchanged external passwords remain usable; offline clients learn revocation later. |
 | Malware compromises an authorized 2ndPass process | Private scalars remain behind the hardware boundary | Malware may request operations, read plaintext and copy results. Hardware protection is not endpoint immunity. |
-| Every enrolled device is lost | Optional separate hardware recovery plus verified backups | Without surviving ordinary or recovery keys there is no decryption backdoor. |
+| Every enrolled device is lost | Offline recovery copy plus access to the same Apple Account and live vault data | Without the offline secret or surviving ordinary keys there is no decryption backdoor. Missing cloud data and account loss require a separate backup route. |
 
 ## Evidence and source map
 
 Recorded evidence includes real Enclave signing/HPKE, authentication behavior,
 Keychain reload and private-database CloudKit checks on one Mac, plus automated
 membership, enrollment, revocation, recovery and publication models. Second-account
-CloudKit sharing, separate physical recovery devices, and signed iPhone/iPad and
+CloudKit sharing, offline recovery on physical devices, and signed iPhone/iPad and
 actual AutoFill workflows still require the physical acceptance checks in
 [VAULT-NEXT-VALIDATION.md](VAULT-NEXT-VALIDATION.md). Simulator compilation and
-software-key tests do not prove those platform behaviors. No new hardware
-validation was performed for this documentation revision. 2ndPass has not yet
+software-key tests do not prove those platform behaviors. The SALE-1 validation record is in [offline recovery](OFFLINE-RECOVERY.md); physical acceptance is pending. 2ndPass has not yet
 been independently audited. Protocol design correctness and implementation
 correctness are separate questions; neither source availability nor model tests
 establishes both. The [documentation audit](security-audit/2026-09-29-documentation.md)

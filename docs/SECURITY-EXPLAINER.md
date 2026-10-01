@@ -132,17 +132,9 @@ password. 2ndPass checks the authenticated vault again before filling it.
 
 ## Plan for a lost or broken device
 
-You can add a separate hardware recovery device and keep encrypted backups.
-Recovery is optional; a new vault starts without it. A configured recovery device
-can help restore access, including moving a verified backup to a new account if
-necessary. Because it can unlock your secrets, keep it secure and separate from
-your everyday device.
-
-**If you lose every enrolled device and every configured recovery device, your
-vault cannot be recovered.** Restoring your Apple Account or finding an encrypted
-backup does not recreate the hardware keys. There is no recovery seed or hidden
-master key that bypasses this protection. This reduces remote recovery attack
-surface but increases the risk of permanent data loss.
+Keep an offline recovery copy separate from your devices and verify it before
+you need it. Recovery requires access to the same Apple Account and live cloud
+data. See [offline recovery](#offline-recovery-after-device-loss).
 
 ## How these protections have been checked
 
@@ -171,3 +163,18 @@ Opening that key permits access to the whole item. It is not a vault-wide key,
 and the app does not retain it between operations. Adding a device wraps existing
 item keys for that device; removal replaces keys and ciphertext for all retained
 items, including recently deleted items. Old copies cannot be revoked.
+
+## Offline recovery after device loss
+
+Generate and verify an offline recovery copy before losing access to your devices.
+On a replacement device, sign into the same Apple Account and import the copy or
+enter its code. Read-only recovery can open healthy data while unavailable
+attachments postpone completion. Complete each vault to rotate encryption and
+remove previous device access. Keep both copies during key replacement until
+coverage is complete.
+
+The private recovery secret and copied ciphertext suffice for offline decryption;
+protect the copy separately from your devices. It cannot restore Apple Account
+access or missing cloud data. Account-loss recovery requires a separately exported
+backup; backup restoration is outside this feature. Physical-device acceptance
+and cryptographic review remain pending.
