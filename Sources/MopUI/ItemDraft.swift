@@ -78,6 +78,9 @@ struct ItemDraft: Identifiable {
             }.filter { !$0.isEmpty })).sorted()
         }
     }
+    var credential: KeyCredential?
+    var sshPurpose: CredentialPurpose = .ssh
+    var sshPassphrase = ""
     var metadata: ItemMetadata?
     var autoFill: AutoFillMapping
     var mode: Mode
@@ -85,11 +88,12 @@ struct ItemDraft: Identifiable {
     private let initialItem: VaultItem
 
     /// Compare the save projection, not transient IDs or decrypted password loads.
-    var isModified: Bool { vault != initialVault || item != initialItem }
+    var isModified: Bool { vault != initialVault || item != initialItem || sshPurpose != .ssh || !sshPassphrase.isEmpty }
 
     init(vault: String, revision: String, item: VaultItem, mode: Mode = .item, isNew: Bool = false) {
         tagsText = item.metadata?.tags.joined(separator: ", ") ?? ""
         metadata = item.metadata
+        credential = item.credential
         autoFill = item.autoFill ?? AutoFillMapping()
         initialVault = vault
         self.isNew = isNew
@@ -104,12 +108,14 @@ struct ItemDraft: Identifiable {
         }
         var baseline = VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field))
         baseline.metadata = metadata
+        baseline.credential = credential
         baseline.autoFill = autoFill.isAutomatic ? nil : autoFill
         initialItem = baseline
     }
     var item: VaultItem {
         var result = VaultItem(name: name.precomposedStringWithCanonicalMapping, type: type, fields: fields.map(\.field))
         result.metadata = metadata
+        result.credential = credential
         result.autoFill = autoFill.isAutomatic ? nil : autoFill
         return result
     }

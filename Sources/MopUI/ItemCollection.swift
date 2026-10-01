@@ -2,11 +2,14 @@ import Foundation
 import MopCore
 
 enum ItemCollection: Equatable, Codable {
+    case passkeys, sshKeys
     case all, local, vault(String), favorites, archive, recentlyDeleted
     case recentlyAdded, recentlyChanged, recentlyUsed
 
     var sidebarID: String {
         switch self {
+        case .passkeys: "passkeys"
+        case .sshKeys: "ssh-keys"
         case .all: "all"
         case .local: "vault:" + LocalVault.id
         case .vault(let id): "vault:" + id
@@ -23,6 +26,8 @@ enum ItemCollection: Equatable, Codable {
     }
     var title: String? {
         switch self {
+        case .passkeys: "Passkeys"
+        case .sshKeys: "SSH Keys"
         case .all: "All Items"
         case .local: "local"
         case .vault: nil

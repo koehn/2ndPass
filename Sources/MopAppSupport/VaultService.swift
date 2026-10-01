@@ -101,6 +101,7 @@ public struct VaultResult: Sendable {
     }
 }
 public protocol VaultService: Sendable {
+    var sessionGeneration: Int { get }
     var authenticatedAt: TimeInterval? { get }
     var operationProgress: String? { get }
     var operationFraction: Double? { get }
@@ -113,6 +114,7 @@ public protocol VaultService: Sendable {
 }
 
 public extension VaultService {
+    var sessionGeneration: Int { 0 }
     func endRecoverySession() {}
     func cachedCatalog(vault: String) async throws -> VaultResult? { nil }
     var operationProgress: String? { nil }

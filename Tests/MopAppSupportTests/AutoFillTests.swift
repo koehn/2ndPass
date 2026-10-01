@@ -461,3 +461,28 @@ private actor DeliveredUsageStore: ItemUsageStoring {
     await session.recordDeliveredUsage()
     #expect(await store.writes == 1)
 }
+
+@Test func cloudPasskeysPublishAlongsideLocalAndSurviveLocalLookupFailure() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let published = PublishedAutoFillIdentities()
+    let publisher = AutoFillPublisher(directory: root, publish: { await published.save($0) })
+    var item = VaultItem(name: "passkey", type: .passkey, fields: [])
+    item.credential = KeyCredential(algorithm: .p256, publicKey: Data(repeating: 1, count: 65), purposes: [.passkey],
+        relyingParty: "example.com", userName: "alice", userHandle: Data([1]), credentialID: Data(repeating: 3, count: 32))
+    let first = UUID().uuidString, second = UUID().uuidString
+    let catalog = ItemCatalog(vault: "vault", revision: "r1", items: [item])
+    try await publisher.publish(catalog: catalog, vaultID: first)
+    try await publisher.publish(catalog: catalog, vaultID: second)
+    try await publisher.refresh()
+    let cloud = await published.rows
+    #expect(cloud.count == 2 && Set(cloud.map(\.recordIdentifier)).count == 2)
+    let local = ASPasskeyCredentialIdentity(relyingPartyIdentifier: "example.com", userName: "alice", credentialID: Data(repeating: 4, count: 32), userHandle: Data([1]), recordIdentifier: "local-test")
+    let combined = AutoFillPublisher.combinedIdentities(cloud, local: { [local] })
+    #expect(combined.count == 3)
+    #expect(AutoFillIdentity(identity: combined[0]) == cloud[0])
+    let withoutLocal = AutoFillPublisher.combinedIdentities(cloud, local: { throw MopError.authentication })
+    #expect(withoutLocal.count == 2)
+    try await publisher.publish(catalog: ItemCatalog(vault: "vault", revision: "r2", items: []), vaultID: first)
+    #expect(await published.rows.count == 1)
+}

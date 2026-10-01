@@ -34,6 +34,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
     private var attachmentSyncOverride: Bool?
     private let publishesAutoFill: Bool
     private var accountObserver: NSObjectProtocol?
+    public var sessionGeneration: Int { control.generation }
     public var authenticatedAt: TimeInterval? { control.authenticatedAt }
     public init(state: URL? = nil, allowsAttachments: Bool = true, configuration: any VaultPlatformConfiguration = DefaultVaultPlatformConfiguration(), documents: any DocumentAccessing = SystemDocumentAccess(), usageStore: (any ItemUsageStoring)? = nil, wallNow: @escaping @Sendable () -> Date = Date.init) {
         self.wallNow = wallNow

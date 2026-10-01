@@ -17,6 +17,7 @@ final class AppModel {
     let service: any VaultService
     let documents: any DocumentAccessing
     let clipboard: any SecretClipboardAccess
+    var keyCreationPresented = false
     var isActive = true
     var vaults: [VaultDescriptor] = []
     var vault = "" {
@@ -56,6 +57,7 @@ final class AppModel {
     // account, sync, or recovery and is independent of the cloud session state.
     var localIdentities: [LocalIdentity] = [] {
         didSet {
+            invalidateItemSearch()
             if let id = selectedLocalIdentityID, !localIdentities.contains(where: { $0.id == id }) {
                 selectedLocalIdentityID = nil
             }
@@ -63,13 +65,15 @@ final class AppModel {
     }
     var selectedLocalIdentityID: UUID?
     var selectedLocalIdentity: LocalIdentity? {
-        guard isLocalVaultSelected else { return nil }
+        guard isLocalVaultSelected || collection == .all else { return nil }
         return localIdentities.first { $0.id == selectedLocalIdentityID }
     }
     var displayedLocalIdentities: [LocalIdentity] {
         localIdentities.filter {
-            search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.protocolType.rawValue.localizedCaseInsensitiveContains(search)
-        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            let credential = CredentialPresentation(identity: $0)
+            return search.isEmpty || [credential.title, credential.account ?? "", $0.name, $0.protocolType.rawValue]
+                .contains { $0.localizedCaseInsensitiveContains(search) }
+        }.sorted { CredentialPresentation(identity: $0).title.localizedStandardCompare(CredentialPresentation(identity: $1).title) == .orderedAscending }
     }
     var localReady = false
     var localLoading = false
@@ -222,7 +226,8 @@ final class AppModel {
             return
         }
         vault = saved.vault
-        collection = saved.collection
+        // Retired type-specific sidebar selections reopen in All Items.
+        collection = saved.collection == .passkeys || saved.collection == .sshKeys ? .all : saved.collection
         try? applyCatalog(source)
         selectedItem = nil; selectedDeleted = nil
         guard let id = saved.item else { return }
@@ -436,10 +441,11 @@ final class AppModel {
         if let itemSearchIndex { return itemSearchIndex }
         let included = allVaults ? catalogs : catalog.map { [vault: $0] } ?? [:]
         var rows = included.flatMap { id, catalog in
-            catalog.items.filter { $0.deletion == nil && $0.isArchived == showArchived && (!favoritesOnly || $0.isFavorite) }.map { item in
+            catalog.items.filter { $0.deletion == nil && $0.isArchived == showArchived && (!favoritesOnly || $0.isFavorite) && (collection != .passkeys || $0.type == .passkey) && (collection != .sshKeys || $0.type == .sshKey) }.map { item in
                 ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item)
             }
         }
+        if collection == .all { rows += localIdentities.map(ItemRow.local) }
         if collection.isRecent {
             rows = rows.compactMap { row in
                 guard let date = recentDate(for: row) else { return nil }
@@ -473,7 +479,8 @@ final class AppModel {
     var displayedItems: [ItemRow] { activeIndex.search(search).rows }
     var listSelection: ItemRow.ID? {
         get {
-            if searchIsFocused, !search.isEmpty { return searchHighlighted }
+            // A keyboard highlight is not a navigation selection. Feeding it
+            // into List(selection:) makes iOS push a detail screen while typing.
             return selectedRow.flatMap { activeIndex.search(search).ids.contains($0) ? $0 : nil }
         }
         set {
@@ -485,7 +492,7 @@ final class AppModel {
     var allDeletedRows: [ItemRow] { deletedIndex.rows }
     var deletedRows: [ItemRow] { deletedIndex.search(search).rows }
     var deletedListSelection: ItemRow.ID? {
-        get { searchIsFocused && !search.isEmpty ? searchHighlighted : selectedDeleted.flatMap { deletedIndex.search(search).ids.contains($0) ? $0 : nil } }
+        get { selectedDeleted.flatMap { deletedIndex.search(search).ids.contains($0) ? $0 : nil } }
         set {
             if newValue == nil, let selectedDeleted, !deletedIndex.search(search).ids.contains(selectedDeleted) { return }
             selectedDeleted = newValue
@@ -545,12 +552,24 @@ final class AppModel {
     }
 
     var selectedRow: ItemRow.ID? {
-        get { selectedItem.map { .init(vault: vault, name: $0) } }
+        get {
+            if collection == .all, let identity = selectedLocalIdentity {
+                return .init(vault: LocalVault.id, name: identity.id.uuidString)
+            }
+            return selectedItem.map { .init(vault: vault, name: $0) }
+        }
         set {
             guard !busy, (newValue != selectedRow || vaultDetailsTarget != nil), allowTransition(.item(newValue)) else { return }
             vaultDetailsTarget = nil
             cancelItemEditing(); selected = nil; passwordQualities = [:]
+            selectedLocalIdentityID = nil
             guard let newValue else { selectedItem = nil; return }
+            if newValue.vault == LocalVault.id, collection == .all,
+               let identity = localIdentities.first(where: { $0.id.uuidString == newValue.name }) {
+                selectedItem = nil
+                selectedLocalIdentityID = identity.id
+                return
+            }
             if let cached = catalogs[newValue.vault] {
                 vault = newValue.vault
                 try? applyCatalog(cached)
@@ -605,6 +624,15 @@ final class AppModel {
         self.collection = collection
         changedVault()
     }
+    func chooseCredentials(_ collection: ItemCollection) {
+        guard collection == .passkeys || collection == .sshKeys,
+              !busy, allowTransition(.credentials(collection)) else { return }
+        self.collection = collection
+        searchHighlighted = nil
+        searchIsFocused = false
+        changedVault()
+        scheduleAutomaticUnlock()
+    }
     func toggleFavorite() {
         guard authenticated, !busy, !offline, itemDraft == nil, let item = selectedTypedItem else { return }
         guard let catalog else { return }
@@ -617,7 +645,10 @@ final class AppModel {
         get { collection.sidebarID }
         set {
             guard newValue != sidebarSelection else { return }
-            if newValue == "recent-added" { chooseRecent(.recentlyAdded) }
+            if newValue == "passkeys" || newValue == "ssh-keys" {
+                chooseCredentials(newValue == "passkeys" ? .passkeys : .sshKeys)
+            }
+            else if newValue == "recent-added" { chooseRecent(.recentlyAdded) }
             else if newValue == "recent-changed" { chooseRecent(.recentlyChanged) }
             else if newValue == "recent-used" { chooseRecent(.recentlyUsed) }
             else if newValue == "archive" { chooseCollection(archived: true) }
@@ -656,6 +687,7 @@ final class AppModel {
     /// Load the device's local identities. Listing requires no authentication; the
     /// public keys are not secret.
     func openLocalVault() {
+        guard !localLoading else { return }
         localLoading = true; localError = nil
         Task { @MainActor in
             defer { localLoading = false }
@@ -780,7 +812,11 @@ final class AppModel {
               let target = catalogs[destination] else { return }
         let remember = allVaults
         let edit = ItemEdit(revision: target.revision, item: item, create: true)
+        let purpose = itemDraft?.sshPurpose ?? .ssh
+        let passphrase = itemDraft.flatMap { $0.sshPassphrase.isEmpty ? nil : SecretBytes(utf8: $0.sshPassphrase) }
         perform { token in
+            let edit = try await CloudCredentialService(self.service).prepareSSHSave(edit, vault: destination, purpose: purpose, passphrase: passphrase)
+            guard self.current(token) else { return }
             let result = try await self.service.execute(.save(edit), vault: destination, offline: false)
             guard self.current(token) else { return }
             let catalog = try result.requireCatalog()
@@ -801,8 +837,13 @@ final class AppModel {
             }) else { return }
         }
         let edit = ItemEdit(revision: revision ?? catalog.revision, item: item, create: create, originalName: originalName)
+        let destination = vault
+        let purpose = itemDraft?.sshPurpose ?? .ssh
+        let passphrase = itemDraft.flatMap { $0.sshPassphrase.isEmpty ? nil : SecretBytes(utf8: $0.sshPassphrase) }
         perform { token in
-            let result = try await self.service.execute(.save(edit), vault: self.selectedVault, offline: false)
+            let edit = try await CloudCredentialService(self.service).prepareSSHSave(edit, vault: destination, purpose: purpose, passphrase: passphrase)
+            guard self.current(token) else { return }
+            let result = try await self.service.execute(.save(edit), vault: destination, offline: false)
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
             self.selectedItem = item.name; self.selected = nil; self.sheet = nil
@@ -902,6 +943,7 @@ final class AppModel {
         if launchAttempted && authenticated { cloudChanged() }
     }
     private func clearSelection() {
+        selectedLocalIdentityID = nil
         generation += 1; editorGeneration += 1; itemDraft = nil; draftConflict = false
         selectedDeleted = nil; itemToDelete = nil
         conceal(); catalog = nil; passwordQualities = [:]; references = []; selected = nil; members = []
@@ -915,6 +957,10 @@ final class AppModel {
         catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
+        #if os(macOS)
+        DistributedNotificationCenter.default().postNotificationName(LocalAuthorization.appLockNotification, object: nil, userInfo: nil, deliverImmediately: true)
+        #endif
+        keyCreationPresented = false
         localAuthorization?.revoke(); localAuthorization = nil
         rememberSelection(); restoreLastSelection = true
         enrollmentGeneration += 1; enrollmentTask?.cancel(); enrollmentTask = nil; enrollmentWorking = false
@@ -1840,6 +1886,7 @@ enum PendingTransition {
     case item(ItemRow.ID?), vault(String), allItems, recentlyDeleted
     case collection(archived: Bool)
     case recent(ItemCollection)
+    case credentials(ItemCollection)
     case vaultTarget(String), sheet(AppSheet), presentation(SheetRequest), details(VaultDescriptor?), refresh, trash(ItemRow)
     case closeWindow, quit
 }
@@ -1930,6 +1977,7 @@ extension AppModel {
         case .allItems: chooseAllVaults()
         case .collection(let archived): chooseCollection(archived: archived)
         case .recent(let collection): chooseRecent(collection)
+        case .credentials(let collection): chooseCredentials(collection)
         case .recentlyDeleted: chooseRecentlyDeleted()
         case .vaultTarget(let id):
             guard prepareVaultAction(id) else { completion?(false); return }
@@ -1938,7 +1986,9 @@ extension AppModel {
             sheetRequest = request
             if request.kind == .addDevice { showsSetupChecklist = false }
         case .details(let target): conceal(); vaultDetailsTarget = target
-        case .refresh: discover()
+        case .refresh:
+            if collection == .all { openLocalVault() }
+            discover()
         case .trash(let row): trashItem(row)
         case .closeWindow, .quit: break
         }

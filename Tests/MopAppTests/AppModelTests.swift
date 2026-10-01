@@ -1,4 +1,6 @@
 import Foundation
+import CryptoKit
+import MopLocalIdentity
 import Synchronization
 import Testing
 import MopCore
@@ -1664,6 +1666,79 @@ extension AppModelTests {
 
 
 extension AppModelTests {
+    @Test func searchHighlightDoesNotBecomeNavigationSelection() throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service); app.authenticated = true
+        try app.applyCatalog(Self.catalog)
+        app.search = "github"; app.searchIsFocused = true
+        let row = try #require(app.displayedItems.first)
+        app.searchHighlighted = row.id
+        #expect(app.listSelection == nil && app.selectedRow == nil)
+        #expect(app.deletedListSelection == nil && app.selectedDeleted == nil)
+        app.search = "no matching result"
+        app.searchHighlighted = nil
+        #expect(app.listSelection == nil && app.selectedRow == nil)
+        app.search = "github"
+        app.selectedRow = row.id // Explicit open, as on Return or a row tap.
+        #expect(app.listSelection == row.id)
+    }
+
+    @Test func allItemsSearchIncludesLocalCredentialsAndPreservesTheirBackend() throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service); app.authenticated = true
+        try app.applyCatalog(Self.catalog)
+        let cloudVault = app.vault
+        let key = P256.Signing.PrivateKey()
+        let ssh = try LocalIdentity(name: "deployment", algorithm: .p256Signing, protocolType: .ssh, publicKey: key.publicKey.x963Representation)
+        let metadata = try PasskeyMetadata(relyingParty: "example.test", userName: "local-alice", userHandle: Data([1]), credentialID: Data(repeating: 1, count: 32))
+        let passkey = try LocalIdentity(name: "internal-passkey", algorithm: .p256Signing, protocolType: .webauthn, publicKey: key.publicKey.x963Representation, metadata: .passkey(metadata))
+        app.collection = .all
+        _ = app.displayedItems // Build the index before the async local list arrives.
+        app.localIdentities = [ssh, passkey]
+        for query in ["example.test", "local-alice", "internal-passkey"] {
+            app.search = query
+            #expect(app.displayedItems.count == 1)
+            #expect(app.displayedItems.first?.localIdentity?.id == passkey.id)
+        }
+        app.search = "deployment"
+        let row = try #require(app.displayedItems.first)
+        #expect(row.id.vault == LocalVault.id)
+        #expect(row.item.fields.allSatisfy { !$0.type.concealed })
+        app.selectedRow = row.id
+        #expect(app.collection == .all && app.vault == cloudVault)
+        #expect(app.selectedLocalIdentity?.id == ssh.id && app.selectedItem == nil)
+        #expect(app.listSelection == row.id && app.itemDraft == nil)
+        app.localIdentities = [passkey]
+        #expect(app.displayedItems.isEmpty && app.selectedLocalIdentity == nil)
+        app.search = "local-alice"
+        app.collection = .vault(cloudVault)
+        #expect(app.displayedItems.isEmpty)
+        #expect(service.state.withLock { $0.operations.isEmpty })
+    }
+
+    @Test(arguments: [true, false])
+    func invalidSSHSaveKeepsDraftAndDoesNotWrite(_ creating: Bool) async throws {
+        let item = VaultItem(name: "server", type: .sshKey, fields: [ItemField(path: "privateKey", type: .privateKey, value: "invalid key")])
+        var catalog = ItemCatalog(vault: "personal", revision: "r1", items: creating ? [] : [item])
+        catalog.canEdit = true
+        let source = catalog
+        let service = FakeService { operation, _, _ in
+            guard case .catalog = operation else { Issue.record("Invalid key must not reach a write"); throw MopError.invalidVault }
+            var result = VaultResult(); result.catalog = source; return result
+        }
+        service.authenticate()
+        let app = model(service); app.authenticated = true
+        try app.applyCatalog(source)
+        app.selectedItem = creating ? nil : item.name
+        app.itemDraft = ItemDraft(vault: app.vault, revision: source.revision, item: item, isNew: creating)
+        let id = app.itemDraft?.id
+        app.saveItemDraft(); try await finish(app)
+        #expect(app.error != nil)
+        #expect(app.itemDraft?.id == id && app.itemDraft?.name == item.name)
+        #expect(app.itemDraft?.fields.first?.value == "invalid key")
+        #expect(!service.state.withLock { $0.operations.contains { if case .save = $0 { return true }; return false } })
+    }
+
     @Test func favoritesSaveWithoutReadingConcealedFields() async throws {
         let service = FakeService { operation, _, _ in
             guard case .save(let edit) = operation else { throw MopError.invalidProcess }
@@ -1701,6 +1776,38 @@ extension AppModelTests {
         #expect(app.showsUnsavedChanges && !app.showArchived)
         app.discardAndContinue()
         #expect(app.showArchived && app.itemDraft == nil)
+    }
+
+    @Test(arguments: ["passkeys", "ssh-keys"])
+    func credentialCollectionsDismissUnchangedEditors(_ selection: String) throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service); app.authenticated = true
+        try app.applyCatalog(Self.catalog)
+        app.selectedItem = "github"; app.beginItemEditing()
+        #expect(app.itemDraft != nil && !app.hasUnsavedChanges)
+        app.sidebarSelection = selection
+        #expect(app.sidebarSelection == selection)
+        #expect(app.itemDraft == nil && app.selectedRow == nil)
+        #expect(!app.showsUnsavedChanges)
+    }
+
+    @Test(arguments: ["passkeys", "ssh-keys"])
+    func credentialCollectionsClearSelectionAndRespectUnsavedDrafts(_ selection: String) throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service); app.authenticated = true
+        try app.applyCatalog(Self.catalog)
+        app.selectedItem = "github"; app.beginItemEditing()
+        app.itemDraft?.name = "Changed"
+        let previous = app.sidebarSelection
+        app.sidebarSelection = selection
+        #expect(app.showsUnsavedChanges && app.sidebarSelection == previous)
+        app.discardAndContinue()
+        #expect(app.sidebarSelection == selection && app.itemDraft == nil)
+        #expect(app.selectedRow == nil && app.listSelection == nil)
+        #expect(app.selectedDeleted == nil && !app.searchIsFocused)
+        #expect(app.allVaults && app.authenticated)
+        app.sidebarSelection = selection
+        #expect(app.sidebarSelection == selection && app.selectedRow == nil)
     }
 
     @Test func developerErrorsIncludeUnderlyingFailureAndClearStaleDetails() async throws {

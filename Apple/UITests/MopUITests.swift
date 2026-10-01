@@ -13,6 +13,46 @@ import XCTest
         app.launch()
         return app
     }
+    func testTypingSearchDoesNotNavigateOrDismissKeyboard() {
+        let app = launch()
+        openItems(app)
+        let search = app.textFields["Item search"]
+        search.tap()
+        typeReliably("Example", into: search)
+        XCTAssertTrue(search.isHittable)
+        XCTAssertEqual(search.value as? String, "Example")
+        XCTAssertTrue(app.keyboards.firstMatch.exists)
+        typeReliably(" missing", into: search)
+        XCTAssertTrue(search.isHittable)
+        XCTAssertTrue(app.keyboards.firstMatch.exists)
+        app.buttons["Clear Search"].firstMatch.tap()
+        typeReliably("Example", into: search)
+        search.typeText("\n")
+        XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5))
+    }
+    func testKeyCreationRequiresExplicitStorageAndImportsResetSelection() {
+        let app = launch()
+        openItems(app)
+        app.buttons["New"].firstMatch.tap()
+        app.buttons["New SSH Key…"].tap()
+        let save = app.buttons["key-save"]
+        XCTAssertTrue(save.waitForExistence(timeout: 5))
+        XCTAssertFalse(save.isEnabled)
+        let name = app.textFields["key-name"]
+        name.tap(); typeReliably("SSH test", into: name)
+        XCTAssertFalse(save.isEnabled, "Naming a key must not silently choose cloud or hardware storage")
+        app.buttons["key-storage"].tap()
+        let personal = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'personal'")).firstMatch
+        XCTAssertTrue(personal.waitForExistence(timeout: 5)); personal.tap()
+        XCTAssertTrue(save.isEnabled)
+        app.segmentedControls["key-source"].buttons["Import"].tap()
+        XCTAssertTrue(app.buttons["Choose OpenSSH File…"].waitForExistence(timeout: 5))
+        XCTAssertFalse(save.isEnabled, "Import requires an explicit cloud destination and file")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Explicit key storage and import"; screenshot.lifetime = .keepAlways
+        add(screenshot)
+        app.buttons["Cancel"].tap()
+    }
     func testEnrollmentWaitsWithoutSpinnerAndCanClose() {
         let app = XCUIApplication()
         app.launchEnvironment["MOP_UI_TESTING"] = "1"

@@ -10,18 +10,10 @@ struct LocalVaultView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            GroupBox {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Device-only vault", systemImage: "internaldrive")
-                    Text(LocalIdentityWarning.loss)
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-            }
-            .tint(.secondary)
-
             if !LocalIdentityStore.isAvailable { Text("Secure Enclave is unavailable. Identity creation is disabled; no software fallback is provided.").foregroundStyle(.orange) }
             if !model.localCreatePresented {
-                Button("New Identity…") { model.beginLocalCreate() }
+                Button("New SSH Key…") { model.keyCreationPresented = true }
+                Button("New Certificate Identity…") { model.beginLocalCreate(); model.localCreateProtocol = .x509 }
                     .disabled(model.localCreating || model.localLoading || model.localDeleteInProgress || !LocalIdentityStore.isAvailable)
             }
 
@@ -42,18 +34,17 @@ struct LocalVaultView: View {
             } else {
                 List(model.displayedLocalIdentities, selection: $model.selectedLocalIdentityID) { identity in
                     NavigationLink(value: identity.id) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "key.fill").foregroundStyle(Color.accentColor).frame(width: 22)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(identity.name).fontWeight(.medium)
-                                Text(identity.protocolType.rawValue).font(.caption).foregroundStyle(.secondary)
-                            }
-                        }.padding(.vertical, 2)
+                        let credential = CredentialPresentation(identity: identity)
+                        VaultItemRowLabel(title: credential.title,
+                            symbol: identity.protocolType == .x509 ? "key.fill" : credential.symbol,
+                            subtitle: credential.account)
                     }
                     .tag(identity.id)
                     .contextMenu {
                         Button("Copy Reference") { copyLocalPublicText(identity.reference.description) }
-                        Button("Copy Public Key") { copyLocalPublicText(identity.publicKeyText) }
+                        if identity.protocolType != .webauthn {
+                            Button("Copy Public Key") { model.clipboard.copy(SecretBytes(utf8: identity.publicKeyText), concealed: false) }
+                        }
                         Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
                     }
                 }
@@ -69,13 +60,7 @@ struct LocalVaultView: View {
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .confirmationDialog("Delete this identity?", isPresented: Binding(get: { model.localDeleting != nil }, set: { if !$0 { model.localDeleting = nil } }), titleVisibility: .visible) {
-            if let id = model.localDeleting, let identity = model.localIdentities.first(where: { $0.id == id }) {
-                Button("Delete “" + identity.name + "”", role: .destructive) { model.confirmLocalDelete() }
-            }
-        } message: {
-            Text(LocalIdentityWarning.deletion)
-        }
+
     }
 }
 
@@ -89,6 +74,39 @@ private func copyLocalPublicText(_ text: String) {
 }
 
 struct LocalIdentityDetailView: View {
+    @Bindable var model: AppModel
+    let identity: LocalIdentity
+
+    var body: some View {
+        if [.ssh, .gitSigning, .webauthn].contains(identity.protocolType) {
+            let credential = CredentialPresentation(identity: identity)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Label("local", systemImage: "internaldrive").foregroundStyle(.secondary)
+                    Spacer()
+                    Menu {
+                        Button("Copy Reference") { copy(identity.reference.description) }
+                        Button("Delete", role: .destructive) { model.requestLocalDelete(identity.id) }
+                            .disabled(model.localDeleteInProgress || model.localCreating)
+                    } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Item actions") }
+                }.font(.callout)
+                Divider()
+                Text(credential.title).font(.title2.weight(.semibold))
+                CredentialDetailsView(credential: credential, copy: copy)
+                Text("This device only · Secure Enclave").font(.caption).foregroundStyle(.secondary)
+                Text("Created: " + identity.createdAt.formatted()).font(.caption).foregroundStyle(.secondary)
+            }.padding().frame(maxWidth: .infinity, alignment: .topLeading)
+        } else {
+            LocalCertificateDetailView(model: model, identity: identity)
+        }
+    }
+
+    private func copy(_ text: String) {
+        model.clipboard.copy(SecretBytes(utf8: text), concealed: false)
+    }
+}
+
+private struct LocalCertificateDetailView: View {
     @Bindable var model: AppModel
     let identity: LocalIdentity
 
@@ -130,22 +148,6 @@ struct LocalIdentityDetailView: View {
                         ShareLink("Share Public Key", item: identity.publicKeyText)
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
-            }
-            if identity.protocolType == .gitSigning {
-                GroupBox("Git signing setup") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(identity.gitSetup).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-                        Button("Copy Setup Instructions") { copyLocalPublicText(identity.gitSetup) }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            if case .passkey(let data) = identity.metadata {
-                GroupBox("Passkey") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        LabeledContent("Website", value: data.relyingParty)
-                        LabeledContent("User", value: data.userName)
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                }
             }
             if let certificates = try? identity.certificateInfo, !certificates.isEmpty {
                 GroupBox("Certificates") {

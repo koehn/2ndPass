@@ -18,18 +18,19 @@ public enum FieldType: String, Codable, CaseIterable, Sendable {
 }
 
 public enum ItemType: String, Codable, CaseIterable, Sendable {
-    case login, password, apiCredential, secureNote, database, sshKey, paymentCard, identity, document, custom
+    case login, password, apiCredential, secureNote, database, sshKey, passkey, paymentCard, identity, document, custom
     public var label: String {
         switch self {
         case .apiCredential: "API credential"
         case .secureNote: "Secure note"
         case .sshKey: "SSH key"
+        case .passkey: "Passkey"
         case .paymentCard: "Payment card"
         default: rawValue.capitalized
         }
     }
     /// Custom remains decodable for existing items, but has no creation template.
-    public static var templateTypes: [ItemType] { allCases.filter { $0 != .custom } }
+    public static var templateTypes: [ItemType] { allCases.filter { $0 != .custom && $0 != .passkey } }
     public var template: [ItemField] {
         let fields: [(String, FieldType)]
         switch self {
@@ -38,11 +39,11 @@ public enum ItemType: String, Codable, CaseIterable, Sendable {
         case .apiCredential: fields = [("token", .concealed), ("endpoint", .website)]
         case .secureNote: fields = [("note", .concealed)]
         case .database: fields = [("server", .text), ("username", .username), ("password", .password), ("database", .text)]
-        case .sshKey: fields = [("privateKey", .privateKey), ("publicKey", .text), ("passphrase", .password), ("fingerprint", .text)]
+        case .sshKey: fields = [("privateKey", .privateKey)]
         case .paymentCard: fields = [("cardholder", .text), ("number", .cardNumber), ("brand", .text), ("expiration", .expirationMonthYear), ("securityCode", .concealed), ("pin", .concealed)]
         case .identity: fields = [("firstName", .text), ("middleName", .text), ("lastName", .text), ("company", .text), ("birthDate", .date), ("email", .email), ("phone", .phone), ("address1", .text), ("address2", .text), ("city", .text), ("state", .text), ("postalCode", .text), ("country", .text), ("username", .username), ("governmentID", .concealed)]
         case .document: fields = [("attachment", .attachment)]
-        case .custom: return []
+        case .custom, .passkey: return []
         }
         return (fields + (self == .secureNote ? [] : [("notes", .notes)])).map { ItemField(path: $0.0, type: $0.1, value: "", isTemplate: true) }
     }
@@ -89,13 +90,14 @@ public struct VaultItem: Codable, Equatable, Sendable {
     public var deletion: ItemDeletion?
     public var autoFill: AutoFillMapping?
     public var metadata: ItemMetadata?
+    public var credential: KeyCredential?
     /// Verified catalog projection, never serialized or accepted from an edit/import.
     public var storageID: String? = nil
-    private enum CodingKeys: String, CodingKey { case name, type, fields, deletion, autoFill, metadata }
+    private enum CodingKeys: String, CodingKey { case name, type, fields, deletion, autoFill, metadata, credential }
     public var isArchived: Bool { metadata?.archived == true }
     public var isFavorite: Bool { metadata?.favorite == true }
     public var requiresExtendedModel: Bool {
-        metadata != nil || [.sshKey, .paymentCard, .identity, .document].contains(type) || fields.contains {
+        credential != nil || metadata != nil || [.sshKey, .paymentCard, .identity, .document].contains(type) || fields.contains {
             $0.label != nil || [.recoveryCodes, .privateKey, .cardNumber, .expirationMonthYear, .date, .phone, .attachment, .bankAccount, .address].contains($0.type)
         }
     }

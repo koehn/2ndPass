@@ -5,17 +5,17 @@ import Testing
 import MopCore
 @testable import MopLocalIdentity
 
-@Test func passkeysAdvertiseBackupFlagsAndCOSEPublicKey() throws {
+@Test func passkeysAdvertiseTruthfulLocalFlagsAndCOSEPublicKey() throws {
     let publicKey = P256.Signing.PrivateKey().publicKey.x963Representation
     let metadata = try PasskeyMetadata(relyingParty: "example.com", userName: "alice", userHandle: Data([1]), credentialID: Data(repeating: 7, count: 32))
     let registration = try LocalWebAuthn.registrationData(metadata: metadata, publicKey: publicKey)
     #expect(registration.prefix(32) == Data(SHA256.hash(data: Data("example.com".utf8))))
-    #expect(registration[32] == 0x5d) // UP, UV, BE, BS, AT
+    #expect(registration[32] == 0x45) // UP, UV, AT
     #expect(registration[33..<37] == Data(repeating: 0, count: 4))
     #expect(registration[53..<55] == Data([0, 32]))
     #expect(registration[55..<87] == metadata.credentialID)
     #expect(registration.suffix(32) == publicKey.suffix(32))
-    #expect(LocalWebAuthn.authenticatorData(relyingParty: "example.com")[32] == 0x1d)
+    #expect(LocalWebAuthn.authenticatorData(relyingParty: "example.com")[32] == 0x05)
     let attestation = try LocalWebAuthn.attestation(metadata: metadata, publicKey: publicKey)
     #expect(attestation.contains(Data("none".utf8)))
     #expect(attestation.contains(registration))

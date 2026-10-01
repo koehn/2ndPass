@@ -32,6 +32,7 @@ public enum SSHAgentCommand {
 public struct SSHAgentIdentity: Equatable, Sendable {
     public let blob: Data
     public let comment: String
+    public init(blob: Data, comment: String) { self.blob = blob; self.comment = comment }
 }
 
 /// The source of keys the agent serves. Production wraps the Secure Enclave store;
@@ -40,6 +41,13 @@ public protocol SSHAgentBackend {
     func identities() throws -> [SSHAgentIdentity]
     /// Return a DER-encoded ECDSA signature over `data` using the key `blob`.
     func sign(blob: Data, data: Data) throws -> Data
+    func signature(blob: Data, data: Data, flags: UInt32) throws -> Data
+}
+public extension SSHAgentBackend {
+    func signature(blob: Data, data: Data, flags: UInt32) throws -> Data {
+        guard flags == 0 else { throw MopError.localIdentityCapability }
+        return try SSHAgentFraming.sshSignature(der: sign(blob: blob, data: data))
+    }
 }
 
 /// Pure SSH agent-protocol framing and dispatch (RFC 9987). No I/O: the socket
@@ -118,9 +126,9 @@ public enum SSHAgentFraming {
             var offset = 0
             let blob = try parseString(payload, &offset)
             let data = try parseString(payload, &offset)
-            guard try parseUInt32(payload, &offset) == 0, offset == payload.count else { throw MopError.invalidLocalIdentity }
-            let signature = try backend.sign(blob: blob, data: data)
-            return signResponse(signature: try sshSignature(der: signature))
+            let flags = try parseUInt32(payload, &offset)
+            guard offset == payload.count else { throw MopError.invalidLocalIdentity }
+            return signResponse(signature: try backend.signature(blob: blob, data: data, flags: flags))
         case SSHAgentCommand.agentExtension:
             return handleExtension(payload: payload)
         case SSHAgentCommand.lock, SSHAgentCommand.unlock, SSHAgentCommand.removeAllIdentities:

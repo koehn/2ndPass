@@ -12,6 +12,7 @@ struct RecentlyDeletedList: View {
                         Text(row.item.deletion?.originalName ?? row.item.name).fontWeight(.medium)
                         Text(row.vaultName).font(.caption).foregroundStyle(.secondary)
                     }.padding(.vertical, 5) }.tag(row.id)
+                        .listRowBackground(model.searchIsFocused && !model.search.isEmpty && model.searchHighlighted == row.id ? Color.accentColor.opacity(0.12) : nil)
                         .contextMenu {
                             Button("Restore") { model.restoreDeletedItem(row) }.disabled(model.offline || model.busy)
                         }

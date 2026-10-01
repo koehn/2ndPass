@@ -147,7 +147,7 @@ struct Inject: AsyncParsableCommand {
 }
 
 struct Item: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "List typed items or atomically save an item from JSON stdin.", subcommands: [Catalog.self, Save.self, Import.self, Attachments.self, Create.self, PublicKey.self, DeleteIdentity.self, CSR.self, Certificate.self])
+    static let configuration = CommandConfiguration(abstract: "List typed items or atomically save an item from JSON stdin.", subcommands: [Catalog.self, Save.self, Import.self, Attachments.self, Create.self, ImportSSH.self, PublicKey.self, DeleteIdentity.self, CSR.self, Certificate.self])
     struct Catalog: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         func run() async throws {

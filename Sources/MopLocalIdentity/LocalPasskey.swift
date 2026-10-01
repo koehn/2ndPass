@@ -7,15 +7,15 @@ import Security
 /// supplies the validated RP ID and clientDataHash; we never accept a URL from UI.
 public enum LocalWebAuthn {
     public static func authenticatorData(relyingParty: String) -> Data {
-        // UP + UV + BE + BS for platform compatibility. These advertised backup
-        // flags do not reflect the device-local key's actual nonrecoverability.
+        // UP + UV. Hardware keys are neither backup eligible nor backed up.
         // A zero counter means counters are unsupported.
-        Data(SHA256.hash(data: Data(relyingParty.utf8))) + Data([0x1d, 0, 0, 0, 0])
+        Data(SHA256.hash(data: Data(relyingParty.utf8))) + Data([0x05, 0, 0, 0, 0])
     }
-    public static func registrationData(metadata: PasskeyMetadata, publicKey: Data) throws -> Data {
+    public static func registrationData(metadata: PasskeyMetadata, publicKey: Data, backedUp: Bool = false) throws -> Data {
         _ = try P256.Signing.PublicKey(x963Representation: publicKey)
         var data = authenticatorData(relyingParty: metadata.relyingParty)
         data[32] |= 0x40 // AT
+        if backedUp { data[32] |= 0x18 }
         data.append(Data(repeating: 0, count: 16)) // no identifying attestation
         data.append(contentsOf: [0, 32]); data.append(metadata.credentialID)
         // COSE EC2, ES256, P-256, x, y. No private key component.
@@ -24,8 +24,8 @@ public enum LocalWebAuthn {
         data.append(0x22); data.append(cborBytes(Data(publicKey.suffix(32))))
         return data
     }
-    public static func attestation(metadata: PasskeyMetadata, publicKey: Data) throws -> Data {
-        let authData = try registrationData(metadata: metadata, publicKey: publicKey)
+    public static func attestation(metadata: PasskeyMetadata, publicKey: Data, backedUp: Bool = false) throws -> Data {
+        let authData = try registrationData(metadata: metadata, publicKey: publicKey, backedUp: backedUp)
         // {fmt: "none", attStmt: {}, authData: bytes}, RFC 8949 encoding.
         return Data([0xa3]) + cborText("fmt") + cborText("none") + cborText("attStmt") + Data([0xa0]) + cborText("authData") + cborBytes(authData)
     }

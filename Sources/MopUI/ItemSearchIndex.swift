@@ -62,7 +62,10 @@ final class ItemSearchIndex {
 
     nonisolated private static func entry(_ row: ItemRow, deleted: Bool, locale: Locale) -> Entry {
         Entry(row: row,
-              name: normalize(deleted ? row.item.deletion?.originalName ?? row.item.name : row.item.name, locale: locale),
+              name: normalize(deleted ? row.item.deletion?.originalName ?? row.item.name :
+                  (row.item.credential?.purposes == [.passkey]
+                   ? [row.item.displayTitle, row.subtitle ?? "", row.item.name].joined(separator: " ")
+                   : row.item.name), locale: locale),
               vault: normalize(row.vaultName, locale: locale),
               tags: (row.item.metadata?.tags ?? []).map { ($0, normalize($0, locale: locale)) },
               fields: row.item.fields.filter { !$0.type.concealed }.map {

@@ -11,6 +11,7 @@ public enum LocalKeyOperation: Hashable, Sendable { case create, delete, sign, c
 /// Unforgeable outside this module. No serialization; holds only the authorized
 /// context, exact scope, and revocation state. Key handles remain operation-local.
 public final class LocalAuthorization: @unchecked Sendable {
+    public static let appLockNotification = Notification.Name("com.koehn.2ndpass.sessionLocked")
     private let lock = NSLock()
     private var active = true
     private var used = false
@@ -44,6 +45,7 @@ public final class LocalAuthorization: @unchecked Sendable {
             }
             #if os(macOS)
             observe(DistributedNotificationCenter.default(), Notification.Name("com.apple.screenIsLocked"))
+            observe(DistributedNotificationCenter.default(), Self.appLockNotification)
             observe(NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification)
             observe(NSWorkspace.shared.notificationCenter, NSWorkspace.sessionDidResignActiveNotification)
             #else

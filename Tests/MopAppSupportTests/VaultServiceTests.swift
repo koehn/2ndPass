@@ -1109,3 +1109,51 @@ func offlineRecoveryFinalizationResumesAfterCloudCommit(lostAcknowledgement: Boo
     _ = try await collaborator.service.execute(.write(reference, "collaborator-write", replace: true), vault: id)
     #expect(try await fresh.service.execute(.read(reference), vault: id).value == "collaborator-write")
 }
+
+@Test func cloudPasskeyAssertionUsesOneFreshVaultAuthentication() async throws {
+    let server = Server()
+    let owner = Client(server, "a"), recovery = Client(server, "a")
+    let vault = try await create(owner, recovery: recovery)
+    let provider = CloudCredentialService(owner.service)
+    let hash = Data(repeating: 9, count: 32)
+    let record = try await provider.registerPasskey(vault: vault, relyingParty: "example.test", userName: "alice", userHandle: Data([1]), clientDataHash: hash, algorithms: [-7])
+    let suggestion = try #require(AutoFillIdentity(passkey: record.item, vaultID: vault))
+    for _ in 0..<2 {
+        owner.service.lock()
+        let before = owner.calls.withLock { $0 }
+        let resolved = try await provider.resolvePasskey(suggestion, relyingParty: "example.test", allowed: [])
+        let assertion = try await provider.assertPasskey(resolved, relyingParty: "example.test", allowed: [], clientDataHash: hash)
+        #expect(owner.calls.withLock { $0 } == before + 1)
+        #expect(assertion.authenticatorData[32] & 0x04 != 0)
+        let key = try P256.Signing.PublicKey(x963Representation: record.credential.publicKey)
+        #expect(key.isValidSignature(try P256.Signing.ECDSASignature(derRepresentation: assertion.signature), for: assertion.authenticatorData + hash))
+        owner.service.lock()
+        #expect(!owner.service.isAuthenticated)
+    }
+}
+
+@Test func autoFillSavesNewLoginAndRejectsOverwriteAndViewer() async throws {
+    let server = Server()
+    let owner = Client(server, "a"), recovery = Client(server, "a"), viewer = Client(server, "b")
+    let vault = try await create(owner, recovery: recovery)
+    let draft = AutoFillLoginDraft(name: "  My account  ", username: "alice", password: "new-login-secret", website: "https://example.test/signup")
+    #expect(draft.canSave)
+    let saved = try await draft.save(vault: vault, service: owner.service)
+    let item = try #require(saved.items.first { $0.name == "My account" })
+    #expect(item.type == .login)
+    #expect(item.fields.first { $0.path == "password" }?.value == nil)
+    #expect(item.fields.first { $0.path == "username" }?.value == "alice")
+    let suggestions = AutoFillEntry.entries(catalog: saved, vaultID: vault)
+    #expect(suggestions.contains { $0.website == "example.test" && $0.username == "alice" })
+    var replacement = draft; replacement.password = "must-not-overwrite"
+    await #expect(throws: MopError.duplicate) { try await replacement.save(vault: vault, service: owner.service) }
+    let value = try await owner.service.execute(.read(SecretReference("sp://personal/My%20account/password")), vault: vault)
+    #expect(value.value == SecretBytes(utf8: "new-login-secret"))
+    await #expect(throws: AutoFillLoginSaveError.invalidDraft) { try await draft.save(vault: "local-vault", service: owner.service) }
+    try await enroll(viewer, owner: owner, vault: vault, role: .viewer)
+    await #expect(throws: AutoFillLoginSaveError.readOnly) { try await draft.save(vault: vault, service: viewer.service) }
+    var invalid = draft; invalid.name = " \n "
+    #expect(!invalid.canSave)
+    invalid = draft; invalid.password = ""
+    #expect(!invalid.canSave)
+}

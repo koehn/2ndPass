@@ -25,7 +25,7 @@ It supersedes earlier deferrals of passkeys and cross-account sharing for the
 paid release. Free/Pro packaging is the chosen direction (SALE-15); prices and
 subscription versus permanent-unlock purchase options remain undecided.
 
-- [ ] **SALE-1 — Offline master recovery key.** Generate a recovery keypair and
+- [X] **SALE-1 — Offline master recovery key.** Generate a recovery keypair and
   let the user retain the private key offline. Add the public key as an additional
   recovery recipient for the vault catalog, items, and attachments. Devices on
   the same iCloud account must be able to recover vault access using that key.

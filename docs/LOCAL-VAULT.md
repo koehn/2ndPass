@@ -94,11 +94,10 @@ See [Git configuration](https://git-scm.com/docs/git-config).
 
 ## Device-bound passkeys
 
-**Development compatibility override:** Registration and assertion currently advertise
-`BE=1, BS=1` at the user's request to test Apple platform acceptance. These flags
-do not describe the actual storage: the private key remains device-local,
-non-exportable, and cannot be backed up or recovered. This overrides the flag
-behavior described below; browser acceptance still requires physical-device testing.
+Local passkeys report truthful `BE=0, BS=0`. An earlier development override
+advertised backup flags despite keeping keys only in hardware. Existing credentials
+are retained; sites may require re-registration after this correction. Cloud-backed
+alternatives are described in [Cloud key credentials](CLOUD-KEY-CREDENTIALS.md).
 
 Enable 2ndPass as a credential provider in system AutoFill settings. In a website’s
 passkey registration flow choose 2ndPass, acknowledge device loss, and authenticate.

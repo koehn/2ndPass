@@ -63,9 +63,10 @@ System suggestions and the picker reveal websites and usernames before authentic
 item/vault names remain encrypted. Identical website/username pairs in separate
 vaults appear as separate entries without decrypted labels.
 
-This version fills existing passwords and verification codes. Passkeys, saving new
-credentials, and generating passwords inside AutoFill are not implemented. Disabling
-the provider clears Apple’s store; enable it again and refresh suggestions in 2ndPass.
+This version fills passwords, verification codes, and passkeys. Saving new logins
+is supported on iOS/iPadOS 26.2 and later as described below; password generation
+inside AutoFill is not implemented. Disabling the provider clears Apple’s store;
+enable it again and refresh suggestions in 2ndPass.
 An invalid derived metadata cache is rebuilt from authenticated catalogs. Filesystem
 permission failures remain errors and are never bypassed during repair.
 
@@ -154,3 +155,41 @@ BE and BS are both zero. Apple has documented a credential-provider restriction
 requiring those flags to be true, so physical-device acceptance is not yet established.
 The implementation never lies about backups to bypass that restriction. See
 [the compatibility limitation and acceptance suite](LOCAL-VAULT.md#device-bound-passkeys).
+
+## Cloud-vault passkeys
+
+Registration now offers an explicit cloud/device-local destination. Cloud passkeys
+are saved before the registration response and indexed alongside local passkeys.
+The sign-in picker reads only published suggestion metadata; listing accounts does
+not open cloud vaults or request authentication. Cloud entries use the label
+“Cloud vault” because vault names remain encrypted. Selecting an account requires
+authentication and a fresh lookup; stale suggestions cannot authorize signing.
+When exactly one cloud or device-local passkey matches, sign-in skips the account
+picker. Cloud sign-in uses one fresh vault authentication for user verification
+and key access, then locks that operation's session when it finishes. Multiple
+matches still require an account selection; browsing them does not authenticate.
+Assertions re-resolve the selected vault credential and enforce exact RP and
+allow-list matching after authentication. See [Cloud key credentials](CLOUD-KEY-CREDENTIALS.md)
+for compatibility, synchronization, recovery, and acceptance requirements.
+
+## Saving new logins
+
+On iOS/iPadOS 26.2 and later, system save-password requests open a branded **Save
+Login** form with the supplied website, username, concealed password, and suggested
+name. Choose a writable cloud vault and confirm the name before saving. No vault
+is selected implicitly. Shared-vault members receive access through the existing
+vault membership rules. The extension authenticates through the normal vault
+service, rechecks write permission at save time, and confirms completion only after
+the encrypted save succeeds. The public AutoFill index receives no password.
+
+This flow creates a new Login item; it never silently updates an existing item.
+A conflicting name leaves the draft open so you can rename it. Cancellation or
+locking clears the in-memory draft. The extension does not keep a plaintext draft
+or write temporary password files. Suggestion publication is best effort after a
+successful save; the containing app can refresh suggestions if publication fails.
+
+Apple's save-password extension callback is unavailable on macOS and on iOS/iPadOS
+before 26.2. Automatic form capture there requires a separate browser integration;
+it is not supplied by this extension. Existing macOS 15/iOS 18 deployment targets
+remain unchanged. Live website-triggered saving on a signed physical device is a
+separate acceptance check from service tests and extension builds.

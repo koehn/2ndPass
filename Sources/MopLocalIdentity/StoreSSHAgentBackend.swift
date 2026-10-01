@@ -3,7 +3,7 @@ import MopCore
 
 /// Enforces protocol purpose even when an untrusted client controls the socket.
 public enum SSHSigningPolicy {
-    public static func validate(data: Data, key: Data, purpose: LocalIdentityProtocol) throws {
+    public static func validate(data: Data, key: Data, purpose: LocalIdentityProtocol, algorithm: String = SSHPublicKey.algorithm) throws {
         var offset = 0
         func string() throws -> Data { try SSHAgentFraming.parseString(data, &offset) }
         func text() throws -> String { String(decoding: try string(), as: UTF8.self) }
@@ -23,7 +23,7 @@ public enum SSHSigningPolicy {
             guard ["publickey", "publickey-hostbound-v00@openssh.com"].contains(method),
                   offset < data.count, data[offset] == 1 else { throw MopError.localIdentityCapability }
             offset += 1
-            guard try text() == SSHPublicKey.algorithm, try string() == key else { throw MopError.localIdentityCapability }
+            guard try text() == algorithm, try string() == key else { throw MopError.localIdentityCapability }
             if method == "publickey-hostbound-v00@openssh.com" {
                 // OpenSSH adds the server's public key to the signed authentication
                 // payload. Accepting this format does not verify a session binding

@@ -90,35 +90,40 @@ struct ContentView: View {
                         // SwiftUI's macOS OutlineListCoordinator. Let List manage
                         // its selection without forcing an outline traversal.
                         List(model.displayedItems, selection: $model.listSelection) { row in
-                            NavigationLink(value: row.id) { HStack(spacing: 10) {
-                                Image(systemName: row.item.type.symbol)
-                                    .foregroundStyle(Color.accentColor).frame(width: 22)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(row.item.name).fontWeight(.medium)
-                                    if let date = row.recentDate {
-                                        Text(date, style: .relative).font(.caption).foregroundStyle(.secondary)
-                                            .help(date.formatted(date: .complete, time: .standard))
-                                    }
-                                    if let subtitle = row.subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
-                                    if model.allVaults { Text(row.vaultName).font(.caption).foregroundStyle(.secondary) }
-                                    if let detail = row.searchDetail {
-                                        Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                    }
-                                }
-                            }.padding(.vertical, 2) }.tag(row.id).id(row.id)
+                            NavigationLink(value: row.id) {
+                                VaultItemRowLabel(title: row.item.displayTitle, symbol: row.item.type.symbol,
+                                    subtitle: row.subtitle, vaultName: model.allVaults ? row.vaultName : nil,
+                                    recentDate: row.recentDate, searchDetail: row.searchDetail)
+                            }.tag(row.id).id(row.id)
+                                .listRowBackground(model.searchIsFocused && !model.search.isEmpty && model.searchHighlighted == row.id ? Color.accentColor.opacity(0.12) : nil)
                                 .contextMenu {
-                                    Button("Delete", role: .destructive) { model.itemToDelete = row }
-                                        .disabled(model.offline || model.busy)
+                                    if let identity = row.localIdentity {
+                                        Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
+                                            .disabled(model.localDeleteInProgress || model.localCreating)
+                                    } else {
+                                        Button("Delete", role: .destructive) { model.itemToDelete = row }
+                                            .disabled(model.offline || model.busy)
+                                    }
                                 }
                         }.disabled(model.busy).id(model.selectionGeneration)
-                        if model.displayedItems.isEmpty {
-                            ContentUnavailableView {
-                                Label(model.search.isEmpty ? "No items" : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")
-                            } actions: {
-                                if !model.search.isEmpty { Button("Clear Search") { model.search = "" } }
-                                else {
-                                    Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy)
-                                    Button("Import…") { model.beginImport() }.disabled(model.offline || model.busy)
+                        .overlay {
+                            if model.displayedItems.isEmpty {
+                                ContentUnavailableView {
+                                    Label(model.search.isEmpty ? emptyCollectionTitle : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")
+                                } description: {
+                                    if model.search.isEmpty && model.collection == .passkeys {
+                                        Text("Create a passkey when signing up or signing in on a website that supports them.")
+                                    }
+                                } actions: {
+                                    if !model.search.isEmpty { Button("Clear Search") { model.search = "" } }
+                                    else if model.collection == .sshKeys {
+                                        Button("Add SSH Key") { model.keyCreationPresented = true }
+                                            .disabled(model.offline || model.busy)
+                                    }
+                                    else if model.collection != .passkeys {
+                                        Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy)
+                                        Button("Import…") { model.beginImport() }.disabled(model.offline || model.busy)
+                                    }
                                 }
                             }
                         }
@@ -143,6 +148,9 @@ struct ContentView: View {
                         } else {
                             LocalVaultDetailHint()
                         }
+                    }
+                    else if let identity = model.selectedLocalIdentity {
+                        LocalIdentityDetailView(model: model, identity: identity).id(identity.id)
                     }
                     else if let draft = model.itemDraft, draft.isNew, model.authenticated {
                         ItemDetailView(model: model, itemName: "").id(draft.id)
@@ -231,6 +239,13 @@ struct ContentView: View {
         .toolbar { SessionToolbar(model: model, settings: $settingsPresented) }
         #endif
     }
+    private var emptyCollectionTitle: String {
+        switch model.collection {
+        case .passkeys: "No Passkeys"
+        case .sshKeys: "No SSH Keys"
+        default: "No items"
+        }
+    }
     private var sessionContent: some View {
         Group {
             if !model.authenticated && model.cloudVaultsPresent && !model.isLocalVaultSelected {
@@ -266,6 +281,7 @@ struct ContentView: View {
     }
     private var content: some View {
         sessionContent
+        .sheet(isPresented: $model.keyCreationPresented) { KeyCredentialCreateView(model: model) }
         .sheet(item: $model.vaultDetailsTarget) { target in
             VaultDetailsDialog(model: model, target: target)
         }
@@ -281,7 +297,17 @@ struct ContentView: View {
         .confirmationDialog("Delete Field?", isPresented: $model.deleteConfirmation, titleVisibility: .visible) {
             Button("Delete Field", role: .destructive) { model.delete() }
         } message: { Text("This deletes the current field after authentication. Historical encrypted copies remain.") }
+        .confirmationDialog("Delete this identity?", isPresented: Binding(get: { model.localDeleting != nil }, set: { if !$0 { model.localDeleting = nil } }), titleVisibility: .visible) {
+            if let id = model.localDeleting, let identity = model.localIdentities.first(where: { $0.id == id }) {
+                Button("Delete “" + identity.name + "”", role: .destructive) { model.confirmLocalDelete() }
+            }
+        } message: {
+            Text(LocalIdentityWarning.deletion)
+        }
         .task { model.start() }
+        .task(id: model.collection) {
+            if model.collection == .all { model.openLocalVault() }
+        }
     }
 
 }

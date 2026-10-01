@@ -6,8 +6,8 @@ import MopCore
 import MopKeychain
 
 public enum AutoFillKind: String, Codable, Sendable, CaseIterable {
-    case password, oneTimeCode
-    var prefix: String { self == .password ? "mop-autofill-v7" : "mop-autofill-otp-v7" }
+    case password, oneTimeCode, passkey
+    var prefix: String { self == .password ? "mop-autofill-v7" : self == .passkey ? "mop-passkey-v7" : "mop-autofill-otp-v7" }
 }
 
 /// Only websites, usernames, credential kinds and opaque locators leave the encrypted catalog.
@@ -21,7 +21,7 @@ public struct AutoFillEntry: Equatable, Sendable {
     public static func entries(catalog: ItemCatalog, vaultID: String) -> [Self] {
         guard let id = UUID(uuidString: vaultID) else { return [] }
         return catalog.items.filter { $0.type == .login && $0.deletion == nil && !$0.isArchived }.flatMap { item -> [Self] in
-            AutoFillKind.allCases.flatMap { kind -> [Self] in
+            [AutoFillKind.password, .oneTimeCode].flatMap { kind -> [Self] in
                 guard exclusionReason(for: item, kind: kind) == nil,
                       let username = usernameField(in: item)?.value,
                       let field = kind == .password ? passwordField(in: item) : otpField(in: item),
@@ -108,8 +108,24 @@ public struct AutoFillIdentity: Codable, Equatable, Identifiable, Sendable {
     public let username: String
     public let recordIdentifier: String
     public let kind: AutoFillKind
+    public var credentialID: Data? = nil
+    public var userHandle: Data? = nil
+    public func matchesPasskey(relyingParty: String, allowed: [Data]) -> Bool {
+        guard kind == .passkey, website == relyingParty,
+              AutoFillEntry.vaultID(recordIdentifier) != nil,
+              let credentialID, credentialID.count == 32,
+              let userHandle, (1...64).contains(userHandle.count) else { return false }
+        return allowed.isEmpty || allowed.contains(credentialID)
+    }
     public init(entry: AutoFillEntry) {
         website = entry.website; username = entry.username; recordIdentifier = entry.recordIdentifier; kind = entry.kind
+    }
+    public init?(passkey item: VaultItem, vaultID: String) {
+        guard UUID(uuidString: vaultID) != nil, item.deletion == nil, !item.isArchived,
+              let c = item.credential, c.purposes == [.passkey], (try? c.validate()) != nil,
+              let rp = c.relyingParty, let user = c.userName, let credentialID = c.credentialID, let handle = c.userHandle else { return nil }
+        website = rp; username = user; kind = .passkey; self.credentialID = credentialID; userHandle = handle
+        recordIdentifier = "mop-passkey-v7:" + vaultID + ":" + SHA256.hash(data: credentialID).map { String(format: "%02x", $0) }.joined()
     }
     public init?(identity: any ASCredentialIdentity) {
         guard let identifier = identity.recordIdentifier else { return nil }
@@ -118,19 +134,26 @@ public struct AutoFillIdentity: Codable, Equatable, Identifiable, Sendable {
             website = password.serviceIdentifier.identifier; username = password.user; kind = .password
         } else if let code = identity as? ASOneTimeCodeCredentialIdentity {
             website = code.serviceIdentifier.identifier; username = code.label; kind = .oneTimeCode
+        } else if let passkey = identity as? ASPasskeyCredentialIdentity {
+            website = passkey.relyingPartyIdentifier; username = passkey.userName; kind = .passkey
+            credentialID = passkey.credentialID; userHandle = passkey.userHandle
         } else { return nil }
     }
-    private enum CodingKeys: String, CodingKey { case website, username, recordIdentifier, kind }
+    private enum CodingKeys: String, CodingKey { case website, username, recordIdentifier, kind, credentialID, userHandle }
     public init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         website = try values.decode(String.self, forKey: .website)
         username = try values.decode(String.self, forKey: .username)
         recordIdentifier = try values.decode(String.self, forKey: .recordIdentifier)
         kind = try values.decodeIfPresent(AutoFillKind.self, forKey: .kind) ?? .password
+        credentialID = try values.decodeIfPresent(Data.self, forKey: .credentialID)
+        userHandle = try values.decodeIfPresent(Data.self, forKey: .userHandle)
+        if kind == .passkey { guard credentialID?.count == 32, let userHandle, (1...64).contains(userHandle.count) else { throw CredentialFailure.invalid } }
     }
     public var identity: any ASCredentialIdentity {
         let service = ASCredentialServiceIdentifier(identifier: website, type: .domain)
         switch kind {
+        case .passkey: return ASPasskeyCredentialIdentity(relyingPartyIdentifier: website, userName: username, credentialID: credentialID ?? Data(), userHandle: userHandle ?? Data(), recordIdentifier: recordIdentifier)
         case .password: return ASPasswordCredentialIdentity(serviceIdentifier: service, user: username, recordIdentifier: recordIdentifier)
         case .oneTimeCode: return ASOneTimeCodeCredentialIdentity(serviceIdentifier: service, label: username, recordIdentifier: recordIdentifier)
         }
@@ -224,9 +247,15 @@ public actor AutoFillPublisher: AutoFillPublishing {
         else if publish != nil { self.enabled = { true } }
         else { self.enabled = { await ASCredentialIdentityStore.shared.state().isEnabled } }
         publishIdentities = publish ?? { entries in
-            let passkeys = try LocalIdentityStore.open().list().compactMap(\.passkeySuggestion)
-            try await ASCredentialIdentityStore.shared.replaceCredentialIdentities(entries.map(\.identity) + passkeys)
+            let identities = Self.combinedIdentities(entries) {
+                try LocalIdentityStore.open().list().compactMap(\.passkeySuggestion)
+            }
+            try await ASCredentialIdentityStore.shared.replaceCredentialIdentities(identities)
         }
+    }
+    nonisolated static func combinedIdentities(_ entries: [AutoFillIdentity], local: () throws -> [ASPasskeyCredentialIdentity]) -> [any ASCredentialIdentity] {
+        // Cloud suggestions do not depend on access to this device's hardware keys.
+        entries.map(\.identity) + ((try? local()) ?? [])
     }
     private func directory() throws -> URL { try indexDirectory ?? AutoFillStorage.directory() }
     private func rememberedStatus() -> AutoFillPublicationStatus {
@@ -288,6 +317,7 @@ public actor AutoFillPublisher: AutoFillPublishing {
         try await update(scope: vaultID) { old in
             old.filter { AutoFillEntry.vaultID($0.recordIdentifier) != vaultID }
                 + AutoFillEntry.entries(catalog: catalog, vaultID: vaultID).map(AutoFillIdentity.init)
+                + catalog.items.compactMap { AutoFillIdentity(passkey: $0, vaultID: vaultID) }
         }
     }
     public func refresh() async throws { try await update { $0 } }

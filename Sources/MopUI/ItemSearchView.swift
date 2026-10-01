@@ -21,6 +21,7 @@ struct ItemSearchBar: View {
         }
         .padding(8).background(.quaternary, in: RoundedRectangle(cornerRadius: 8)).padding(10)
         .onChange(of: model.searchFocusRequest) { _, _ in focused = true }
+        .onChange(of: model.collection) { _, _ in focused = false }
         .onChange(of: focused) { _, value in model.searchIsFocused = value }
         .onDisappear { model.searchIsFocused = false }
         .onChange(of: model.search) { _, _ in model.searchHighlighted = rows.first?.id }
@@ -54,7 +55,7 @@ struct SearchSummary: View {
         HStack {
             Text(model.searchScope)
             Spacer()
-            let count = model.page == .recentlyDeleted ? model.deletedRows.count : model.displayedItems.count
+            let count = model.isLocalVaultSelected ? model.displayedLocalIdentities.count : model.page == .recentlyDeleted ? model.deletedRows.count : model.displayedItems.count
             Text("\(count) \(count == 1 ? "result" : "results")")
         }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 6)
     }

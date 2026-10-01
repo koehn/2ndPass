@@ -205,6 +205,10 @@ and deployment configuration.
 
 ### Device-local identities
 
+Cloud vaults support usable passkeys and generated/imported SSH keys. Choose storage
+explicitly when creating a credential. See [cloud key credentials](docs/CLOUD-KEY-CREDENTIALS.md)
+for supported formats, SSH/Git setup, protection, sharing, and outstanding acceptance.
+
 The vault named exactly `local` holds Secure Enclave SSH, Git signing, certificate,
 and device-bound passkey identities. Private keys never leave this device and cannot
 be synced, exported, backed up, or restored. Register independent credentials on

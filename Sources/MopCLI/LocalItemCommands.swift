@@ -2,6 +2,7 @@ import ArgumentParser
 import Darwin
 import Foundation
 import MopCore
+import MopAppSupport
 import MopLocalIdentity
 
 extension Item {
@@ -9,6 +10,7 @@ extension Item {
         @OptionGroup var storage: VaultOptions
         @Option var type: String
         @Option var name: String
+        @Option(help: "ed25519 or p256 for cloud keys") var algorithm = "ed25519"
         @Flag(help: "Acknowledge permanent identity loss if this device is lost or erased") var acknowledgeDeviceLoss = false
         func validate() throws {
             _ = try LocalIdentity.validateName(name)
@@ -16,6 +18,14 @@ extension Item {
         }
         func run() async throws {
             guard let vault = storage.vault else { throw ValidationError("Specify --vault for identity creation.") }
+            if !LocalVault.isLocal(vault) {
+                try storage.requireOnline()
+                guard let purpose = CredentialPurpose(rawValue: type), purpose != .passkey,
+                      let algorithm = CredentialAlgorithm(rawValue: algorithm), algorithm != .rsa else { throw CredentialFailure.unsupportedAlgorithm }
+                let service = storage.native(); defer { service.lock() }
+                let row = try await CloudCredentialService(service).createSSH(vault: vault, name: name, algorithm: algorithm, purposes: [purpose])
+                try IO.output(row.publicKeyText + "\n"); return
+            }
             try IdentitySelection.requireSupportedBackend(vault)
             guard !storage.offline,
                   let purpose = LocalIdentityProtocol(rawValue: type), LocalIdentityProtocol.creatable.contains(purpose) else { throw MopError.localOperationForbidden }
@@ -36,6 +46,11 @@ extension Item {
         @Argument var identity: String
         func run() async throws {
             let selection = try IdentitySelection(identity, vault: storage.vault)
+            if !LocalVault.isLocal(selection.reference.vault) {
+                let service = storage.native(); defer { service.lock() }
+                guard let row = try await CloudCredentialService(service).records(vault: selection.reference.vault, offline: storage.offline).first(where: { $0.item.name == selection.reference.name || $0.item.storageID == selection.reference.name }), row.credential.purposes != [.passkey] else { throw MopError.notFound }
+                try IO.output(row.publicKeyText + "\n"); return
+            }
             let store = try selection.openStore()
             try IO.output(store.read(id: localIdentityID(store, selection.reference.name)).publicKeyText + "\n")
         }
@@ -47,6 +62,19 @@ extension Item {
         @Flag var yes = false
         func run() async throws {
             let selection = try IdentitySelection(identity, vault: storage.vault)
+            if !LocalVault.isLocal(selection.reference.vault) {
+                try storage.requireOnline()
+                let service = storage.native(); defer { service.lock() }
+                let catalog = try await service.execute(.catalog, vault: selection.reference.vault, offline: false).requireCatalog()
+                guard let item = catalog.items.first(where: { $0.name == selection.reference.name || $0.storageID == selection.reference.name }), item.credential != nil else { throw MopError.notFound }
+                if !yes {
+                    guard isatty(STDIN_FILENO) != 0 else { throw MopError.confirmationRequired }
+                    IO.diagnostic("Type \(item.name) to move this cloud credential to Recently Deleted: ")
+                    guard readLine() == item.name else { throw MopError.operationCancelled }
+                }
+                _ = try await service.execute(.trashItem(name: item.name, revision: catalog.revision), vault: selection.reference.vault, offline: false)
+                return
+            }
             let store = try selection.openStore(), id = try localIdentityID(store, selection.reference.name), row = try store.read(id: id)
             IO.diagnostic(LocalIdentityWarning.deletion + "\n")
             if !yes {

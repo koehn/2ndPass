@@ -34,6 +34,8 @@
 				<true/>
 				<key>ProvidesPasskeys</key>
 				<true/>
+				<key>SupportsSavePasswordCredentials</key>
+				<true/>
 				<key>ProvidesPasswords</key>
 				<true/>
 				<key>ProvidesTextToInsert</key>

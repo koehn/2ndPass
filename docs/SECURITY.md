@@ -639,3 +639,14 @@ such a relay. Destination binding and forwarding restrictions are not implemente
 The system authentication prompt identifies the local executable and key but does
 not claim a verified remote host. Physical-device review must exercise Touch ID,
 lock/sleep during an outstanding prompt, and late Secure Enclave results.
+
+### Cloud software key credentials
+
+Typed cloud SSH/Git credentials and passkeys store normalized software private keys
+as concealed encrypted item payloads, with public protocol metadata inside the
+encrypted catalog. Authorized members can obtain software key material; these
+credentials do not inherit Secure Enclave non-extractability. Owner/editor writes
+and member reads use the existing vault permission boundary. Recovery and
+revocation have the same limitations as other cloud secrets. Hardware keys remain
+non-exportable and never enter this format. See [supported cloud keys and
+validation limits](CLOUD-KEY-CREDENTIALS.md).

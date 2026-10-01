@@ -37,6 +37,7 @@ struct SessionToolbar: ToolbarContent {
             Menu {
                 Button("New Item") { model.beginCreatingItem() }
                     .disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil || model.page != .secrets)
+                Button("New SSH Key…") { model.keyCreationPresented = true }.disabled(model.busy || model.offline || !model.authenticated)
                 Button("Import…") { model.beginImport() }.disabled(model.busy || model.offline || !model.authenticated)
                 Button("New Vault…") { model.presentSheet(.createVault) }.disabled(model.busy || model.offline)
             } label: { Label("New", systemImage: "plus") }.help("New item or vault")

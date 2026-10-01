@@ -18,7 +18,12 @@ struct ItemDetailView: View {
     }
     private var editingItem: Bool { model.itemDraft?.mode == .item }
     private var fields: [ItemDraft.Field] {
-        model.itemDraft?.fields ?? model.selectedTypedItem?.fields.map { ItemDraft.Field($0) } ?? []
+        (model.itemDraft?.fields ?? model.selectedTypedItem?.fields.map { ItemDraft.Field($0) } ?? []).filter {
+            if (model.itemDraft?.type ?? model.selectedTypedItem?.type) == .sshKey,
+               ["publicKey", "fingerprint"].contains($0.path) { return false }
+            if model.itemDraft?.type == .sshKey, model.itemDraft?.credential == nil, $0.path == "passphrase" { return false }
+            return $0.path != KeyCredential.privateField || (model.itemDraft?.credential ?? model.selectedTypedItem?.credential) == nil
+        }
     }
     private var motion: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.18) }
     private func change(_ action: () -> Void) { withAnimation(motion, action) }
@@ -49,17 +54,19 @@ struct ItemDetailView: View {
                 }
             } else {
                 HStack {
-                    Text(itemName).font(.title2).fontWeight(.semibold)
+                    Text(model.selectedTypedItem?.displayTitle ?? itemName).font(.title2).fontWeight(.semibold)
                     if model.selectedTypedItem?.isFavorite == true {
                         Image(systemName: "star.fill").foregroundStyle(.yellow).accessibilityLabel("Favorite")
                     }
                 }
             }
+            if !editingItem, let item = model.selectedTypedItem, item.credential != nil { CloudCredentialDetails(model: model, item: item) }
             if editingItem {
                 Picker("Item type", selection: Binding(get: { model.itemDraft?.type ?? .custom }, set: { model.changeDraftType($0) })) {
                     ForEach(ItemType.templateTypes, id: \.self) { Text($0.label).tag($0) }
                     if !creating && model.itemDraft?.type == .custom { Text("Custom").tag(ItemType.custom) }
-                }.frame(maxWidth: 280).disabled(model.busy)
+                    if !creating && model.itemDraft?.type == .passkey { Text("Passkey").tag(ItemType.passkey) }
+                }.frame(maxWidth: 280).disabled(model.busy || model.itemDraft?.credential != nil)
                 Text("Drag the handles to reorder fields. Changes are saved together when you choose Save.")
                     .font(.caption).foregroundStyle(.secondary)
             } else { Text(model.selectedTypedItem?.type.label ?? "Custom").foregroundStyle(.secondary) }
@@ -80,6 +87,15 @@ struct ItemDetailView: View {
                 ItemDatesView(item: item, lastUsed: model.lastUsedDate(for: item, vaultID: model.vault))
             }
             if editingItem, model.itemDraft?.type == .login { autoFillMappingEditor }
+            if model.itemDraft?.type == .sshKey, model.itemDraft?.credential == nil {
+                Picker("Use for", selection: Binding(get: { model.itemDraft?.sshPurpose ?? .ssh }, set: { model.itemDraft?.sshPurpose = $0 })) {
+                    Text("SSH authentication").tag(CredentialPurpose.ssh)
+                    Text("Git signing").tag(CredentialPurpose.gitSigning)
+                }
+                SecureField("Key passphrase (if encrypted)", text: Binding(get: { model.itemDraft?.sshPassphrase ?? "" }, set: { model.itemDraft?.sshPassphrase = $0 }))
+                Text("Saving validates the OpenSSH private key and makes it available to the SSH agent. The public key and fingerprint are calculated automatically. The file passphrase is not kept.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let item = model.itemDraft?.item ?? model.selectedTypedItem, item.type == .login {
                 ForEach(AutoFillKind.allCases.filter { $0 == .password || item.fields.contains { $0.type == .otp } || item.autoFill?.oneTimeCode != nil }, id: \.self) { kind in
                     let label = kind == .password ? "Password AutoFill" : "Code AutoFill"

@@ -5,11 +5,25 @@ import MopCore
 
 /// Requests are serialized by SSHAgent. The state lock also allows stop/lock to
 /// invalidate a pending system prompt without waiting for that request to finish.
+public struct SSHSessionIdentity {
+    public let id: UUID
+    public let name: String
+    public let purpose: LocalIdentityProtocol
+    public let blob: Data
+    public let algorithm: String
+    public init(id: UUID, name: String, purpose: LocalIdentityProtocol, blob: Data, algorithm: String) {
+        self.id = id; self.name = name; self.purpose = purpose; self.blob = blob; self.algorithm = algorithm
+    }
+    init(_ local: LocalIdentity) throws {
+        self.init(id: local.id, name: local.name, purpose: local.protocolType, blob: try SSHPublicKey.wireBlob(x963: local.publicKey), algorithm: SSHPublicKey.algorithm)
+    }
+}
 public final class SSHAgentSession: @unchecked Sendable {
     typealias Authorizer = (String, LocalIdentity, TimeInterval, (LAContext) throws -> Void) throws -> LocalAuthorization
-    private let list: () throws -> [LocalIdentity]
-    private let signData: (UUID, Data, LocalAuthorization) throws -> Data
-    private let authorize: Authorizer
+    private let list: () throws -> [SSHSessionIdentity]
+    private let signData: (UUID, Data, UInt32, LocalAuthorization) throws -> Data
+    private let authorize: (String, SSHSessionIdentity, TimeInterval, (LAContext) throws -> Void) throws -> LocalAuthorization
+    private let wireSignatures: Bool
     private let purpose: LocalIdentityProtocol
     private let ids: Set<UUID>
     private let wrapped: Bool
@@ -29,12 +43,35 @@ public final class SSHAgentSession: @unchecked Sendable {
             })
     }
 
-    init(purpose: LocalIdentityProtocol, ids: Set<UUID>, wrapped: Bool, approvalLifetime: TimeInterval,
+    convenience init(purpose: LocalIdentityProtocol, ids: Set<UUID>, wrapped: Bool, approvalLifetime: TimeInterval,
          list: @escaping () throws -> [LocalIdentity], sign: @escaping (UUID, Data, LocalAuthorization) throws -> Data,
          authorize: @escaping Authorizer, watchDevice: Bool = true) throws {
+        try self.init(purpose: purpose, ids: ids, wrapped: wrapped, approvalLifetime: approvalLifetime,
+            listCredentials: { try list().map(SSHSessionIdentity.init) }, sign: { id, data, flags, auth in
+                guard flags == 0 else { throw MopError.localIdentityCapability }
+                return try sign(id, data, auth)
+            }, authorizeCredential: { reason, row, lifetime, created in
+                guard let local = try list().first(where: { $0.id == row.id }) else { throw MopError.notFound }
+                return try authorize(reason, local, lifetime, created)
+            }, wireSignatures: false, watchDevice: watchDevice)
+    }
+    public convenience init(purpose: LocalIdentityProtocol, ids: Set<UUID>, wrapped: Bool, approvalLifetime: TimeInterval,
+        listCredentials: @escaping () throws -> [SSHSessionIdentity],
+        sign: @escaping (UUID, Data, UInt32, LocalAuthorization) throws -> Data) throws {
+        try self.init(purpose: purpose, ids: ids, wrapped: wrapped, approvalLifetime: approvalLifetime, listCredentials: listCredentials, sign: sign,
+            authorizeCredential: { reason, row, lifetime, created in
+                try LocalAuthorization.authorize(reason: reason, ids: [row.id], purposes: [row.purpose], operations: [.sign], oneShot: false, lifetime: lifetime, contextCreated: created)
+            })
+    }
+    private init(purpose: LocalIdentityProtocol, ids: Set<UUID>, wrapped: Bool, approvalLifetime: TimeInterval,
+        listCredentials: @escaping () throws -> [SSHSessionIdentity],
+        sign: @escaping (UUID, Data, UInt32, LocalAuthorization) throws -> Data,
+        authorizeCredential: @escaping (String, SSHSessionIdentity, TimeInterval, (LAContext) throws -> Void) throws -> LocalAuthorization,
+        wireSignatures: Bool = true, watchDevice: Bool = true) throws {
         guard [.ssh, .gitSigning].contains(purpose), !ids.isEmpty,
               approvalLifetime > 0, approvalLifetime <= 43200 else { throw MopError.localIdentityCapability }
-        self.list = list; self.signData = sign; self.authorize = authorize
+        self.wireSignatures = wireSignatures
+        self.list = listCredentials; self.signData = sign; self.authorize = authorizeCredential
         self.purpose = purpose; self.ids = ids
         self.wrapped = wrapped; self.lifetime = approvalLifetime
         // Monitors device lock/sleep without authenticating the user at startup.
@@ -75,17 +112,18 @@ public final class SSHAgentSession: @unchecked Sendable {
         try peer.validate(root: command)
     }
 
-    private func identities(_ peer: SSHAgentPeer) throws -> [LocalIdentity] {
+    private func identities(_ peer: SSHAgentPeer) throws -> [SSHSessionIdentity] {
         try validate(peer)
-        let rows = try list().filter { ids.contains($0.id) && $0.protocolType == purpose }
+        let rows = try list().filter { ids.contains($0.id) && $0.purpose == purpose }
         guard Set(rows.map(\.id)) == ids else { stop(); throw MopError.authentication }
         try validate(peer)
         return rows
     }
 
-    private func sign(_ peer: SSHAgentPeer, blob: Data, data: Data) throws -> Data {
-        guard let identity = try identities(peer).first(where: { try SSHPublicKey.wireBlob(x963: $0.publicKey) == blob }) else { throw MopError.notFound }
-        try SSHSigningPolicy.validate(data: data, key: blob, purpose: purpose)
+    private func sign(_ peer: SSHAgentPeer, blob: Data, data: Data, flags: UInt32) throws -> Data {
+        guard let identity = try identities(peer).first(where: { $0.blob == blob }) else { throw MopError.notFound }
+        guard identity.algorithm == "ssh-rsa" ? (flags == 2 || flags == 4 || flags == 6) : flags == 0 else { throw MopError.localIdentityCapability }
+        try SSHSigningPolicy.validate(data: data, key: blob, purpose: purpose, algorithm: identity.algorithm == "ssh-rsa" ? (flags & 4 != 0 ? "rsa-sha2-512" : "rsa-sha2-256") : identity.algorithm)
         // Wrapped mode approves this key for the command tree. Standalone mode
         // approves only this exact connecting process instance (including exec version).
         let scope = (wrapped ? "command" : peer.cacheKey) + ":" + identity.id.uuidString
@@ -112,7 +150,7 @@ public final class SSHAgentSession: @unchecked Sendable {
         }
         guard let auth else { throw MopError.authentication }
         try validate(peer)
-        let signature = try signData(identity.id, data, auth)
+        let signature = try signData(identity.id, data, flags, auth)
         try validate(peer)
         try auth.check()
         return signature
@@ -122,9 +160,13 @@ public final class SSHAgentSession: @unchecked Sendable {
         let session: SSHAgentSession
         let peer: SSHAgentPeer
         func identities() throws -> [SSHAgentIdentity] {
-            try session.identities(peer).map { SSHAgentIdentity(blob: try SSHPublicKey.wireBlob(x963: $0.publicKey), comment: $0.sshComment) }
+            try session.identities(peer).map { SSHAgentIdentity(blob: $0.blob, comment: $0.name) }
         }
-        func sign(blob: Data, data: Data) throws -> Data { try session.sign(peer, blob: blob, data: data) }
+        func sign(blob: Data, data: Data) throws -> Data { try session.sign(peer, blob: blob, data: data, flags: 0) }
+        func signature(blob: Data, data: Data, flags: UInt32) throws -> Data {
+            let result = try session.sign(peer, blob: blob, data: data, flags: flags)
+            return session.wireSignatures ? result : try SSHAgentFraming.sshSignature(der: result)
+        }
     }
 }
 #endif

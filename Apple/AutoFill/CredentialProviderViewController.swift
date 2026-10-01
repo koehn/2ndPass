@@ -6,6 +6,7 @@ import MopCore
 import MopLocalIdentity
 
 @MainActor final class CredentialProviderViewController: ASCredentialProviderViewController {
+    private let cloudPasskeyService = NativeVaultService()
     private var passkeyAuthorization: LocalAuthorization?
     private var passkeyRequest: ASPasskeyCredentialRequest?
     private var passkeyParameters: ASPasskeyCredentialRequestParameters?
@@ -25,10 +26,15 @@ import MopLocalIdentity
     private let model = CredentialListModel()
 
     override func loadView() {
-        let content = CredentialRootView(model: model, passkeyPerform: { [weak self] in self?.performPasskey($0) }, select: { [weak self] in self?.fill($0, field: $1) },
+        let content = CredentialRootView(model: model, saveLogin: { [weak self] in self?.saveLogin() }, reloadLoginVaults: { [weak self] in self?.loadLoginVaults() }, passkeyPerform: { [weak self] in self?.performPasskey($0, vault: $1) }, select: { [weak self] in self?.fill($0, field: $1) },
                                          retry: { [weak self] in self?.retry() },
                                          chooseAnother: { [weak self] in self?.prepareList(kind: self?.model.kind) },
-                                         cancel: { [weak self] in self?.cancel() })
+                                         cancel: { [weak self] in self?.cancel() },
+                                         resizePasskey: { [weak self] height in
+                                             #if os(macOS)
+                                             self?.preferredContentSize = .init(width: 480, height: min(640, max(360, height)))
+                                             #endif
+                                         })
         #if os(macOS)
         let host = NSHostingController(rootView: content)
         addChild(host); view = host.view
@@ -94,6 +100,75 @@ import MopLocalIdentity
         model.hosts = []; model.textInsertion = true; prepareList(kind: nil)
     }
     #endif
+    #if os(iOS)
+    @available(iOS 26.2, *)
+    override func performWithoutUserInteractionIfPossible(savePasswordRequest: ASSavePasswordRequest) {
+        // Every save requires an explicit destination and name confirmation.
+        requireInteraction()
+    }
+    @available(iOS 26.2, *)
+    override func prepareInterface(for savePasswordRequest: ASSavePasswordRequest) {
+        stop()
+        let website = savePasswordRequest.serviceIdentifier.identifier
+        model.loginDraft = AutoFillLoginDraft(name: savePasswordRequest.title ?? AutoFillEntry.website(website) ?? website,
+            username: savePasswordRequest.credential.user, password: savePasswordRequest.credential.password, website: website)
+        model.message = nil
+        loadLoginVaults()
+    }
+    #endif
+    private func loadLoginVaults() {
+        guard model.loginDraft != nil else { return }
+        let token = generation
+        model.loading = true; model.message = nil; model.loginVaults = []; model.loginVault = ""
+        task = Task {
+            defer { if token == generation { model.loading = false } }
+            do {
+                let result = try await cloudPasskeyService.execute(.discover, vault: nil, offline: false)
+                var available: [VaultDescriptor] = []
+                var unavailable = false
+                for vault in result.vaults where vault.enrolled && vault.supported {
+                    do {
+                        let catalog = try await cloudPasskeyService.execute(.catalog, vault: vault.id, offline: false).requireCatalog()
+                        if catalog.canEdit == true { available.append(vault) }
+                    } catch { unavailable = true }
+                    guard token == generation, !Task.isCancelled else { return }
+                }
+                guard token == generation, !Task.isCancelled else { return }
+                model.loginVaults = available
+                if available.isEmpty { model.message = "No writable vaults are available. Open 2ndPass to connect a vault, then try again." }
+                else if unavailable { model.message = "Some vaults could not be opened. You can retry or choose an available vault." }
+            } catch {
+                guard token == generation, !Task.isCancelled else { return }
+                model.message = "Vaults could not be loaded. Try again."
+            }
+        }
+    }
+    private func saveLogin() {
+        #if os(iOS)
+        guard #available(iOS 26.2, *), !model.loading, let draft = model.loginDraft,
+              draft.canSave, model.loginVaults.contains(where: { $0.id == model.loginVault }) else { return }
+        let token = generation, vault = model.loginVault
+        model.loading = true; model.message = nil
+        task = Task {
+            defer { if token == generation { model.loading = false } }
+            do {
+                let catalog = try await draft.save(vault: vault, service: cloudPasskeyService)
+                guard token == generation, !Task.isCancelled else { return }
+                // Saving succeeded even if the system's suggestion store is unavailable.
+                // The containing app can refresh that public index later.
+                try? await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault)
+                guard token == generation, !Task.isCancelled else { return }
+                model.loginDraft = nil; cloudPasskeyService.lock()
+                extensionContext.completeSavePasswordRequest(completionHandler: nil)
+            } catch {
+                guard token == generation, !Task.isCancelled else { return }
+                if let failure = error as? MopError, case .duplicate = failure {
+                    model.message = "A login with this name already exists. Choose a different name to save a new login."
+                } else { model.message = error.localizedDescription }
+            }
+        }
+        #endif
+    }
     private func prepareList(kind: AutoFillKind?) {
         stop(); pendingIdentity = nil; retryIdentity = nil; retryField = nil
         model.kind = kind; model.showsPicker = true; model.message = nil; model.loading = true
@@ -170,9 +245,50 @@ import MopLocalIdentity
             model.passkeys = try LocalIdentityStore.open().list().filter { LocalWebAuthn.matches($0, relyingParty: rp, allowedCredentials: allowed) }
             if !LocalIdentityStore.isAvailable { model.message = "Secure Enclave is unavailable on this device." }
         } catch { model.message = String(describing: error) }
-        preferredContentSize = .init(width: 480, height: 480)
+        let token = generation
+        model.loading = true
+        task = Task {
+            do {
+                let allowed = parameters?.allowedCredentials ?? (request.flatMap { $0.credentialIdentity as? ASPasskeyCredentialIdentity }.map { [$0.credentialID] } ?? [])
+                if registration {
+                    let discovery = try await CloudCredentialService(cloudPasskeyService).discoverPasskeys(
+                        relyingParty: rp, allowed: allowed, registration: true)
+                    guard token == generation, !Task.isCancelled else { return }
+                    model.passkeyVaults = discovery.vaults
+                    if discovery.unavailableVaults > 0 {
+                        model.message = "Some cloud vaults could not be opened. Available vaults are shown."
+                    }
+                } else {
+                    // Browsing must never open vaults or ask for authentication.
+                    let directory = try AutoFillStorage.directory()
+                    let entries = try await Task.detached { try AutoFillIndex(directory: directory).load() }.value
+                    guard token == generation, !Task.isCancelled else { return }
+                    model.cloudPasskeys = entries.filter { $0.matchesPasskey(relyingParty: rp, allowed: allowed) }
+                    // Discovery is complete: only skip the chooser when the combined
+                    // cloud/device-local result is unambiguous. Use the normal signing
+                    // path so fresh verification and live access checks still apply.
+                    model.loading = false
+                    if model.passkeys.count + model.cloudPasskeys.count == 1 {
+                        if let identity = model.passkeys.first {
+                            performPasskey(identity.id.uuidString, vault: LocalVault.id)
+                        } else if let identity = model.cloudPasskeys.first,
+                                  let vault = AutoFillEntry.vaultID(identity.recordIdentifier) {
+                            performPasskey(identity.id, vault: vault)
+                        }
+                        return
+                    }
+                }
+            } catch {
+                guard token == generation else { return }
+                model.message = "Cloud passkeys could not be loaded: \(error.localizedDescription). Device-local credentials remain available."
+            }
+            if token == generation { model.loading = false }
+        }
+        preferredContentSize = .init(width: 480, height: 400)
     }
-    private func performPasskey(_ id: UUID?) {
+    private func performPasskey(_ selection: String?, vault: String) {
+        if !LocalVault.isLocal(vault) { performCloudPasskey(selection, vault: vault); return }
+        let id = selection.flatMap(UUID.init(uuidString:))
         guard !model.loading, let rp = model.passkeyRP, LocalIdentityStore.isAvailable else { return }
         let request = passkeyRequest, parameters = passkeyParameters, registration = passkeyRegistration
         let token = generation
@@ -208,7 +324,44 @@ import MopLocalIdentity
                 }
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
-                model.message = "Passkey operation failed: \(error)."
+                model.message = "Device-local passkey operation failed: \(error). This platform or website may not accept device-bound passkeys. A credential created under the earlier backup-flag override may require re-registration."
+            }
+        }
+    }
+    private func performCloudPasskey(_ selection: String?, vault: String) {
+        guard !model.loading, let rp = model.passkeyRP else { return }
+        let request = passkeyRequest, parameters = passkeyParameters, registration = passkeyRegistration, token = generation
+        model.loading = true; model.message = nil
+        // One fresh vault authentication both verifies the user and unlocks the
+        // device key. A separate LocalAuthorization would prompt a second time.
+        cloudPasskeyService.lock()
+        let vaultGeneration = cloudPasskeyService.sessionGeneration
+        task = Task {
+            defer {
+                if token == generation { cloudPasskeyService.lock(); model.loading = false }
+            }
+            do {
+                guard token == generation, !Task.isCancelled else { return }
+                let provider = CloudCredentialService(cloudPasskeyService)
+                if registration {
+                    guard let request, let identity = request.credentialIdentity as? ASPasskeyCredentialIdentity else { throw CredentialFailure.invalid }
+                    let row = try await provider.registerPasskey(vault: vault, relyingParty: rp, userName: identity.userName, userHandle: identity.userHandle, clientDataHash: request.clientDataHash, algorithms: request.supportedAlgorithms.map { Int($0.rawValue) })
+                    guard token == generation, cloudPasskeyService.sessionGeneration == vaultGeneration, cloudPasskeyService.isAuthenticated, !Task.isCancelled else { return }
+                    let savedCatalog = try await cloudPasskeyService.execute(.catalog, vault: vault, offline: false).requireCatalog()
+                    try await AutoFillPublisher.shared.publish(catalog: savedCatalog, vaultID: vault)
+                    guard token == generation, cloudPasskeyService.sessionGeneration == vaultGeneration, cloudPasskeyService.isAuthenticated, !Task.isCancelled else { return }
+                    extensionContext.completeRegistrationRequest(using: ASPasskeyRegistrationCredential(relyingParty: rp, clientDataHash: request.clientDataHash, credentialID: row.credential.credentialID!, attestationObject: try CloudCredentialService.attestation(row))) { _ in }
+                } else {
+                    guard let suggestion = model.cloudPasskeys.first(where: { $0.id == selection && AutoFillEntry.vaultID($0.recordIdentifier) == vault }), let hash = parameters?.clientDataHash ?? request?.clientDataHash else { throw MopError.notFound }
+                    let allowed = parameters?.allowedCredentials ?? (request.flatMap { $0.credentialIdentity as? ASPasskeyCredentialIdentity }.map { [$0.credentialID] } ?? [])
+                    let row = try await provider.resolvePasskey(suggestion, relyingParty: rp, allowed: allowed)
+                    guard token == generation, cloudPasskeyService.sessionGeneration == vaultGeneration, cloudPasskeyService.isAuthenticated, !Task.isCancelled else { return }
+                    let result = try await provider.assertPasskey(row, relyingParty: rp, allowed: allowed, clientDataHash: hash)
+                    guard token == generation, cloudPasskeyService.sessionGeneration == vaultGeneration, cloudPasskeyService.isAuthenticated, !Task.isCancelled else { return }
+                    extensionContext.completeAssertionRequest(using: ASPasskeyAssertionCredential(userHandle: row.credential.userHandle!, relyingParty: rp, signature: result.signature, clientDataHash: hash, authenticatorData: result.authenticatorData, credentialID: row.credential.credentialID!), completionHandler: nil)
+                }
+            } catch {
+                guard token == generation else { return }; model.message = error.localizedDescription
             }
         }
     }
@@ -239,7 +392,7 @@ import MopLocalIdentity
     #endif
     private func updatePreferredContentSize() {
         #if os(macOS)
-        preferredContentSize = model.showsPicker ? NSSize(width: 480, height: 540) : NSSize(width: 440, height: model.message == nil ? 180 : 320)
+        preferredContentSize = model.showsPicker ? NSSize(width: 480, height: 640) : NSSize(width: 440, height: model.message == nil ? 300 : 440)
         #endif
     }
     private func fill(_ identity: AutoFillIdentity, field: CredentialField? = nil) {
@@ -303,8 +456,9 @@ import MopLocalIdentity
         model.entries = []; model.loading = false
     }
     private func stop() {
+        model.loginDraft = nil; model.loginVaults = []; model.loginVault = ""
         passkeyAuthorization?.revoke(); passkeyAuthorization = nil; passkeyRequest = nil; passkeyParameters = nil
-        model.passkeyRP = nil; model.passkeys = []
+        model.passkeyRP = nil; model.passkeys = []; model.cloudPasskeys = []; model.passkeyVaults = []; cloudPasskeyService.lock()
         generation += 1; task?.cancel(); task = nil; pendingIdentity = nil; pendingList = false; finish()
     }
     #if os(macOS)
@@ -317,7 +471,7 @@ import MopLocalIdentity
     }
     #endif
     private func interrupt(_ reason: String = "AutoFill paused because the device locked, slept, or the request entered the background. Retry to authenticate again.") {
-        guard session != nil || model.passkeyRP != nil else { return }
+        guard session != nil || model.passkeyRP != nil || model.loginDraft != nil else { return }
         stop(); model.message = reason; updatePreferredContentSize()
     }
     private func identityNotFound() {
@@ -330,9 +484,14 @@ import MopLocalIdentity
 
 private enum CredentialField { case username, password, code }
 @MainActor @Observable private final class CredentialListModel {
+    var loginDraft: AutoFillLoginDraft?
+    var loginVaults: [VaultDescriptor] = []
+    var loginVault = ""
     var passkeyRP: String?
     var passkeyRegistration = false
     var passkeys: [LocalIdentity] = []
+    var cloudPasskeys: [AutoFillIdentity] = []
+    var passkeyVaults: [VaultDescriptor] = []
     var showsPicker = false
     var textInsertion = false
     var kind: AutoFillKind? = .password
@@ -344,14 +503,19 @@ private enum CredentialField { case username, password, code }
 
 private struct CredentialRootView: View {
     @Bindable var model: CredentialListModel
-    let passkeyPerform: (UUID?) -> Void
+    let saveLogin: () -> Void
+    let reloadLoginVaults: () -> Void
+    let passkeyPerform: (String?, String) -> Void
     let select: (AutoFillIdentity, CredentialField?) -> Void
     let retry: () -> Void
     let chooseAnother: () -> Void
     let cancel: () -> Void
+    let resizePasskey: (CGFloat) -> Void
     var body: some View {
-        if let rp = model.passkeyRP {
-            LocalPasskeyPrompt(relyingParty: rp, registration: model.passkeyRegistration, identities: model.passkeys, busy: model.loading, message: model.message, perform: passkeyPerform, cancel: cancel)
+        if model.loginDraft != nil {
+            SaveLoginView(model: model, save: saveLogin, reload: reloadLoginVaults, cancel: cancel)
+        } else if let rp = model.passkeyRP {
+            LocalPasskeyPrompt(relyingParty: rp, registration: model.passkeyRegistration, identities: model.passkeys, cloud: model.cloudPasskeys, vaults: model.passkeyVaults, busy: model.loading, message: model.message, perform: passkeyPerform, cancel: cancel, resize: resizePasskey)
         } else {
             CredentialListView(model: model, select: select, retry: retry, chooseAnother: chooseAnother, cancel: cancel)
         }
@@ -380,8 +544,7 @@ private struct CredentialListView: View {
     private var other: [AutoFillIdentity] { filtered.filter { !model.hosts.contains($0.website) } }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Text("2ndPass AutoFill").font(.headline); Spacer(); Button("Cancel", action: cancel).keyboardShortcut(.cancelAction) }
-            if !model.hosts.isEmpty { Text("Filling for " + model.hosts.sorted().joined(separator: ", ")).font(.callout) }
+            AutoFillDialogHeader(title: "2ndPass AutoFill", subtitle: model.hosts.isEmpty ? nil : "Filling for " + model.hosts.sorted().joined(separator: ", "))
             if model.loading { ProgressView(model.showsPicker && model.entries.isEmpty ? "Loading accounts…" : "Authenticating for AutoFill…") }
             if let message = model.message {
                 Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
@@ -420,7 +583,9 @@ private struct CredentialListView: View {
                     }
                 }
             }
-        }.padding().frame(minWidth: 280, minHeight: model.showsPicker ? 300 : 120)
+            Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+        }.padding(24).frame(minWidth: 280, minHeight: model.showsPicker ? 300 : 120)
+        .frame(maxHeight: .infinity, alignment: .top)
         .onChange(of: model.entries) { _, _ in
             selection = ordered.first?.id; searchFocused = !model.entries.isEmpty
             if model.entries.isEmpty { unrelated = nil; search = ""; showsOtherAccounts = false }
@@ -429,11 +594,24 @@ private struct CredentialListView: View {
             showsOtherAccounts = false; unrelated = nil; selection = ordered.first?.id
         }
         .onChange(of: search) { _, _ in selection = ordered.first?.id }
-        .confirmationDialog("Use this account for another website?", isPresented: Binding(get: { unrelated != nil }, set: { if !$0 { unrelated = nil } }), titleVisibility: .visible) {
-            if let unrelated { Button("Fill Account") { select(unrelated, insertionField); self.unrelated = nil } }
-            Button("Cancel", role: .cancel) { unrelated = nil }
-        } message: {
-            if let unrelated { Text("The requested site is \(model.hosts.sorted().joined(separator: ", ")). This account is for \(unrelated.website): \(unrelated.username).") }
+        .sheet(item: $unrelated) { account in
+            VStack(spacing: 24) {
+                AutoFillDialogHeader(title: "Use this account for another website?")
+                Text("The requested site is \(model.hosts.sorted().joined(separator: ", ")). This account is for \(account.website): \(account.username).")
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Cancel", role: .cancel) { unrelated = nil }.keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Fill Account") { unrelated = nil; select(account, insertionField) }
+                        .buttonStyle(.borderedProminent).disabled(model.loading)
+                }
+            }.padding(24)
+                #if os(macOS)
+                .frame(width: 432)
+                #else
+                .frame(maxHeight: .infinity, alignment: .top)
+                #endif
+                .presentationDetents([.medium, .large])
         }
     }
     @ViewBuilder private func section(_ title: String, entries: [AutoFillIdentity]) -> some View {
@@ -481,4 +659,50 @@ private final class AccountObservation: @unchecked Sendable {
     let token: NSObjectProtocol
     init(center: NotificationCenter, token: NSObjectProtocol) { self.center = center; self.token = token }
     deinit { center.removeObserver(token) }
+}
+
+private struct SaveLoginView: View {
+    @Bindable var model: CredentialListModel
+    let save: () -> Void
+    let reload: () -> Void
+    let cancel: () -> Void
+    private func field(_ key: WritableKeyPath<AutoFillLoginDraft, String>) -> Binding<String> {
+        Binding(get: { model.loginDraft?[keyPath: key] ?? "" }, set: { model.loginDraft?[keyPath: key] = $0 })
+    }
+    var body: some View {
+        VStack(spacing: 0) {
+            AutoFillDialogHeader(title: "Save Login", subtitle: model.loginDraft?.website ?? "")
+                .padding()
+            Form {
+                Section {
+                    TextField("Name", text: field(\.name))
+                        .accessibilityIdentifier("save-login-name")
+                    TextField("Username", text: field(\.username))
+                        .autocorrectionDisabled()
+                    SecureField("Password", text: field(\.password))
+                    Picker("Save in", selection: $model.loginVault) {
+                        Text("Choose a vault…").tag("")
+                        ForEach(model.loginVaults, id: \.id) { vault in Text(vault.name ?? vault.id).tag(vault.id) }
+                    }.accessibilityIdentifier("save-login-vault")
+                } footer: {
+                    Text("Saved as a new login in the selected vault. Members of a shared vault will also have access.")
+                }
+                if let message = model.message {
+                    Section {
+                        Text(message).foregroundStyle(.secondary)
+                        Button("Reload Vaults", action: reload)
+                    }
+                }
+            }.formStyle(.grouped).disabled(model.loading)
+            Divider()
+            HStack {
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+                Spacer()
+                if model.loading { ProgressView().controlSize(.small).accessibilityLabel("Saving or loading vaults") }
+                Button("Save Login", action: save).buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.loading || model.loginDraft?.canSave != true || model.loginVault.isEmpty)
+            }.padding()
+        }
+    }
 }

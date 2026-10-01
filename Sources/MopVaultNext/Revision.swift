@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MopCore
+import MopCredentials
 
 struct SealedObject: Codable, Equatable, Sendable {
     let ciphertext: Data
@@ -136,6 +137,7 @@ struct Revision: Codable, Sendable {
             }
         }
         var features = Set(header.requiredFeatures ?? [])
+        if items.contains(where: { $0.credential != nil }) { features.insert("key-credentials-1") }
         if header.membership.offlineRecovery != nil { features.insert("offline-recovery-1") }
         if records.count > 4096 || items.contains(where: \.requiresExtendedModel) { features.insert("item-model-1") }
         if items.contains(where: { $0.type == .document || $0.fields.contains(where: { $0.type == .attachment }) }) { features.insert("attachments-1") }
@@ -176,7 +178,7 @@ struct Revision: Codable, Sendable {
     func validateStructure() throws {
         if let features = header.requiredFeatures {
             guard !features.isEmpty, features == Set(features).sorted(),
-                  Set(features).isSubset(of: ["item-model-1", "attachments-1", "compound-fields-1", "attachment-blobs-1", "offline-recovery-1"]),
+                  Set(features).isSubset(of: ["item-model-1", "attachments-1", "compound-fields-1", "attachment-blobs-1", "offline-recovery-1", "key-credentials-1"]),
                   (!(features.contains("attachments-1") || features.contains("compound-fields-1")) || features.contains("item-model-1")) else { throw MopError.invalidVault }
         }
         guard header.membership.offlineRecovery == nil || header.requiredFeatures?.contains("offline-recovery-1") == true else { throw MopError.invalidVault }
@@ -296,6 +298,10 @@ struct Revision: Codable, Sendable {
         guard Set(payload.items.map(\.name)).count == payload.items.count,
               payload.items.allSatisfy({ $0.fields.allSatisfy { !$0.type.concealed || $0.value == nil } }) else { throw MopError.invalidVault }
         for item in payload.items {
+            if item.credential != nil {
+                guard header.requiredFeatures?.contains("key-credentials-1") == true else { throw MopError.invalidVault }
+                try CloudKey.validate(item: item)
+            }
             guard !item.fields.isEmpty, Set(item.fields.map(\.path)).count == item.fields.count else { throw MopError.invalidVault }
             for field in item.fields {
                 let path = SecretReference.encode(item.name) + "/" + field.path

@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import MopCore
+import MopCredentials
 
 /// An unlocked session's verified ciphertext and catalog. No concealed field plaintext,
 /// private keys, or unwrapped item keys are retained here.
@@ -101,6 +102,10 @@ public extension VaultEngine {
               edit.item.deletion == nil, !edit.item.fields.isEmpty,
               Set(edit.item.fields.map(\.path)).count == edit.item.fields.count else { throw MopError.invalidVault }
         guard edit.item.autoFill?.validationError(in: edit.item.fields) == nil else { throw MopError.invalidVault }
+        try CloudKey.validate(item: edit.item)
+        if let credential = old?.credential {
+            guard edit.item.credential == credential else { throw CredentialFailure.invalid }
+        }
         var item = edit.item
         item.storageID = nil
         if item.metadata == nil { item.metadata = ItemMetadata() }
