@@ -74,25 +74,26 @@ Cloud-access device keys and local credential keys have different jobs. Both are
 
 ### Inside a cloud vault
 
-<figure class="security-architecture" tabindex="0" aria-label="Security diagram; scroll horizontally on narrow screens"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 335 960 675" role="img" aria-labelledby="vault-structure-title vault-structure-description">
+<figure class="security-architecture" tabindex="0" aria-label="Security diagram; scroll horizontally on narrow screens"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 335 960 715" role="img" aria-labelledby="vault-structure-title vault-structure-description">
 <title id="vault-structure-title">Inside a cloud vault: catalog, items, attachments, and recipient key envelopes</title>
 <desc id="vault-structure-description">Outside CloudKit, a device agreement key or optional offline recovery copy opens recipient key envelopes. Inside the cloud vault, a signed revision binds the encrypted catalog and item fields. A separate catalog key encrypts metadata; per-item keys encrypt fields and separate attachment blobs, referenced by ciphertext digest and size.</desc>
-<defs><marker id="vault-structure-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#353d87"/></marker></defs><rect x="40" y="350" width="550" height="64" rx="10" fill="#eeeef8" stroke="#9197bd"/><text x="315" y="377" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Device Secure Enclave agreement key</text><text x="315" y="400" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Opens this device’s envelopes in an authorized client</text><rect x="15" y="450" width="930" height="550" rx="10" fill="#f9f9fc" stroke="#9197bd"/>
+<defs><marker id="vault-structure-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#353d87"/></marker></defs><rect x="40" y="350" width="550" height="64" rx="10" fill="#eeeef8" stroke="#9197bd"/><text x="315" y="377" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Device Secure Enclave agreement key</text><text x="315" y="400" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Opens this device’s envelopes in an authorized client</text><rect x="15" y="450" width="930" height="590" rx="10" fill="#f9f9fc" stroke="#9197bd"/>
 <text x="480.0" y="475" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">iCloud / CloudKit — one cloud vault</text>
-<rect x="40" y="480" width="880" height="62" rx="10" fill="#eeeef8" stroke="#9197bd"/>
-<text x="480.0" y="507" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Signed revision + head</text>
-<text x="480.0" y="530" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Membership, public device identities, ancestry; covers catalog and field/key tables</text>
-<rect x="40" y="568" width="550" height="82" rx="10" fill="#eeeef8" stroke="#9197bd"/>
-<text x="315.0" y="377" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">HPKE envelopes for each authorized recipient</text>
-<text x="315.0" y="400" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Separate catalog key + per-item keys</text>
-<text x="315.0" y="423" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Opened using device agreement key or recovery authority</text>
+<rect x="40" y="960" width="880" height="62" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="480.0" y="987" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Signed revision + head</text>
+<text x="480.0" y="1010" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Membership, public device identities, ancestry; covers catalog and field/key tables</text>
+<rect x="40" y="490" width="880" height="82" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="480" y="517" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">HPKE envelopes for each authorized recipient</text>
+<text x="480" y="540" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Separate catalog key + per-item keys</text>
+<text x="480" y="563" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Opened using device agreement key or recovery authority</text>
 <rect x="625" y="350" width="295" height="82" rx="10" fill="#fff6df" stroke="#9197bd" stroke-dasharray="6 4"/>
 <text x="772.5" y="377" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Offline recovery copy</text>
 <text x="772.5" y="400" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Optional; kept outside iCloud</text>
 <text x="772.5" y="423" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">For covered owned vaults</text>
-<path d="M772 432 L772 550 L600 550 L600 610 L592 610" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
-<path d="M170 650 L170 705" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
-<path d="M450 650 L450 705" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<path d="M772 432 L772 488" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<path d="M315 414 L315 488" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<path d="M195 572 L195 705" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<path d="M650 572 L650 705" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
 <rect x="40" y="710" width="310" height="85" rx="10" fill="#eeeef8" stroke="#9197bd"/>
 <text x="195.0" y="737" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Encrypted catalog</text>
 <text x="195.0" y="760" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Item names, types, metadata,</text>
