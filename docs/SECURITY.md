@@ -50,6 +50,85 @@ additional enrollment consequences above. 2ndPass does not promise availability
 against a malicious server, secrecy from an authorized recipient, or protection
 of plaintext on a compromised endpoint.
 
+## Devices, vaults, and keys
+
+### Devices and local identities
+
+```mermaid
+flowchart TB
+    subgraph A["Device A"]
+        APP["Authorized client + verified encrypted cloud cache"]
+        LOCAL["local vault<br/>Public metadata + device-only Keychain references"]
+        subgraph SE["Secure Enclave — non-exportable private keys"]
+            DEVICE["Device identity<br/>Agreement + revision signing keys"]
+            KEYS["Separate local credential keys<br/>Passkeys, SSH, Git signing, certificates"]
+        end
+        APP -->|"authorized operations"| DEVICE
+        APP --> LOCAL
+        LOCAL -->|"references"| KEYS
+    end
+    subgraph B["Device B — independently enrolled"]
+        APPB["Authorized client + verified encrypted cloud cache"]
+        SEB["Its own Secure Enclave<br/>Independent device identity keys"]
+        LOCALB["Its own local vault and enclave credential keys<br/>Independent credentials; never copied from Device A"]
+        APPB -->|"authorized operations"| SEB
+        APPB --> LOCALB
+    end
+    CLOUD["CloudKit cloud vault<br/>Signed revisions, encrypted catalog, fields, attachments<br/>Key envelopes for authorized recipients"]
+    APP <-->|"verify / sync ciphertext"| CLOUD
+    APPB <-->|"verify / sync ciphertext"| CLOUD
+```
+
+### Inside a cloud vault
+
+```mermaid
+flowchart TB
+    DEVICE["Authorized device's Secure Enclave agreement key"]
+    REC["Optional offline recovery copy<br/>Private authority stored outside iCloud"]
+    subgraph CLOUD["iCloud / CloudKit — one cloud vault"]
+        REV["Signed revision + head<br/>Membership, public identities, ancestry"]
+        ENV["HPKE envelopes for each authorized recipient<br/>Separate catalog key + per-item keys"]
+        CAT["Encrypted catalog<br/>Item names, types, metadata, field references"]
+        ITEMS["Encrypted item fields<br/>Passwords, notes, cloud passkey / SSH / Git private keys"]
+        ATT["Separate encrypted attachment blobs<br/>Revision references ciphertext digest and size"]
+        REV --- ENV
+        REV --- CAT
+        REV --- ITEMS
+        REV -->|"digest / size references"| ATT
+        ENV -.->|"catalog key encrypts"| CAT
+        ENV -.->|"each item key encrypts its fields"| ITEMS
+        ENV -.->|"owning item key encrypts"| ATT
+    end
+    DEVICE -->|"opens this device's envelopes"| ENV
+    REC -->|"opens recovery envelopes for covered owned vaults"| ENV
+```
+
+
+Each enrolled device has independent Secure Enclave keys. **Device identity keys**
+open cloud-vault key envelopes and sign revisions; **local credential keys** perform
+passkey, SSH, Git signing, or certificate operations. The `local` vault is an
+on-device collection of identities and references, not a cloud vault or a container
+holding plaintext private keys. Local keys have no sync or recovery path; another
+device must generate and register its own independent credentials.
+
+The cloud vault contains ciphertext, signed structure, public membership data,
+and wrapped symmetric keys—not the device's Secure Enclave private keys. The
+catalog has a separate encryption key; each item key encrypts that item's fields,
+including attachments whose ciphertext is stored separately. Cloud passkeys and
+SSH/Git credentials are software private keys inside encrypted item payloads, so
+authorized enrolled devices can use the same credential. Catalog and item keys,
+decrypted fields, and attachment plaintext enter authorized process memory during
+use; the diagram's encryption arrows describe key relationships, not decryption
+inside CloudKit.
+
+The optional offline recovery copy is an additional private authority for covered
+owned cloud vaults. It is not a copy of any device's enclave keys and does not
+recover local credentials, an Apple Account, or missing cloud data. Device-local
+Keychain records hold opaque key representations/references; verified caches hold
+cloud ciphertext. Neither makes enclave keys portable. The diagram omits enrollment
+mailboxes and detailed record formats; see [the trust model](#composed-apple--2ndpass-trust-model),
+[the v7 format](VAULT-V7.md), and [offline recovery](OFFLINE-RECOVERY.md).
+
 ## Composed Apple + 2ndPass trust model
 
 The enrollment path composes Apple device/account security, code signing and

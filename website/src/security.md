@@ -8,6 +8,7 @@ heading: "Know what you’re trusting."
 intro: "Hardware-protected device keys. Encryption before sync. Explicit boundaries, including the uncomfortable ones."
 toc:
   - {id: encryption, label: Encryption & keys}
+  - {id: architecture, label: Devices & vaults diagram}
   - {id: attacks, label: Common attacks}
   - {id: icloud, label: iCloud & account trust}
   - {id: devices, label: Devices & sharing}
@@ -22,11 +23,99 @@ Each enrolled device creates separate P-256 private keys for decryption and sign
 
 2ndPass uses authenticated encryption and HPKE (`P256_SHA256_AES_GCM_256`) to wrap secret keys for authorized devices. Signed revisions and verified checkpoints help clients detect tampering and rollback relative to the state they already trust. Vault contents are encrypted locally before they leave the device.
 
-**Secure Enclave protection is not a promise that plaintext never enters memory.** Derived key material and decrypted secrets are used in the app’s process. A compromised, unlocked device or malicious software with sufficient privileges can invoke authorized key operations and capture their plaintext results even when the device private key remains non-exportable. The enclave protects the device’s private key, not everything an application does with a password.
+**Secure Enclave protection is not a promise that plaintext never enters memory.** Derived key material and decrypted secrets are used in the app’s process. A compromised, unlocked device or malicious software with sufficient privileges can invoke authorized key operations and capture their plaintext results even when the device private key remains non-exportable. The enclave protects the device’s private key, not everything an application does with a password. Private keys for local-vault identities are generated and used inside the Secure Enclave; metadata and opaque key references are stored outside it. Their private key material cannot be extracted; because of that, these items cannot be synced across devices or backed up.
 
 Apple Passwords/iCloud Keychain also uses substantial Secure Enclave-backed protection; see Apple's [Keychain security documentation](https://support.apple.com/guide/security/secb0694df1a/web). 2ndPass's distinction is its explicit, inspectable device-identity and item-key protocol, not exclusive use of Apple security hardware or a claim of greater security. Apple's system is integrated deeper into the OS and its complete implementation is not publicly inspectable.
 
 The [security design](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md) and [vault protocol](vault.html) describe the algorithms, checks, and trust model in detail.
+
+## Architecture
+
+Cloud-access device keys and local credential keys have different jobs. Both are generated in the Secure Enclave, but local keys serve passkey, SSH, Git signing, and certificate operations directly. Cloud device keys open the encrypted keys needed to read a cloud vault and sign its revisions.
+
+### Devices and local identities
+
+<figure class="security-architecture" tabindex="0" aria-label="Security diagram; scroll horizontally on narrow screens"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" role="img" aria-labelledby="architecture-title architecture-description">
+<title id="architecture-title">Devices, Secure Enclaves, local vaults, and a cloud vault</title>
+<desc id="architecture-description">Two devices independently access one encrypted cloud vault. Each device has its own Secure Enclave keys and local identities. The cloud holds a signed revision, recipient key envelopes, an encrypted catalog, item fields, and separate attachment blobs. An optional offline recovery copy opens recovery envelopes. Local credential keys never sync.</desc>
+<defs><marker id="architecture-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#353d87"/></marker></defs><rect x="15" y="10" width="450" height="335" rx="10" fill="#f9f9fc" stroke="#9197bd"/>
+<text x="240.0" y="37" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Device A</text>
+<rect x="30" y="55" width="420" height="65" rx="10" fill="#ffffff" stroke="#9197bd"/>
+<text x="240.0" y="82" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Authorized client + verified encrypted cache</text>
+<text x="240.0" y="105" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Plaintext and temporary keys during use</text>
+<path d="M240 120 L240 151" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#architecture-arrow)"/>
+<rect x="30" y="155" width="420" height="95" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="240.0" y="182" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Secure Enclave — non-exportable private keys</text>
+<text x="240.0" y="205" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Device identity: agreement + revision signing</text>
+<text x="240.0" y="228" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Separate local keys: passkeys, SSH, Git, certificates</text>
+<rect x="30" y="270" width="420" height="60" rx="10" fill="#ffffff" stroke="#9197bd"/>
+<text x="240.0" y="297" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">local vault: metadata + Keychain references</text>
+<text x="240.0" y="320" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Local credential keys never sync or recover</text>
+<path d="M240 270 L240 252" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#architecture-arrow)"/>
+<rect x="495" y="10" width="450" height="335" rx="10" fill="#f9f9fc" stroke="#9197bd"/>
+<text x="720.0" y="37" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Device B — independent keys</text>
+<rect x="510" y="55" width="420" height="65" rx="10" fill="#ffffff" stroke="#9197bd"/>
+<text x="720.0" y="82" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Authorized client + verified encrypted cache</text>
+<text x="720.0" y="105" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Plaintext and temporary keys during use</text>
+<path d="M720 120 L720 151" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#architecture-arrow)"/>
+<rect x="510" y="155" width="420" height="95" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="720.0" y="182" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Secure Enclave — non-exportable private keys</text>
+<text x="720.0" y="205" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Device identity: agreement + revision signing</text>
+<text x="720.0" y="228" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Separate local keys: passkeys, SSH, Git, certificates</text>
+<rect x="510" y="270" width="420" height="60" rx="10" fill="#ffffff" stroke="#9197bd"/>
+<text x="720.0" y="297" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">local vault: metadata + Keychain references</text>
+<text x="720.0" y="320" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Local credential keys never sync or recover</text>
+<path d="M720 270 L720 252" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#architecture-arrow)"/>
+<path d="M235 345 L235 422" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#architecture-arrow)"/>
+<text x="247.0" y="383.5" fill="#353d87" font-family="system-ui, sans-serif" font-size="15">Cloud sync</text>
+<path d="M715 345 L715 422" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#architecture-arrow)"/>
+<text x="727.0" y="383.5" fill="#353d87" font-family="system-ui, sans-serif" font-size="15">Cloud sync</text>
+<rect x="15" y="425" width="930" height="80" rx="10" fill="#eeeef8" stroke="#9197bd"/><text x="480" y="454" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="18" font-weight="650">Shared cloud vault in iCloud / CloudKit</text><text x="480" y="482" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Signed revisions, encrypted catalog, item fields, attachment blobs, and recipient key envelopes</text></svg><figcaption>Each device has independent hardware keys. Cloud credentials can sync; local passkeys, SSH/Git keys, and certificate private keys stay in their original Secure Enclave.</figcaption></figure>
+
+### Inside a cloud vault
+
+<figure class="security-architecture" tabindex="0" aria-label="Security diagram; scroll horizontally on narrow screens"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 335 960 675" role="img" aria-labelledby="vault-structure-title vault-structure-description">
+<title id="vault-structure-title">Inside a cloud vault: catalog, items, attachments, and recipient key envelopes</title>
+<desc id="vault-structure-description">Outside CloudKit, a device agreement key or optional offline recovery copy opens recipient key envelopes. Inside the cloud vault, a signed revision binds the encrypted catalog and item fields. A separate catalog key encrypts metadata; per-item keys encrypt fields and separate attachment blobs, referenced by ciphertext digest and size.</desc>
+<defs><marker id="vault-structure-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#353d87"/></marker></defs><rect x="40" y="350" width="550" height="64" rx="10" fill="#eeeef8" stroke="#9197bd"/><text x="315" y="377" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Device Secure Enclave agreement key</text><text x="315" y="400" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Opens this device’s envelopes in an authorized client</text><rect x="15" y="450" width="930" height="550" rx="10" fill="#f9f9fc" stroke="#9197bd"/>
+<text x="480.0" y="475" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">iCloud / CloudKit — one cloud vault</text>
+<rect x="40" y="480" width="880" height="62" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="480.0" y="507" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Signed revision + head</text>
+<text x="480.0" y="530" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Membership, public device identities, ancestry; covers catalog and field/key tables</text>
+<rect x="40" y="568" width="550" height="82" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="315.0" y="377" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">HPKE envelopes for each authorized recipient</text>
+<text x="315.0" y="400" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Separate catalog key + per-item keys</text>
+<text x="315.0" y="423" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Opened using device agreement key or recovery authority</text>
+<rect x="625" y="350" width="295" height="82" rx="10" fill="#fff6df" stroke="#9197bd" stroke-dasharray="6 4"/>
+<text x="772.5" y="377" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Offline recovery copy</text>
+<text x="772.5" y="400" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Optional; kept outside iCloud</text>
+<text x="772.5" y="423" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">For covered owned vaults</text>
+<path d="M772 432 L772 550 L600 550 L600 610 L592 610" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<path d="M170 650 L170 705" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<path d="M450 650 L450 705" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<rect x="40" y="710" width="310" height="85" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="195.0" y="737" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Encrypted catalog</text>
+<text x="195.0" y="760" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Item names, types, metadata,</text>
+<text x="195.0" y="783" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">and field references</text>
+<rect x="380" y="710" width="540" height="85" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="650.0" y="737" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Encrypted item fields</text>
+<text x="650.0" y="760" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Passwords, notes, cloud passkey / SSH / Git private keys</text>
+<text x="650.0" y="783" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Each item has its own symmetric encryption key</text>
+<rect x="380" y="860" width="540" height="85" rx="10" fill="#eeeef8" stroke="#9197bd"/>
+<text x="650.0" y="887" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16" font-weight="650">Separate encrypted attachment blobs</text>
+<text x="650.0" y="910" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Encrypted with the owning item key</text>
+<text x="650.0" y="933" text-anchor="middle" fill="#20233d" font-family="system-ui, sans-serif" font-size="16">Revision references ciphertext digest and size</text>
+<path d="M650 795 L650 855" fill="none" stroke="#353d87" stroke-width="2" marker-end="url(#vault-structure-arrow)"/>
+<text x="662.0" y="825.0" fill="#353d87" font-family="system-ui, sans-serif" font-size="15">Same item key</text>
+<text x="55" y="894" fill="#353d87" font-family="system-ui, sans-serif" font-size="16">Encryption happens on devices.</text>
+<text x="55" y="920" fill="#353d87" font-family="system-ui, sans-serif" font-size="16">CloudKit stores ciphertext.</text>
+</svg><figcaption>CloudKit stores encrypted data and wrapped keys. Encryption and decryption happen on authorized devices. The optional recovery copy stays outside iCloud; it can open recovery envelopes for covered owned vaults.</figcaption></figure>
+
+The catalog uses its own encryption key. Each item has a separate key for its fields and attachments; attachment ciphertext is stored as separate blobs referenced by the signed revision. Cloud passkeys and SSH/Git keys are encrypted software keys within item payloads. Authorized enrolled devices can use the same cloud credential; local credentials cannot move between devices.
+
+**Private keys stay in the Secure Enclave; decrypted cloud data does not.** The `local` vault holds public metadata and device-only Keychain references, not exported private keys. Authorized clients use decrypted catalogs, item keys, secrets, and attachments in process memory. Verified local caches keep cloud ciphertext for offline reads, subject to the [freshness limits](#icloud).
+
+An offline recovery copy can open recovery envelopes for covered owned cloud vaults. It cannot recover local keys, an Apple Account, or missing cloud data. The diagram omits enrollment mailboxes and detailed record formats; the [Mermaid diagram and technical explanation](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md#devices-vaults-and-keys) provide more detail.
 
 ## Attacks
 
