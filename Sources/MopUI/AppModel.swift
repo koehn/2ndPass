@@ -2,6 +2,7 @@ import MopLocalIdentity
 import SwiftUI
 import OSLog
 import MopCore
+import MopSubscriptions
 import MopAppSupport
 import MopAuth
 import LocalAuthentication
@@ -910,12 +911,12 @@ final class AppModel {
         lifecycle.start { [weak self] event in
             guard let self else { return }
             switch event {
-            case .active: self.activate()
+            case .active: self.activate(); Task { await SubscriptionModel.shared.refresh() }
             case .cloudChanged: self.cloudChanged()
             case .inactive: self.deactivate()
             case .background: self.background()
             case .lock: self.deactivate(); self.lock(reason: .system)
-            case .accountChanged:
+            case .accountChanged: SubscriptionModel.shared.accountChanged();
                 self.lock(); self.submittedEnrollments = []; self.enrollmentSelection = []; self.enrollmentProgress = [:]; self.vaults = []; self.vault = ""
                 self.launchUnlockAvailable = false
                 self.accessNeedsRepair = false

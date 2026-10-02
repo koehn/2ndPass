@@ -18,6 +18,9 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<true/>
+	<key>MopAppAppleID</key><string>$(MOP_APP_APPLE_ID)</string>
+	<key>MopSubscriptionPublicationEnabled</key><string>$(MOP_SUBSCRIPTION_PUBLICATION)</string>
+	<key>MopSubscriptionPurchasesEnabled</key><string>$(MOP_SUBSCRIPTION_PURCHASES)</string>
 	<key>MopAppGroup</key>
 	<string>group.$(MOP_HOST_BUNDLE_ID)</string>
 	<key>MopCloudContainer</key>

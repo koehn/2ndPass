@@ -31,17 +31,25 @@ site-deploy bucket prefix="" distribution="": site-build
 
 # Compile the release CLI (vault access requires a provisioned app bundle).
 cli-build:
-    swift build -c release --product sp
+    CLANG_MODULE_CACHE_PATH=/tmp/mop-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/mop-swift-cache swift build --disable-sandbox -c release --product sp
 
-# Compile the macOS app and CLI.
-app-build: cli-build
+# Package and sign the universal CLI using MOP_SIGN_IDENTITY and MOP_CLI_PROVISION_PROFILE.
+cli-package:
+    bash scripts/package-cli.sh
+
+# Build, sign, and install the separate CLI (MOP_INSTALL_ROOT overrides the prefix).
+cli-install: cli-package
+    bash scripts/install-cli.sh
+
+# Compile the macOS app.
+app-build:
     swift build -c release --product MopApp
 
 # Package and sign the macOS app using exported MOP_* settings.
 app-package:
     bash scripts/package.sh
 
-# Install the packaged macOS app and CLI using the existing installer.
+# Build, sign, and install the sandboxed macOS app without the CLI.
 app-install: app-package
     bash scripts/install.sh
 

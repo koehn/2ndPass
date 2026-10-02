@@ -9,25 +9,25 @@ import subprocess
 import sys
 import tempfile
 
-app = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/2ndPass.app').resolve()
+app = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/cli/2ndPass CLI.app').resolve()
 root = pathlib.Path(__file__).resolve().parent.parent
 with tempfile.TemporaryDirectory(prefix='sp-install-test-') as directory:
     prefix = pathlib.Path(directory) / 'prefix'
-    applications = pathlib.Path(directory) / 'Applications'
+    applications = prefix / 'lib/sp'
     environment = os.environ | {'MOP_INSTALL_ROOT': str(prefix), 'MOP_APPLICATIONS_DIR': str(applications)}
-    command = [str(root / 'scripts/install.sh'), str(app)]
+    command = [str(root / 'scripts/install-cli.sh'), str(app)]
     subprocess.run(command, env=environment, check=True, capture_output=True)
     link = prefix / 'bin/sp'
     assert link.is_symlink()
-    assert link.readlink() == applications / '2ndPass.app/Contents/MacOS/sp'
-    assert (applications / '2ndPass.app/Contents/embedded.provisionprofile').is_file()
-    info = plistlib.loads((applications / '2ndPass.app/Contents/Info.plist').read_bytes())
-    assert info['CFBundleExecutable'] == 'MopApp'
-    assert (applications / '2ndPass.app/Contents/MacOS/MopApp').is_file()
-    resources_dir = applications / '2ndPass.app/Contents/Resources'
+    assert link.readlink() == applications / '2ndPass CLI.app/Contents/MacOS/sp'
+    assert (applications / '2ndPass CLI.app/Contents/embedded.provisionprofile').is_file()
+    info = plistlib.loads((applications / '2ndPass CLI.app/Contents/Info.plist').read_bytes())
+    assert info['CFBundleExecutable'] == 'sp'
+    assert (applications / '2ndPass CLI.app/Contents/MacOS/sp').is_file()
+    resources_dir = applications / '2ndPass CLI.app/Contents/Resources'
     assert (resources_dir / 'zxcvbn_zxcvbn.bundle').is_dir()
     assert (resources_dir / 'zxcvbn-LICENSE.txt').is_file()
-    direct = applications / '2ndPass.app/Contents/MacOS/sp'
+    direct = applications / '2ndPass CLI.app/Contents/MacOS/sp'
     identity = subprocess.check_output([str(direct), 'device', 'identity']).strip()
     assert identity
     assert subprocess.check_output([str(link), 'device', 'identity']).strip() == identity

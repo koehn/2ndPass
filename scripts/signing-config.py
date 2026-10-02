@@ -5,9 +5,21 @@ import fnmatch
 import os
 import plistlib
 import sys
-from pathlib import Path
 
 profile_path, bundle_id, executable, info_path, entitlements_path = sys.argv[1:]
+app_apple_id = os.environ.get('MOP_APP_APPLE_ID', '')
+publication = os.environ.get('MOP_SUBSCRIPTION_PUBLICATION', 'NO')
+purchases = os.environ.get('MOP_SUBSCRIPTION_PURCHASES', 'NO')
+if publication not in ('YES', 'NO') or purchases not in ('YES', 'NO'):
+    sys.exit('Subscription switches must be YES or NO.')
+if (publication == 'YES' or purchases == 'YES') and (not app_apple_id.isascii() or not app_apple_id.isdecimal() or not 0 < int(app_apple_id) <= 9223372036854775807):
+    sys.exit('Set MOP_APP_APPLE_ID to the positive numeric App Store app ID before enabling subscriptions.')
+# This script produces Developer ID/development bundles, not App Store GUI builds.
+if purchases == 'YES':
+    sys.exit('Enable subscription purchases in the Xcode App Store/test configuration, not the direct-distribution packager.')
+
+if executable not in ('sp', 'MopApp', 'MopAutoFill'):
+    sys.exit('Unknown executable role.')
 with open(profile_path, 'rb') as f:
     profile = plistlib.load(f)
 entitlements = profile['Entitlements']
@@ -17,22 +29,27 @@ if not team or not app_id.endswith('.' + bundle_id) or '*' in app_id:
     sys.exit(f'Provisioning profile {profile.get("Name", "(unnamed)")!r} authorizes {app_id or "(missing App ID)"}, '
              f'but this target requires <AppIdentifierPrefix>.{bundle_id}. '
              + ('Set MOP_AUTOFILL_PROVISION_PROFILE to a separate profile for the AutoFill extension.'
-                if executable == 'MopAutoFill' else 'Set MOP_PROVISION_PROFILE to the matching app profile.'))
+                if executable == 'MopAutoFill' else 'Set MOP_CLI_PROVISION_PROFILE to the matching CLI profile.'
+                if executable == 'sp' else 'Set MOP_PROVISION_PROFILE to the matching app profile.'))
 if profile.get('ExpirationDate', datetime.datetime.min) <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None):
     sys.exit('The provisioning profile has expired.')
-if executable != 'MopAutoFill' and not any(fnmatch.fnmatchcase(app_id, group) for group in entitlements.get('keychain-access-groups', [])):
+if executable not in ('MopAutoFill', 'sp') and not any(fnmatch.fnmatchcase(app_id, group) for group in entitlements.get('keychain-access-groups', [])):
     sys.exit('The provisioning profile must permit the application-specific Keychain group.')
 is_extension = executable == 'MopAutoFill'
-parent_bundle = bundle_id.removesuffix('.AutoFill') if is_extension else bundle_id
-shared_group = app_id.removesuffix('.AutoFill') if is_extension else app_id
+is_cli = executable == 'sp'
+if is_cli and not bundle_id.endswith('.CLI'):
+    sys.exit('CLI bundle ID must end in .CLI; use a separate CLI provisioning profile.')
+suffix = '.AutoFill' if is_extension else '.CLI' if is_cli else ''
+parent_bundle = bundle_id.removesuffix(suffix) if suffix else bundle_id
+shared_group = app_id.removesuffix(suffix) if suffix else app_id
 if is_extension and not bundle_id.endswith('.AutoFill'):
     sys.exit('AutoFill extension bundle ID must end in .AutoFill.')
 if not any(fnmatch.fnmatchcase(shared_group, group) for group in entitlements.get('keychain-access-groups', [])):
-    sys.exit('The extension profile must authorize the containing app Keychain group.')
+    sys.exit('The profile must authorize the shared host app Keychain group.')
 output = {'com.apple.application-identifier': app_id,
           'com.apple.developer.team-identifier': team,
           'keychain-access-groups': [shared_group]}
-if executable == 'sp' or is_extension:
+if executable in ('sp', 'MopApp') or is_extension:
     container = 'iCloud.' + parent_bundle
     environment = os.environ.get('MOP_CLOUD_ENVIRONMENT', 'Production')
     if environment not in ('Development', 'Production'):
@@ -70,7 +87,7 @@ if executable == 'sp' or is_extension:
                    'com.apple.developer.icloud-container-identifiers': [container],
                    'com.apple.developer.icloud-services': ['CloudKit'],
                    'com.apple.developer.icloud-container-environment': environment})
-autofill = is_extension or os.environ.get('MOP_AUTOFILL') == '1'
+autofill = is_extension or executable == 'MopApp'
 if autofill:
     capability = 'com.apple.developer.authentication-services.autofill-credential-provider'
     group = 'group.' + parent_bundle
@@ -78,12 +95,20 @@ if autofill:
         sys.exit('Enable AutoFill Credential Provider and App Groups (' + group + ') and regenerate the provisioning profile.')
     output[capability] = True
     output['com.apple.security.application-groups'] = [group]
+group = 'group.' + parent_bundle
+if not permits('com.apple.security.application-groups', group):
+    sys.exit('Provisioning profile must authorize App Group ' + group)
+output['com.apple.security.application-groups'] = [group]
+if executable == 'MopApp':
+    output['com.apple.security.app-sandbox'] = True
+    output['com.apple.security.network.client'] = True
+    output['com.apple.security.files.user-selected.read-write'] = True
 if is_extension:
     output.pop('com.apple.developer.ubiquity-kvstore-identifier', None)
     output['com.apple.security.app-sandbox'] = True
     output['com.apple.security.network.client'] = True
 # Carry the profile's APNs environment into native macOS app signatures.
-if executable == 'sp' and entitlements.get('com.apple.developer.aps-environment'):
+if executable == 'MopApp' and entitlements.get('com.apple.developer.aps-environment'):
     output['com.apple.developer.aps-environment'] = entitlements['com.apple.developer.aps-environment']
 with open(entitlements_path, 'wb') as f:
     plistlib.dump(output, f)
@@ -93,13 +118,18 @@ with open(info_path, 'wb') as f:
                   'CFBundleVersion': '0.7.0', 'CFBundleShortVersionString': '0.7.0',
                   'LSMinimumSystemVersion': '15.0'}, f)
 
-if autofill:
+if executable in ('sp', 'MopApp', 'MopAutoFill'):
     with open(info_path, 'rb') as f:
         info = plistlib.load(f)
-    info.update({'MopAppGroup': 'group.' + parent_bundle,
-                 'MopPublishesAutoFill': not is_extension,
+    info.update({'MopAppAppleID': app_apple_id,
+                 'MopSubscriptionPublicationEnabled': publication,
+                 'MopSubscriptionPurchasesEnabled': 'NO',
+                 'MopAppGroup': 'group.' + parent_bundle,
+                 'MopPublishesAutoFill': executable == 'MopApp',
                  'MopCloudContainer': 'iCloud.' + parent_bundle,
                  'MopCloudEnvironment': environment,
                  'MopKeychainAccessGroup': shared_group})
+    if is_cli:
+        info.update({'CFBundleName': '2ndPass CLI', 'CFBundleDisplayName': '2ndPass CLI', 'LSUIElement': True})
     with open(info_path, 'wb') as f:
         plistlib.dump(info, f)

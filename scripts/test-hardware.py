@@ -14,7 +14,7 @@ import tempfile
 import uuid
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('cli', nargs='?', default='dist/2ndPass.app/Contents/MacOS/sp')
+parser.add_argument('cli', nargs='?', default='dist/cli/2ndPass CLI.app/Contents/MacOS/sp')
 options = parser.parse_args()
 cli = str(Path(options.cli).resolve())
 if subprocess.check_output([cli, '--version'], text=True).strip() != '0.7.0':

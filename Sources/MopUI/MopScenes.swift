@@ -1,5 +1,6 @@
 import SwiftUI
 import MopCore
+import MopSubscriptions
 import MopAppSupport
 
 public struct MopScenes: Scene {
@@ -14,6 +15,7 @@ public struct MopScenes: Scene {
     }
     public init() {
         _ = DeveloperPreferences.shared
+        SubscriptionModel.shared.start()
         _model = State(initialValue: Self.initialModel())
     }
     public var body: some Scene {
@@ -205,6 +207,7 @@ struct SessionSettings: View {
             }
 
             case .advanced:
+                SubscriptionSettingsView()
                 Section("Attachments on this device") {
                     Picker("Download attachments", selection: $downloadAttachmentsDuringSync) {
                         Text("On demand").tag(false)
@@ -217,6 +220,16 @@ struct SessionSettings: View {
                 Toggle("Show developer tools", isOn: Binding(get: { developerTools }, set: { DeveloperPreferences.shared.set($0) }))
                 Text("Include Copy Reference in field menus for scripts and configuration. Syncs across devices using your Apple Account.")
                     .font(.caption).foregroundStyle(.secondary)
+                #if os(macOS)
+                Text("Install the command-line tools")
+                    .font(.headline)
+                Text("Install Homebrew, then run these commands in Terminal to install sp and its SSH agent:")
+                    .font(.callout)
+                Link("Get Homebrew", destination: URL(string: "https://brew.sh")!)
+                Text("brew tap koehn/2ndpass https://github.com/koehn/2ndPass\nbrew install --cask koehn/2ndpass/secondpass-cli")
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                #endif
             }
             DisclosureGroup("Advanced") {
                 Text("Open a vault by ID when it is missing from discovery, including a previously verified offline snapshot.")

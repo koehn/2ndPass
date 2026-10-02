@@ -27,6 +27,20 @@ public enum SigningIdentity {
         return group
     }
 
+    public static func subscriptionSettings() -> (appAppleID: Int64?, publicationEnabled: Bool, purchasesEnabled: Bool) {
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        var information: CFDictionary?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any], let executable = info[kSecCodeInfoMainExecutable as String] as? URL,
+              let bundle = applicationBundle(for: executable) else { return (nil, false, false) }
+        return (Int64(bundle.object(forInfoDictionaryKey: "MopAppAppleID") as? String ?? ""),
+                bundle.object(forInfoDictionaryKey: "MopSubscriptionPublicationEnabled") as? String == "YES",
+                bundle.object(forInfoDictionaryKey: "MopSubscriptionPurchasesEnabled") as? String == "YES")
+    }
+
     public static func accessGroup() throws -> String {
         var code: SecCode?
         var staticCode: SecStaticCode?
@@ -53,9 +67,12 @@ public enum SigningIdentity {
               FileManager.default.fileExists(atPath: bundle.bundleURL.appendingPathComponent("Contents/embedded.provisionprofile").path)
         else { throw MopError.signing }
         let extensionRole = bundle.bundleURL.pathExtension == "appex"
-        let group = extensionRole ? String(applicationID.dropLast(".AutoFill".count)) : applicationID
+        let cliRole = bundleID.hasSuffix(".CLI")
+        let group = extensionRole ? String(applicationID.dropLast(".AutoFill".count))
+            : cliRole ? String(applicationID.dropLast(".CLI".count)) : applicationID
         guard !extensionRole || (bundleID.hasSuffix(".AutoFill") &&
             entitlements["com.apple.developer.authentication-services.autofill-credential-provider"] as? Bool == true),
+            (!cliRole || bundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String == "sp"),
             groups == [group] else { throw MopError.signing }
         // Let securityd verify the provisioned entitlement too. This query cannot
         // prompt and asks only for a nonexistent diagnostic item, never key data.

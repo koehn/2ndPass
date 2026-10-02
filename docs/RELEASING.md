@@ -9,8 +9,10 @@ These release procedures are for the copyright holder and separately authorized 
 
 Follow the [signed build instructions](../README.md#build-and-provision) and
 [mobile distribution guide](MOBILE.md). Packaging produces `dist/2ndPass.app`
-and shell resources. `scripts/install.sh` installs `/Applications/2ndPass.app`
-and `/usr/local/bin/sp`.
+without a CLI. `scripts/install.sh` installs `/Applications/2ndPass.app`.
+`scripts/package-cli.sh` separately produces `dist/cli/2ndPass CLI.app` and shell
+resources; `scripts/install-cli.sh` installs them independently. See
+[Homebrew releases](HOMEBREW.md) for CLI profiles, notarization, and cask generation.
 
 Keep the existing bundle ID, Keychain groups, CloudKit container, and environment
 consistent across Mac/mobile builds and updates. The branding change does not

@@ -77,8 +77,9 @@ Both App IDs need AutoFill Credential Provider and the App Group
 same CloudKit container (`iCloud.com.koehn.mop`) and existing Keychain group
 `<AppIdentifierPrefix>com.koehn.mop`. Regenerate both profiles after enabling these
 capabilities. Keep the app's existing identifier/group so existing keys remain
-accessible. The Mac extension is sandboxed and uses the hardened runtime. The packaged Mac
-app and CLI do not enable App Sandbox; iOS/iPadOS apply their platform sandbox.
+accessible. The Mac extension is sandboxed and uses the hardened runtime. The Mac
+app also enables App Sandbox. The separately packaged CLI is unsandboxed;
+iOS/iPadOS apply their platform sandbox.
 The Keychain access group authorizes identity access, the App Group shares local
 files, and CloudKit entitlements authorize container access. These are distinct
 capabilities. The extension intentionally has access to the same hardware-bound

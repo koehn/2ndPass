@@ -57,7 +57,7 @@ subscription versus permanent-unlock purchase options remain undecided.
 - [ ] **SALE-5 — Chrome extension.** Complete the equivalent Chrome integration
   and validate its installation, connection, unlock, credential workflows,
   origin matching, permission boundaries, and failure states on supported versions.
-- [ ] **SALE-6 — Cloud-vault passkeys, SSH keys, and other key credentials.**
+- [X] **SALE-6 — Cloud-vault passkeys, SSH keys, and other key credentials.**
   Let users explicitly choose cloud-vault storage for supported key types as an
   alternative to device-local storage. Acceptance: document the supported key
   types and protection/recovery differences; verify creation/import where
@@ -115,7 +115,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   cancellation and failed saves without silent loss, and avoid duplicate records.
   Document platform limitations and provide a clear app handoff where native
   AutoFill cannot support a step.
-- [ ] **SALE-13 — Existing SSH keys as usable cloud-vault credentials.** Import
+- [X] **SALE-13 — Existing SSH keys as usable cloud-vault credentials.** Import
   existing OpenSSH private keys into cloud vaults and use them through the SSH
   agent and Git signing workflows, not merely as stored text. Existing private
   keys must never be imported into the device-local vault: that vault only holds

@@ -11,8 +11,9 @@ import tempfile
 
 script = Path(__file__).with_name('signing-config.py')
 base = {'ExpirationDate': datetime.datetime.now() + datetime.timedelta(days=1),
-        'Entitlements': {'com.apple.application-identifier': 'TEAM.net.test.mop',
+        'Entitlements': {'com.apple.application-identifier': 'TEAM.net.test.mop.CLI',
                          'com.apple.developer.team-identifier': 'TEAM',
+                         'com.apple.security.application-groups': ['group.net.test.mop'],
                          'keychain-access-groups': ['TEAM.*'], 'get-task-allow': True,
                          'com.apple.developer.icloud-container-identifiers': ['iCloud.net.test.mop'],
                          'com.apple.developer.icloud-services': ['CloudKit'],
@@ -23,13 +24,14 @@ with tempfile.TemporaryDirectory() as tmp:
     def generate(profile, environment="Production"):
         (root / 'profile').write_bytes(plistlib.dumps(profile))
         return subprocess.run([sys.executable, str(script), str(root / 'profile'),
-                               'net.test.mop', 'sp', str(root / 'info'), str(root / 'entitlements')],
+                               'net.test.mop.CLI', 'sp', str(root / 'info'), str(root / 'entitlements')],
                               capture_output=True, env={**os.environ, "MOP_CLOUD_ENVIRONMENT": environment})
     assert generate(base).returncode == 0
     ent = plistlib.loads((root / 'entitlements').read_bytes())
-    assert ent == {'com.apple.application-identifier': 'TEAM.net.test.mop',
+    assert ent == {'com.apple.application-identifier': 'TEAM.net.test.mop.CLI',
                    'com.apple.developer.team-identifier': 'TEAM',
                    'keychain-access-groups': ['TEAM.net.test.mop'],
+                   'com.apple.security.application-groups': ['group.net.test.mop'],
                    'com.apple.developer.icloud-container-identifiers': ['iCloud.net.test.mop'],
                    'com.apple.developer.icloud-services': ['CloudKit'],
                          'com.apple.developer.ubiquity-kvstore-identifier': 'TEAM.net.test.mop',
@@ -46,6 +48,23 @@ with tempfile.TemporaryDirectory() as tmp:
         bad = copy.deepcopy(base)
         bad['Entitlements'][field] = value
         assert generate(bad).returncode != 0, field
+    assert 'com.apple.security.app-sandbox' not in ent
+    assert 'com.apple.developer.authentication-services.autofill-credential-provider' not in ent
+    assert plistlib.loads((root / 'info').read_bytes())['MopPublishesAutoFill'] is False
+    for field, value in [('keychain-access-groups', ['TEAM.net.test.mop.CLI']),
+                         ('com.apple.security.application-groups', ['group.net.test.mop.CLI'])]:
+        bad = copy.deepcopy(base)
+        bad['Entitlements'][field] = value
+        assert generate(bad).returncode != 0, field
+    # Subscription publication cannot be enabled without a real App Store identifier.
+    with __import__('unittest.mock', fromlist=['patch']).patch.dict(os.environ, {'MOP_SUBSCRIPTION_PUBLICATION': 'YES', 'MOP_APP_APPLE_ID': ''}):
+        assert generate(base).returncode != 0
+    with __import__('unittest.mock', fromlist=['patch']).patch.dict(os.environ, {'MOP_SUBSCRIPTION_PUBLICATION': 'YES', 'MOP_APP_APPLE_ID': '123456789'}):
+        assert generate(base).returncode == 0
+        info = plistlib.loads((root / 'info').read_bytes())
+        assert info['MopAppAppleID'] == '123456789'
+        assert info['MopSubscriptionPublicationEnabled'] == 'YES'
+        assert info['MopSubscriptionPurchasesEnabled'] == 'NO'
     # Apple profiles use allowed-value arrays and may authorize wildcard services.
     multiple = copy.deepcopy(base)
     multiple['Entitlements']['com.apple.developer.icloud-container-environment'] = ['Development', 'Production']
@@ -103,4 +122,17 @@ with tempfile.TemporaryDirectory() as tmp:
         bad = copy.deepcopy(autofill)
         del bad['Entitlements'][key]
         assert extension(bad).returncode != 0
+    host = copy.deepcopy(base)
+    host['Entitlements']['com.apple.application-identifier'] = 'TEAM.net.test.mop'
+    host['Entitlements']['com.apple.developer.authentication-services.autofill-credential-provider'] = True
+    (root / 'profile').write_bytes(plistlib.dumps(host))
+    result = subprocess.run([sys.executable, str(script), str(root / 'profile'),
+                             'net.test.mop', 'MopApp', str(root / 'info'), str(root / 'entitlements')], capture_output=True)
+    assert result.returncode == 0, result.stderr
+    host_ent = plistlib.loads((root / 'entitlements').read_bytes())
+    for key in ('com.apple.security.app-sandbox', 'com.apple.security.network.client',
+                'com.apple.security.files.user-selected.read-write'):
+        assert host_ent[key] is True
+    assert host_ent['keychain-access-groups'] == ent['keychain-access-groups']
+    assert plistlib.loads((root / 'info').read_bytes())['MopPublishesAutoFill'] is True
 print('PASS: explicit identity, narrow access group, no debug entitlements, and profile rejection checks.')

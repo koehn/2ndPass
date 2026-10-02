@@ -42,10 +42,11 @@ client or delete user data as part of validation.
 
 ```sh
 scripts/package.sh
-python3 scripts/test-tooling.py dist/2ndPass.app
-python3 scripts/test-shell-support.py dist/2ndPass.app/Contents/MacOS/sp
+scripts/package-cli.sh
+python3 scripts/test-tooling.py "dist/cli/2ndPass CLI.app"
+python3 scripts/test-shell-support.py "dist/cli/2ndPass CLI.app/Contents/MacOS/sp"
 MOP_LIVE_CLOUD_TEST=1 python3 scripts/test-hardware.py \
-  dist/2ndPass.app/Contents/MacOS/sp
+  "dist/cli/2ndPass CLI.app/Contents/MacOS/sp"
 ```
 
 The live script creates a fresh v7 CloudKit vault and retains its local state.
@@ -88,3 +89,23 @@ its usage limit. The changed Python scripts passed syntax parsing. Production
 CloudKit schema deployment, signed physical-device recovery with the same Apple
 Account, and independent cryptographic review remain pending. No production data
 or real Keychain identity was changed by this implementation session.
+
+## Subscription reporting preview
+
+`Tests/MopSubscriptionTests` covers verified-claim policy, expiry/grace/revocation,
+account/product/environment rejection, independent renewal freshness, offline
+cache expiration, deadlines and late callbacks, purchase outcomes, durable
+publication retries, and account switching. Test adapters deliberately use unsigned
+fixtures; the real Apple verifier separately rejects those fixtures.
+
+Run `python3 scripts/test-subscription-cli.py PATH_TO_UNSIGNED_SP` against a local
+unsigned build to check help/version/completion exemptions, JSON/null date fields,
+offline inspection, and stderr-only operational reporting. This test requires no
+purchase or vault and expects unsigned configuration to report unavailable.
+
+On 2026-10-01 the full Swift suite passed (454 tests), the CLI and macOS app built
+for arm64 and x86_64, and iOS simulator and Release device app/extension builds
+succeeded with code signing disabled. These results do not validate live StoreKit
+purchase publication or CloudKit consumption. Follow [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md)
+for product/schema configuration and signed cross-device validation before enabling
+production publication or releasing a paid offering.

@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 umask 077
+export CLANG_MODULE_CACHE_PATH=${CLANG_MODULE_CACHE_PATH:-/tmp/mop-clang-cache}
+export SWIFTPM_MODULECACHE_OVERRIDE=${SWIFTPM_MODULECACHE_OVERRIDE:-/tmp/mop-swift-cache}
 cd "$(dirname "$0")/.."
-product=sp
+product=MopApp
 bundle_name=2ndPass
 bundle_id=${MOP_BUNDLE_ID:-com.koehn.mop}
 if [[ $# != 0 ]]; then echo "Usage: scripts/package.sh" >&2; exit 2; fi
@@ -34,27 +36,18 @@ security cms -D -i "$MOP_AUTOFILL_PROVISION_PROFILE" > "$stage/extension-profile
 python3 scripts/signing-config.py "$stage/extension-profile.plist" "$bundle_id.AutoFill" MopAutoFill \
     "$stage/extension-info.plist" "$stage/extension-entitlements.plist"
 cp "$MOP_PROVISION_PROFILE" "$app/Contents/embedded.provisionprofile"
-swift build -c release --product "$product"
-bin_dir=$(swift build -c release --show-bin-path)
+swift build --disable-sandbox --arch arm64 --arch x86_64 -c release --product "$product"
+bin_dir=$(swift build --disable-sandbox --arch arm64 --arch x86_64 -c release --show-bin-path)
 cp "$bin_dir/$product" "$app/Contents/MacOS/$product"
-if [[ "$product" == sp ]]; then
-    swift build -c release --product MopApp
-    cp "$bin_dir/MopApp" "$app/Contents/MacOS/MopApp"
-    /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable MopApp' "$app/Contents/Info.plist"
-    mkdir -p "$app/Contents/Resources"
-    # SwiftPM resources used by the UI and password-strength estimator.
-    cp -R "$bin_dir/2ndpass_MopUI.bundle" "$app/Contents/Resources/"
-    cp -R "$bin_dir/zxcvbn_zxcvbn.bundle" "$app/Contents/Resources/"
-    cp .build/checkouts/zxcvbn-swift/LICENSE "$app/Contents/Resources/zxcvbn-LICENSE.txt"
-    cp assets/Mop.icns "$app/Contents/Resources/Mop.icns"
-    /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string Mop.icns' "$app/Contents/Info.plist"
-    # Sign the CLI helper with the same identity, CloudKit container, and Keychain group.
-    codesign --force --sign "$MOP_SIGN_IDENTITY" --identifier "$bundle_id" --options runtime --timestamp \
-        --entitlements "$stage/entitlements.plist" "$app/Contents/MacOS/sp"
-fi
+mkdir -p "$app/Contents/Resources"
+cp -R "$bin_dir/2ndpass_MopUI.bundle" "$app/Contents/Resources/"
+cp -R "$bin_dir/zxcvbn_zxcvbn.bundle" "$app/Contents/Resources/"
+cp .build/checkouts/zxcvbn-swift/LICENSE "$app/Contents/Resources/zxcvbn-LICENSE.txt"
+cp assets/Mop.icns "$app/Contents/Resources/Mop.icns"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string Mop.icns' "$app/Contents/Info.plist"
 # Build the native extension for both Mac architectures and sign it before the app.
 xcodebuild -project Apple/Mop.xcodeproj -scheme MopAutoFill -configuration Release \
-    -destination 'generic/platform=macOS' -derivedDataPath "$PWD/.build/autofill" \
+    -destination 'generic/platform=macOS' -derivedDataPath "$PWD/.build/autofill" -clonedSourcePackagesDirPath "$PWD/.build" \
     CODE_SIGNING_ALLOWED=NO MOP_HOST_BUNDLE_ID="$bundle_id" \
     PRODUCT_BUNDLE_IDENTIFIER="$bundle_id.AutoFill" \
     MOP_CLOUD_ENVIRONMENT="${MOP_CLOUD_ENVIRONMENT:-Production}" build
@@ -79,20 +72,6 @@ codesign --verify --strict "$extension"
 codesign --force --sign "$MOP_SIGN_IDENTITY" --options runtime --timestamp \
     --entitlements "$stage/entitlements.plist" "$app"
 codesign --verify --strict "$app"
-if [[ "$product" == sp ]]; then
-    "$app/Contents/MacOS/sp" device identity
-    mkdir -p "$stage/share/man/man1" "$stage/share/bash-completion/completions" \
-        "$stage/share/zsh/site-functions" "$stage/share/fish/vendor_completions.d"
-    cp docs/man/sp.1 "$stage/share/man/man1/sp.1"
-    "$app/Contents/MacOS/sp" completion bash > "$stage/share/bash-completion/completions/sp"
-    "$app/Contents/MacOS/sp" completion zsh > "$stage/share/zsh/site-functions/_sp"
-    "$app/Contents/MacOS/sp" completion fish > "$stage/share/fish/vendor_completions.d/sp.fish"
-    for resource in man/man1/sp.1 bash-completion/completions/sp zsh/site-functions/_sp fish/vendor_completions.d/sp.fish; do
-        mkdir -p "dist/share/$(dirname "$resource")"
-        chmod 644 "$stage/share/$resource"
-        mv -f "$stage/share/$resource" "dist/share/$resource"
-    done
-fi
 # Preserve an existing bundle until the replacement has passed signature validation.
 if [[ -e "dist/$bundle_name.app" ]]; then
     [[ -d "dist/$bundle_name.app" && ! -L "dist/$bundle_name.app" ]] || exit 7

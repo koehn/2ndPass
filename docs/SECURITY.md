@@ -512,8 +512,11 @@ an arbitrary child does with plaintext. `--no-masking` disables that filter.
 These are necessary disclosure boundaries for developer automation, not an
 extension of vault encryption to the receiving process.
 
-The app, bundled CLI and AutoFill extension intentionally share the provisioned
-Keychain access group and device identity on a device. The extension has its own
+The sandboxed app, separately distributed CLI, and AutoFill extension intentionally
+share the provisioned Keychain access group and device identity on a device. The
+CLI has its own `.CLI` App ID/profile and remains unsandboxed for developer
+automation. Its signature authorizes only the existing shared vault groups and
+CloudKit container. The extension has its own
 App ID/profile, shares the App Group's local checkpoints/index, and can access
 the same CloudKit container. This makes extension code part of the vault's
 trusted computing base, not a metadata-only helper. Each fill authenticates

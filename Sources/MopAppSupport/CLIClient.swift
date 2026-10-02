@@ -24,9 +24,9 @@ public enum CLIError: LocalizedError, Sendable {
     case missingExecutable, malformedResponse, failed(Int32), launch
     public var errorDescription: String? {
         switch self {
-        case .missingExecutable: return "Open the packaged 2ndPass.app. Its bundled command-line executable is missing."
+        case .missingExecutable: return "Install the separate 2ndPass CLI. Its command-line executable is missing."
         case .malformedResponse: return "The command returned an unreadable response."
-        case .launch: return "The bundled command could not be started."
+        case .launch: return "The command-line tool could not be started."
         case .failed(let code):
             if code == 17 { return "CloudKit could not complete the operation. Check your connection and retry. Refreshing account membership requires online access." }
             // Never display arbitrary subprocess diagnostics or secret output.

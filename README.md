@@ -154,15 +154,21 @@ Unsigned builds support help, completions, and commands without secret reference
 ```sh
 export MOP_SIGN_IDENTITY='Your Apple signing identity'
 export MOP_PROVISION_PROFILE='/path/to/profile.provisionprofile'
+export MOP_AUTOFILL_PROVISION_PROFILE='/path/to/AutoFill.provisionprofile'
+export MOP_CLI_PROVISION_PROFILE='/path/to/CLI.provisionprofile'
 export MOP_BUNDLE_ID='com.koehn.mop'
 export MOP_CLOUD_ENVIRONMENT='Development' # Production for release builds
+scripts/package-cli.sh
+scripts/install-cli.sh
 scripts/package.sh
 scripts/install.sh dist/2ndPass.app
 open /Applications/2ndPass.app
 sp vault list
 ```
-The installer places the app at `/Applications/2ndPass.app` and links the CLI at `/usr/local/bin/sp`. It requests administrator access only when needed for file installation. Run the script as your normal user. Manpages and completions go under `/usr/local/share`; ensure `/usr/local/bin` is on your PATH. If an older installation at `~/.local/bin/sp` takes precedence, remove that old symlink or place `/usr/local/bin` earlier in PATH; check with `command -v sp`. Existing vault state is preserved by the installer. For isolated test installs, set both `MOP_INSTALL_ROOT` (CLI/resources prefix) and `MOP_APPLICATIONS_DIR`.
-Packaging defaults to `Production` and rejects profiles without the matching CloudKit environment/container. It emits only the narrow Keychain and CloudKit entitlements, without debugging exceptions. Moving the executable out of its app bundle breaks access; the installer uses a symlink to the bundled executable. Developer profiles/environments are distinct from production data
+The GUI installer places the sandboxed app at `/Applications/2ndPass.app`; it contains no CLI. The separate CLI installer places its signed bundle under `/usr/local/lib/sp` and links `/usr/local/bin/sp`, manpages, and completions. Set `MOP_INSTALL_ROOT` for a different CLI prefix, or `MOP_APPLICATIONS_DIR` for a different GUI destination. Install the CLI before upgrading an older combined app so its shell link continues to work.
+
+Register a separate `com.koehn.mop.CLI` App ID with access to the existing host Keychain group, App Group, and CloudKit container. The host and AutoFill extension need their AutoFill capability and shared App Group as well. See [CLI provisioning and Homebrew releases](docs/HOMEBREW.md) for exact capabilities and notarized release commands. Both packages default to Production and reject profiles that do not authorize the requested resources. Keep the CLI inside its own signed bundle; expose it through a symlink.
+
 ## Platform checks
 `sp-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VAULT-NEXT-VALIDATION.md) for live CloudKit/Enclave probes, modeled scenarios and checks still requiring separate physical devices/accounts. Do not treat software fixtures or simulator builds as hardware evidence.
 ## Remove a device or repeat enrollment testing
@@ -214,3 +220,7 @@ and device-bound passkey identities. Private keys never leave this device and ca
 be synced, exported, backed up, or restored. Register independent credentials on
 another device before relying on them. See [local vault usage, passkey platform
 limitations, and acceptance requirements](docs/LOCAL-VAULT.md).
+
+Subscription status reporting and release configuration are documented in
+[Subscription evidence](docs/SUBSCRIPTIONS.md). This preview does not enforce
+Free/Pro limits; purchase UI and production publication default to disabled.

@@ -11,6 +11,11 @@ public enum SigningIdentity {
         Bundle.main.object(forInfoDictionaryKey: "MopAppGroup") as? String
     }
 
+    public static func subscriptionSettings() -> (appAppleID: Int64?, publicationEnabled: Bool, purchasesEnabled: Bool) {
+        (Int64(Bundle.main.object(forInfoDictionaryKey: "MopAppAppleID") as? String ?? ""),
+         Bundle.main.object(forInfoDictionaryKey: "MopSubscriptionPublicationEnabled") as? String == "YES",
+         Bundle.main.object(forInfoDictionaryKey: "MopSubscriptionPurchasesEnabled") as? String == "YES")
+    }
     public static func accessGroup() throws -> String {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "MopKeychainAccessGroup") as? String,
               let identifier = Bundle.main.bundleIdentifier,

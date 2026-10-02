@@ -49,10 +49,11 @@ struct CredentialPresentation {
     private static func instructions(vault: String, name: String, publicKey: String, gitSigning: Bool) -> String {
         func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
         let agent = "sp ssh-agent --vault " + quote(vault) + " --identity " + quote(name)
+        let prerequisite = "Install the separate 2ndPass CLI to use these commands.\n\n"
         if gitSigning {
-            return "git config gpg.format ssh\ngit config user.signingkey " + quote("key::" + publicKey) + "\n" + agent + " --purpose git-signing -- git commit -S\n\nRegister the public key with your Git provider as a signing key."
+            return prerequisite + "git config gpg.format ssh\ngit config user.signingkey " + quote("key::" + publicKey) + "\n" + agent + " --purpose git-signing -- git commit -S\n\nRegister the public key with your Git provider as a signing key."
         }
-        return "Register this public key with the server first.\n\n" + agent + " -- ssh user@host\n\nFor IDEs, start the agent without a command and configure the IDE’s SSH_AUTH_SOCK using the printed socket path. Approvals are scoped to the requesting process."
+        return prerequisite + "Register this public key with the server first.\n\n" + agent + " -- ssh user@host\n\nFor IDEs, start the agent without a command and configure the IDE’s SSH_AUTH_SOCK using the printed socket path. Approvals are scoped to the requesting process."
     }
 }
 

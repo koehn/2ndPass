@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 
-binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/2ndPass.app/Contents/MacOS/sp').resolve()
+binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'dist/cli/2ndPass CLI.app/Contents/MacOS/sp').resolve()
 brew_prefix = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
 share = brew_prefix / 'share' if brew_prefix else (binary.parents[3] / 'share' if binary.parent.name == 'MacOS' else binary.parent / 'share')
 bash_script = (brew_prefix / 'etc/bash_completion.d/sp' if brew_prefix

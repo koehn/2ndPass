@@ -156,3 +156,14 @@ revocation.
 explicitly permits fresh-key enrollment after removal; follow it with
 .Sy sp vault enrollment request --vault UUID
 while another owner device is unlocked.
+
+.Sh SUBSCRIPTION STATUS
+.Nm subscription status
+.Op Fl Fl json
+.Op Fl Fl offline
+.Pp
+Report shared Pro subscription evidence without restricting commands.
+Operational commands emit a concise status on stderr; stdout and exit codes
+retain their existing meanings. Offline checks use previously verified evidence
+through its expiration or billing-grace deadline, without an extension.
+Development CloudKit builds are explicitly exempt.

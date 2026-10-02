@@ -11,7 +11,7 @@ root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="sp-install-layout-") as directory:
     temp = Path(directory)
     package = temp / "package"
-    app = package / "2ndPass.app"
+    app = package / "2ndPass CLI.app"
     helper = app / "Contents/MacOS/sp"
     helper.parent.mkdir(parents=True)
     helper.write_text('#!/bin/sh\necho TEST.net.koehn.mop\n')
@@ -33,21 +33,22 @@ with tempfile.TemporaryDirectory(prefix="sp-install-layout-") as directory:
 if [ "${FAIL_INSTALLED:-}" = "$3" ] && [ ! -f "$3/old-version" ]; then exit 8; fi
 ''')
     codesign.chmod(0o755)
-    applications, prefix = temp / "Applications", temp / "prefix"
+    prefix = temp / "prefix"
+    applications = prefix / "lib/sp"
     env = os.environ | {"PATH": str(stubs) + ":" + os.environ["PATH"],
                         "MOP_APPLICATIONS_DIR": str(applications), "MOP_INSTALL_ROOT": str(prefix)}
-    command = ["/bin/bash", str(root / "scripts/install.sh"), str(app)]
+    command = ["/bin/bash", str(root / "scripts/install-cli.sh"), str(app)]
     def run(extra=None):
         return subprocess.run(command, env=env | (extra or {}), capture_output=True, text=True)
     result = run()
     assert result.returncode == 0, result.stderr
     assert not result.stderr, result.stderr
-    installed = applications / "2ndPass.app"
+    installed = applications / "2ndPass CLI.app"
     link = prefix / "bin/sp"
     assert link.readlink() == installed / "Contents/MacOS/sp"
     assert installed.stat().st_mode & 0o055 == 0o055
     assert (installed / "Contents/MacOS/sp").stat().st_mode & 0o055 == 0o055
-    assert not (prefix / "lib/sp/2ndPass.app").exists()
+    assert not (temp / "Applications/2ndPass.app").exists()
     for resource in resources:
         target = prefix / "share" / resource
         assert target.is_symlink() and target.read_text() == resource
@@ -58,6 +59,14 @@ if [ "${FAIL_INSTALLED:-}" = "$3" ] && [ ! -f "$3/old-version" ]; then exit 8; f
     assert not result.stderr, result.stderr
     assert (installed / "Contents/MacOS/sp").is_file()
     assert not (installed / "Contents/MacOS/2ndpass").exists()
+    # Migrating the old GUI's link must never move or replace that GUI.
+    gui = temp / "Applications/2ndPass.app"
+    gui.mkdir(parents=True)
+    (gui / "untouched").write_text("GUI")
+    link.unlink()
+    link.symlink_to("/Applications/2ndPass.app/Contents/MacOS/sp")
+    assert run().returncode == 0
+    assert (gui / "untouched").read_text() == "GUI"
     (installed / "old-version").touch()
     result = run({"FAIL_INSTALLED": str(installed)})
     assert result.returncode != 0

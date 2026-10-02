@@ -9,7 +9,7 @@ struct Mop: AsyncParsableCommand {
         commandName: "sp",
         abstract: "Read and manage an encrypted vault using your Mac's Secure Enclave.",
         version: "0.7.0",
-        subcommands: [Item.self, Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Completion.self, Device.self, SSHAgent.self]
+        subcommands: [Item.self, Read.self, Write.self, List.self, Delete.self, Run.self, Inject.self, Vault.self, Completion.self, Device.self, SSHAgent.self, Subscription.self]
     )
 
     /// ArgumentParser wraps errors thrown by option-group validation. Match only
@@ -23,6 +23,7 @@ struct Mop: AsyncParsableCommand {
     static func main() async {
         do {
             var command = try parseAsRoot()
+            await CLISubscription.reportIfNeeded(command, arguments: Array(CommandLine.arguments.dropFirst()))
             if var asyncCommand = command as? any AsyncParsableCommand { try await asyncCommand.run() }
             else { try command.run() }
         } catch let code as ExitCode {
