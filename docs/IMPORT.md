@@ -28,7 +28,8 @@ identities, and documents use 2ndPass's item templates. Source folders/collectio
 the selected vault. Favorites and archive state are retained when exported.
 Archived entries do not appear in normal lists or AutoFill; use the Archived
 filter and edit an item to unarchive it. Cards and identities have no system
-AutoFill integration, and SSH items do not provide an SSH agent. Recovery codes
+AutoFill integration. Imported SSH text items must be explicitly validated and
+converted before use with `sp ssh-agent`; see [cloud key credentials](CLOUD-KEY-CREDENTIALS.md). Recovery codes
 are concealed multiline values; copying does not mark a code used.
 
 An import is published as one encrypted revision. There is **no field-count

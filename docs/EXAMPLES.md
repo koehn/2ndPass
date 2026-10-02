@@ -228,7 +228,9 @@ byte to the stored value, and `&&` prevents SSH from starting if the read fails.
 If the output file exists, sp refuses to replace it unless you explicitly add
 `--force`. The exported key remains on disk until you remove it; a passphrase on
 the key is still handled by SSH. This workflow stores UTF-8 key text and does not
-provide an SSH agent, generate keys, or convert their formats.
+use the SSH agent. For generated or imported cloud keys and device-local Secure
+Enclave keys, use `sp ssh-agent` instead; see [cloud key credentials](CLOUD-KEY-CREDENTIALS.md)
+and [local identities](LOCAL-VAULT.md).
 
 For account access, recovery, and trust errors, see
 [Security and key management](SECURITY.md).

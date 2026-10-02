@@ -123,7 +123,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   and algorithms, handle encrypted private-key imports, and verify authentication
   and signing with SSH, Git, and representative IDE workflows. Verify key
   selection, unlock/approval, lock revocation, synchronization, and recovery.
-- [ ] **SALE-14 — Mac App Store sandboxing and developer-tool distribution.**
+- [X] **SALE-14 — Mac App Store sandboxing and developer-tool distribution.**
   Establish and validate an App Sandbox-compliant Mac App Store distribution
   architecture. Acceptance: prove clean-machine installation and updates preserve
   working CLI access, `sp run`, secret injection, SSH-agent sockets, Git signing,
@@ -131,7 +131,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   entitlements. Document any separately distributed companion and its installation
   and signing requirements. Validate the actual distribution artifacts; development
   builds alone do not establish sandbox compatibility or App Store acceptance.
-- [ ] **SALE-15 — Free/Pro tiers and a single Pro entitlement.** Launch with a
+- [X] **SALE-15 — Free/Pro tiers and a single Pro entitlement.** Launch with a
   useful Free tier and one Pro upgrade for Apple-using developers and engineers.
   Implement the packaging and entitlement rules below across the app, CLI,
   AutoFill, and browser integrations. Acceptance: verify purchases, restoration

@@ -58,7 +58,7 @@ Apple protects account sign-in with [two-factor authentication](https://support.
 
 **Apple and 2ndPass provide different layers of the trust model.** Apple authenticates the iCloud environment; code signing, provisioning and CloudKit entitlements restrict native client access to the 2ndPass container and its private per-user database. A new device creates its own Secure Enclave identity, submits a signed request through that namespace, and receives item-key envelopes only after an enrolled owner device publishes a signed membership grant. See Apple's [container access](https://developer.apple.com/documentation/cloudkit/ckcontainer) and [private database](https://developer.apple.com/documentation/cloudkit/ckcontainer/privateclouddatabase) documentation.
 
-Ordinary same-account enrollment deliberately reuses Apple's account/device authentication and authorized app access without adding another comparison ceremony. It does not directly query or join Apple's private iCloud Keychain trust circle. Platform sandboxing also contributes on iOS/iPadOS and in the Mac AutoFill extension; the packaged Mac app and CLI use the hardened runtime and restricted entitlements but do not enable App Sandbox.
+Ordinary same-account enrollment deliberately reuses Apple's account/device authentication and authorized app access without adding another comparison ceremony. It does not directly query or join Apple's private iCloud Keychain trust circle. Platform sandboxing also contributes on iOS/iPadOS. The Mac app and AutoFill extension enable App Sandbox; the app permits outbound network connections and user-selected file access. The separately installed Mac CLI remains unsandboxed for developer workflows. The Mac packages also use the hardened runtime and restricted entitlements.
 
 **Residual enrollment threat:** an attacker with enough control of your Apple environment to operate an authorized 2ndPass client and access your private 2ndPass container may submit a valid request. If an enrolled owner session processes the exchange while unlocked and online, that identity may receive owner membership and access to existing secrets. Apple Account credentials alone do not permit arbitrary writes into this container. Compromise of the bootstrap mailbox could also substitute a new device's initial trust root; existing devices still check against their previously trusted history.
 
@@ -84,8 +84,8 @@ the [design review](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md#
 Generate and verify an offline recovery copy before losing access to your devices.
 On a replacement device, sign into the same Apple Account and import the copy or
 enter its code. Read-only recovery can open healthy data while unavailable
-attachments postpone completion. Complete each vault to rotate encryption and
-remove previous device access. Keep both copies during key replacement until
+attachments postpone completion. Complete each vault to rotate encryption and enroll the replacement device while
+preserving existing devices, accounts, and roles. Keep both copies during key replacement until
 coverage is complete.
 
 The private recovery secret and copied ciphertext suffice for offline decryption;

@@ -48,6 +48,8 @@ Secret references use `sp://`, spelled out because a URI scheme cannot start wit
 
 2ndPass joins two daily workflows: filling a password in an app, and supplying a credential to a command. Native Apple apps and AutoFill handle the first; references, environment injection, and configuration templates handle the second.
 
+Passkeys are implemented in both cloud and local vaults. Cloud passkeys sync across enrolled devices; local passkeys, SSH keys, Git signing keys, and certificate identities keep their private keys in one device’s Secure Enclave. Choosing where keys live is part of the product: local keys cannot be exported or recovered, so register an independent credential on another device. See [vault capabilities](docs.html#vault-capabilities).
+
 Each device has its own Secure Enclave private key. iCloud carries encrypted vault data using your Apple Account, without a separate 2ndPass-hosted vault service. Those choices come with real tradeoffs: Apple-only platforms, an Apple platform and provisioned private-container trust boundary during device enrollment, and an offline master recovery copy. Read the [security explanation](security.html) before deciding whether they fit your needs.
 
 ## Op
@@ -74,7 +76,7 @@ Build and installation documentation is for the copyright holder and separately 
 
 The project targets macOS 15+ and iOS/iPadOS 18+ with supported Secure Enclave hardware. The command-line tool runs on Mac. There is no Windows, Linux, Android, or browser vault client.
 
-Passwords, TOTP codes, typed items, encrypted attachments, imports, and developer integrations are implemented. Cross-account vault sharing is not yet implemented as a supported feature; preliminary code exists. Passkeys, an SSH agent, system AutoFill for cards/identities, and AutoFill-based saving of new logins are not currently supported. Enrollment-mailbox isolation is a design detail to address when completing sharing, not a current product vulnerability; see [release status](security.html#status).
+Passwords, TOTP codes, typed items, encrypted attachments, imports, and developer integrations are implemented. Cross-account vault sharing is not yet implemented as a supported feature; preliminary code exists. Cloud and device-local passkeys, an SSH agent, and Git SSH signing are implemented. AutoFill can save new logins on iOS/iPadOS 26.2 and later. System AutoFill for cards/identities and password generation inside AutoFill are not implemented. Compare [vault capabilities](docs.html#vault-capabilities) and [CLI workflows](docs.html#cli); physical-device acceptance remains outstanding. Enrollment-mailbox isolation is a design detail to address when completing sharing, not a current product vulnerability; see [release status](security.html#status).
 
 ## Account
 
@@ -102,8 +104,8 @@ Previously verified cached data can be read offline. Writes need connectivity. A
 Generate and verify an offline recovery copy before losing access to your devices.
 On a replacement device, sign into the same Apple Account and import the copy or
 enter its code. Read-only recovery can open healthy data while unavailable
-attachments postpone completion. Complete each vault to rotate encryption and
-remove previous device access. Keep both copies during key replacement until
+attachments postpone completion. Complete each vault to rotate encryption and enroll the replacement device while
+preserving existing devices, accounts, and roles. Keep both copies during key replacement until
 coverage is complete.
 
 The private recovery secret and copied ciphertext suffice for offline decryption;

@@ -80,9 +80,10 @@ sign-in ceremony.
 
 **Platform qualification:** iOS/iPadOS enforce [application sandboxing](https://support.apple.com/guide/security/sec15bfe098e/web); the Mac
 AutoFill extension explicitly enables App Sandbox and outbound network access.
-The current Mac app and CLI packaging does **not** enable App Sandbox. They rely
-on code signing, provisioning, restricted Keychain/CloudKit entitlements and the
-hardened runtime for the boundaries described here. App Groups share local files;
+The Mac app also enables App Sandbox, with outbound network access and
+user-selected file access. The separately distributed CLI remains unsandboxed for
+developer workflows. Both use code signing, provisioning, restricted
+Keychain/CloudKit entitlements, and the hardened runtime. App Groups share local files;
 they are not interchangeable with Keychain access groups or CloudKit entitlements.
 
 Apple documents [container entitlement isolation](https://developer.apple.com/documentation/cloudkit/ckcontainer),

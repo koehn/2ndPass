@@ -209,7 +209,11 @@ recipes. `just site-deploy-dry-run BUCKET` prints the deployment plan without ma
 AWS calls. See the [website guide](website/README.md#deploy-to-s3) for HTTPS hosting
 and deployment configuration.
 
-### Device-local identities
+### Cloud and device-local capabilities
+
+See the website’s [vault capability comparison](https://2ndpass.app/docs.html#vault-capabilities)
+for supported secret types, key operations, synchronization, and recovery by vault type.
+The [website guide source](website/src/docs.md#vault-capabilities) tracks the current implementation.
 
 Cloud vaults support usable passkeys and generated/imported SSH keys. Choose storage
 explicitly when creating a credential. See [cloud key credentials](docs/CLOUD-KEY-CREDENTIALS.md)

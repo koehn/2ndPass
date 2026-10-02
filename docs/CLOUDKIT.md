@@ -33,7 +33,8 @@ do not authorize an arbitrary native client to write this container.
 
 2ndPass adds independent Secure Enclave device identities, signed vault membership
 and per-item key envelopes. Applicable OS sandboxing is another layer: the Mac
-extension enables App Sandbox, but the packaged Mac app/CLI do not. See the
+app and AutoFill extension enable App Sandbox; the separately distributed CLI
+remains unsandboxed for developer workflows. See the
 [composed trust model](SECURITY.md#composed-apple--2ndpass-trust-model).
 No code directly queries Apple's private iCloud Keychain trust circle.
 

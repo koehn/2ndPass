@@ -131,6 +131,22 @@ unsaved. Sharing steps retain their input when switching between steps. File
 picker cancellation is silent, and backup names include the vault, date, and a
 unique suffix. Mac users can reveal a completed backup in Finder.
 
+## Vault capabilities and key credentials
+
+Cloud vaults hold passwords, notes, API and database credentials, TOTP seeds,
+recovery codes, cards, identities, documents, attachments, and usable passkeys
+and SSH/Git keys. The fixed `local` vault holds only device-bound Secure Enclave
+SSH, Git signing, certificate, and passkey identities; it cannot hold ordinary
+secrets or imported private keys and has no synchronization, backup, or recovery.
+See the [vault comparison](../website/src/docs.md#vault-capabilities).
+
+Choose **New → New SSH Key** to generate or import a supported key and explicitly
+select its destination and purpose. Create passkeys through a website's
+registration flow and choose a cloud vault or **This Device — Secure Enclave**.
+Credential details supply public keys and setup commands. The separately installed
+`sp` CLI provides the SSH agent and Git signing workflow; see
+[cloud credentials](CLOUD-KEY-CREDENTIALS.md) and [local identities](LOCAL-VAULT.md).
+
 ## Search and item layout
 
 Command-F focuses native search. Search filters the current scope, including
@@ -178,8 +194,8 @@ Recovery applies to all your owned iCloud vaults, regardless of the selected vau
 On a replacement device, sign into the same Apple Account. Open
 **Settings → Recovery → Recover Vault Access…** (or choose recovery during
 onboarding), then import the copy or enter its code. Read-only recovery can open healthy data while unavailable
-attachments postpone completion. Complete each vault to rotate encryption and
-remove previous device access. Keep both copies during key replacement until
+attachments postpone completion. Complete each vault to rotate encryption and enroll the replacement device while
+preserving existing devices, accounts, and roles. Keep both copies during key replacement until
 coverage is complete.
 
 The private recovery secret and copied ciphertext suffice for offline decryption;
