@@ -131,13 +131,13 @@ import MopCore
     let imported = try VaultEngine.importItems(preview.items, revision: original.digest, in: original, device: owner)
     #expect(imported.revision.header.generation == original.revision.header.generation + 1)
     #expect(imported.revision.header.parent == original.digest)
-    #expect(imported.revision.header.requiredFeatures == ["item-model-1"])
+    #expect(imported.revision.header.requiredFeatures == ["credential-redundancy-1", "item-model-1", "secret-history-1"])
     #expect(try VaultEngine.catalog(in: imported, device: owner).items[0].fields[1].value == nil)
     #expect(try VaultEngine.previewImport(document, in: imported, device: owner).preview.report.rows[0].disposition == .duplicate)
     #expect(throws: MopError.vaultConflict) { try VaultEngine.importItems([], revision: original.digest, in: imported, device: owner) }
     #expect(throws: MopError.cloudPermission) { try VaultEngine.importItems([], revision: original.digest, in: original, device: TestDevice()) }
     let renamed = try VaultEngine.rename("renamed", in: imported, device: owner)
-    #expect(renamed.revision.header.requiredFeatures == ["item-model-1"])
+    #expect(renamed.revision.header.requiredFeatures == ["credential-redundancy-1", "item-model-1", "secret-history-1"])
 }
 
 @Test func importsMoreThan4096FieldsAndRetainsByteBound() throws {
@@ -164,7 +164,7 @@ import MopCore
 @Test func extendedModelMarkerChangesLegacyCanonicalEncodingAndCannotBeRemoved() throws {
     let owner = try TestDevice()
     let root = try VaultEngine.create(name: "personal", owner: owner)
-    #expect(root.revision.header.requiredFeatures == nil)
+    #expect(root.revision.header.requiredFeatures == ["credential-redundancy-1", "secret-history-1"])
     var item = VaultItem(name: "note", type: .secureNote, fields: [ItemField(path: "note", value: "secret")])
     item.metadata = ItemMetadata(archived: true)
     let extended = try VaultEngine.saveItem(.init(revision: root.digest, item: item, create: true), in: root, device: owner)
@@ -192,7 +192,7 @@ import MopCore
     let attachment = try Attachment(fileName: "binary.dat", data: Data([0, 128, 255, 13, 10]))
     let item = VaultItem(name: "File", type: .document, fields: [.init(path: "file", type: .attachment, value: try attachment.encodedValue())])
     vault = try VaultEngine.importItems([item], revision: vault.digest, in: vault, device: owner)
-    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "item-model-1", "offline-recovery-1"])
+    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "credential-redundancy-1", "item-model-1", "offline-recovery-1", "secret-history-1"])
     var downgradedHeader = try VaultEngine.header(vault, operation: .content)
     downgradedHeader.requiredFeatures = ["item-model-1"]
     let downgrade = try Revision.seal(header: downgradedHeader,
@@ -215,7 +215,7 @@ import MopCore
     }
     vault = try VaultEngine.write("Renamed/file", value: nil, in: vault, device: owner)
     #expect(throws: MopError.notFound) { try VaultEngine.read("Renamed/file", in: vault, device: owner) }
-    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "item-model-1", "offline-recovery-1"])
+    #expect(vault.revision.header.requiredFeatures == ["attachment-blobs-1", "attachments-1", "credential-redundancy-1", "item-model-1", "offline-recovery-1", "secret-history-1"])
 }
 
 @Test func attachmentBatchExceedsOldCapacityWithoutGrowingRevision() throws {
@@ -237,7 +237,7 @@ import MopCore
     let value = try CompoundField(#"{"street":"A road","zip":"00123","extra":{"x":"kept"}}"#).encodedValue
     let item = VaultItem(name: "Address", fields: [.init(path: "address", type: .address, value: value)])
     vault = try VaultEngine.saveItem(.init(revision: vault.digest, item: item, create: true), in: vault, device: owner)
-    #expect(vault.revision.header.requiredFeatures == ["compound-fields-1", "item-model-1"])
+    #expect(vault.revision.header.requiredFeatures == ["compound-fields-1", "credential-redundancy-1", "item-model-1", "secret-history-1"])
     let stored = try #require(VaultEngine.catalog(in: vault, device: owner).items.first)
     #expect(stored.fields[0].value == nil)
     vault = try VaultEngine.saveItem(.init(revision: vault.digest, item: stored, create: false), in: vault, device: owner)
@@ -263,4 +263,21 @@ import MopCore
         }
     }
     #expect(try VaultEngine.catalog(in: root, device: owner).items.isEmpty)
+}
+
+@Test func healthRecordVersionsTrackOnlyChangedFieldsAndStayOutOfSchema() throws {
+    let owner = try TestDevice()
+    var vault = try VaultEngine.create(name: "personal", owner: owner)
+    vault = try VaultEngine.write("a/password", value: "first", in: vault, device: owner)
+    vault = try VaultEngine.write("b/password", value: "second", in: vault, device: owner)
+    let before = try VaultEngine.catalog(in: vault, device: owner)
+    let first = try #require(before.items[0].fields[0].recordVersion)
+    let second = try #require(before.items[1].fields[0].recordVersion)
+    vault = try VaultEngine.write("a/password", value: "replacement", in: vault, device: owner)
+    let after = try VaultEngine.catalog(in: vault, device: owner)
+    #expect(after.items[0].fields[0].recordVersion != first)
+    #expect(after.items[1].fields[0].recordVersion == second)
+    let encoded = try JSONEncoder().encode(after.items[0].fields[0])
+    #expect(!String(decoding: encoded, as: UTF8.self).contains("recordVersion"))
+    #expect(try JSONDecoder().decode(ItemField.self, from: encoded).recordVersion == nil)
 }

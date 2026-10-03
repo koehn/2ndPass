@@ -13,6 +13,38 @@ import XCTest
         app.launch()
         return app
     }
+    func testSecurityFindingAndConcealedHistory() {
+        let app = XCUIApplication()
+        app.launchEnvironment["MOP_UI_TESTING"] = "1"
+        app.launchEnvironment["MOP_UI_SECURITY_TEST"] = "1"
+        app.launch()
+        let security = app.staticTexts["Security"].firstMatch
+        if !app.buttons["Check Now"].waitForExistence(timeout: 5), security.exists { security.tap() }
+        XCTAssertTrue(app.buttons["Check Now"].waitForExistence(timeout: 10))
+        let finding = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'security-finding-'")).firstMatch
+        for _ in 0..<5 {
+            if finding.exists && finding.isHittable { break }
+            let list = app.collectionViews["security-health-list"]
+            if list.exists { list.swipeUp() } else { app.swipeUp() }
+        }
+        XCTAssertTrue(finding.waitForExistence(timeout: 10))
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Security health findings"; shot.lifetime = .keepAlways; add(shot)
+        finding.tap()
+        let actions = app.buttons["Actions for password"]
+        XCTAssertTrue(actions.waitForExistence(timeout: 5)); actions.tap()
+        app.buttons["View History"].tap()
+        XCTAssertTrue(app.staticTexts["Secret History"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts["previous-ui-password"].exists)
+        app.buttons["Reveal"].firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["previous-ui-password"].waitForExistence(timeout: 5))
+        app.buttons["Conceal"].firstMatch.tap()
+        XCTAssertFalse(app.staticTexts["previous-ui-password"].exists)
+        let history = XCTAttachment(screenshot: app.screenshot())
+        history.name = "Concealed secret history"; history.lifetime = .keepAlways; add(history)
+        app.buttons["Done"].firstMatch.tap()
+    }
+
     func testTypingSearchDoesNotNavigateOrDismissKeyboard() {
         let app = launch()
         openItems(app)
@@ -359,6 +391,27 @@ import XCTest
         app.buttons["Save"].tap()
         XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5), app.debugDescription)
         XCUIDevice.shared.orientation = .portrait
+    }
+    func testTrustFailureOffersCancellableRepairOnLockedScreen() {
+        let app = XCUIApplication()
+        app.launchArguments += ["-icloud-connection-repair-enabled", "YES"]
+        app.launchEnvironment["MOP_UI_TESTING"] = "1"
+        app.launchEnvironment["MOP_UI_VAULT_TRUST_FAILURE"] = "1"
+        app.launch()
+        let alert = app.alerts["Operation not completed"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 10))
+        alert.buttons["OK"].tap()
+        let repair = app.buttons["Repair iCloud Connection…"]
+        XCTAssertTrue(repair.waitForExistence(timeout: 5))
+        repair.tap()
+        XCTAssertTrue(app.buttons["Reset Connection"].waitForExistence(timeout: 5))
+        app.buttons["Cancel"].tap()
+        XCTAssertTrue(repair.exists)
+        XCTAssertFalse(app.buttons["Reconnect"].exists)
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertFalse(alert.waitForExistence(timeout: 3))
+        XCTAssertTrue(repair.exists)
     }
     func testTrustFailureDoesNotAutomaticallyRetry() {
         let app = XCUIApplication()

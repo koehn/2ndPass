@@ -8,6 +8,7 @@ import UIKit
 /// Replaces the navigation hierarchy so locked content cannot be read by accessibility.
 struct LockedView: View {
     @Bindable var model: AppModel
+    @State private var confirmRepair = false
     // This is a loose SwiftPM resource, not an asset-catalog image. SwiftUI's
     // named lookup can render it blank in a packaged app's resource bundle.
     private static let icon: Image = {
@@ -32,9 +33,23 @@ struct LockedView: View {
             }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                 .disabled(model.hasConnectedVaults ? !model.canUnlock : model.busy || model.deviceRemoved)
+            if model.cloudConnectionRepairEnabled && model.sessionState == .needsRepair && !model.deviceRemoved {
+                Text("This device could not open its saved vault connection. If you can open your vaults on another device, reset this device’s iCloud connection and connect again.")
+                    .multilineTextAlignment(.center).frame(maxWidth: 420)
+                Button("Repair iCloud Connection…") { confirmRepair = true }
+                    .disabled(model.busy || model.enrollmentWorking)
+                Button("Recover with Offline Copy…") { model.presentSheet(.recover) }
+                    .disabled(model.busy || model.enrollmentWorking)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
         .accessibilityIdentifier("Locked screen")
+        .alert("Reset this device’s iCloud connection?", isPresented: $confirmRepair) {
+            Button("Reset Connection", role: .destructive) { model.resetCloudAccess() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("First make sure you can open your vaults on another device. This removes this device’s iCloud vault keys and cached data, including any changes that have not reached iCloud. You will need to reconnect every iCloud vault. Vaults in iCloud, other devices, local-only vaults, and exported backups stay intact.")
+        }
     }
 }

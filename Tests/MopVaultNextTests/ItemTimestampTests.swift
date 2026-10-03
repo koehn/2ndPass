@@ -53,7 +53,7 @@ import MopCore
     var legacy = payload.items
     legacy[0].metadata = nil
     vault = try vault.applying(Revision.seal(header: VaultEngine.header(vault, operation: .content),
-        references: payload.references, records: vault.revision.records, itemKeys: vault.revision.itemKeys, items: legacy, signer: owner))
+        references: payload.references, records: vault.revision.records, itemKeys: vault.revision.itemKeys, items: legacy, security: payload.security, signer: owner))
     vault = try VaultEngine.write("entry/second", value: "three", in: vault, device: owner, at: created.addingTimeInterval(3))
     let migrated = try #require(VaultEngine.catalog(in: vault, device: owner).items.first)
     #expect(migrated.metadata?.createdAt == nil && migrated.metadata?.addedAt == nil)

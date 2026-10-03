@@ -37,12 +37,15 @@ struct ContentView: View {
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var compactColumn: NavigationSplitViewColumn = .sidebar
     @AppStorage("vaultSidebarExpanded") private var vaultsExpanded = true
-    var body: some View { content }
+    var body: some View { content.sheet(item: $model.historySelection) { selection in
+        SecretHistoryView(model: model, selection: selection)
+    } }
     private var navigation: some View {
         NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $compactColumn) {
             VStack(alignment: .leading, spacing: 12) {
                 List(selection: Binding<String?>(get: { model.sidebarSelection }, set: { if let value = $0 { model.sidebarSelection = value } })) {
                     NavigationLink(value: "all") { Label("All Items", systemImage: "square.stack.3d.up") }
+                    NavigationLink(value: "security") { Label("Security", systemImage: "checkmark.shield") }
                     NavigationLink(value: "favorites") { Label("Favorites", systemImage: "star") }
                     NavigationLink(value: "recent-added") { Label("Recently Added", systemImage: "plus.circle") }
                     NavigationLink(value: "recent-changed") { Label("Recently Changed", systemImage: "pencil.circle") }
@@ -70,7 +73,9 @@ struct ContentView: View {
             .mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout)
         } content: {
             Group {
-                if model.page == .secrets {
+                if model.page == .security {
+                    SecurityHealthView(model: model, showDetail: showDetail)
+                } else if model.page == .secrets {
                 VStack(spacing: 0) {
                     ItemSearchBar(model: model)
                     SearchSummary(model: model)
@@ -139,7 +144,13 @@ struct ContentView: View {
             }.mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout)
         } detail: {
                 ScrollView {
-                    if model.page == .recentlyDeleted { RecentlyDeletedDetail(model: model) }
+                    if model.page == .security {
+                        if let item = model.selectedItem, model.authenticated {
+                            ItemDetailView(model: model, itemName: item).id(model.vault + ":" + item)
+                        } else {
+                            ContentUnavailableView("Security", systemImage: "checkmark.shield", description: Text("Choose a finding to review the account and update its saved credential."))
+                        }
+                    } else if model.page == .recentlyDeleted { RecentlyDeletedDetail(model: model) }
                     else if model.isLocalVaultSelected {
                         if model.localCreatePresented {
                             LocalCreateForm(model: model).padding()
@@ -265,6 +276,8 @@ struct ContentView: View {
             try? await Task.sleep(for: .seconds(5))
             if !Task.isCancelled, model.notice == notice { model.notice = nil }
         }
+        .onAppear { if model.securityVisible { compactColumn = .content } }
+        .onChange(of: model.securityVisible) { _, visible in if visible { compactColumn = .content } else if model.selectedItem != nil { showDetail() } }
         .onChange(of: model.itemDraft?.isNew) { _, new in if new == true { showDetail() } }
         .onChange(of: model.error) { _, error in
             if error != nil, !model.authenticated { showDetail() }
@@ -296,7 +309,7 @@ struct ContentView: View {
         } message: { Text("You can restore the item for 30 days. It stays protected by its original vault.") }
         .confirmationDialog("Delete Field?", isPresented: $model.deleteConfirmation, titleVisibility: .visible) {
             Button("Delete Field", role: .destructive) { model.delete() }
-        } message: { Text("This deletes the current field after authentication. Historical encrypted copies remain.") }
+        } message: { Text("This deletes the current field and its live history after authentication. Earlier encrypted revisions and backups may retain copies.") }
         .confirmationDialog("Delete this identity?", isPresented: Binding(get: { model.localDeleting != nil }, set: { if !$0 { model.localDeleting = nil } }), titleVisibility: .visible) {
             if let id = model.localDeleting, let identity = model.localIdentities.first(where: { $0.id == id }) {
                 Button("Delete “" + identity.name + "”", role: .destructive) { model.confirmLocalDelete() }

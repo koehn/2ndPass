@@ -37,6 +37,7 @@ private struct DocumentTransfers: ViewModifier {
             case .success(let folder):
                 model.completeBackupSelection(folder: folder, request: request)
             case .failure(let error):
+                model.pendingSecurityUpgrade = nil
                 guard (error as NSError).code != NSUserCancelledError else { return }
                 #if os(macOS)
                 model.error = "The folder could not be opened. Choose a writable folder in Finder."

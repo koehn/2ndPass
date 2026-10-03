@@ -141,6 +141,10 @@ subscription versus permanent-unlock purchase options remain undecided.
   recovery/export, or revoking cryptographic vault membership. Include upgrade,
   restore-purchase, and expired-entitlement flows in SALE-8 UI acceptance.
 
+Implementation notes for SALE-2, SALE-3, and the basic-history portion of SALE-11
+are in [security health and history](SECURITY-HEALTH.md). These items remain open
+until their physical-platform, real-service, and UI acceptance gates are complete.
+
 Track implementation and acceptance evidence against these stable IDs. Check an
 item off only when its behavior and acceptance are complete; passing builds alone
 does not close a feature or the UI release gate.

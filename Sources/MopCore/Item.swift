@@ -54,6 +54,10 @@ public struct ItemField: Codable, Equatable, Sendable {
     public var path: String
     public var type: FieldType
     public var value: String?
+    public var historyID: UUID? = nil
+    /// Verified projection for session caches; never part of the encrypted item schema.
+    public var recordVersion: String? = nil
+    private enum CodingKeys: String, CodingKey { case path, type, value, historyID, passwordQuality, isTemplate, label }
     public var passwordQuality: PasswordQuality?
     public var isTemplate: Bool?
     public var label: String?
@@ -115,6 +119,11 @@ public struct ItemCatalog: Codable, Sendable {
     public var items: [VaultItem]
     public var canEdit: Bool?
     public var usageScope: String? = nil
+    public var security: VaultSecurityMetadata? = nil
+    public var securityEnabled: Bool? = nil
+    public var canUpgradeSecurity: Bool? = nil
+    public var currentDeviceID: String? = nil
+    public var sharingAudience: String? = nil
     public init(vault: String, revision: String, items: [VaultItem]) { self.vault = vault; self.revision = revision; self.items = items }
 }
 

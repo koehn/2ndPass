@@ -35,7 +35,7 @@ import Testing
         let board = NSPasteboard.withUniqueName()
         defer { board.releaseGlobally() }
         let clipboard = SecretClipboard(pasteboard: board)
-        let model = AppModel(clipboard: clipboard)
+        let model = AppModel(breachClient: TestBreachClient(), clipboard: clipboard)
         clipboard.copy("fixture-secret")
         model.deactivate()
         #expect(board.string(forType: .string) == "fixture-secret")
@@ -54,7 +54,7 @@ extension SecretClipboardTests {
         #expect(board.types?.contains(NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")) != true)
         try await Task.sleep(for: .milliseconds(150))
         #expect(board.string(forType: .string) == "alice@example.com")
-        let model = AppModel(clipboard: clipboard, automaticTimer: false)
+        let model = AppModel(breachClient: TestBreachClient(), clipboard: clipboard, automaticTimer: false)
         model.lock()
         #expect(board.string(forType: .string) == "alice@example.com")
         clipboard.copy("new-secret")

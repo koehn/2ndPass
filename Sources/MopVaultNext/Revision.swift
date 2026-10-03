@@ -82,6 +82,7 @@ struct CatalogPayload: Codable {
     var references: [String: String]
     var items: [VaultItem]
     var itemIDs: [String: String]
+    var security: VaultSecurityMetadata? = nil
 }
 
 struct Revision: Codable, Sendable {
@@ -122,9 +123,40 @@ struct Revision: Codable, Sendable {
         guard bytes.count <= Codec.maximumSize else { throw MopError.invalidVault }
         return bytes
     }
-    static func seal(header: Header, references: [String: String], records: [String: SealedObject], itemKeys: [String: ItemKey] = [:], items: [VaultItem] = [], signer: any DeviceOperations) throws -> Self {
+    static func seal(header: Header, references: [String: String], records: [String: SealedObject], itemKeys: [String: ItemKey] = [:], items: [VaultItem] = [], security: VaultSecurityMetadata? = nil, signer: any DeviceOperations) throws -> Self {
         var header = header
+        var items = items
         var records = records
+        var security = security
+        if header.requiredFeatures?.contains("secret-history-1") == true {
+            for i in items.indices {
+                for f in items[i].fields.indices where [.password, .concealed].contains(items[i].fields[f].type) {
+                    if items[i].fields[f].historyID == nil { items[i].fields[f].historyID = UUID() }
+                }
+            }
+        }
+        // History is addressed by stable item/field identity, never by a CLI reference.
+        var liveFields = Set<String>()
+        for item in items {
+            for field in item.fields where [.password, .concealed].contains(field.type) {
+                if let record = references[SecretReference.encode(item.name) + "/" + field.path], let itemID = records[record]?.itemID {
+                    if let id = field.historyID { liveFields.insert(itemID + ":" + id.uuidString) }
+                }
+            }
+        }
+        if security != nil {
+            // A changed, archived, deleted, or rotated secret invalidates derived results.
+            let eligible = Set(items.filter { !$0.isArchived && $0.deletion == nil }.flatMap { item in
+                item.fields.filter { $0.type == .password || ($0.path == item.autoFill?.password && [.concealed, .text, .username, .email].contains($0.type)) }
+                    .compactMap { references[SecretReference.encode(item.name) + "/" + $0.path] }
+            })
+            security!.passwordChecks?.removeAll { !eligible.contains($0.record) }
+            security!.histories.removeAll { history in
+                let live = liveFields.contains(history.itemID + ":" + history.id.uuidString)
+                if !live { for entry in history.entries { records.removeValue(forKey: entry.id) } }
+                return !live
+            }
+        }
         let used = Set(records.values.compactMap(\.itemID))
         let itemKeys = itemKeys.filter { used.contains($0.key) }
         for item in items {
@@ -151,7 +183,13 @@ struct Revision: Codable, Sendable {
             guard itemIDs[name] == nil || itemIDs[name] == item else { throw MopError.invalidVault }
             itemIDs[name] = item
         }
-        var plaintext = try Codec.encode(CatalogPayload(references: references, items: items, itemIDs: itemIDs))
+        if security != nil {
+            let liveItems = Set(itemIDs.values)
+            for index in security!.accounts.indices {
+                if let linked = security!.accounts[index].linkedItemID, !liveItems.contains(linked) { security!.accounts[index].linkedItemID = nil }
+            }
+        }
+        var plaintext = try Codec.encode(CatalogPayload(references: references, items: items, itemIDs: itemIDs, security: security))
         defer { SecretBytes.wipe(&plaintext) }
         let catalog = try SealedObject.seal(plaintext, vault: header.vault, epoch: header.epoch, object: "catalog",
                                           membership: header.membership, authenticating: aad(header: header, records: records, itemKeys: itemKeys))
@@ -178,7 +216,7 @@ struct Revision: Codable, Sendable {
     func validateStructure() throws {
         if let features = header.requiredFeatures {
             guard !features.isEmpty, features == Set(features).sorted(),
-                  Set(features).isSubset(of: ["item-model-1", "attachments-1", "compound-fields-1", "attachment-blobs-1", "offline-recovery-1", "key-credentials-1"]),
+                  Set(features).isSubset(of: ["item-model-1", "attachments-1", "compound-fields-1", "attachment-blobs-1", "offline-recovery-1", "key-credentials-1", "secret-history-1", "credential-redundancy-1"]),
                   (!(features.contains("attachments-1") || features.contains("compound-fields-1")) || features.contains("item-model-1")) else { throw MopError.invalidVault }
         }
         guard header.membership.offlineRecovery == nil || header.requiredFeatures?.contains("offline-recovery-1") == true else { throw MopError.invalidVault }
@@ -226,6 +264,8 @@ struct Revision: Codable, Sendable {
               signer.verifies(signature, message: try message()) else { throw MopError.vaultUntrusted }
         guard Set(header.requiredFeatures ?? []).isSuperset(of: parent.header.requiredFeatures ?? []) else { throw MopError.invalidVault }
         let role = parent.header.membership.role(of: signer)
+        let addedSecurity = Set(header.requiredFeatures ?? []).subtracting(parent.header.requiredFeatures ?? []).intersection(["secret-history-1", "credential-redundancy-1"])
+        guard addedSecurity.isEmpty || role == .owner else { throw MopError.cloudPermission }
         switch header.operation {
         case .create: throw MopError.vaultUntrusted
         case .content:
@@ -284,6 +324,9 @@ struct Revision: Codable, Sendable {
         defer { SecretBytes.wipe(&bytes) }
         let payload = try JSONDecoder().decode(CatalogPayload.self, from: bytes)
         let references = payload.references
+        if header.requiredFeatures?.contains("secret-history-1") == true || header.requiredFeatures?.contains("credential-redundancy-1") == true {
+            guard payload.security != nil else { throw MopError.invalidVault }
+        }
         var itemNames: [String: String] = [:], itemIDs: [String: String] = [:]
         for (path, recordID) in references {
             let name = try SecretReference(vault: header.name, relativePath: path).item
@@ -293,7 +336,7 @@ struct Revision: Codable, Sendable {
             itemNames[id] = name; itemIDs[name] = id
         }
         guard itemIDs == payload.itemIDs else { throw MopError.invalidVault }
-        guard Set(references.values).count == references.count, Set(references.values) == Set(records.keys),
+        guard Set(references.values).count == references.count, Set(references.values).union(payload.security?.histories.flatMap { $0.entries.map(\.id) } ?? []) == Set(records.keys),
               references.keys.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 4096 }) else { throw MopError.invalidVault }
         guard Set(payload.items.map(\.name)).count == payload.items.count,
               payload.items.allSatisfy({ $0.fields.allSatisfy { !$0.type.concealed || $0.value == nil } }) else { throw MopError.invalidVault }
@@ -307,7 +350,40 @@ struct Revision: Codable, Sendable {
                 let path = SecretReference.encode(item.name) + "/" + field.path
                 _ = try SecretReference(vault: header.name, relativePath: path)
                 guard references[path] != nil else { throw MopError.invalidVault }
+                if field.historyID != nil { guard header.requiredFeatures?.contains("secret-history-1") == true else { throw MopError.invalidVault } }
             }
+        }
+        if let security = payload.security {
+            guard header.requiredFeatures?.contains("secret-history-1") == true,
+                  header.requiredFeatures?.contains("credential-redundancy-1") == true,
+                  Set(security.histories.map(\.id)).count == security.histories.count,
+                  Set(security.histories.map { $0.itemID + ":" + $0.path }).count == security.histories.count,
+                  Set(security.accounts.map(\.id)).count == security.accounts.count else { throw MopError.invalidVault }
+            let fieldIDs = payload.items.flatMap { $0.fields.compactMap(\.historyID) }
+            guard Set(fieldIDs).count == fieldIDs.count else { throw MopError.invalidVault }
+            var seen = Set(references.values)
+            for history in security.histories {
+                guard let name = itemNames[history.itemID],
+                      references[SecretReference.encode(name) + "/" + history.path] != nil,
+                      payload.items.first(where: { $0.name == name })?.fields.contains(where: { $0.path == history.path && $0.historyID == history.id && [.password, .concealed].contains($0.type) }) == true,
+                      history.entries.count <= 20 else { throw MopError.invalidVault }
+                for entry in history.entries {
+                    guard seen.insert(entry.id).inserted, records[entry.id]?.itemID == history.itemID,
+                          records[entry.id]?.attachmentDigest == nil,
+                          entry.replacedAt.timeIntervalSince1970.isFinite else { throw MopError.invalidVault }
+                }
+            }
+            if let checks = security.passwordChecks {
+                guard checks.count <= references.count, Set(checks.map(\.record)).count == checks.count else { throw MopError.invalidVault }
+                for check in checks {
+                    guard references.values.contains(check.record), check.context.count == 2,
+                          check.context.allSatisfy({ $0.utf8.count <= 16384 }), check.scope.count == 64,
+                          check.scope.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+                          check.checkedAt.timeIntervalSince1970.isFinite,
+                          check.breachCheckedAt.map({ $0.timeIntervalSince1970.isFinite }) ?? true else { throw MopError.invalidVault }
+                }
+            }
+            for account in security.accounts { try account.validate() }
         }
         return payload
     }
@@ -325,6 +401,7 @@ public struct VerifiedVault: Sendable {
     public var generation: UInt64 { revision.header.generation }
     public var membership: Membership { revision.header.membership }
     public var parent: String? { revision.header.parent }
+    public var supportsSecurity: Bool { revision.header.requiredFeatures?.contains("secret-history-1") == true && revision.header.requiredFeatures?.contains("credential-redundancy-1") == true }
 
     public init(checkpoint bytes: Data, independentlyVerifiedDigest: String) throws {
         guard Codec.hash(independentlyVerifiedDigest), Codec.digest(bytes) == independentlyVerifiedDigest else { throw MopError.vaultUntrusted }

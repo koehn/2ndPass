@@ -38,6 +38,12 @@ struct ItemDetailView: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Vault and item")
             Divider()
+            if !creating && !editingItem {
+                ForEach(model.healthReport.findings.filter { $0.vaultID == model.vault && $0.item == itemName }) { finding in
+                    Label(finding.kinds.map(\.rawValue).sorted().joined(separator: " · ") + " · " + finding.path, systemImage: "exclamationmark.shield")
+                        .foregroundStyle(.orange)
+                }
+            }
             if creating && model.allVaults {
                 Picker("Vault", selection: Binding(get: { model.itemDraft?.vault ?? "" }, set: { model.chooseCreationVault($0) })) {
                     ForEach(model.itemCreationVaults) { vault in
@@ -67,7 +73,7 @@ struct ItemDetailView: View {
                     if !creating && model.itemDraft?.type == .custom { Text("Custom").tag(ItemType.custom) }
                     if !creating && model.itemDraft?.type == .passkey { Text("Passkey").tag(ItemType.passkey) }
                 }.frame(maxWidth: 280).disabled(model.busy || model.itemDraft?.credential != nil)
-                Text("Drag the handles to reorder fields. Changes are saved together when you choose Save.")
+                Text("Drag the handles to reorder fields. Changes are saved together when you choose Save. Removing a field also removes its live history; earlier backups may retain it.")
                     .font(.caption).foregroundStyle(.secondary)
             } else { Text(model.selectedTypedItem?.type.label ?? "Custom").foregroundStyle(.secondary) }
             if editingItem {
@@ -510,7 +516,12 @@ struct ItemDetailView: View {
     }
     private func fieldMenu(_ field: ItemDraft.Field, ref: SecretReference) -> some View {
         Menu {
-            Button("Edit value", systemImage: "pencil") {
+            if [.password, .concealed].contains(field.type) {
+                Button("View History", systemImage: "clock.arrow.circlepath") {
+                    model.historySelection = HistorySelection(vault: model.vault, item: itemName, path: field.path)
+                }
+            }
+            Button(field.type == .password ? "Edit Password" : "Edit value", systemImage: "pencil") {
                 model.selectField(ref)
                 change { model.beginItemEditing(replacing: field.path) }
                 focusedField = field.id

@@ -37,7 +37,7 @@ struct AppSheetView: View {
                 }
             case .enrollDevice:
                 if model.deviceRemoved {
-                    Text("This device was removed").font(.title2)
+                    Text("Connect this device again").font(.title2)
                     Text(model.removalCleanupPending ? "Local cleanup could not finish. Reconnect will retry cleanup before adding this device again." : "Its local account access has been cleared. Reconnect only if you want to add this device again.")
                     Button("Reconnect") { model.reconnectDevice() }
                     Button("Recover with Offline Copy…") { dismissOrConfirm(next: .recover) }

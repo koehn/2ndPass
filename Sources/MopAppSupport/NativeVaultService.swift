@@ -573,6 +573,19 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             throw MopError.deviceRemoved
         }
         if case .manage(.reconnect) = operation { return result }
+        if case .manage(.resetCloudAccess) = operation {
+            guard !offline else { throw MopError.offlineWrite }
+            _ = try await authorizedContext(token: token)
+            // Explicit local repair must not discard an interrupted recovery's key.
+            guard try !registry.hasPendingRecovery() else { throw MopError.vaultConflict }
+            try control.check(token)
+            // Reuse the durable barrier and drained cleanup used for revocation.
+            // No cloud membership or vault data is changed. A fresh device key
+            // must be approved through enrollment before access can resume.
+            try registry.setRemoved(true)
+            removedRegistry.withLock { $0 = registry }
+            throw MopError.deviceRemoved
+        }
         if case .manage(let action) = operation {
             switch action {
             case .devices, .removeAccountDevice:
@@ -941,7 +954,7 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
             switch operation {
             case .read(let reference):
                 if let digest = try current.attachmentDigest(for: reference.relativePath, device: key) { needed.insert(digest) }
-            case .export, .previewImport, .commitImport: needed = current.attachmentDigests
+            case .export, .upgradeSecurity, .previewImport, .commitImport: needed = current.attachmentDigests
             case .manage(.removeMember), .manage(.removeDevice):
                 reportProgress("Preparing encrypted files…")
                 needed = current.attachmentDigests
@@ -1048,6 +1061,29 @@ public final class NativeVaultService: VaultService, @unchecked Sendable {
         var reconcile = false
         switch operation {
         case .catalog, .recentlyDeleted: break
+        case .readHistory(let entry, let revision):
+            result.value = try VaultEngine.readHistory(entry, revision: revision, in: current, device: key)
+            return result
+        case .restoreHistory(let entry, let revision):
+            proposal = try VaultEngine.restoreHistory(entry, revision: revision, in: current, device: key, at: wallNow())
+        case .clearHistory(let field, let revision):
+            proposal = try VaultEngine.clearHistory(field, revision: revision, in: current, device: key)
+        case .reconcileLocalCredentials(let ids, let revision):
+            proposal = try VaultEngine.invalidateMissingLocalCredentials(ids, revision: revision, in: current, device: key)
+        case .savePasswordChecks(let checks, let revision):
+            proposal = try VaultEngine.savePasswordChecks(checks, revision: revision, in: current, device: key)
+        case .saveCredentialAccount(let registration, let revision):
+            proposal = try VaultEngine.saveCredentialAccount(registration, revision: revision, in: current, device: key, at: wallNow())
+        case .upgradeSecurity(let url, let revision):
+            guard current.membership.role(of: key.identity) == .owner else { throw MopError.cloudPermission }
+            guard current.digest == revision else { throw MopError.vaultConflict }
+            try documents.write(to: url) { target in
+                try OutputFile(url: target, force: false, mode: 0o600, protectedFiles: [], protectedDirectories: [state]).write(try current.backup())
+                let restored = try VerifiedVault.restoreBackup(Data(contentsOf: target), independentlyVerifiedDigest: current.digest)
+                guard restored.digest == current.digest else { throw MopError.invalidVault }
+                _ = try VaultEngine.catalog(in: restored, device: key)
+            }
+            proposal = try VaultEngine.upgradeSecurity(revision: revision, in: current, device: key)
         case .passwordQuality(let name):
             guard let item = try VaultEngine.catalog(in: current, device: key).items.first(where: { $0.name == name }) else { throw MopError.notFound }
             for field in item.fields where field.type == .password { result.passwordQuality[field.path] = field.passwordQuality }

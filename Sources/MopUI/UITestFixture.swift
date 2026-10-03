@@ -6,6 +6,10 @@ import Synchronization
 import MopCore
 import MopAppSupport
 
+struct UITestBreachClient: BreachChecking {
+    func contains(_ password: Data, force: Bool) async throws -> Bool { ProcessInfo.processInfo.environment["MOP_UI_SECURITY_TEST"] == "1" }
+    func clear() async {}
+}
 final class UITestVaultService: VaultService, Sendable {
     static let vaultID = "00000000-0000-0000-0000-000000000001"
     private struct State {
@@ -31,6 +35,13 @@ final class UITestVaultService: VaultService, Sendable {
                 result.defaultVault = Self.vaultID
                 return result
             case .catalog:
+                if ProcessInfo.processInfo.environment["MOP_UI_SECURITY_TEST"] == "1" {
+                    state.catalog.securityEnabled = true; state.catalog.canEdit = true
+                    state.catalog.items[0].storageID = "00000000-0000-0000-0000-000000000002"
+                    var metadata = VaultSecurityMetadata()
+                    metadata.histories = [SecretFieldHistory(itemID: "00000000-0000-0000-0000-000000000002", path: "password", entries: [SecretHistoryEntry(id: "00000000-0000-0000-0000-000000000003", replacedAt: Date(timeIntervalSince1970: 1_700_000_000))])]
+                    state.catalog.security = metadata
+                }
                 if let account = ProcessInfo.processInfo.environment["MOP_UI_SELECTION_TEST"] {
                     state.catalog.usageScope = account
                     state.catalog.items[0].storageID = "00000000-0000-0000-0000-000000000002"
@@ -50,6 +61,9 @@ final class UITestVaultService: VaultService, Sendable {
                    !state.catalog.items[0].fields.contains(where: { $0.type == .otp }) {
                     state.catalog.items[0].fields.insert(contentsOf: [ItemField(path: "otp", type: .otp), ItemField(path: "otp-url", type: .otp), ItemField(path: "otp-legacy", type: .concealed)], at: 0)
                 }
+            case .readHistory:
+                guard state.authenticatedAt != nil else { throw MopError.authentication }
+                result.value = "previous-ui-password"; return result
             case .read(let reference):
                 guard state.authenticatedAt != nil else { throw MopError.authentication }
                 if reference.field == "otp" || reference.field == "otp-url" || reference.field == "otp-legacy" {

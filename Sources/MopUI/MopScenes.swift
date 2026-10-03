@@ -8,7 +8,9 @@ public struct MopScenes: Scene {
     @MainActor private static func initialModel() -> AppModel {
         #if DEBUG && (os(macOS) || targetEnvironment(simulator))
         if ProcessInfo.processInfo.environment["MOP_UI_TESTING"] == "1" {
-            return AppModel(service: UITestVaultService())
+            let model = AppModel(breachClient: UITestBreachClient(), service: UITestVaultService())
+            if ProcessInfo.processInfo.environment["MOP_UI_SECURITY_TEST"] == "1" { model.securityVisible = true }
+            return model
         }
         #endif
         return AppModel()
@@ -148,6 +150,10 @@ struct SessionSettings: View {
         Form {
             switch category {
             case .security:
+                Section("Password Health") {
+                    Toggle("Check exposed passwords with HIBP", isOn: $model.breachChecksEnabled)
+                    Text("HIBP receives a five-character hash prefix and your network address, not your password or account details. Checks run only on saved passwords while unlocked.").font(.caption)
+                }
                 Section("Session") {
                     Picker(selection: Binding(get: { customTimeout || !durations.contains(model.autoLockMinutes) ? 0 : model.autoLockMinutes }, set: { value in
                         customTimeout = value == 0

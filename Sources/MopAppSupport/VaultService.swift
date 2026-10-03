@@ -30,7 +30,7 @@ public enum VaultManagement: Sendable {
     case invite(request: Data, fingerprint: String, role: MemberRole)
     case accept(packet: Data, checkpoint: String, shareURL: URL?)
     case approve(packet: Data, fingerprint: String)
-    case devices, removeAccountDevice(UUID), reconnect
+    case devices, removeAccountDevice(UUID), reconnect, resetCloudAccess
     case removeMember(UUID), removeDevice(UUID), role(UUID, MemberRole)
     case recoveryEligibility, recoveryGenerate, recoveryStatus, recoveryRevoke, recoveryResume
     case recoveryTestReset(copy: SecretBytes)
@@ -45,6 +45,11 @@ public enum VaultOperation: Sendable {
     case commitImport(ImportDocument, selected: Set<Int>, vault: UUID, revision: String)
     case discover, catalog, passwordQuality(item: String), read(SecretReference), save(ItemEdit)
     case write(SecretReference, SecretBytes, replace: Bool), delete(SecretReference)
+    case readHistory(entry: String, revision: String), restoreHistory(entry: String, revision: String), clearHistory(field: UUID, revision: String)
+    case reconcileLocalCredentials(Set<UUID>, revision: String)
+    case saveCredentialAccount(CredentialAccount, revision: String)
+    case savePasswordChecks([CachedPasswordCheck], revision: String)
+    case upgradeSecurity(backup: URL, revision: String)
     case recentlyDeleted, trashItem(name: String, revision: String), restoreItem(id: UUID, revision: String)
     case members, manage(VaultManagement), sync
     case create(name: String)
@@ -53,7 +58,7 @@ public enum VaultOperation: Sendable {
 extension VaultOperation {
     var allowsCachedRead: Bool {
         switch self {
-        case .discover, .catalog, .read, .passwordQuality, .recentlyDeleted, .export: true
+        case .discover, .catalog, .read, .passwordQuality, .recentlyDeleted, .readHistory, .export: true
         default: false
         }
     }

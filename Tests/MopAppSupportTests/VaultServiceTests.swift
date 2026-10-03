@@ -564,6 +564,64 @@ private actor AuthenticationGate {
     #expect(try await tablet.service.execute(.manage(.checkEnrollment), vault: first).enrollmentCompleted)
 }
 
+@Test func explicitConnectionRepairClearsUntrustedStateAndReenrollsBothVaults() async throws {
+    let server = Server(), owner = Client(server, "a"), tablet = Client(server, "a")
+    let personal = UUID().uuidString, demo = UUID().uuidString
+    for (id, name) in [(personal, "personal"), (demo, "demo")] {
+        _ = try await owner.service.execute(.create(name: name), vault: id)
+        try await enroll(tablet, owner: owner, vault: id, role: .owner)
+        _ = try await tablet.service.execute(.catalog, vault: id)
+    }
+    let old = try await tablet.request().1.device
+    _ = try await owner.service.execute(.manage(.removeAccountDevice(old.device)), vault: personal)
+    let registry = try NextRegistry(state: tablet.state, container: "iCloud.test", environment: "Development", account: "a")
+    let entry = try registry.select(personal)
+    // A mismatched local digest prevents even the normal revocation check.
+    let url = registry.cache.directory.appendingPathComponent("checkpoints").appendingPathComponent(entry.address.binding + ".json")
+    var saved = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+    saved["verifiedDigest"] = String(repeating: "0", count: 64)
+    try LocalFile.write(JSONSerialization.data(withJSONObject: saved), to: url, replace: true)
+    await #expect(throws: MopError.vaultUntrusted) { try await tablet.service.execute(.catalog, vault: personal) }
+    let addresses = await server.discover("a")
+    var heads: [UUID: String] = [:]
+    for address in addresses { heads[address.vault] = try await server.head(address.vault).digest }
+    let backup = tablet.state.appendingPathComponent("exported-backup")
+    try Data("preserve backup".utf8).write(to: backup)
+    await #expect(throws: MopError.deviceRemoved) {
+        try await tablet.service.execute(.manage(.resetCloudAccess), vault: nil)
+    }
+    tablet.reopen()
+    #expect(try await tablet.service.execute(.discover, vault: nil).deviceRemoved)
+    #expect(try registry.entries().isEmpty)
+    #expect(try Data(contentsOf: backup) == Data("preserve backup".utf8))
+    for address in addresses { #expect(try await server.head(address.vault).digest == heads[address.vault]) }
+    _ = try await tablet.service.execute(.manage(.reconnect), vault: nil)
+    for id in [personal, demo] {
+        _ = try await tablet.service.execute(.manage(.requestEnrollment(name: "iPad")), vault: id)
+        _ = try await owner.service.execute(.manage(.automaticEnrollment), vault: id)
+        _ = try await tablet.service.execute(.manage(.checkEnrollment), vault: id)
+        _ = try await owner.service.execute(.manage(.automaticEnrollment), vault: id)
+        #expect(try await tablet.service.execute(.manage(.checkEnrollment), vault: id).enrollmentCompleted)
+        #expect(try await tablet.service.execute(.catalog, vault: id).catalog != nil)
+    }
+    #expect(try await tablet.request().1.device.device != old.device)
+}
+
+@Test func connectionRepairDoesNotDiscardPendingRecovery() async throws {
+    let server = Server(), client = Client(server, "a")
+    let id = UUID().uuidString
+    _ = try await client.service.execute(.create(name: "personal"), vault: id)
+    let before = try await client.request().1.device
+    let registry = try NextRegistry(state: client.state, container: "iCloud.test", environment: "Development", account: "a")
+    try registry.setRecoveryPending(true, vault: UUID(uuidString: id)!)
+    await #expect(throws: MopError.vaultConflict) {
+        try await client.service.execute(.manage(.resetCloudAccess), vault: nil)
+    }
+    #expect(try !registry.removed())
+    #expect(try registry.entries().count == 1)
+    #expect(try await client.request().1.device == before)
+}
+
 @Test func interruptedRemovalCleanupRemainsBlockedAcrossRelaunch() async throws {
     let server = Server(), owner = Client(server, "a"), tablet = Client(server, "a")
     let id = UUID().uuidString
@@ -1156,4 +1214,67 @@ func offlineRecoveryFinalizationResumesAfterCloudCommit(lostAcknowledgement: Boo
     #expect(!invalid.canSave)
     invalid = draft; invalid.password = ""
     #expect(!invalid.canSave)
+}
+
+@Test func securityHistoryPublishesSynchronizesAndRejectsStaleRestores() async throws {
+    let server = Server(), owner = Client(server, "security-history"), second = Client(server, "security-history")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    let reference = try SecretReference("sp://personal/login/password")
+    _ = try await owner.service.execute(.write(reference, "first", replace: false), vault: id)
+    _ = try await owner.service.execute(.write(reference, "second", replace: true), vault: id)
+    try await enroll(second, owner: owner, vault: id, role: .owner)
+    let catalog = try #require(try await second.service.execute(.catalog, vault: id).catalog)
+    let entry = try #require(catalog.security?.histories.first?.entries.first)
+    #expect(try await second.service.execute(.readHistory(entry: entry.id, revision: catalog.revision), vault: id).value == "first")
+    let result = try await second.service.execute(.restoreHistory(entry: entry.id, revision: catalog.revision), vault: id)
+    #expect(result.catalog?.security?.histories.first?.entries.count == 2)
+    #expect(try await owner.service.execute(.read(reference), vault: id).value == "first")
+    await #expect(throws: MopError.vaultConflict) {
+        try await owner.service.execute(.restoreHistory(entry: entry.id, revision: catalog.revision), vault: id)
+    }
+    let current = try #require(try await owner.service.execute(.catalog, vault: id).catalog)
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let backup = folder.appendingPathComponent("before-upgrade.mopfile")
+    let upgraded = try await owner.service.execute(.upgradeSecurity(backup: backup, revision: current.revision), vault: id)
+    let saved = try VerifiedVault.restoreBackup(Data(contentsOf: backup), independentlyVerifiedDigest: current.revision)
+    #expect(saved.digest == current.revision)
+    #expect(upgraded.catalog?.securityEnabled == true)
+    let head = try #require(upgraded.catalog?.revision)
+    // The exclusive writer must fail before publication when the backup already exists.
+    await #expect(throws: (any Error).self) { try await owner.service.execute(.upgradeSecurity(backup: backup, revision: head), vault: id) }
+    #expect(try await owner.service.execute(.catalog, vault: id).catalog?.revision == head)
+}
+
+private actor CachedHealthBreach: BreachChecking {
+    var count = 0
+    func contains(_ password: Data, force: Bool) async throws -> Bool { count += 1; return true }
+    func clear() {}
+}
+
+@MainActor @Test func passwordHealthResultsSynchronizeBetweenClients() async throws {
+    let server = Server(), owner = Client(server, "health-cache"), second = Client(server, "health-cache")
+    let id = UUID().uuidString
+    _ = try await owner.service.execute(.create(name: "personal"), vault: id)
+    var catalog = try #require(try await owner.service.execute(.catalog, vault: id).catalog)
+    let item = VaultItem(name: "login", fields: [ItemField(path: "password", type: .password, value: "password")])
+    _ = try await owner.service.execute(.save(ItemEdit(revision: catalog.revision, item: item, create: true)), vault: id)
+    try await enroll(second, owner: owner, vault: id, role: .owner)
+    catalog = try #require(try await owner.service.execute(.catalog, vault: id).catalog)
+    let breach = CachedHealthBreach()
+    let report = try await PasswordHealthSession().scan(catalogs: [id: catalog], service: owner.service, breach: breach, enabled: true)
+    let checks = try #require(report.cachedChecks[id])
+    _ = try await owner.service.execute(.savePasswordChecks(checks, revision: catalog.revision), vault: id)
+    let synced = try #require(try await second.service.execute(.catalog, vault: id).catalog)
+    #expect(synced.security?.passwordChecks == checks)
+    let reopened = try await PasswordHealthSession().scan(catalogs: [id: synced], service: second.service, breach: breach, enabled: true)
+    #expect(reopened.usedCloudCache)
+    #expect(reopened.completedAt == report.completedAt)
+    #expect(reopened.findings.first?.kinds.contains(.exposed) == true)
+    #expect(await breach.count == 1)
+    await #expect(throws: MopError.vaultConflict) {
+        try await owner.service.execute(.savePasswordChecks(checks, revision: catalog.revision), vault: id)
+    }
 }

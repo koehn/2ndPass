@@ -31,7 +31,7 @@ private func localModel(localService: (any LocalVaultServing)? = nil,
                         authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { _, _, _, _ in throw MopError.authentication }) -> (AppModel, CloudOnlyService) {
     let service = CloudOnlyService()
     let defaults = UserDefaults(suiteName: "mop-local-vault-test-" + UUID().uuidString)!
-    let model = AppModel(service: service, defaults: defaults, automaticTimer: false,
+    let model = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, automaticTimer: false,
                          localService: localService, authorizeLocal: authorizeLocal)
     model.vault = ""; model.vaults = []
     return (model, service)

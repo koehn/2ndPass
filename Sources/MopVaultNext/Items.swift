@@ -36,7 +36,7 @@ public extension VaultEngine {
         } }
         payload.items.removeAll { $0.deletion?.isExpired(at: date) == true }
         return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
-            records: records, itemKeys: keys, items: payload.items, signer: device))
+            records: records, itemKeys: keys, items: payload.items, security: payload.security, signer: device))
     }
     static func catalog(in vault: VerifiedVault, device: any DeviceOperations, deleted: Bool = false) throws -> ItemCatalog {
         let payload = try vault.revision.payload(device: device)
@@ -60,12 +60,22 @@ public extension VaultEngine {
                 if !items[index].fields.contains(where: { $0.path == field }) { items[index].fields.append(ItemField(path: field)) }
             } else { items.append(VaultItem(name: reference.item, fields: [ItemField(path: field)])) }
         }
-        for index in items.indices { items[index].storageID = payload.itemIDs[items[index].name] }
+        for index in items.indices {
+            items[index].storageID = payload.itemIDs[items[index].name]
+            for field in items[index].fields.indices {
+                items[index].fields[field].recordVersion = payload.references[SecretReference.encode(items[index].name) + "/" + items[index].fields[field].path]
+            }
+        }
         var result = ItemCatalog(vault: vault.name, revision: vault.digest, items: items.filter {
             deleted ? ($0.deletion != nil && !$0.deletion!.isExpired(at: Date())) : $0.deletion == nil
         }.sorted { $0.name < $1.name })
         let role = vault.membership.role(of: device.identity)
         result.canEdit = role == .owner || role == .editor
+        result.security = payload.security
+        result.securityEnabled = vault.supportsSecurity
+        result.canUpgradeSecurity = role == .owner
+        result.currentDeviceID = device.identity.device.uuidString
+        result.sharingAudience = "Visible to all members of this vault (\(vault.membership.accounts.count) account(s))."
         return result
     }
 
@@ -78,7 +88,7 @@ public extension VaultEngine {
         try apply(edit, payload: &payload, records: &records, keys: &keys, vault: vault, device: device, at: date)
         do {
             return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
-                records: records, itemKeys: keys, items: payload.items, signer: device))
+                records: records, itemKeys: keys, items: payload.items, security: payload.security, signer: device))
         } catch MopError.invalidVault where edit.item.fields.contains(where: { $0.type == .attachment }) {
             throw AttachmentFailure.capacity
         }
@@ -131,14 +141,22 @@ public extension VaultEngine {
             return result
         }
         var kept = Set<String>()
+        let originalReferences = payload.references
+        var replacementReferences: [String: String] = [:]
         for index in item.fields.indices {
+            let input = item.fields[index]
+            let priorField = input.historyID.flatMap { id in old?.fields.first { $0.historyID == id } } ?? old?.fields.first { $0.path == input.path }
+            item.fields[index].historyID = priorField?.historyID
             let field = item.fields[index]
+            if let id = priorField?.historyID, let h = payload.security?.histories.firstIndex(where: { $0.itemID == itemID && $0.id == id }) {
+                payload.security?.histories[h].path = field.path
+            }
             let path = SecretReference.encode(item.name) + "/" + field.path
             _ = try SecretReference(vault: vault.name, relativePath: path)
-            let previousPath = SecretReference.encode(original) + "/" + field.path
-            kept.insert(previousPath)
+            let previousPath = SecretReference.encode(original) + "/" + (priorField?.path ?? field.path)
+            guard kept.insert(previousPath).inserted else { throw MopError.invalidVault }
             let recordID: String
-            if let value = field.value, !(old?.fields.contains(where: { $0.path == field.path && $0.type == field.type && $0.value == value }) ?? false) {
+            if let value = field.value, !(priorField?.type == field.type && priorField?.value == value) {
                 if field.type == .attachment { _ = try Attachment.decode(value) }
                 if field.type.isCompound { _ = try CompoundField(value) }
                 recordID = UUID().uuidString
@@ -146,11 +164,16 @@ public extension VaultEngine {
                 defer { SecretBytes.wipe(&bytes) }
                 let material = try key()
                 records[recordID] = try SealedObject.field(bytes, key: material, vault: vault.id, item: itemID, generation: keys[itemID]!.generation, id: recordID)
-                if let previous = payload.references[previousPath] { records.removeValue(forKey: previous) }
+                if let previous = originalReferences[previousPath] {
+                    if [.password, .concealed].contains(field.type), let previousType = priorField?.type, [.password, .concealed].contains(previousType) {
+                        try retainPrevious(previous, replacement: bytes, itemID: itemID, path: field.path, payload: &payload, records: &records, vault: vault, device: device, at: date, key: material, fieldID: priorField?.historyID)
+                    }
+                    if !(payload.security?.histories.contains { $0.entries.contains { $0.id == previous } } ?? false) { records.removeValue(forKey: previous) }
+                }
             } else {
-                if field.type.isCompound, old?.fields.first(where: { $0.path == field.path })?.type != field.type { throw CompoundFieldFailure.invalid }
-                if field.type == .attachment, old?.fields.first(where: { $0.path == field.path })?.type != .attachment { throw AttachmentFailure.invalid }
-                guard let previous = payload.references[previousPath] else { throw MopError.notFound }
+                if field.type.isCompound, priorField?.type != field.type { throw CompoundFieldFailure.invalid }
+                if field.type == .attachment, priorField?.type != .attachment { throw AttachmentFailure.invalid }
+                guard let previous = originalReferences[previousPath] else { throw MopError.notFound }
                 recordID = previous
                 if !field.type.concealed {
                     guard let record = records[previous] else { throw MopError.invalidVault }
@@ -160,18 +183,19 @@ public extension VaultEngine {
                     item.fields[index].value = String(decoding: value, as: UTF8.self)
                 }
             }
-            payload.references.removeValue(forKey: previousPath)
-            payload.references[path] = recordID
+            replacementReferences[path] = recordID
             if field.type == .password {
                 item.fields[index].passwordQuality = field.value.map { PasswordEstimator.estimate($0, userInputs: [item.name]) }
-                    ?? old?.fields.first(where: { $0.path == field.path })?.passwordQuality
+                    ?? priorField?.passwordQuality
             } else { item.fields[index].passwordQuality = nil }
             if field.type.concealed { item.fields[index].value = nil }
         }
         for field in old?.fields ?? [] {
             let path = SecretReference.encode(original) + "/" + field.path
-            if !kept.contains(path), let id = payload.references.removeValue(forKey: path) { records.removeValue(forKey: id) }
+            if !kept.contains(path), let id = originalReferences[path] { records.removeValue(forKey: id) }
         }
+        for path in originalReferences.keys where (try? SecretReference(vault: vault.name, relativePath: path).item) == original { payload.references.removeValue(forKey: path) }
+        payload.references.merge(replacementReferences) { _, new in new }
         payload.items.removeAll { $0.name == original }
         payload.items.append(item)
     }
@@ -189,7 +213,7 @@ public extension VaultEngine {
         }
         do {
             return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
-                records: records, itemKeys: keys, items: payload.items, signer: device))
+                records: records, itemKeys: keys, items: payload.items, security: payload.security, signer: device))
         } catch MopError.invalidVault { throw ImportFailure.capacity }
     }
     static func previewImport(_ document: ImportDocument, selected: Set<Int>? = nil, in vault: VerifiedVault, device: any DeviceOperations) throws -> (items: [VaultItem], preview: ImportPreview) {
@@ -245,7 +269,7 @@ public extension VaultEngine {
         let role = vault.membership.role(of: device.identity)
         guard role == .owner || role == .editor else { throw MopError.cloudPermission }
         return try vault.applying(Revision.seal(header: header(vault, operation: .content), references: payload.references,
-            records: vault.revision.records, itemKeys: vault.revision.itemKeys, items: payload.items, signer: device))
+            records: vault.revision.records, itemKeys: vault.revision.itemKeys, items: payload.items, security: payload.security, signer: device))
     }
     static func rename(_ name: String, in vault: VerifiedVault, device: any DeviceOperations) throws -> VerifiedVault {
         guard vault.membership.role(of: device.identity) == .owner else { throw MopError.cloudPermission }
@@ -254,6 +278,6 @@ public extension VaultEngine {
         let next = Revision.Header(requiredFeatures: old.requiredFeatures, format: old.format, vault: old.vault, name: name, generation: old.generation, parent: old.parent,
             epoch: old.epoch, membership: old.membership, operation: old.operation, acceptedInvitations: old.acceptedInvitations)
         let payload = try vault.revision.payload(device: device)
-        return try vault.applying(Revision.seal(header: next, references: payload.references, records: vault.revision.records, itemKeys: vault.revision.itemKeys, items: payload.items, signer: device))
+        return try vault.applying(Revision.seal(header: next, references: payload.references, records: vault.revision.records, itemKeys: vault.revision.itemKeys, items: payload.items, security: payload.security, signer: device))
     }
 }

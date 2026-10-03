@@ -12,12 +12,14 @@ struct ItemDraft: Identifiable {
         var label: String?
         var path: String
         var type: FieldType
+        let historyID: UUID?
         let storedPasswordQuality: PasswordQuality?
         var loadedPassword: String?
         var loadedCompound: String?
         var value: String?
         init(_ field: ItemField, existing: Bool = true) {
             id = existing ? "existing:" + field.path : "new:" + UUID().uuidString
+            historyID = field.historyID
             isTemplate = field.isTemplate == true
             label = field.label
             self.existing = existing; path = field.path; type = field.type
@@ -57,6 +59,7 @@ struct ItemDraft: Identifiable {
             var result = ItemField(path: encodedPath, type: effectiveType,
                       value: existing && ((loadedPassword != nil && value == loadedPassword) || (loadedCompound != nil && value == loadedCompound)) ? nil : value,
                       isTemplate: isTemplate ? true : nil)
+            result.historyID = historyID
             result.label = label
             return result
         }

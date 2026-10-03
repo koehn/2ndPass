@@ -8,13 +8,32 @@ import MopAuth
 import LocalAuthentication
 import MopVaultNext
 
-enum AppPage: String, CaseIterable { case secrets = "Secrets", recentlyDeleted = "Recently Deleted" }
+enum AppPage: String, CaseIterable { case security = "Security", secrets = "Secrets", recentlyDeleted = "Recently Deleted" }
 enum AppSheet: String, Identifiable { case createVault, enrollDevice, addDevice, shareAccount, setupRecovery, renameVault, deleteVault, recover, importItems
     var id: String { rawValue }
 }
 
 @MainActor @Observable
 final class AppModel {
+    var securityVisible = false
+    var healthReport = PasswordHealthReport()
+    var healthChecking = false
+    var healthRestoringCache = false
+    var healthProgress = 0.0
+    var healthToken = UUID()
+    @ObservationIgnored var healthSession = PasswordHealthSession()
+    @ObservationIgnored var healthRequest: String?
+    @ObservationIgnored var healthPublishing: UUID?
+    var healthCacheNotice: String?
+    @ObservationIgnored var healthSessionGeneration: Int?
+    @ObservationIgnored var healthWakeTask: Task<Void, Never>?
+    @ObservationIgnored var healthTask: Task<Void, Never>?
+    @ObservationIgnored var breachClient: any BreachChecking = PwnedPasswordsClient()
+    var breachChecksEnabled = true {
+        didSet { defaults.set(breachChecksEnabled, forKey: "breachChecksEnabled"); refreshHealth() }
+    }
+    var historySelection: HistorySelection?
+    var pendingSecurityUpgrade: (String, String)?
     let service: any VaultService
     let documents: any DocumentAccessing
     let clipboard: any SecretClipboardAccess
@@ -36,7 +55,7 @@ final class AppModel {
         get { if case .vault = collection { return false }; return collection != .recentlyDeleted && collection != .local }
         set { collection = newValue ? .all : (vault == LocalVault.id ? .local : .vault(vault)) }
     }
-    var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch(); reloadUsage() } }
+    var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch(); reloadUsage(); refreshHealth() } }
     var deletedCatalogs: [String: ItemCatalog] = [:] { didSet { invalidateDeletedSearch() } }
     var selectedDeleted: ItemRow.ID? { didSet { rememberSelection() } }
     var itemToDelete: ItemRow?
@@ -46,8 +65,9 @@ final class AppModel {
     var passwordQualities: [String: PasswordQuality] = [:]
     private var launchAttempted = false
     var page: AppPage {
-        get { collection == .recentlyDeleted ? .recentlyDeleted : .secrets }
-        set { if newValue == .recentlyDeleted { collection = .recentlyDeleted }
+        get { securityVisible ? .security : collection == .recentlyDeleted ? .recentlyDeleted : .secrets }
+        set { securityVisible = newValue == .security
+            if newValue == .recentlyDeleted { collection = .recentlyDeleted }
             else if collection == .recentlyDeleted { collection = .vault(vault) } }
     }
     var selectedItem: String? { didSet { rememberSelection() } }
@@ -125,7 +145,7 @@ final class AppModel {
     var offline = false
     private var cloudRefreshPending = false
     private var nextCloudRefresh = Date.distantPast
-    var authenticated = false { didSet { if authenticated { reloadUsage() } } }
+    var authenticated = false { didSet { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() } } }
     var revealed: SecretBytes?
     var busy = false
     private(set) var localOperation = false
@@ -143,6 +163,7 @@ final class AppModel {
     private static let logger = Logger(subsystem: "com.koehn.mop", category: "App")
     var errorDetails: String?
     var developerDiagnosticsEnabled: Bool { defaults.bool(forKey: DeveloperPreferences.key) }
+    var cloudConnectionRepairEnabled: Bool { defaults.bool(forKey: "icloud-connection-repair-enabled") }
     var error: String? {
         didSet {
             errorDetails = nil
@@ -188,7 +209,7 @@ final class AppModel {
     var deleteConfirmation = false
     var documentRequest: DocumentRequest?
     private var generation = 0
-    private var visibilityGeneration = 0
+    private(set) var visibilityGeneration = 0
     @ObservationIgnored private let lifecycle: any AppLifecycleMonitoring
     private var concealTask: Task<Void, Never>?
 
@@ -246,6 +267,11 @@ final class AppModel {
     private var lastActivity: TimeInterval?
     private var launchUnlockAvailable = true
     private var accessNeedsRepair = false
+    private var connectionRepairMessage: String {
+        cloudConnectionRepairEnabled
+            ? "This device could not verify its saved vault connection. Choose Repair iCloud Connection on the unlock screen to connect again using another authorized device, or use your offline recovery copy."
+            : "This device could not verify its saved vault connection. Repair access from another authorized device or use your offline recovery copy."
+    }
     enum LockReason: Equatable { case initial, manual, timeout, system, accessFailure }
     enum SessionState: Equatable { case locked(LockReason), unlocking, unlocked, needsRepair }
     private var lockReason = LockReason.initial
@@ -259,7 +285,7 @@ final class AppModel {
     var sessionStatus: String {
         if unlocking { return "Unlocking 2ndPass…" }
         if authenticated || !hasConnectedVaults { return status }
-        if accessNeedsRepair { return "Access needs attention — choose Unlock to retry after repairing access." }
+        if accessNeedsRepair { return "Vault access needs repair. Connect again using another authorized device or your offline recovery copy." }
         return lockReason == .timeout ? "Locked after inactivity" : "Locked"
     }
     var canUnlock: Bool { !authenticated && !busy && hasConnectedVaults && !deviceRemoved }
@@ -274,7 +300,12 @@ final class AppModel {
     private var needsAccountDiscovery = false
     @ObservationIgnored private var automaticUnlockTask: Task<Void, Never>?
     var editorGeneration = 0
-    var itemDraft: ItemDraft?
+    var itemDraft: ItemDraft? {
+        didSet {
+            if itemDraft != nil { healthTask?.cancel(); healthToken = UUID(); healthChecking = false }
+            else if oldValue != nil { refreshHealth() }
+        }
+    }
     var passwordGeneratorOptions = PasswordOptions() {
         didSet {
             if let data = try? JSONEncoder().encode(passwordGeneratorOptions) {
@@ -291,7 +322,7 @@ final class AppModel {
         }
     }
 
-    init(service: any VaultService = NativeVaultService(), clipboard: (any SecretClipboardAccess)? = nil,
+    init(breachClient: any BreachChecking = PwnedPasswordsClient(), service: any VaultService = NativeVaultService(), clipboard: (any SecretClipboardAccess)? = nil,
          defaults: UserDefaults = .standard, lifecycle: (any AppLifecycleMonitoring)? = nil,
          documents: any DocumentAccessing = SystemDocumentAccess(),
          usageStore: any ItemUsageStoring = ItemUsageStore(),
@@ -299,6 +330,7 @@ final class AppModel {
          automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init,
          localService: (any LocalVaultServing)? = nil,
          authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { try await LocalAuthorization.authorizeAsync(reason: $0, ids: $1, purposes: $2, operations: $3) }) {
+        self.breachClient = breachClient
         self.localService = localService
         self.authorizeLocal = authorizeLocal
         self.lifecycle = lifecycle ?? SystemAppLifecycleMonitor()
@@ -308,6 +340,7 @@ final class AppModel {
         self.documents = documents
         self.clipboard = clipboard ?? SecretClipboard()
         self.defaults = defaults; self.now = now
+        breachChecksEnabled = defaults.object(forKey: "breachChecksEnabled") as? Bool ?? true
         settingsCategory = SettingsCategory(rawValue: defaults.string(forKey: "settingsCategory") ?? "") ?? .security
         let saved = defaults.object(forKey: "autoLockMinutes") as? Int ?? 5
         autoLockMinutes = min(60, max(1, saved))
@@ -643,9 +676,16 @@ final class AppModel {
         saveItemDraft()
     }
     var sidebarSelection: String {
-        get { collection.sidebarID }
+        get { securityVisible ? "security" : collection.sidebarID }
         set {
             guard newValue != sidebarSelection else { return }
+            if newValue == "security" {
+                guard itemDraft == nil else { return }
+                conceal(); selectedItem = nil; selected = nil; selectedLocalIdentityID = nil
+                vaultDetailsTarget = nil
+                securityVisible = true; openLocalVault(); refreshHealth(); return
+            }
+            securityVisible = false
             if newValue == "passkeys" || newValue == "ssh-keys" {
                 chooseCredentials(newValue == "passkeys" ? .passkeys : .sshKeys)
             }
@@ -695,6 +735,7 @@ final class AppModel {
             do {
                 localIdentities = try localStore().list()
                 localReady = true
+                reconcileLocalCredentialEvidence()
             } catch {
                 localError = (error as? MopError)?.errorDescription ?? "Could not read the device-local vault."
             }
@@ -761,6 +802,8 @@ final class AppModel {
                 try Task.checkCancellation()
                 try localStore().delete(id: id, authorization: context)
                 localIdentities = try localStore().list()
+                localReady = true
+                reconcileLocalCredentialEvidence()
                 localError = nil
             } catch {
                 localError = "Could not delete the identity."
@@ -967,6 +1010,7 @@ final class AppModel {
         enrollmentGeneration += 1; enrollmentTask?.cancel(); enrollmentTask = nil; enrollmentWorking = false
         for id in submittedEnrollments { enrollmentProgress[id, default: EnrollmentProgress()].phase = .paused }
         securityGeneration += 1
+        clearHealth(); pendingSecurityUpgrade = nil
         usageLoadTask?.cancel(); usageLoadGeneration += 1; lastUsed = [:]
         search = ""; searchHighlighted = nil; searchIsFocused = false; lastBackupURL = nil
         lockReason = reason; unlocking = false; launchUnlockAvailable = false
@@ -1086,7 +1130,7 @@ final class AppModel {
                     // Framework errors may contain arbitrary diagnostics. Only
                     // domain errors have user-safe messages.
                     if error as? MopError == .vaultUntrusted {
-                        self.error = "Vault trust could not be verified. Automatic unlocking is paused. Repair access from an authorized owner device or use your offline recovery copy. Older vault formats are unsupported."
+                        self.error = self.connectionRepairMessage
                     } else {
                         self.error = (error as? MopError)?.errorDescription ?? (error as? ImportFailure)?.errorDescription ?? (error as? AttachmentFailure)?.errorDescription ?? (error as? CompoundFieldFailure)?.errorDescription ?? "The operation could not be completed."
                     }
@@ -1264,8 +1308,9 @@ final class AppModel {
                         }
                         if let failure = error as? MopError,
                            [.authentication, .cloudAccount, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember].contains(failure) {
+                            if failure != .authentication { self.accessNeedsRepair = true }
                             self.lock(reason: .accessFailure)
-                            self.error = failure.errorDescription
+                            self.error = failure == .vaultUntrusted ? self.connectionRepairMessage : failure.errorDescription
                             group.cancelAll(); return
                         }
                         if error as? MopError == .vaultMissing {
@@ -1445,13 +1490,22 @@ final class AppModel {
         sheetRequest = SheetRequest(kind: .recover, inSettings: inSettings, target: nil)
         if pending { error = "The device reset needs to finish local cleanup. Restart 2ndPass before continuing recovery." }
     }
+    func resetCloudAccess() {
+        guard cloudConnectionRepairEnabled, sessionState == .needsRepair, !busy, !enrollmentWorking else { return }
+        perform { _ in
+            _ = try await self.service.execute(.manage(.resetCloudAccess), vault: nil, offline: false)
+        }
+    }
     func reconnectDevice() {
         perform { token in
             _ = try await self.service.execute(.manage(.reconnect), vault: nil, offline: false)
             guard self.current(token) else { return }
             self.deviceRemoved = false; self.removalCleanupPending = false; self.enrollmentPaused = false
+            self.accessNeedsRepair = false
             self.launchUnlockAvailable = false
             let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
+            guard self.current(token) else { return }
+            self.offline = discovery.usingCache
             self.vaults = discovery.vaults
             self.sheet = .enrollDevice
             self.enrollmentStatus = "Ready to connect."
@@ -1567,7 +1621,9 @@ final class AppModel {
             return true
         }
         guard !ids.isEmpty else { enrollmentStatus = "Choose at least one vault to connect."; return }
-        guard !offline else {
+        // Cached catalogs are not proof of current network reachability.
+        // Explicit Connect/Retry must let the cloud request determine availability.
+        guard !offline || !automatic else {
             for id in ids { updateEnrollmentProgress(id, owner: owner) { $0.phase = .offline } }
             enrollmentStatus = "Offline. Reconnect to iCloud, then retry."; return
         }
@@ -1675,7 +1731,6 @@ final class AppModel {
     func cancelCloudEnrollment(_ id: String? = nil) { changeCloudEnrollment(id: id, restart: false) }
     private func changeCloudEnrollment(id: String?, restart: Bool) {
         guard !busy, !enrollmentWorking, let id = id ?? enrollmentVault else { return }
-        guard !offline else { enrollmentProgress[id, default: EnrollmentProgress()].phase = .offline; return }
         enrollmentWorking = true
         enrollmentProgress[id, default: EnrollmentProgress()].phase = .contacting
         let token = enrollmentGeneration
@@ -1792,8 +1847,9 @@ final class AppModel {
                 }
                 if let failure = error as? MopError,
                    [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(failure) {
-                    lock()
-                    self.error = failure.errorDescription
+                    if failure != .authentication { accessNeedsRepair = true }
+                    lock(reason: .accessFailure)
+                    self.error = failure == .vaultUntrusted ? self.connectionRepairMessage : failure.errorDescription
                 } else {
                     cloudRefreshPending = true
                 }
@@ -1861,6 +1917,7 @@ final class AppModel {
     func chooseExportBackup(target: VaultDescriptor? = nil) {
         guard !busy, let target = target ?? selectedVaultDescriptor, target.enrolled else { return }
         guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.export) ?? ""; return }
+        pendingSecurityUpgrade = nil
         documentRequest = DocumentRequest(vault: target.id, generation: securityGeneration)
     }
     func completeBackupSelection(folder: URL, request: DocumentRequest) {
@@ -1873,7 +1930,16 @@ final class AppModel {
     func exportBackup(to url: URL, vaultID: String? = nil) {
         guard !busy, let id = vaultID ?? selectedVault, vaults.contains(where: { $0.id == id && $0.enrolled }) else { return }
         perform { token in
-            _ = try await self.service.execute(.export(url), vault: id, offline: false)
+            let operation: VaultOperation
+            if let upgrade = self.pendingSecurityUpgrade, upgrade.0 == id {
+                operation = .upgradeSecurity(backup: url, revision: upgrade.1)
+            } else { operation = .export(url) }
+            self.pendingSecurityUpgrade = nil
+            let result = try await self.service.execute(operation, vault: id, offline: false)
+            if self.current(token), let updated = result.catalog {
+                self.catalogs[id] = updated
+                if self.vault == id { try self.applyCatalog(updated) }
+            }
             guard self.current(token) else { return }
             self.lastBackupURL = url; self.lastBackupVaultID = id
             self.notice = "Encrypted backup exported. Keep your offline recovery copy separately."

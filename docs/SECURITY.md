@@ -457,6 +457,20 @@ previous observations. These checkpoints are private local files, not a hardware
 monotonic counter; an attacker able to replace the trusted local state is outside
 this rollback guarantee.
 
+The locked-screen repair and recovery controls are behind the local
+`icloud-connection-repair-enabled` UserDefaults flag, which defaults to off.
+Enable them with the Xcode launch arguments `-icloud-connection-repair-enabled YES`.
+When enabled, after a vault trust failure the locked app offers an explicit iCloud
+connection reset with confirmation and local authentication. This clears the current
+account's device key, cached checkpoints, and enrollment requests using the same
+durable barrier and drained cleanup as device removal. It does not modify cloud
+vaults or membership, local-only vaults, or exported backups. Unsynchronized
+cached changes can be lost. Reconnection uses a fresh device key and requires
+normal enrollment approval; discovery alone never restores trust. An interrupted
+offline recovery blocks reset so its pending key is retained. Reset also discards
+this device's previous rollback observations, so users should first verify access
+on another authorized device.
+
 Content-addressed CloudKit assets are treated as immutable by the client. Head
 updates use `ifServerRecordUnchanged` and actual server change tags, so competing
 writes conflict instead of silently overwriting each other. 2ndPass does not
@@ -733,3 +747,11 @@ and member reads use the existing vault permission boundary. Recovery and
 revocation have the same limitations as other cloud secrets. Hardware keys remain
 non-exportable and never enter this format. See [supported cloud keys and
 validation limits](CLOUD-KEY-CREDENTIALS.md).
+
+## Password health and retained secrets
+
+See [security health and history](SECURITY-HEALTH.md) for the HIBP hash-prefix
+disclosure, encrypted health-result caching in iCloud, session-only reuse fingerprints, user-confirmed credential-registration
+evidence, and required-feature v7 compatibility break. Previous password/token
+values share the item’s encryption and membership/recovery permissions. Clearing
+live history cannot erase earlier encrypted revisions, backups, or copied secrets.

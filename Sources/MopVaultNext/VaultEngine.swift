@@ -9,9 +9,9 @@ public enum VaultEngine {
     public static func create(name: String, owner: any DeviceOperations, recovery: DevicePublicKey? = nil, id: UUID = UUID()) throws -> VerifiedVault {
         try CloudVaultBoundary.validateName(name)
         let membership = try Membership(accounts: [AccountMember(id: owner.identity.member, role: .owner, devices: [owner.identity])], offlineRecovery: recovery)
-        let header = Revision.Header(format: "mop-vault-v7", vault: id, name: name, generation: 1, parent: nil,
+        let header = Revision.Header(requiredFeatures: ["credential-redundancy-1", "secret-history-1"], format: "mop-vault-v7", vault: id, name: name, generation: 1, parent: nil,
                                      epoch: 1, membership: membership, operation: .create, acceptedInvitations: [])
-        let revision = try Revision.seal(header: header, references: [:], records: [:], signer: owner)
+        let revision = try Revision.seal(header: header, references: [:], records: [:], security: VaultSecurityMetadata(), signer: owner)
         try revision.verifyGenesis()
         return try VerifiedVault(revision: revision, bytes: revision.encoded())
     }
@@ -44,20 +44,29 @@ public enum VaultEngine {
         guard !reference.isEmpty, reference.utf8.count <= 4096 else { throw MopError.invalidReference }
         let role = vault.membership.role(of: device.identity)
         guard role == .owner || role == .editor else { throw MopError.cloudPermission }
-        let payload = try vault.revision.payload(device: device)
+        var payload = try vault.revision.payload(device: device)
         var references = payload.references
         var keys = vault.revision.itemKeys
         let name = try SecretReference(vault: vault.name, relativePath: reference).item
         let itemID = try references.first { try SecretReference(vault: vault.name, relativePath: $0.key).item == name }.flatMap { vault.revision.records[$0.value]?.itemID } ?? UUID().uuidString
         var records = vault.revision.records
-        if let old = references.removeValue(forKey: reference) { records.removeValue(forKey: old) }
+        let existingKey = try value == nil ? nil : keys[itemID]?.unwrap(vault: vault.id, item: itemID, device: device)
+        if let old = references.removeValue(forKey: reference) {
+            let ref = try SecretReference(vault: vault.name, relativePath: reference)
+            let path = [ref.section, ref.field].compactMap { $0 }.map(SecretReference.encode).joined(separator: "/")
+            let type = payload.items.first { $0.name == name }?.fields.first { $0.path == path }?.type ?? .concealed
+            if let value, [.password, .concealed].contains(type) {
+                try retainPrevious(old, replacement: Data(value), itemID: itemID, path: path, payload: &payload, records: &records, vault: vault, device: device, at: date, key: existingKey)
+            }
+            if !(payload.security?.histories.contains { $0.entries.contains { $0.id == old } } ?? false) { records.removeValue(forKey: old) }
+        }
         else if value == nil { throw MopError.notFound }
         if let value {
             let id = UUID().uuidString
             var bytes = Data(value)
             defer { SecretBytes.wipe(&bytes) }
             let key: SymmetricKey
-            if let old = keys[itemID] { key = try old.unwrap(vault: vault.id, item: itemID, device: device) }
+            if let existingKey { key = existingKey }
             else {
                 key = SymmetricKey(size: .bits256)
                 keys[itemID] = try ItemKey.wrap(key, vault: vault.id, item: itemID, generation: 1, recipients: vault.membership.recipients)
@@ -89,7 +98,7 @@ public enum VaultEngine {
             }
             if items[item].fields.isEmpty { items.remove(at: item) }
         }
-        let revision = try Revision.seal(header: header(vault, operation: .content), references: references, records: records, itemKeys: keys, items: items, signer: device)
+        let revision = try Revision.seal(header: header(vault, operation: .content), references: references, records: records, itemKeys: keys, items: items, security: payload.security, signer: device)
         return try vault.applying(revision)
     }
     public static func invite(member: UUID, role: MemberRole, to vault: VerifiedVault, owner: any DeviceOperations,
@@ -167,7 +176,15 @@ public enum VaultEngine {
                                operation: RevisionOperation, invitations: [UUID]? = nil,
                                progress: ((Int, Int) throws -> Void)? = nil) throws -> VerifiedVault {
         let header = try header(vault, operation: operation, membership: membership, invitations: invitations)
-        let payload = try vault.revision.payload(device: signer)
+        var payload = try vault.revision.payload(device: signer)
+        let removedDeviceIDs = Set(vault.membership.devices.map { $0.device.uuidString }).subtracting(membership.devices.map { $0.device.uuidString })
+        if payload.security != nil {
+            for a in payload.security!.accounts.indices {
+                for r in payload.security!.accounts[a].registrations.indices where removedDeviceIDs.contains(payload.security!.accounts[a].registrations[r].deviceID) {
+                    payload.security!.accounts[a].registrations[r].state = .removed
+                }
+            }
+        }
         let removed = Set(vault.membership.recipients.map(\.fingerprint)).subtracting(membership.recipients.map(\.fingerprint))
         let added = membership.recipients.filter { recipient in !vault.membership.recipients.contains { $0.fingerprint == recipient.fingerprint } }
         let rotate = !removed.isEmpty || operation == .recovery
@@ -189,7 +206,11 @@ public enum VaultEngine {
                     defer { SecretBytes.wipe(&bytes) }
                     let id = UUID().uuidString
                     records[id] = try SealedObject.field(bytes, key: key, vault: vault.id, item: item, generation: generation, id: id)
-                    references[paths[oldID]!] = id
+                    if let path = paths[oldID] { references[path] = id }
+                    else if let h = payload.security?.histories.firstIndex(where: { $0.entries.contains { $0.id == oldID } }),
+                            let e = payload.security?.histories[h].entries.firstIndex(where: { $0.id == oldID }) {
+                        payload.security?.histories[h].entries[e].id = id
+                    } else { throw MopError.invalidVault }
                 }
             } else if !added.isEmpty {
                 let key = try old.unwrap(vault: vault.id, item: item, device: signer)
@@ -199,7 +220,7 @@ public enum VaultEngine {
             completed += 1
             try progress?(completed, keys.count)
         }
-        let revision = try Revision.seal(header: header, references: references, records: records, itemKeys: keys, items: payload.items, signer: signer)
+        let revision = try Revision.seal(header: header, references: references, records: records, itemKeys: keys, items: payload.items, security: payload.security, signer: signer)
         return try vault.applying(revision)
     }
 
