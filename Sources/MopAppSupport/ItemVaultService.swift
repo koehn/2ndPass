@@ -16,6 +16,7 @@ public protocol ItemVaultServiceBackend: Sendable {
     func inventory(offline: Bool) async throws -> [VaultDescriptor]
     func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession
     func requestSync() async throws
+    func conflictAdapter() async throws -> CloudKitSyncAdapter
     func waitForDelivery(_ mutationIDs: [UUID], timeout: Duration) async throws -> Bool
     func creationMutations(_ vaultID: UUID) async throws -> [UUID]
     func lock()
@@ -24,6 +25,7 @@ public protocol ItemVaultServiceBackend: Sendable {
     func resolveVault(named name: String, offline: Bool) async throws -> UUID?
 }
 public extension ItemVaultServiceBackend {
+    func conflictAdapter() async throws -> CloudKitSyncAdapter { throw ItemVaultServiceFailure.unavailable }
     func discover() async throws -> ItemVaultDiscovery { try await ItemVaultDiscovery(vaults: inventory(), complete: true) }
     func invalidateDiscovery() {}
     func enrollment(_ action: VaultManagement, vaultID: UUID) async throws -> VaultResult { throw ItemVaultServiceFailure.unavailable }
@@ -148,6 +150,42 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         state.withLock { value in if value.generation == token, value.authenticated == nil { value.authenticated = ProcessInfo.processInfo.systemUptime } }
         return session
     }
+    public func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] {
+        let token = sessionGeneration
+        guard let id = UUID(uuidString: vault), let session = await backend.existing(id), session.isUnlocked else { return [] }
+        let previews = try await session.conflictPreviews()
+        try checked(token)
+        return previews
+    }
+
+    public func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes {
+        let token = sessionGeneration
+        guard let session = await backend.existing(preview.conflict.local.scope.vaultID), session.isUnlocked else { throw MopError.authentication }
+        let catalog = side == .local ? preview.local : preview.remote
+        guard let record = catalog.references[SecretReference.encode(catalog.item.name) + "/" + path] else { throw MopError.notFound }
+        let value = try await session.revealConflict(preview.conflict, side: side, recordID: record)
+        try checked(token)
+        return value
+    }
+
+    public func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws {
+        let token = sessionGeneration
+        guard let session = await backend.existing(preview.conflict.local.scope.vaultID), session.isUnlocked else { throw MopError.authentication }
+        let adapter = try await backend.conflictAdapter()
+        try checked(token)
+        switch choice {
+        case .remote:
+            _ = try await session.resolveConflictUsingRemote(preview.conflict, coordinator: adapter)
+        case .local:
+            _ = try await session.resolveConflict(preview.conflict, catalog: preview.local, coordinator: adapter)
+        case .combine(let metadata, let fields):
+            let patch = try await session.combinedConflict(preview.conflict, metadata: metadata, fields: fields)
+            _ = try await session.resolveConflict(preview.conflict, catalog: patch.catalog,
+                changedRecords: patch.changedRecords, removedRecords: patch.removedRecords, coordinator: adapter)
+        }
+        try checked(token)
+    }
+
     public func cachedCatalog(vault: String) async throws -> VaultResult? {
         try CloudVaultBoundary.requireCloud(vault)
         guard authenticatedAt != nil else { return nil }

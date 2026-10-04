@@ -6,6 +6,7 @@ struct RecentlyDeletedList: View {
         VStack(spacing: 0) {
             ItemSearchBar(model: model)
             SearchSummary(model: model)
+            ItemConflictInbox(model: model)
             if model.authenticated {
                 List(model.deletedRows, selection: $model.deletedListSelection) { row in
                     NavigationLink(value: row.id) { VStack(alignment: .leading, spacing: 4) {
@@ -36,6 +37,7 @@ struct RecentlyDeletedDetail: View {
             VStack(alignment: .leading, spacing: 16) {
                 Label(row.vaultName + " › Recently Deleted", systemImage: "trash").foregroundStyle(.secondary)
                 Text(deletion.originalName).font(.title2).fontWeight(.semibold)
+                ItemConflictBanner(model: model, item: row.id)
                 ItemDatesView(item: row.item, lastUsed: model.lastUsedDate(for: row.item, vaultID: row.id.vault))
                 Text("Deleted " + deletion.deletedAt.formatted(date: .abbreviated, time: .shortened))
                 Text("Expires " + deletion.expiresAt.formatted(date: .abbreviated, time: .shortened))

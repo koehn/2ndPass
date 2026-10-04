@@ -308,6 +308,11 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
         baseVersionID: nil, ciphertext: try remoteEnvelope.encoded())
     let conflict = try await repository.recordConflict(remote: remote, serverSystemFields: Data([1]))
     let preview = try await session.conflictPreview(conflict)
+    #expect(preview.local.editOrigin != nil)
+    #expect(preview.remote.editOrigin == nil) // Existing envelopes remain readable.
+    #expect(preview.localDeviceName == preview.remoteDeviceName) // Same known author.
+    #expect(preview.localUpdatedAt != nil)
+    #expect(preview.remoteUpdatedAt == nil) // Never fabricate a time for older items.
     #expect(preview.local.item.fields.allSatisfy { $0.value == nil })
     #expect(preview.remote.item.fields.allSatisfy { $0.value == nil })
     #expect(try await session.revealConflict(conflict, side: .local, recordID: recordID) == SecretBytes(utf8: "session-secret"))

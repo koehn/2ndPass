@@ -4,7 +4,9 @@ import MopLocalIdentity
 import Synchronization
 import Testing
 import MopCore
-import MopAppSupport
+@testable import MopAppSupport
+@testable import MopSync
+import MopVaultNext
 @testable import MopUI
 
 struct TestBreachClient: BreachChecking {
@@ -26,6 +28,8 @@ private final class FakeService: VaultService, Sendable {
         var syncFails = false
         var displayCalls = 0
         var exactReadIDs: [String?] = []
+        var conflicts: [ItemVaultConflictPreview] = []
+        var conflictCalls = 0
     }
     let state = Mutex(State())
     let handler: @Sendable (VaultOperation, String?, Bool) async throws -> VaultResult
@@ -49,6 +53,12 @@ private final class FakeService: VaultService, Sendable {
     func requestSynchronization() async throws {
         let fail = state.withLock { $0.syncRequests += 1; return $0.syncFails }
         if fail { throw MopError.cloudUnavailable }
+    }
+    func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] {
+        state.withLock { state in
+            state.conflictCalls += 1
+            return state.conflicts.filter { $0.conflict.local.scope.vaultID.uuidString == vault }
+        }
     }
     func cachedCatalog(vault: String) async throws -> VaultResult? { try await cachedHandler(vault) }
 
@@ -89,6 +99,56 @@ private actor Barrier {
         model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)]
         return model
     }
+    @Test func conflictAppearsWithoutMountingListAndUpdatesWhileEditing() async throws {
+        let service = FakeService()
+        let app = model(service)
+        let vault = try #require(UUID(uuidString: app.vault))
+        let scope = ItemScope(account: "test", vaultID: vault, itemID: UUID())
+        let local = EncryptedItemVersion(scope: scope, baseVersionID: nil, ciphertext: Data([1]))
+        let remote = EncryptedItemVersion(scope: scope, baseVersionID: nil, ciphertext: Data([2]))
+        let conflict = EncryptedItemConflict(id: UUID(), local: local, remote: remote, serverSystemFields: Data([3]))
+        let item = VaultItem(name: "login", fields: [ItemField(path: "password", type: .password)])
+        let catalog = ItemEnvelopeCatalog(item: item, references: [:])
+        let preview = ItemVaultConflictPreview(conflict: conflict, local: catalog, remote: catalog)
+        service.state.withLock { $0.conflicts = [preview] }
+        service.authenticate()
+        app.catalogs = [app.vault: ItemCatalog(vault: "personal", revision: "same", items: [item])]
+        app.authenticated = true
+        // No SwiftUI view exists: loading must not depend on a nonempty list.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while app.conflictPreviews.isEmpty || service.observerCount == 0 {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        let row = ItemRow.ID(vault: app.vault, name: "login")
+        #expect(app.conflictItems.contains(row))
+        app.reviewConflict(row)
+        #expect(app.conflictReviewPresented && app.conflictReviewItem == row)
+        app.busy = true // Catalog refresh may be deferred; conflict state must not be.
+        service.state.withLock { $0.conflicts = [] }
+        service.notifyChange()
+        while !app.conflictPreviews.isEmpty {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        #expect(app.conflictItems.isEmpty)
+        service.state.withLock { $0.conflicts = [preview] }
+        service.notifyChange()
+        while app.conflictPreviews.isEmpty {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        app.deactivate()
+        #expect(app.conflictPreviews.isEmpty && !app.conflictReviewPresented)
+        app.isActive = true
+        while app.conflictPreviews.isEmpty {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        app.lock(clearClipboard: false)
+        #expect(app.conflictItems.isEmpty && !app.conflictReviewPresented)
+    }
+
     @Test func editWithExpiredNativeAuthorizationLocksAndOffersFreshUnlock() async throws {
         let service = FakeService { operation, _, _ in
             if case .read = operation {

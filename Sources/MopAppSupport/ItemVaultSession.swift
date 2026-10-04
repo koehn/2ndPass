@@ -1,4 +1,7 @@
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 import Synchronization
 import MopCore
 import MopAuth
@@ -38,12 +41,18 @@ public struct PreparedDeviceAdmission: Sendable {
     public let versions: [EncryptedItemVersion]
 }
 
-public enum ItemVaultConflictSide: Sendable { case local, remote }
+public enum ItemVaultConflictSide: String, Hashable, Sendable { case local, remote }
 
 public struct ItemVaultConflictPreview: Sendable {
     public let conflict: EncryptedItemConflict
     public let local: ItemEnvelopeCatalog
     public let remote: ItemEnvelopeCatalog
+    public var localAuthorName: String? = nil
+    public var remoteAuthorName: String? = nil
+    public var localDeviceName: String { local.editOrigin?.deviceName ?? localAuthorName ?? "Device name unavailable (local version)" }
+    public var remoteDeviceName: String { remote.editOrigin?.deviceName ?? remoteAuthorName ?? "Device name unavailable (cloud version)" }
+    public var localUpdatedAt: Date? { local.editOrigin?.updatedAt ?? local.item.metadata?.updatedAt }
+    public var remoteUpdatedAt: Date? { remote.editOrigin?.updatedAt ?? remote.item.metadata?.updatedAt }
 }
 
 public struct ItemVaultDisplayBatch: Sendable {
@@ -598,6 +607,14 @@ public final class ItemVaultSession: @unchecked Sendable {
         }
     }
 
+    private static func editingDeviceName() async -> String {
+        #if os(iOS)
+        return await MainActor.run { UIDevice.current.name }
+        #else
+        return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        #endif
+    }
+
     public func save(_ item: PortableVaultArchive, expectedBase: UUID?) async throws -> PendingItemMutation {
         try permit.check()
         try item.validate()
@@ -605,10 +622,12 @@ public final class ItemVaultSession: @unchecked Sendable {
               let itemID = item.itemIDs[itemName].flatMap(UUID.init(uuidString:)),
               itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
         let previous = try await repository.item(binding.item(itemID))
+        let deviceName = await Self.editingDeviceName()
         let version = try permit.withDevice { device in
             let generation = try nextGeneration(previous, expectedBase: expectedBase)
             let envelope = try ItemEnvelope.seal(item, vault: binding.vaultID, generation: generation, base: expectedBase,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
+                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device,
+                editOrigin: ItemEditOrigin(deviceID: device.identity.device, deviceName: deviceName, updatedAt: Date()))
             guard envelope.header.item != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
             return try EncryptedItemVersion(scope: binding.item(envelope.header.item), versionID: envelope.header.version,
                 baseVersionID: expectedBase, ciphertext: envelope.encoded(), generation: generation)
@@ -623,9 +642,12 @@ public final class ItemVaultSession: @unchecked Sendable {
         try permit.check()
         guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
         let stored = try await repository.item(binding.item(itemID))
+        let deviceName = await Self.editingDeviceName()
         let version = try permit.withDevice { device in
             guard let stored, stored.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
             let current = try envelope(stored)
+            var catalog = catalog
+            catalog.editOrigin = ItemEditOrigin(deviceID: device.identity.device, deviceName: deviceName, updatedAt: Date())
             let changed = try current.edit(catalog: catalog, changedRecords: changedRecords, removedRecords: removedRecords,
                 membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
             return try EncryptedItemVersion(scope: stored.scope, versionID: changed.header.version,
@@ -639,13 +661,16 @@ public final class ItemVaultSession: @unchecked Sendable {
         try permit.check()
         guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
         let stored = try await repository.item(binding.item(itemID))
+        let deviceName = await Self.editingDeviceName()
         let version = try permit.withDevice { device in
             guard let stored, stored.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
             let current = try envelope(stored)
             guard current.header.membership == currentDigest else { throw ItemEnvelopeFailure.rekeyRequired }
             let catalog = try current.catalog(device: device, membership: history.current.membership, membershipStateDigest: currentDigest)
             let patch = try catalog.replacingField(path, value: value, itemID: itemID, at: date)
-            let changed = try current.edit(catalog: patch.catalog, changedRecords: patch.changedRecords, removedRecords: patch.removedRecords,
+            var editedCatalog = patch.catalog
+            editedCatalog.editOrigin = ItemEditOrigin(deviceID: device.identity.device, deviceName: deviceName, updatedAt: date)
+            let changed = try current.edit(catalog: editedCatalog, changedRecords: patch.changedRecords, removedRecords: patch.removedRecords,
                 membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
             return try EncryptedItemVersion(scope: stored.scope, versionID: changed.header.version,
                 baseVersionID: expectedBase, ciphertext: changed.encoded(), generation: changed.header.generation)
@@ -672,10 +697,63 @@ public final class ItemVaultSession: @unchecked Sendable {
         return try await repository.commitLocalMutation(version, authorization: permit)
     }
 
+    public func conflictPreviews() async throws -> [ItemVaultConflictPreview] {
+        try permit.check()
+        let conflicts = try await repository.conflicts(account: binding.account)
+        var result: [ItemVaultConflictPreview] = []
+        for conflict in conflicts where binding.contains(conflict.local.scope) && conflict.local.scope.itemID != Self.metadataRecordID {
+            result.append(try await conflictPreview(conflict))
+        }
+        return result
+    }
+
+    /// Field choices include absence on either side, allowing explicit deletion.
+    /// Remote records get fresh IDs and are re-encrypted with the local item key.
+    public func combinedConflict(_ expected: EncryptedItemConflict, metadata: ItemVaultConflictSide,
+                                 fields: [String: ItemVaultConflictSide]) async throws -> ItemEnvelopePatch {
+        let preview = try await conflictPreview(expected)
+        let paths = Set(preview.local.item.fields.map(\.path)).union(preview.remote.item.fields.map(\.path))
+        guard Set(fields.keys) == paths else { throw MopError.invalidVault }
+        var catalog = metadata == .local ? preview.local : preview.remote
+        catalog.item.fields = []; catalog.references = [:]; catalog.histories = []; catalog.projectedValuePaths = []
+        var changed: [String: SecretBytes] = [:]
+        let ordered = preview.local.item.fields.map(\.path) + preview.remote.item.fields.map(\.path).filter { path in
+            !preview.local.item.fields.contains { $0.path == path }
+        }
+        for path in ordered {
+            let side = fields[path]!
+            let source = side == .local ? preview.local : preview.remote
+            guard let field = source.item.fields.first(where: { $0.path == path }) else { continue }
+            catalog.item.fields.append(field)
+            let sourceReference = SecretReference.encode(source.item.name) + "/" + path
+            guard let record = source.references[sourceReference] else { throw MopError.invalidVault }
+            func copied(_ id: String) async throws -> String {
+                if side == .local { return id }
+                let fresh = UUID().uuidString
+                changed[fresh] = try await revealConflict(expected, side: .remote, recordID: id)
+                return fresh
+            }
+            catalog.references[SecretReference.encode(catalog.item.name) + "/" + path] = try await copied(record)
+            if var history = source.histories.first(where: { $0.path == path }) {
+                for index in history.entries.indices {
+                    let entry = history.entries[index]
+                    history.entries[index] = SecretHistoryEntry(id: try await copied(entry.id), replacedAt: entry.replacedAt)
+                }
+                catalog.histories.append(history)
+            }
+            if source.projectedValuePaths.contains(path) { catalog.projectedValuePaths.append(path) }
+        }
+        let old = Set(preview.local.references.values).union(preview.local.histories.flatMap { $0.entries.map(\.id) })
+        let retained = Set(catalog.references.values).union(catalog.histories.flatMap { $0.entries.map(\.id) })
+        try catalog.validate(itemID: expected.local.scope.itemID, recordIDs: retained)
+        return ItemEnvelopePatch(catalog: catalog, changedRecords: changed, removedRecords: old.subtracting(retained))
+    }
+
     public func conflictPreview(_ expected: EncryptedItemConflict) async throws -> ItemVaultConflictPreview {
         try permit.check()
         try validateConflictScope(expected)
         let live = try await repository.reviewedConflict(expected)
+        let deviceName = await Self.editingDeviceName()
         return try permit.withDevice { device in
             guard live == expected else { throw ItemRepositoryError.staleConflict }
             let local = try envelope(expected.local), remote = try envelope(expected.remote)
@@ -683,7 +761,9 @@ public final class ItemVaultSession: @unchecked Sendable {
             let remoteState = try history.state(forDigest: remote.header.membership)
             return try ItemVaultConflictPreview(conflict: expected,
                 local: local.catalog(device: device, membership: localState.membership, membershipStateDigest: local.header.membership),
-                remote: remote.catalog(device: device, membership: remoteState.membership, membershipStateDigest: remote.header.membership))
+                remote: remote.catalog(device: device, membership: remoteState.membership, membershipStateDigest: remote.header.membership),
+                localAuthorName: local.header.author == device.identity.fingerprint ? deviceName : nil,
+                remoteAuthorName: remote.header.author == device.identity.fingerprint ? deviceName : nil)
         }
     }
 
@@ -909,4 +989,9 @@ private final class ItemVaultAuthority: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return try body(&valid)
     }
+}
+
+public enum ItemConflictChoice: Sendable {
+    case local, remote
+    case combine(metadata: ItemVaultConflictSide, fields: [String: ItemVaultConflictSide])
 }

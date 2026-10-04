@@ -524,6 +524,10 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             return session
         }
     }
+    public func conflictAdapter() async throws -> CloudKitSyncAdapter {
+        guard let context = state.withLock({ $0.context }) else { throw MopError.authentication }
+        return try await context.runtime.cloudAdapter()
+    }
     public func requestSync() async throws {
         try Task.checkCancellation()
         let context = try await serialized { [self] in

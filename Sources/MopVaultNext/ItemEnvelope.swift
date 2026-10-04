@@ -67,7 +67,7 @@ public struct ItemEnvelope: Codable, Equatable, Sendable {
 
     public static func seal(_ archive: PortableVaultArchive, vault: UUID, generation: UInt64, version: UUID = UUID(),
                             base: UUID? = nil, membership: Membership, membershipStateDigest: String,
-                            signer: any DeviceOperations) throws -> Self {
+                            signer: any DeviceOperations, editOrigin: ItemEditOrigin? = nil) throws -> Self {
         try archive.validate()
         try membership.validate()
         guard Codec.hash(membershipStateDigest), archive.items.count == 1, let item = archive.items.first,
@@ -83,7 +83,7 @@ public struct ItemEnvelope: Codable, Equatable, Sendable {
         let projectedValuePaths = item.fields.filter { $0.value != nil }.map(\.path)
         for index in projection.fields.indices { projection.fields[index].value = nil }
         let catalog = ItemEnvelopeCatalog(item: projection, references: archive.references,
-            histories: archive.security?.histories ?? [], projectedValuePaths: projectedValuePaths)
+            histories: archive.security?.histories ?? [], projectedValuePaths: projectedValuePaths, editOrigin: editOrigin)
         try catalog.validate(itemID: id, recordIDs: Set(archive.records.keys))
         let key = SymmetricKey(size: .bits256)
         var catalogBytes = try Codec.encode(catalog)
@@ -172,7 +172,8 @@ public struct ItemEnvelope: Codable, Equatable, Sendable {
         let archive = try portableArchive(name: name, device: signer, membership: previousMembership,
             membershipStateDigest: previousMembershipStateDigest)
         return try Self.seal(archive, vault: header.vault, generation: header.generation + 1, base: header.version,
-            membership: membership, membershipStateDigest: membershipStateDigest, signer: signer)
+            membership: membership, membershipStateDigest: membershipStateDigest, signer: signer,
+            editOrigin: catalog(device: signer, membership: previousMembership, membershipStateDigest: previousMembershipStateDigest).editOrigin)
     }
 
     /// Explicit additive admission preserves secret ciphertext. This cannot be
@@ -334,16 +335,32 @@ public struct ItemEnvelope: Codable, Equatable, Sendable {
     }
 }
 
+/// Encrypted, signed provenance of the content edit, independent of rekeying.
+public struct ItemEditOrigin: Codable, Equatable, Sendable {
+    public let deviceID: UUID
+    public let deviceName: String
+    public let updatedAt: Date
+    public init(deviceID: UUID, deviceName: String, updatedAt: Date) {
+        self.deviceID = deviceID; self.deviceName = deviceName; self.updatedAt = updatedAt
+    }
+}
+
 public struct ItemEnvelopeCatalog: Codable, Equatable, Sendable {
+    public var editOrigin: ItemEditOrigin?
     public var item: VaultItem
     public var references: [String: String]
     public var histories: [SecretFieldHistory]
     /// Allows exact portable restoration without storing values in this projection.
     public var projectedValuePaths: [String]
-    public init(item: VaultItem, references: [String: String], histories: [SecretFieldHistory] = [], projectedValuePaths: [String] = []) {
+    public init(item: VaultItem, references: [String: String], histories: [SecretFieldHistory] = [], projectedValuePaths: [String] = [], editOrigin: ItemEditOrigin? = nil) {
+        self.editOrigin = editOrigin
         self.item = item; self.references = references; self.histories = histories; self.projectedValuePaths = projectedValuePaths
     }
     public func validate(itemID: UUID, recordIDs: Set<String>) throws {
+        if let editOrigin {
+            guard !editOrigin.deviceName.isEmpty, editOrigin.deviceName.utf8.count <= 1024,
+                  editOrigin.updatedAt.timeIntervalSince1970.isFinite else { throw MopError.invalidVault }
+        }
         let fieldIDs = item.fields.compactMap(\.historyID)
         guard !item.fields.isEmpty, recordIDs.count <= 262_144,
               recordIDs.allSatisfy({ UUID(uuidString: $0)?.uuidString == $0 }),
@@ -425,6 +442,9 @@ public struct ItemEnvelopeCatalog: Codable, Equatable, Sendable {
 }
 
 public struct ItemEnvelopePatch: Sendable {
+    public init(catalog: ItemEnvelopeCatalog, changedRecords: [String: SecretBytes], removedRecords: Set<String>) {
+        self.catalog = catalog; self.changedRecords = changedRecords; self.removedRecords = removedRecords
+    }
     public let catalog: ItemEnvelopeCatalog
     public let changedRecords: [String: SecretBytes]
     public let removedRecords: Set<String>

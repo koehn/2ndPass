@@ -34,11 +34,50 @@ final class AppModel {
     }
     var historySelection: HistorySelection?
     var pendingSecurityUpgrade: (String, String)?
+    private(set) var conflictPreviews: [ItemVaultConflictPreview] = []
+    private(set) var conflictFailure: String?
+    var conflictReviewPresented = false
+    var conflictReviewItem: ItemRow.ID?
+    @ObservationIgnored private var conflictRefreshTask: Task<Void, Never>?
+    private var conflictRefreshGeneration = 0
+    var conflictItems: Set<ItemRow.ID> {
+        Set(conflictPreviews.map { .init(vault: $0.conflict.local.scope.vaultID.uuidString, name: $0.local.item.name) })
+    }
+    func reviewConflict(_ item: ItemRow.ID? = nil) {
+        conflictReviewItem = item
+        conflictReviewPresented = true
+        refreshConflicts()
+    }
+    func refreshConflicts() {
+        conflictRefreshGeneration += 1
+        let token = conflictRefreshGeneration
+        conflictRefreshTask?.cancel(); conflictRefreshTask = nil
+        guard authenticated, isActive else {
+            conflictPreviews = []; conflictFailure = nil
+            conflictReviewPresented = false; conflictReviewItem = nil
+            return
+        }
+        let vaultIDs = catalogs.keys.sorted()
+        conflictRefreshTask = Task { [weak self, service] in
+            do {
+                var loaded: [ItemVaultConflictPreview] = []
+                for id in vaultIDs {
+                    loaded += try await service.conflicts(vault: id)
+                    try Task.checkCancellation()
+                }
+                guard let self, self.conflictRefreshGeneration == token, self.authenticated, self.isActive else { return }
+                self.conflictPreviews = loaded; self.conflictFailure = nil
+            } catch {
+                guard !Task.isCancelled, let self, self.conflictRefreshGeneration == token else { return }
+                self.conflictFailure = "Conflict status could not be refreshed. Try again."
+            }
+        }
+    }
     let service: any VaultService
     let documents: any DocumentAccessing
     let clipboard: any SecretClipboardAccess
     var keyCreationPresented = false
-    var isActive = true
+    var isActive = true { didSet { if oldValue != isActive { refreshConflicts() } } }
     var vaults: [VaultDescriptor] = []
     var vault = "" {
         didSet {
@@ -55,7 +94,7 @@ final class AppModel {
         get { if case .vault = collection { return false }; return collection != .recentlyDeleted && collection != .local }
         set { collection = newValue ? .all : (vault == LocalVault.id ? .local : .vault(vault)) }
     }
-    var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch(); reloadUsage(); refreshHealth() } }
+    var catalogs: [String: ItemCatalog] = [:] { didSet { invalidateItemSearch(); reloadUsage(); refreshHealth(); if Set(oldValue.keys) != Set(catalogs.keys) { refreshConflicts() } } }
     var deletedCatalogs: [String: ItemCatalog] = [:] { didSet { invalidateDeletedSearch() } }
     var selectedDeleted: ItemRow.ID? { didSet { rememberSelection() } }
     var itemToDelete: ItemRow?
@@ -144,7 +183,7 @@ final class AppModel {
     private var cachedVaults: Set<String> = []
     var offline = false
     private var cloudRefreshPending = false
-    var authenticated = false { didSet { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() } } }
+    var authenticated = false { didSet { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() }; refreshConflicts() } }
     var revealed: SecretBytes?
     @ObservationIgnored private var storeChangesTask: Task<Void, Never>?
     var busy = false
@@ -463,7 +502,7 @@ final class AppModel {
             }
         }
     }
-    deinit { syncWakeTask?.cancel(); catalogLoadTask?.cancel(); usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); storeChangesTask?.cancel() }
+    deinit { conflictRefreshTask?.cancel(); syncWakeTask?.cancel(); catalogLoadTask?.cancel(); usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); storeChangesTask?.cancel() }
     func checkExpiration() {
         if let started = service.authenticatedAt {
             if lastActivity == nil { lastActivity = started }
@@ -1740,6 +1779,7 @@ final class AppModel {
         }
     }
     func cloudChanged() {
+        refreshConflicts()
         cloudRefreshPending = true
         refreshCloudIfNeeded()
     }

@@ -126,6 +126,9 @@ public enum VaultServiceCapability: CaseIterable, Hashable, Sendable {
 public protocol VaultService: Sendable {
     var capabilities: Set<VaultServiceCapability> { get }
     func changes() async -> AsyncStream<Void>
+    func conflicts(vault: String) async throws -> [ItemVaultConflictPreview]
+    func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws
+    func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes
     func invalidateDiscovery()
     /// Foreground/push wake, independent of local catalog reads and authentication.
     func requestSynchronization() async throws
@@ -144,6 +147,10 @@ public protocol VaultService: Sendable {
 }
 
 public extension VaultService {
+    func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] { [] }
+    func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws { throw ItemVaultServiceFailure.unavailable }
+    func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes { throw ItemVaultServiceFailure.unavailable }
+
     func displayCatalog(vault: String) async throws -> VaultResult { try await execute(.catalog, vault: vault, offline: false) }
     func readLocal(_ reference: SecretReference, vault: String?, itemID: String?) async throws -> VaultResult {
         try await readLocal(reference, vault: vault)

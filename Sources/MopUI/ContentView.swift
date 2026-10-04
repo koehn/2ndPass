@@ -39,6 +39,8 @@ struct ContentView: View {
     @AppStorage("vaultSidebarExpanded") private var vaultsExpanded = true
     var body: some View { content.sheet(item: $model.historySelection) { selection in
         SecretHistoryView(model: model, selection: selection)
+    }.sheet(isPresented: $model.conflictReviewPresented) {
+        ItemConflictReview(model: model)
     } }
     private var navigation: some View {
         NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $compactColumn) {
@@ -79,6 +81,7 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     ItemSearchBar(model: model)
                     SearchSummary(model: model)
+                    ItemConflictInbox(model: model)
 
                     if model.isLocalVaultSelected {
                         LocalVaultView(model: model)
@@ -96,6 +99,9 @@ struct ContentView: View {
                         // its selection without forcing an outline traversal.
                         List(model.displayedItems, selection: $model.listSelection) { row in
                             NavigationLink(value: row.id) {
+                                if model.conflictItems.contains(row.id) {
+                                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).accessibilityLabel("Sync conflict — review both versions")
+                                }
                                 VaultItemRowLabel(title: row.item.displayTitle, symbol: row.item.type.symbol,
                                     subtitle: row.subtitle, vaultName: model.allVaults ? row.vaultName : nil,
                                     recentDate: row.recentDate, searchDetail: row.searchDetail)

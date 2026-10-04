@@ -37,6 +37,9 @@ struct ItemDetailView: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Vault and item")
             Divider()
+            if !creating {
+                ItemConflictBanner(model: model, item: .init(vault: model.vault, name: itemName))
+            }
             if !creating && !editingItem {
                 ForEach(model.healthReport.findings.filter { $0.vaultID == model.vault && $0.item == itemName }) { finding in
                     Label(finding.kinds.map(\.rawValue).sorted().joined(separator: " · ") + " · " + finding.path, systemImage: "exclamationmark.shield")
