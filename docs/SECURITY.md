@@ -1,22 +1,14 @@
 # Security and key management
 
-This document describes 2ndPass v7's implemented security model, reviewed against the
-working-tree source on 2026-09-29. For a user-oriented overview, see
-[How 2ndPass protects your secrets](SECURITY-EXPLAINER.md). The
-[validation record](VAULT-NEXT-VALIDATION.md) distinguishes implementation and
-model tests from physical-device evidence. This document is not a claim of an
-independent security audit or completed release acceptance.
+## Current item backend and historical v7 material
 
-The GUI, CLI, background verifier and AutoFill use `MopVaultNext` through
-`NativeVaultService`. Historical software-key vault/cloud sources are outside
-the application dependency graphs. There is no software device-key fallback,
-old-format reader, or automatic migration in this implementation.
+Same-account device connection now uses the authenticated private iCloud account as its initial trust channel, without human approval or comparison codes. An unlocked existing device automatically admits a scoped signed device packet; installed roots and successor checkpoints remain device-only and immutable. Initial enrollment therefore trusts access to that Apple Account/container, and does not defend against an attacker controlling that channel. See [automatic connection requirements](ITEM-SYNC-MIGRATION.md#automatic-connection-on-the-same-apple-account).
 
-**Sharing design status:** cross-account vault sharing is not yet implemented as
-a supported product feature. Preliminary protocol, transport and UI code exists,
-but enrollment mailbox isolation remains a design detail to address before
-completing sharing. See [shared-zone enrollment exposure](#shared-zone-enrollment-exposure).
-This is an unfinished-feature design issue, not a current product vulnerability.
+The GUI, CLI and AutoFill now default to `ItemVaultService`. The old `NativeVaultService`, registry and snapshot-download path have been deleted. Current security boundaries are recorded in [the item migration document](ITEM-SYNC-MIGRATION.md): independently signed encrypted items, a separately pinned membership history, device-only Keychain trust, transactional local ciphertext/outbox storage, and one CKSyncEngine owner per account/database. Local commits do not prove remote delivery or inventory completeness. Hardware keys remain in Secure Enclave; there is no software device-key fallback.
+
+This source cutover supports private owner vaults. Enrollment, sharing, account recovery and permanent vault deletion remain unavailable. Background work never grants a new authentication session. Physical-device and real CloudKit acceptance are still required.
+
+**The remainder of this document describes the historical v7 implementation, reviewed on 2026-09-29.** Its global revision-chain, recovery and enrollment claims do not apply to the new item backend. Retained cryptographic/protocol modules and historical tests are not active client routing. This document is not an independent audit or completed release acceptance.
 
 ## Trust boundaries and threat model
 
@@ -49,6 +41,25 @@ is insufficient to decrypt secrets; active control of this authorized account/co
 additional enrollment consequences above. 2ndPass does not promise availability
 against a malicious server, secrecy from an authorized recipient, or protection
 of plaintext on a compromised endpoint.
+
+## Device-local display acceleration
+
+The item backend persists a device-local encrypted display catalog. Each vault
+has a random symmetric catalog key wrapped to its device identity; the wrapping
+is signed and scoped to the pinned genesis, account, database, owner and vault.
+Independent AEAD rows bind item/version/key identities. The plaintext catalog key
+is retained only during an authorized session and released on app lock or authority
+invalidation. This is an additional in-process metadata key, not an item decryption
+key. Its ciphertext lives in the nonsynchronized, backup-excluded app-group store.
+
+The catalog includes titles, visible fields, tags, list/search metadata and record
+references. It excludes concealed field values, attachment bodies and item keys.
+It is disposable acceleration: matching local source versions and authenticated
+rows are required for reuse, source records remain authoritative for mutations
+and secret reads, and tampered/stale rows are rebuilt. It does not establish cloud
+freshness or add protection against complete local-store rollback. Permission and
+account invalidation still supersede cached metadata. Device compromise while the
+app is authorized can expose this metadata, as it can the existing plaintext view.
 
 ## Devices, vaults, and keys
 
@@ -572,6 +583,24 @@ plaintext, old ciphertext, or exported backups. Physical-platform recovery
 acceptance and independent cryptographic review remain required before relying
 on the feature as the only recovery route.
 
+Portable backup is a separate, explicit operation. It decrypts transferable vault
+contents in the authorized process, then encrypts the logical archive with a new
+random 256-bit AES-GCM key. The generated archive key is independent of device
+and account recovery keys. Possession of the archive and that key is sufficient
+to read its contents; iCloud authentication is not an additional factor. No
+plaintext archive is intentionally written to disk. The archive includes
+retained histories, trash and software credentials, so it can contain secrets
+no longer visible in the current catalog. Secure Enclave private keys are not
+exported. Restoration creates a new owner-only vault and reencrypts its contents
+under fresh vault keys; it does not recreate the original sharing authority.
+Keep the source vault until both archive files and restoration are verified.
+
+The item-sync migration is not yet the active runtime. Its security differences,
+including independently ordered membership, eventual item consistency and the
+limits of revocation during in-flight writes, are described in the
+[migration plan](ITEM-SYNC-MIGRATION.md). The whole-vault ordering guarantees
+elsewhere in this document describe the active v7 backend.
+
 ## Metadata and intentional disclosure
 
 Cloud-visible data includes vault name/UUID, public membership and key graph,
@@ -755,3 +784,17 @@ disclosure, encrypted health-result caching in iCloud, session-only reuse finger
 evidence, and required-feature v7 compatibility break. Previous password/token
 values share the item’s encryption and membership/recovery permissions. Clearing
 live history cannot erase earlier encrypted revisions, backups, or copied secrets.
+
+### Existing-device reconnect grants
+
+A signed same-account enrollment request from an exact identity already present
+in current membership may receive a reconnect grant. This uses the current
+membership as both the final history state and successor, with the usual signed
+request, scope, author, timestamp and count fields. Verification requires the
+exact device keys, not just its UUID, and a current owner signer. It does not
+change membership or rewrite encrypted items. Older clients reject this grant
+form and require an update. The private CloudKit account remains the bootstrap
+trust boundary. Retained independent pins are never replaced: rebuilding a
+missing store requires matching scope, genesis and digest, authenticated metadata
+and compatible pinned history. A different source grant is accepted against an
+existing pin only for this reconnect case with no initialization receipt.

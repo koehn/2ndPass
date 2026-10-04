@@ -37,7 +37,7 @@ struct AutoFillSettingsView: View {
             }
             if let settingsError { Text(settingsError).font(.callout) }
             if model.authenticated {
-                Button("Refresh Suggestions") { model.refreshAutoFillSuggestions() }.disabled(model.busy || model.refreshing || model.enrollmentWorking)
+                Button("Refresh Suggestions") { model.refreshAutoFillSuggestions() }.disabled(model.busy || model.refreshing)
             } else {
                 Button("Unlock to Refresh Suggestions") { model.unlock() }.disabled(!model.canUnlock)
             }

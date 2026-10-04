@@ -7,7 +7,6 @@ struct ItemDetailView: View {
     let itemName: String
     @Environment(\.dynamicTypeSize) private var textSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @AppStorage("developerToolsEnabled") private var developerTools = false
     @FocusState private var focusedField: String?
     @State private var dropTarget: String?
     @State private var revealedEditor: String?
@@ -536,9 +535,7 @@ struct ItemDetailView: View {
                let url = URL(string: value), ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil {
                 Link("Open website", destination: url)
             }
-            if developerTools {
-                Button("Copy reference", systemImage: "link") { model.selectField(ref); model.copyReference() }
-            }
+            Button("Copy reference", systemImage: "link") { model.selectField(ref); model.copyReference() }
             if !isTemplate(field) {
                 Divider()
                 Button("Delete field…", systemImage: "trash", role: .destructive) {

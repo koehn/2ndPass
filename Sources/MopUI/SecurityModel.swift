@@ -27,7 +27,7 @@ extension AppModel {
         return accounts
     }
     func reconcileLocalCredentialEvidence() {
-        guard authenticated, localReady, !offline, !busy else { return }
+        guard supports(.credentialAccounts), authenticated, localReady, !offline, !busy else { return }
         let ids = Set(localIdentities.map(\.id))
         let targets = catalogs.filter { _, catalog in
             catalog.canEdit == true && catalog.security?.accounts.contains { account in
@@ -47,6 +47,7 @@ extension AppModel {
         }
     }
     func refreshHealth(force: Bool = false) {
+        guard !isUpdatingCatalog else { return }
         guard healthPublishing == nil else { return }
         guard authenticated, !catalogs.isEmpty else { clearHealth(); return }
         guard itemDraft == nil else { return }
@@ -106,6 +107,7 @@ extension AppModel {
         }
     }
     private func persistHealthCache(_ report: PasswordHealthReport, snapshots: [String: ItemCatalog], token: UUID, session: Int) async {
+        guard supports(.passwordCheckCache) else { return }
         guard healthPublishing == nil else { return }
         guard !offline else { healthCacheNotice = "Results are local until iCloud is available."; return }
         healthCacheNotice = nil

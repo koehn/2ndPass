@@ -28,7 +28,7 @@ struct SecurityHealthView: View {
         List {
             if !model.authenticated {
                 Label("Security is locked", systemImage: "lock")
-                Button("Credential Backups") { model.openLocalVault(); registrations = true }
+                if model.supports(.credentialAccounts) { Button("Credential Backups") { model.openLocalVault(); registrations = true } }
                 Button("Unlock") { model.unlock() }.disabled(!model.canUnlock)
             } else {
                 Section {
@@ -60,7 +60,7 @@ struct SecurityHealthView: View {
                     }
                     DisclosureGroup("Breach check settings") {
                         Toggle("Check exposed passwords with HIBP", isOn: $model.breachChecksEnabled)
-                        Text("Results sync encrypted with each vault and are reused for 24 hours. Vault members can see them.").font(.caption)
+                        Text(model.supports(.passwordCheckCache) ? "Results sync encrypted with each vault and are reused for 24 hours. Vault members can see them." : "Results remain available during this unlocked session. Synchronizing cached results is not yet available.").font(.caption)
                         Text("HIBP receives a five-character password hash prefix and your network address. Your password and account details are not sent.").font(.caption)
                     }
                 }
@@ -73,7 +73,7 @@ struct SecurityHealthView: View {
                             }
                         }.pickerStyle(.inline)
                         Divider()
-                        Button("Credential Backups (\(backupCount))") { registrations = true }
+                        if model.supports(.credentialAccounts) { Button("Credential Backups (\(backupCount))") { registrations = true } }
                     } label: {
                         HStack {
                             Text("Categories")

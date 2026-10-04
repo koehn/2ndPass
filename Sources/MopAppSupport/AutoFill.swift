@@ -205,7 +205,7 @@ public struct AutoFillIndex: Sendable {
 public enum AutoFillStorage {
     /// Account changes invalidate offline access as well as visible suggestions.
     public static func invalidate() async {
-        try? NextAccountBinding.invalidate(state: AppStorageLocation.defaultState)
+        try? NativeItemCloudAccount.invalidateOfflineBinding()
         try? await AutoFillPublisher.shared.prune(keeping: [])
     }
 
@@ -284,10 +284,11 @@ public actor AutoFillPublisher: AutoFillPublishing {
         return value
     }
     private func update(scope: String? = nil, retainingScopes: Set<String>? = nil, _ transform: ([AutoFillIdentity]) -> [AutoFillIdentity]) async throws {
-        await gate.enter()
+        try await gate.enter()
         var state = rememberedStatus(); state.phase = .updating; state.message = nil; health = state
         var indexed = false
         do {
+            try Task.checkCancellation()
             let entries = try AutoFillIndex(directory: directory()).update(transform)
             indexed = true
             if let scope { state.catalogsNeedingRefresh?.remove(scope) }

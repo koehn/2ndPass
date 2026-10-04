@@ -4,6 +4,15 @@ import MopCore
 import Synchronization
 
 public enum Authentication {
+    /// Secure Enclave operations can outlive the reusable LA authorization.
+    /// Recognize the observed native interaction-required failure without
+    /// treating unrelated storage or network failures as authentication failures.
+    public static func requiresRenewal(_ error: any Error) -> Bool {
+        let native = error as NSError
+        return native.domain == LAError.errorDomain
+            || (native.domain == "com.apple.LocalAuthentication" && native.code == -1004)
+    }
+
     /// GUI and extension callers must suspend while the system authenticates,
     /// rather than occupying a Swift concurrency worker with a semaphore wait.
     public static func authorizeAsync(reason: String, contextCreated: (LAContext) throws -> Void = { _ in }) async throws -> LAContext {

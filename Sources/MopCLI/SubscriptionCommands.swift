@@ -38,6 +38,7 @@ enum CLISubscription {
         guard command is any AsyncParsableCommand || command is SSHAgent else { return }
         // Work on parsed command types, never inspect argument values for bypasses.
         if command is Completion || command is Subscription.Status || command is Device.Identity { return }
+        if let restore = command as? Vault.RestoreBackup, restore.dryRun { return }
         // Options after -- belong to a child, not to sp.
         let ownArguments = arguments.prefix { $0 != "--" }
         let status = await status(offline: ownArguments.contains("--offline"))

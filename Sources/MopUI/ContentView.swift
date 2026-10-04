@@ -84,10 +84,10 @@ struct ContentView: View {
                         LocalVaultView(model: model)
                     } else if !model.allVaults, let descriptor = model.selectedVaultDescriptor, !descriptor.enrolled {
                         ContentUnavailableView {
-                            Label("Connect this device", systemImage: model.vaultIcon(descriptor))
+                            Label("Connecting iCloud vault", systemImage: model.vaultIcon(descriptor))
                         } description: {
-                            Text("This vault is not connected to this device. Open and unlock 2ndPass on another connected device to connect automatically.")
-                            Button("Connect this device…") { model.presentSheet(.enrollDevice) }
+                            Text("This vault connects automatically. Open and unlock 2ndPass on an existing device so key access can sync.")
+                            if model.canPresent(.enrollDevice) { Button("Retry Connection") { model.enrollmentAction(.automaticEnrollment, vaultID: descriptor.id) } }
                         }
                     } else if model.authenticated {
                         // Selection can be restored while catalogs change. Calling
@@ -112,7 +112,15 @@ struct ContentView: View {
                                 }
                         }.disabled(model.busy).id(model.selectionGeneration)
                         .overlay {
-                            if model.displayedItems.isEmpty {
+                            if model.displayedItems.isEmpty, let progress = model.catalogTransferStatus, !model.isLocalVaultSelected {
+                                ContentUnavailableView {
+                                    Label("Getting vault items", systemImage: "icloud.and.arrow.down")
+                                } description: {
+                                    Text(progress)
+                                }
+                            } else if model.displayedItems.isEmpty && model.isUpdatingCatalog && !model.isLocalVaultSelected {
+                                ProgressView("Preparing local catalog…")
+                            } else if model.displayedItems.isEmpty {
                                 ContentUnavailableView {
                                     Label(model.search.isEmpty ? emptyCollectionTitle : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")
                                 } description: {
@@ -133,7 +141,7 @@ struct ContentView: View {
                             }
                         }
                     } else {
-                        Label(model.unlocking ? "Opening items…" : "Items are locked", systemImage: "lock")
+                        Label(model.unlocking ? "Unlocking…" : "Items are locked", systemImage: "lock")
                             .foregroundStyle(.secondary).padding()
                         Spacer()
                     }
@@ -189,8 +197,8 @@ struct ContentView: View {
                         GroupBox("Finish setting up 2ndPass") {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("Add another connected device or offline recovery so losing this device does not mean losing access.")
-                                Button("Connect Another Device…") { model.presentSheet(.addDevice) }
-                                Button("Set Up Offline Recovery…") { showSettings(.recovery) }
+                                if model.canPresent(.addDevice) { Button("About Device Sync…") { model.presentSheet(.addDevice) } }
+                                if model.supports(.recovery) { Button("Set Up Offline Recovery…") { showSettings(.recovery) } }
                                 Button("Set Up AutoFill…") { showSettings(.autoFill) }
                                 Button("Later") { model.showsSetupChecklist = false }
                             }
@@ -219,6 +227,26 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     Spacer()
                 }.padding(12)
+                if let issue = model.syncIssue {
+                    HStack {
+                        Label(issue, systemImage: "exclamationmark.icloud")
+                        Button("Details…") { model.showSyncIssue() }
+                    }.font(.caption).foregroundStyle(.orange)
+                        .padding(.horizontal, 12).padding(.bottom, 8)
+                        .accessibilityIdentifier("cloud-sync-issue")
+                }
+                if let progress = model.catalogTransferStatus {
+                    HStack(spacing: 8) {
+                        if model.catalogUpdatePaused { Image(systemName: "exclamationmark.circle") }
+                        else if let fraction = model.catalogTransferFraction {
+                            ProgressView(value: fraction).frame(width: 100)
+                                .accessibilityLabel("Items ready")
+                        } else { ProgressView().controlSize(.small) }
+                        Text(progress).font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                    }.padding(.horizontal, 12).padding(.bottom, 8)
+                    .accessibilityIdentifier("catalog-transfer-progress")
+                }
                 }.background(.background)
             }.mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout, isDetail: true)
         }

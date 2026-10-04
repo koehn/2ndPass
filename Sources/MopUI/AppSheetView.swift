@@ -19,6 +19,10 @@ struct AppSheetView: View {
     var body: some View {
         VStack(spacing: 0) { ScrollView { VStack(alignment: .leading, spacing: 18) {
             switch kind {
+            case .portableBackup:
+                PortableBackupView(model: model, target: request.target)
+            case .restoreBackup:
+                PortableBackupView(model: model, target: nil)
             case .importItems:
                 PasswordImportView(model: model, controls: controls)
             case .createVault:
@@ -27,40 +31,19 @@ struct AppSheetView: View {
                 if (try? VaultName.validate(creationName)) == nil {
                     Text("Use letters, numbers, and hyphens for the vault name.").font(.caption).foregroundStyle(.secondary)
                 }
-                Text("2ndPass will create this device’s protected keys automatically. You can start saving passwords immediately and add other devices or offline recovery later.")
-                Text("Until you add another device or recovery, losing this device means losing access to your vault.").font(.caption)
+                Text("2ndPass will create this device’s protected keys automatically.")
+                Text("Export a portable backup and save its separate key. Other devices on your Apple Account connect automatically when an existing device is unlocked. Offline account recovery is not yet available for item vaults.").font(.caption)
                 Divider()
                 DisclosureGroup("More Options") {
-                Button("Connect to an existing vault…") { dismissOrConfirm(next: .enrollDevice) }
-                Button("Set up an offline recovery key…") { dismissOrConfirm(next: .setupRecovery) }
-                Button("Recover an existing vault…") { dismissOrConfirm(next: .recover) }
+                if model.canPresent(.enrollDevice) { Button("Connect to an existing vault…") { dismissOrConfirm(next: .enrollDevice) } }
+                if model.canPresent(.setupRecovery) { Button("Set up an offline recovery key…") { dismissOrConfirm(next: .setupRecovery) } }
+                if model.canPresent(.recover) { Button("Recover an existing vault…") { dismissOrConfirm(next: .recover) } }
+                Button("Restore Portable Backup…") { dismissOrConfirm(next: .restoreBackup) }
                 }
-            case .enrollDevice:
-                if model.deviceRemoved {
-                    Text("Connect this device again").font(.title2)
-                    Text(model.removalCleanupPending ? "Local cleanup could not finish. Reconnect will retry cleanup before adding this device again." : "Its local account access has been cleared. Reconnect only if you want to add this device again.")
-                    Button("Reconnect") { model.reconnectDevice() }
-                    Button("Recover with Offline Copy…") { dismissOrConfirm(next: .recover) }
-                        .disabled(model.removalCleanupPending)
-                } else {
-                Text(connectTitle).font(.title2)
-                Text("2ndPass connects automatically through your Apple Account. Keep 2ndPass unlocked on another device until setup finishes.")
-                CloudEnrollmentView(model: model, owner: false)
-                DisclosureGroup("More Options") {
-                DisclosureGroup("Join another person’s shared vault") { SharingView(model: model, setup: true, flow: .connect, target: request.target, controls: controls) }
-                Button("Refresh vaults") { model.sheet = nil; model.refresh() }
-                Button("Create a different vault…") { dismissOrConfirm(next: .createVault) }
-                Button("No connected device? Recover…") { dismissOrConfirm(next: .recover) }
-                }
-                }
-            case .addDevice:
-                Text("Connect Another Device").font(.title2)
-                Text("Open 2ndPass on your new device using the same Apple Account. Keep this device unlocked; 2ndPass will connect the new device automatically and notify you when it joins.")
-                CloudEnrollmentView(model: model, owner: true)
+            case .enrollDevice, .addDevice:
+                ItemEnrollmentView(model: model, approving: kind == .addDevice, target: request.target)
             case .shareAccount:
-                Text("Share with another person").font(.title2)
-                Text("Ask the other person to open 2ndPass and choose Connect to an existing vault. Choose what they may do, exchange the invitation, then approve their response.")
-                SharingView(model: model, setup: false, flow: .share, target: request.target, controls: controls)
+                Text("Sharing is not yet available for item vaults.")
             case .setupRecovery:
                 OfflineRecoveryView(model: model, recovering: false)
             case .recover:
@@ -109,10 +92,7 @@ struct AppSheetView: View {
                 } else if let title = controls.title {
                     Button(title) { submitted = true; controls.submit?() }
                         .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(model.busy || !controls.canSubmit)
-                } else if kind == .enrollDevice && !model.deviceRemoved && model.canStartEnrollment {
-                    Button("Connect") { model.startEnrollment() }
-                        .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-                        .disabled(model.busy || model.enrollmentWorking)
+
                 }
             }.padding()
         }.mopSheetWidth(640)
@@ -121,7 +101,6 @@ struct AppSheetView: View {
         .onAppear {
             if kind == .renameVault { name = request.target?.name ?? "" }
             initialName = name
-            if kind == .enrollDevice { model.prepareEnrollmentSelection() }
         }
         .onChange(of: controls.revision) { _, _ in if !model.busy { submitted = false } }
         .onChange(of: name) { _, _ in submitted = false }
@@ -153,72 +132,4 @@ struct AppSheetView: View {
         #endif
     }
 
-}
-
-private struct CloudEnrollmentView: View {
-    @Bindable var model: AppModel
-    let owner: Bool
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if owner {
-                Text("Connections are checked automatically while 2ndPass is unlocked.")
-                if !model.enrollmentSessionActive { Button("Unlock 2ndPass") { model.unlock() }.disabled(!model.canUnlock) }
-                if model.enrollmentWorking { ProgressView("Checking connections…") }
-                ForEach(model.vaults.filter { $0.enrolled }) { vault in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.vaultLabel(vault)).font(.headline)
-                        if let progress = model.ownerEnrollmentProgress[vault.id] {
-                            switch progress.phase {
-                            case .connected:
-                                Text("Connection check completed.")
-                            case .waiting:
-                                Text("Connection changed during the check. Retrying automatically…")
-                            default:
-                                Text(progress.phase.message).textSelection(.enabled)
-                            }
-                            if let date = progress.lastContact {
-                                Text("Last checked \(date, style: .relative) ago").font(.caption)
-                            } else if let date = progress.lastAttempt {
-                                Text("Last attempted \(date, style: .relative) ago").font(.caption)
-                            }
-                        } else {
-                            Text("Waiting for the first connection check.")
-                        }
-                    }
-                }
-            } else {
-                ForEach(model.vaults.filter { !$0.enrolled || model.enrollmentSelection.contains($0.id) }) { vault in
-                    VStack(alignment: .leading, spacing: 8) {
-                        if model.enrollmentProgress[vault.id] == nil {
-                            Toggle(model.vaultLabel(vault), isOn: Binding(get: { model.enrollmentSelection.contains(vault.id) }, set: {
-                                if $0 { model.enrollmentSelection.insert(vault.id) } else { model.enrollmentSelection.remove(vault.id) }
-                            }))
-                        } else {
-                            Text(model.vaultLabel(vault)).font(.headline)
-                        }
-                        if let progress = model.enrollmentProgress[vault.id] {
-                            Text(progress.phase.message).accessibilityIdentifier("enrollment-status")
-                            if progress.phase == .contacting { ProgressView() }
-                            if let date = progress.lastContact { Text("Last checked \(date, style: .relative) ago").font(.caption) }
-                            switch progress.phase {
-                            case .failed, .offline, .paused:
-                                Button(progress.phase == .paused ? "Unlock and Retry" : "Retry") { model.retryEnrollment(vault.id) }
-                                    .disabled(model.busy || model.enrollmentWorking)
-                            default: EmptyView()
-                            }
-                            if progress.phase != .connected {
-                                DisclosureGroup("Troubleshooting") {
-                                    Button("Restart Connection") { model.restartCloudEnrollment(vault.id) }
-                                    Button("Cancel Request", role: .destructive) { model.cancelCloudEnrollment(vault.id) }
-                                    Text("Restart replaces this request without deleting your vault or device keys.").font(.caption)
-                                }.disabled(model.busy || model.enrollmentWorking)
-                            }
-                        }
-                    }.padding(.vertical, 6)
-                }
-                Text("Closing this window keeps submitted requests active. 2ndPass checks while unlocked; iPhone and iPad resume checks when you return to 2ndPass. Use Cancel Request to stop a connection.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
 }

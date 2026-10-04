@@ -151,7 +151,7 @@ private final class PasskeyDiscoveryFixture: VaultService, @unchecked Sendable {
         var result = VaultResult()
         switch operation {
         case .discover:
-            result.vaults = [unavailable, readable].map { VaultDescriptor(id: $0, name: "vault", format: "mop-vault-v7", enrolled: true) }
+            result.vaults = [unavailable, readable].map { VaultDescriptor(id: $0, name: "vault", format: "mop-items-v2", enrolled: true) }
         case .catalog:
             if state.withLock({ $0.lockOnRead }) { lock(); throw MopError.authentication }
             guard vault == readable else { throw MopError.cloudUnavailable }

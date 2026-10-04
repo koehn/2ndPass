@@ -1,4 +1,19 @@
-# CloudKit v7
+# Item CloudKit schema and historical v7 reference
+
+Current application entry points use `ItemVaultSyncRuntime` and `CloudKitSyncAdapter`, backed by a device-local Core Data store. This work has not deployed a CloudKit schema. Provision and validate Development before an explicit Production deployment.
+
+Each owned private vault uses a custom zone `MopItems-UUID`. A single CKSyncEngine handles the trusted, commissioned zones in one account/database. The independently pinned control record must be verified before item publication; zone creation is controlled by durable commissioning state, not queued blindly into CKSyncEngine.
+
+| Type | Record name | Fields |
+| --- | --- | --- |
+| `MopMembershipControlV1` | `membership-head` or the immutable membership name | `membership`: Bytes containing signed public authority |
+| `MopEncryptedItemV1` | item/settings UUID | `envelope`: Bytes for small encrypted envelopes, or `envelopeAssets`: Asset list for larger envelopes |
+
+The adapter uses inline bytes through 512 KiB and 16 MiB asset chunks above that. These are encrypted complete item envelopes; independent attachment/blob transfer is still pending. CKSyncEngine handles change tokens, native push scheduling and retry behavior. Durable Core Data mutations and receipts bridge process exits. No automatic `NSPersistentCloudKitContainer` mirroring is enabled alongside it. Shared recipient enrollment and CKShare creation remain unavailable.
+
+See [migration status](ITEM-SYNC-MIGRATION.md) for security boundaries and validation. The rest of this document is historical v7 material; do not use its schema as the item backend schema.
+
+## Historical CloudKit v7
 
 Use the provisioned container and environment. Development and Production identities/state are separate. Deploying schema to Production is an explicit release operation; this implementation work has not deployed it.
 

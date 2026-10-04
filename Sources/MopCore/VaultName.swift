@@ -15,7 +15,7 @@ public struct VaultDescriptor: Codable, Identifiable, Equatable, Sendable {
     public let name: String?
     public let format: String
     public let enrolled: Bool
-    public var supported: Bool { format == "mop-vault-v7" }
+    public var supported: Bool { format == "mop-items-v2" }
     public init(id: String, name: String?, format: String, enrolled: Bool) {
         self.id = id; self.name = name; self.format = format; self.enrolled = enrolled
     }

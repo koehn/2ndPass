@@ -61,7 +61,7 @@ extension Notification.Name {
     }
     private func received(_ userInfo: [AnyHashable: Any]) -> Bool {
         guard let notification = CKNotification(fromRemoteNotificationDictionary: userInfo),
-              ["mop-private-database-v7", "mop-shared-database-v7"].contains(notification.subscriptionID ?? "") else { return false }
+              ["mop-private-database-v7", "mop-shared-database-v7", "mop-enrollment-v1"].contains(notification.subscriptionID ?? "") else { return false }
         NotificationCenter.default.post(name: .mopCloudChanged, object: nil)
         return true
     }
@@ -80,7 +80,7 @@ extension MopApplicationDelegate: NSApplicationDelegate {
     }
     public func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
         guard received(userInfo), !application.isActive else { return }
-        Task { try? await CloudBackgroundRefresh.download() }
+        Task { try? await CloudBackgroundRefresh.request() }
     }
 }
 #else
@@ -92,7 +92,7 @@ extension MopApplicationDelegate: UIApplicationDelegate {
         guard received(userInfo) else { completionHandler(.noData); return }
         guard application.applicationState != .active else { completionHandler(.noData); return }
         Task {
-            do { try await CloudBackgroundRefresh.download(); completionHandler(.newData) }
+            do { try await CloudBackgroundRefresh.request(); completionHandler(.noData) }
             catch { completionHandler(.failed) }
         }
     }

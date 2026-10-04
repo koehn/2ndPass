@@ -38,16 +38,3 @@ public struct KeyEnvelope: Codable, Equatable, Sendable {
         return SymmetricKey(data: bytes)
     }
 }
-
-struct EnvelopeContext: Encodable {
-    let domain = "mop-v7-hpke-key"
-    let vault: UUID
-    let epoch: UInt64
-    let recipient: String
-    let object: String
-}
-struct ObjectContext: Encodable {
-    let domain = "mop-v7-aes-object"
-    let vault: UUID
-    let object: String
-}

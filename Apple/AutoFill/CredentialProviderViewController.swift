@@ -6,7 +6,7 @@ import MopCore
 import MopLocalIdentity
 
 @MainActor final class CredentialProviderViewController: ASCredentialProviderViewController {
-    private let cloudPasskeyService = NativeVaultService()
+    private let cloudPasskeyService = ItemVaultService(allowsAttachments: false)
     private var passkeyAuthorization: LocalAuthorization?
     private var passkeyRequest: ASPasskeyCredentialRequest?
     private var passkeyParameters: ASPasskeyCredentialRequestParameters?

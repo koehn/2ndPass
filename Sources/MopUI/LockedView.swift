@@ -27,19 +27,36 @@ struct LockedView: View {
             Self.icon
                 .resizable().scaledToFit().frame(width: 128, height: 128)
                 .accessibilityLabel("2ndPass")
-            Button(model.unlocking ? "Unlocking…" : "Unlock 2ndPass") {
-                if model.hasConnectedVaults { model.unlock() }
-                else { model.presentSheet(.enrollDevice) }
-            }
+            if model.isConnectingVaults {
+                ProgressView("Connecting securely…")
+                Text("Open and unlock 2ndPass on another device to finish connecting.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("Retry Connection") { model.retryVaultConnection() }
+                    .disabled(model.busy)
+            } else {
+                Button(model.unlocking ? "Unlocking…" : "Unlock 2ndPass") {
+                    if model.vaults.contains(where: { $0.supported }) { model.unlock() }
+                    else { model.presentSheet(model.canPresent(.enrollDevice) ? .enrollDevice : .restoreBackup) }
+                }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                 .disabled(model.hasConnectedVaults ? !model.canUnlock : model.busy || model.deviceRemoved)
-            if model.cloudConnectionRepairEnabled && model.sessionState == .needsRepair && !model.deviceRemoved {
+            }
+            if model.vaults.contains(where: { $0.supported && !$0.enrolled }) {
+                Text("Connecting your iCloud vaults").font(.headline)
+                Text("Open and unlock 2ndPass on an existing device. Key access syncs automatically.")
+                    .multilineTextAlignment(.center).frame(maxWidth: 420)
+                ForEach(model.vaults.filter { $0.supported && !$0.enrolled }) { vault in
+                    Label(vault.name ?? "Vault \(vault.id.prefix(8))", systemImage: "icloud")
+                }
+            }
+            if model.supports(.enrollment) && model.cloudConnectionRepairEnabled && model.sessionState == .needsRepair && !model.deviceRemoved {
                 Text("This device could not open its saved vault connection. If you can open your vaults on another device, reset this device’s iCloud connection and connect again.")
                     .multilineTextAlignment(.center).frame(maxWidth: 420)
                 Button("Repair iCloud Connection…") { confirmRepair = true }
-                    .disabled(model.busy || model.enrollmentWorking)
+                    .disabled(model.busy)
                 Button("Recover with Offline Copy…") { model.presentSheet(.recover) }
-                    .disabled(model.busy || model.enrollmentWorking)
+                    .disabled(model.busy)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

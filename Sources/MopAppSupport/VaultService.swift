@@ -54,16 +54,24 @@ public enum VaultOperation: Sendable {
     case members, manage(VaultManagement), sync
     case create(name: String)
     case rename(String), deleteVault, export(URL)
+    /// Portable logical backup, independent of enrolled keys and cloud state.
+    case exportPortable(URL)
+    case restorePortable(document: Data, key: SecretBytes, name: String)
 }
 extension VaultOperation {
     var allowsCachedRead: Bool {
         switch self {
-        case .discover, .catalog, .read, .passwordQuality, .recentlyDeleted, .readHistory, .export: true
+        case .discover, .catalog, .read, .passwordQuality, .recentlyDeleted, .readHistory, .export, .exportPortable: true
         default: false
         }
     }
 }
+public enum VaultSaveStatus: String, Sendable { case local, cloudConfirmed, pending }
+
 public struct VaultResult: Sendable {
+    public var saveStatus: VaultSaveStatus?
+    /// Exact durable mutations, retained even when cloud confirmation is pending.
+    public var mutationIDs: [UUID] = []
     public var recoveryConfiguration: RecoveryConfiguration?
     public var recoveryScope: RecoveryScope?
     public var recoveryFingerprint: String?
@@ -80,9 +88,16 @@ public struct VaultResult: Sendable {
     public var importPreview: ImportPreview?
     public var importReport: ImportReport?
     public var vaults: [VaultDescriptor] = []
+    public var discoveryComplete = true
+    public var enrollment: ItemEnrollmentView?
     public var defaultVault: String?
     public var autoFillStatus: AutoFillPublicationStatus?
     public var catalog: ItemCatalog?
+    /// Both nil means the local display projection is complete. Counts exclude vault metadata.
+    public var catalogDownloading = false
+    public var catalogWaitingCount: Int?
+    public var catalogLoadedCount: Int?
+    public var catalogTotalCount: Int?
     public var deletedCatalog: ItemCatalog?
     public var value: SecretBytes?
     public var valueIsConcealed = true
@@ -93,7 +108,6 @@ public struct VaultResult: Sendable {
     public var devices: [VaultDeviceRecord] = []
     public var deviceRemovalIncomplete = false
     public var deviceRemoved = false
-    public var enrollments: [EnrollmentExchange] = []
     public var addedDevices: [UUID] = []
     public var enrollmentCompleted = false
     public var document: Data?
@@ -105,7 +119,16 @@ public struct VaultResult: Sendable {
         guard let catalog else { throw MopError.invalidVault }; return catalog
     }
 }
+public enum VaultServiceCapability: CaseIterable, Hashable, Sendable {
+    case enrollment, deviceRemoval, sharing, recovery, securityUpgrade, importDocuments, credentialAccounts, vaultDeletion, portableBackup, passwordCheckCache
+}
+
 public protocol VaultService: Sendable {
+    var capabilities: Set<VaultServiceCapability> { get }
+    func changes() async -> AsyncStream<Void>
+    func invalidateDiscovery()
+    /// Foreground/push wake, independent of local catalog reads and authentication.
+    func requestSynchronization() async throws
     var sessionGeneration: Int { get }
     var authenticatedAt: TimeInterval? { get }
     var operationProgress: String? { get }
@@ -114,11 +137,21 @@ public protocol VaultService: Sendable {
     func lock()
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult
     func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult
+    func readLocal(_ reference: SecretReference, vault: String?, itemID: String?) async throws -> VaultResult
+    func displayCatalog(vault: String) async throws -> VaultResult
     /// A verified, explicitly stale catalog for initial display, if available.
     func cachedCatalog(vault: String) async throws -> VaultResult?
 }
 
 public extension VaultService {
+    func displayCatalog(vault: String) async throws -> VaultResult { try await execute(.catalog, vault: vault, offline: false) }
+    func readLocal(_ reference: SecretReference, vault: String?, itemID: String?) async throws -> VaultResult {
+        try await readLocal(reference, vault: vault)
+    }
+    func invalidateDiscovery() {}
+    func requestSynchronization() async throws {}
+    var capabilities: Set<VaultServiceCapability> { Set(VaultServiceCapability.allCases) }
+    func changes() async -> AsyncStream<Void> { AsyncStream { $0.finish() } }
     var sessionGeneration: Int { 0 }
     func endRecoverySession() {}
     func cachedCatalog(vault: String) async throws -> VaultResult? { nil }
@@ -139,88 +172,12 @@ final class ContextInvalidator: @unchecked Sendable {
     func invalidate() { context.invalidate() }
 }
 
-struct LocalReadSession: Sendable {
-    let reader: VaultReadSnapshot
-    let verifiedAt: Date
-    let account: String
-    let container: String
-    let environment: String
-    let context: ContextInvalidator
-}
-
-// Locking clears snapshots and cancels reads without waiting for network I/O.
-final class SessionControl: Sendable {
-    struct State {
-        var generation = 0
-        var authenticatedAt: TimeInterval?
-        var invalidate: (@Sendable () -> Void)?
-        var tasks: [UUID: @Sendable () -> Void] = [:]
-        var localReads: [String: LocalReadSession] = [:]
-    }
-    private let state = Mutex(State())
-    var generation: Int { state.withLock { $0.generation } }
-    var authenticated: Bool { authenticatedAt != nil }
-    var authenticatedAt: TimeInterval? { state.withLock { $0.authenticatedAt } }
-    func saveLocalRead(_ session: LocalReadSession, token: Int) throws {
-        try state.withLock { value in
-            guard value.generation == token, value.authenticatedAt != nil else { throw MopError.authentication }
-            value.localReads[session.reader.vault.id.uuidString] = session
-        }
-    }
-    func localRead(vault: String?, name: String, token: Int) throws -> LocalReadSession {
-        try state.withLock { value in
-            guard value.generation == token, value.authenticatedAt != nil else { throw MopError.authentication }
-            let matches = value.localReads.values.filter { session in
-                let selection = vault ?? name
-                return selection == session.reader.vault.id.uuidString || selection == session.reader.vault.name
-            }
-            guard matches.count == 1, let session = matches.first else { throw MopError.notFound }
-            return session
-        }
-    }
-    func removeLocalRead(_ vault: String) { state.withLock { $0.localReads[vault] = nil } }
-    func check(_ token: Int) throws {
-        guard state.withLock({ $0.generation == token }) else { throw MopError.authentication }
-        try Task.checkCancellation()
-    }
-    func register(_ invalidate: @escaping @Sendable () -> Void, token: Int) throws {
-        let accepted = state.withLock { value in
-            guard value.generation == token else { return false }
-            value.invalidate = invalidate; return true
-        }
-        if !accepted { invalidate(); throw MopError.authentication }
-    }
-    func authorized(_ token: Int) throws {
-        try state.withLock { value in
-            guard value.generation == token else { throw MopError.authentication }
-            value.authenticatedAt = ProcessInfo.processInfo.systemUptime
-        }
-    }
-    func registerTask(_ id: UUID, token: Int, cancel: @escaping @Sendable () -> Void) {
-        let accepted = state.withLock { value in
-            guard value.generation == token else { return false }
-            value.tasks[id] = cancel; return true
-        }
-        if !accepted { cancel() }
-    }
-    func finishedTask(_ id: UUID) { state.withLock { $0.tasks[id] = nil } }
-    func lock() {
-        let callbacks = state.withLock { value in
-            value.generation += 1; value.authenticatedAt = nil
-            value.localReads.removeAll()
-            let callbacks = Array(value.tasks.values) + [value.invalidate].compactMap { $0 }
-            value.invalidate = nil; value.tasks.removeAll(); return callbacks
-        }
-        callbacks.forEach { $0() }
-    }
-}
-
 /// FIFO permits held across suspension points. Distinct catalog vaults may
 /// overlap; aliases, same-vault operations and account-wide mutations cannot.
 actor OperationGate {
     private var exclusive = false
     private var vaults: Set<String> = []
-    private var waiters: [(String?, CheckedContinuation<Void, Never>)] = []
+    private var waiters: [(UUID, String?, CheckedContinuation<Void, Error>)] = []
     private func available(_ vault: String?) -> Bool {
         guard !exclusive else { return false }
         return vault.map { !vaults.contains($0) } ?? vaults.isEmpty
@@ -228,14 +185,27 @@ actor OperationGate {
     private func occupy(_ vault: String?) {
         if let vault { vaults.insert(vault) } else { exclusive = true }
     }
-    func enter(vault: String? = nil) async {
+    func enter(vault: String? = nil) async throws {
+        try Task.checkCancellation()
         if waiters.isEmpty && available(vault) { occupy(vault); return }
-        await withCheckedContinuation { waiters.append((vault, $0)) }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { waiters.append((id, vault, $0)) }
+        } onCancel: { Task { await self.cancel(id) } }
+        if Task.isCancelled { leave(vault: vault); throw CancellationError() }
+    }
+    private func cancel(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.0 == id }) else { return }
+        waiters.remove(at: index).2.resume(throwing: CancellationError())
+        drain()
     }
     func leave(vault: String? = nil) {
         if let vault { vaults.remove(vault) } else { exclusive = false }
-        while let first = waiters.first, available(first.0) {
-            waiters.removeFirst(); occupy(first.0); first.1.resume()
+        drain()
+    }
+    private func drain() {
+        while let first = waiters.first, available(first.1) {
+            waiters.removeFirst(); occupy(first.1); first.2.resume()
         }
     }
 }

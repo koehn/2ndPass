@@ -42,35 +42,3 @@ private func hex(_ data: Data) -> String { data.map { String(format: "%02x", $0)
     #expect(throws: MopError.authentication) { try key.sign(Data()) }
     #expect(throws: MopError.authentication) { try key.code() }
 }
-
-@Test func offlineRecoveryCoversExistingFutureDataAndRotatesOnRemoval() throws {
-    let scope = try recoveryScope(), owner = try TestDevice(member: scope.member)
-    let key = try OfflineRecoveryKey(scope: scope), replacement = try OfflineRecoveryKey(scope: scope)
-    defer { key.close(); replacement.close() }
-    var vault = try VaultEngine.create(name: "personal", owner: owner)
-    vault = try VaultEngine.write("login/password", value: "before", in: vault, device: owner)
-    vault = try VaultEngine.setOfflineRecovery(key.identity, in: vault, owner: owner)
-    #expect(vault.revision.header.requiredFeatures?.contains("offline-recovery-1") == true)
-    #expect(try VaultEngine.read("login/password", in: vault, device: key) == "before")
-    vault = try VaultEngine.write("next/password", value: "after", in: vault, device: owner)
-    #expect(try VaultEngine.read("next/password", in: vault, device: key) == "after")
-    let historical = vault
-    vault = try VaultEngine.setOfflineRecovery(replacement.identity, in: vault, owner: owner)
-    #expect(throws: MopError.notVaultMember) { try VaultEngine.read("next/password", in: vault, device: key) }
-    #expect(try VaultEngine.read("next/password", in: historical, device: key) == "after")
-    #expect(try VaultEngine.read("next/password", in: vault, device: replacement) == "after")
-    vault = try VaultEngine.setOfflineRecovery(nil, in: vault, owner: owner)
-    #expect(throws: MopError.notVaultMember) { try VaultEngine.read("next/password", in: vault, device: replacement) }
-}
-
-@Test func retiredRecipientIsRejectedAndAbsentRecipientStillDecodes() throws {
-    let owner = try TestDevice(), vault = try VaultEngine.create(name: "personal", owner: owner)
-    #expect(try Revision.decode(vault.bytes).header.membership.offlineRecovery == nil)
-    var object = try JSONSerialization.jsonObject(with: vault.bytes) as! [String: Any]
-    var header = object["header"] as! [String: Any]
-    var membership = header["membership"] as! [String: Any]
-    membership["recovery"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(owner.identity))
-    header["membership"] = membership; object["header"] = header
-    let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
-    #expect(throws: MopError.legacyVault) { try Revision.decode(bytes) }
-}

@@ -4,12 +4,28 @@ import MopCore
 @testable import MopUI
 
 struct ItemDraftTests {
+    @Test func unchangedVisibleDraftValuesPreserveExistingRecordsButChangesAreSubmitted() {
+        let source = VaultItem(name: "login", type: .login, fields: [ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "password", type: .password)])
+        var draft = ItemDraft(vault: "uuid", revision: "revision", item: source)
+        draft.tagsText = "work"
+        #expect(draft.item.fields[0].value == nil)
+        #expect(draft.item.fields[1].value == nil)
+        draft.fields[0].value = "bob"
+        #expect(draft.item.fields[0].value == "bob")
+        draft.fields[0].value = "alice"
+        #expect(draft.item.fields[0].value == nil)
+    }
     private var item: VaultItem {
         VaultItem(name: "login", type: .login, fields: [
             ItemField(path: "username", type: .username, value: "alice", isTemplate: true),
             ItemField(path: "password", type: .password, isTemplate: true),
             ItemField(path: "notes", type: .notes, value: "details", isTemplate: true)
         ])
+    }
+    private var unchangedEdit: VaultItem {
+        var result = item
+        for index in result.fields.indices { result.fields[index].value = nil }
+        return result
     }
     @Test func tagsPreserveTypingAndNormalizeSavedMetadata() {
         var draft = ItemDraft(vault: "uuid", revision: "r1", item: item)
@@ -82,14 +98,14 @@ struct ItemDraftTests {
 
     @Test func editingDoesNotReadOrReplaceUntouchedSecrets() {
         let draft = ItemDraft(vault: "uuid", revision: "r1", item: item)
-        #expect(draft.item == item)
+        #expect(draft.item == unchangedEdit)
         #expect(draft.fields[1].value == nil)
         #expect(draft.revision == "r1")
     }
     @Test func replacementTargetsOnlyOneFieldAndAllowsEmptyValues() {
         let draft = ItemDraft(vault: "uuid", revision: "r1", item: item, mode: .value("password"))
         #expect(draft.item.fields[1].value == nil)
-        #expect(draft.item.fields[0] == item.fields[0] && draft.item.fields[2] == item.fields[2])
+        #expect(draft.item.fields[0] == unchangedEdit.fields[0] && draft.item.fields[2] == unchangedEdit.fields[2])
         let visible = ItemDraft(vault: "uuid", revision: "r1", item: item, mode: .value("notes"))
         #expect(visible.fields[2].value == "details")
     }
@@ -101,15 +117,15 @@ struct ItemDraftTests {
         #expect(draft.fields[2].id == first.id && draft.fields[2].dragID == first.dragID)
         #expect(draft.fields[0].value == nil && draft.fields[2].value == "alice")
         draft.move(first.id, to: draft.fields[0].id)
-        #expect(draft.item == item)
+        #expect(draft.item == unchangedEdit)
     }
     @Test func foreignOrSingleValueMovesCannotReorderFields() {
         var draft = ItemDraft(vault: "uuid", revision: "r1", item: item)
         draft.move("foreign", to: draft.fields[1].id)
-        #expect(draft.item == item)
+        #expect(draft.item == unchangedEdit)
         draft.mode = .value("password")
         draft.move(draft.fields[0].id, to: draft.fields[2].id)
-        #expect(draft.item == item)
+        #expect(draft.item == unchangedEdit)
     }
     @Test func validationProtectsPathsAndRequiresAtLeastOneField() {
         var draft = ItemDraft(vault: "uuid", revision: "r1", item: item)

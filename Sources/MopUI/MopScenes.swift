@@ -87,7 +87,6 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
 struct SessionSettings: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var model: AppModel
-    @AppStorage(AttachmentDownloadSettings.key, store: AttachmentDownloadSettings.defaults) private var downloadAttachmentsDuringSync = false
     @AppStorage("developerToolsEnabled") private var developerTools = false
     @State private var vaultID = ""
     @State private var removal: VaultDeviceRecord?
@@ -169,19 +168,31 @@ struct SessionSettings: View {
                     Text("Activity in 2ndPass keeps your session open. Switching apps conceals secrets. Security locking clears unsaved edits immediately.").font(.callout)
                 }
             case .recovery:
+                if !model.supports(.recovery) {
+                    Section("Portable Recovery") {
+                        Text("Offline account recovery is not yet available for item vaults. Keep a portable backup and its separate key.")
+                        Button("Restore Portable Backup…") { model.presentSheet(.restoreBackup, inSettings: true) }
+                    }
+                } else {
                 Section("Setup and Verification") {
                     Text("Prepare an offline copy before losing your devices. Generate and verify a copy, check coverage across your owned iCloud vaults, or manage an existing key.").font(.callout)
-                    Button("Set Up or Verify Recovery…") { model.presentSheet(.setupRecovery, inSettings: true) }
+                    if model.canPresent(.setupRecovery) { Button("Set Up or Verify Recovery…") { model.presentSheet(.setupRecovery, inSettings: true) }
                         .disabled(model.busy || model.offline)
+                    }
                 }
                 Section("Recover Vault Access") {
                     Text("If your previously connected devices are unavailable, use your saved recovery file or code to restore vault access. You must be signed into the same Apple Account.").font(.callout)
-                    Button("Recover Vault Access…") { model.presentSheet(.recover, inSettings: true) }
+                    if model.canPresent(.recover) { Button("Recover Vault Access…") { model.presentSheet(.recover, inSettings: true) }
                         .disabled(model.busy || model.offline)
+                    }
                     Text("The recovery copy cannot restore Apple Account sign-in or missing iCloud data.").font(.caption)
+                }
                 }
             case .autoFill: AutoFillSettingsView(model: model)
             case .devices:
+            if !model.supports(.enrollment) {
+                Section("Devices") { Text("Additional-device enrollment is not yet available for item vaults.") }
+            } else {
             Section("Devices") {
                 if model.removingDevice {
                     ProgressView(model.removalProgress ?? "Removing device…")
@@ -199,8 +210,10 @@ struct SessionSettings: View {
                             }
                         }
                         Spacer()
-                        Button("Remove…", role: .destructive) { removal = device }
-                            .disabled(model.busy || model.offline || model.devices.count < 2)
+                        if model.supports(.deviceRemoval) {
+                            Button("Remove…", role: .destructive) { removal = device }
+                                .disabled(model.busy || model.offline || model.devices.count < 2)
+                        }
                     }
                 }
                 if model.devices.isEmpty { Text(model.authenticated ? "Refresh to load enrolled devices." : "Unlock 2ndPass to view connected devices.").foregroundStyle(.secondary) }
@@ -209,22 +222,15 @@ struct SessionSettings: View {
                 } else {
                     Button("Unlock to view devices") { model.unlock() }.disabled(!model.canUnlock)
                 }
-                Button("Connect Another Device…") { model.presentSheet(.addDevice, inSettings: true) }.disabled(model.busy || model.offline)
+                Text("Devices using the same Apple Account connect automatically while an existing device is unlocked.").font(.caption).foregroundStyle(.secondary)
             }
 
+            }
             case .advanced:
                 SubscriptionSettingsView()
-                Section("Attachments on this device") {
-                    Picker("Download attachments", selection: $downloadAttachmentsDuringSync) {
-                        Text("On demand").tag(false)
-                        Text("During sync").tag(true)
-                    }
-                    Text("On demand downloads files when you open or export them. During sync keeps encrypted files available offline. AutoFill never downloads attachments. Changing this setting keeps files already downloaded.")
-                        .font(.callout)
-                }
             Section("Developer") {
                 Toggle("Show developer tools", isOn: Binding(get: { developerTools }, set: { DeveloperPreferences.shared.set($0) }))
-                Text("Include Copy Reference in field menus for scripts and configuration. Syncs across devices using your Apple Account.")
+                Text("Show additional diagnostic details. Syncs across devices using your Apple Account.")
                     .font(.caption).foregroundStyle(.secondary)
                 #if os(macOS)
                 Text("Install the command-line tools")

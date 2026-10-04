@@ -21,67 +21,21 @@ See the [copyright notice](LICENSE). Build, installation, and operational instru
 
 Formerly Mop. See [branding and upgrade compatibility](docs/BRANDING.md) for retained signing identities, settings, and legacy secret references.
 
-2ndPass is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. Personal and shared vaults use the same v7 format. Each device has independent Secure Enclave keys; signing in alone does not grant decryption access; an unlocked enrolled owner can automatically grant same-account membership through the provisioned private CloudKit channel.
+2ndPass is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. These clients now use independently encrypted item records in a shared device-local Core Data store. CKSyncEngine transfers committed changes through one synchronization owner per account/database. Saves are durable locally before cloud delivery.
 
-**This is a coordinated format replacement.** There is no old-format reader, migration, synchronized software device key. Offline recovery uses an explicitly exported private recovery copy. Existing files, cloud zones, backups and Keychain items are left untouched. Keep a compatible older client separately if you still need old data.
+**This source is undergoing a coordinated, pre-release backend replacement.** The old v7 service has been removed. Existing v7 cloud vaults are not automatically opened or modified: restore a portable backup into a new vault. Same-account private vaults are discovered and connected automatically through iCloud while an existing device is unlocked. Shared vaults, recovery, device removal, permanent vault deletion and general document import remain unavailable. Do not replace your only working client until the [migration acceptance gates](docs/ITEM-SYNC-MIGRATION.md) pass.
 
-Read [the plain-language security explanation](docs/SECURITY-EXPLAINER.md), [architecture](docs/VAULT-NEXT.md), and [concrete validation results and outstanding physical checks](docs/VAULT-NEXT-VALIDATION.md). Cross-account vault sharing is not yet implemented as a supported feature; preliminary code requires completion, mailbox isolation and two-account acceptance.
+The [portable archive specification](docs/formats/PORTABLE-BACKUP-v1.md) documents how to regenerate an exporter/reader after a Git rollback. Keep its independent copy with the archive and key. Historical v7 security documents are reference material, not the current backend contract.
 
 ## Recent items
 
 Recently Added, Recently Changed, and Recently Used show the newest 50 active, unarchived items across connected vaults. Search filters those 50 items. Item details show known creation, addition, change, and device-local usage times. Existing items have no invented historical dates; imports preserve source dates when available and record when they were added to 2ndPass.
 Usage records successful copies, explicit reveals, AutoFill, and CLI reads (including injection and command execution). Browsing, editing preloads, OTP refreshes, and exports do not count. Usage stays in private app-group storage on this device, outside cloud synchronization and backups.
 Upgrade the Mac app, iOS app, AutoFill extensions, and CLI together before editing timestamped items. This change has no feature flag or mixed-version support.
-## Start a vault
-Open the signed Mac, iPhone or iPad app. If no v7 vaults exist in iCloud, 2ndPass prompts you to create one. Choose a name and authenticate: this device’s Secure Enclave keys are generated automatically, and you can save secrets immediately.
-The CLI equivalent is:
-```sh
-sp vault init personal
-```
+## Start or restore a vault
 
-```sh
-# New device (use the UUID shown by vault list):
-sp vault enrollment request --vault VAULT_UUID --name 'My Mac'
-# Existing owner device:
-sp vault enrollment inbox --vault personal
-# New device: receive the invitation and send acceptance:
-sp vault enrollment status --vault VAULT_UUID
-# After comparing both displays, confirm on the new device:
-sp vault enrollment confirm --vault VAULT_UUID --code MATCHING_CODE
-# Existing owner: refresh inbox and approve:
-sp vault enrollment inbox --vault personal
-sp vault enrollment approve --vault personal --request-id REQUEST_UUID --code MATCHING_CODE
-# New device: finish enrollment:
-sp vault enrollment status --vault VAULT_UUID
-```
-`enrollment decline --request-id REQUEST_UUID` declines a request. On the new device, `enrollment restart --vault VAULT_UUID` sends a fresh request while preserving its keys; `enrollment cancel --vault VAULT_UUID` cancels the pending request. The app provides Restart connection, Cancel request, visible progress and the last successful iCloud check. All operations require online access. Only enrolled owners can approve. CLI status checks are explicit; the app polls automatically while active and authorized.
-For another account, or advanced manual enrollment:
-On the new device:
-```sh
-sp device request > device-request.json
-```
-On an owner device, independently compare the request fingerprint:
-```sh
-sp vault invite --vault personal device-request.json --fingerprint REQUEST_FINGERPRINT --role editor > invitation.json
-```
-Use `--role owner` only for another device on the existing owner account. Other accounts can be editors or viewers. The invitation's checkpoint and, for another account, private iCloud share URL are printed to stderr. Transfer them and compare the checkpoint independently.
-On the new device:
-```sh
-sp vault accept invitation.json --checkpoint VERIFIED_CHECKPOINT --share-url ICLOUD_SHARE_URL > acceptance.json
-```
-Omit `--share-url` for another device on the same account. Return acceptance to the owner:
-```sh
-sp vault approve --vault personal acceptance.json --fingerprint REQUEST_FINGERPRINT
-sp vault members --vault personal
-```
-Refresh on the receiving device. Invitations expire after one day in the clients and bind the exact checkpoint. If another write wins before approval, issue a fresh invitation; do not overwrite the competing revision.
-```sh
-sp vault remove-device --vault personal DEVICE_UUID
-sp vault remove-member --vault personal ACCOUNT_UUID
-sp vault role --vault personal ACCOUNT_UUID viewer
-sp vault reconcile-share --vault personal
-```
-Removal rotates keys and ciphertext for current contents. The final command retries CloudKit permissions after a roster change if its separate transport update failed. Copied passwords, prior ciphertext and old backups cannot be revoked.
+Open the signed app and create a vault, or restore a portable archive. Secure Enclave access requires authentication. The CLI equivalents are `sp vault init personal` and the restore command below. Other devices on the same Apple Account discover existing private vaults and connect automatically. Keep an existing device open and unlocked until key access syncs. Restoring an archive creates an independent vault; it is not how you connect another device.
+
 ## Read, write, run and inject
 ```sh
 sp write sp://personal/service/token          # hidden prompt or stdin
@@ -99,45 +53,31 @@ sp vault rename --vault VAULT_UUID new-name
 sp vault sync --vault VAULT_UUID
 sp read --offline sp://personal/service/token
 ```
-Offline access uses a previously verified encrypted checkpoint and is read-only. It cannot detect remote revocation or prove freshness. Observed account changes invalidate offline account bindings. Local state must never be synchronized: packaged app/CLI/AutoFill share a device-local app-group directory; the CLI permits `--state-directory` or `MOP_STATE_DIRECTORY` for explicit isolation.
+Local operations use the encrypted Core Data store and a device-only account binding. They cannot detect unobserved remote revocation or prove freshness. Observed account changes invalidate that binding. GUI, CLI and AutoFill share the device-local App Group store; cloud clients no longer accept an isolated `--state-directory`. CLI writes normally wait up to 20 seconds for their exact cloud delivery receipts. Use `--local-save` to return after the durable local commit; `--offline` prevents network use. A delivery timeout leaves the local save queued and exits nonzero with receipt IDs and a pending message; do not repeat the write. GUI saves report local durability, not an unconfirmed cloud upload.
 The GUI retains an authenticated session context until lock/expiry, while releasing hardware key handles and individual secret keys after operations. CLI commands own their session. AutoFill always starts fresh authentication and locks after filling. Plaintext necessarily reaches 2ndPass, clipboard destinations, and commands receiving secrets.
 `read` releases plaintext to stdout or a selected file; `inject` produces plaintext configuration on stdout or disk. `run` supplies plaintext environment variables to a child: that program, its dependencies and inheriting descendants become trusted with the secret. Environments can leak through diagnostics or privileged host access. Default masking only filters exact secret bytes in stdout/stderr; it does not constrain transformed output, files or network traffic. 2ndPass cannot control a child's use of plaintext. See [CLI boundaries](docs/SECURITY.md#cli-and-extension-disclosure-boundaries).
-## Offline recovery
-Set up an offline master recovery copy while you can access your vaults. In the app,
-choose **Manage Offline Recovery**, generate a copy, save it offline or write down
-the displayed code, then re-import or re-enter it to activate protection.
+## Recovery during migration
 
-```sh
-sp vault recovery generate --output /Volumes/OFFLINE/2ndpass-recovery.txt
-sp vault recovery activate --file /Volumes/OFFLINE/2ndpass-recovery.txt --fingerprint PUBLIC_FINGERPRINT
-sp vault recovery status
-```
-
-If all enrolled devices are unavailable, sign into the **same Apple Account** on a
-replacement device, choose **Recover an existing vault**, and enter the offline
-code or import the file. No surviving device or locally retained checkpoint is
-required. Open read-only access first, then complete recovery for each vault.
-
-```sh
-sp vault recovery open --file /Volumes/OFFLINE/2ndpass-recovery.txt
-sp vault recovery open --file /Volumes/OFFLINE/2ndpass-recovery.txt --complete
-sp vault recovery resume
-sp vault recovery revoke
-```
-
-During replacement, keep both offline copies until coverage is complete. A missing
-attachment can postpone completion while healthy data remains readable. Existing
-devices and accounts remain connected after completion. The code cannot recover your
-Apple Account or missing cloud data. Loss of the account requires a separately
-exported backup; backup restoration is outside this feature. See
-[the recovery security model](docs/SECURITY.md#recovery-and-backups).
+Use portable backups and retain their separate archive keys. Offline account recovery is not yet connected. Same-account device connection is automatic; no access request, approval screen or comparison code is needed.
 
 ## Backups and deletion
-Export returns an encrypted v7 checkpoint; record its digest independently. Import requires that digest and an already enrolled device. For a shared-database checkpoint, also supply `--shared-owner` with its actual zone owner record name. Import never creates or overwrites a cloud zone.
+Portable backups contain transferable vault contents and use a newly generated
+key. Keep that key separately from the archive; both are needed to restore into
+a new owned vault, even without the original device keys or cloud vault.
+
 ```sh
-sp vault delete --vault VAULT_UUID --confirm VAULT_UUID
+sp vault backup --offline --vault VAULT_UUID /path/vault.moparchive --key-file /separate/path/vault.key
+sp vault restore-backup /path/vault.moparchive --key-file /separate/path/vault.key --name restored --restore-id NEW_UUID --dry-run
+sp vault restore-backup /path/vault.moparchive --key-file /separate/path/vault.key --name restored --restore-id NEW_UUID
 ```
-Deletion requires owner authorization, removes the cloud zone, and forgets its active registry entry. Existing local ciphertext and exported backups remain. Old-format data cannot be selected or deleted through v7 commands.
+
+Generate and retain a fresh restore UUID for retries. Restore does not reinstate
+sharing or export Secure Enclave private keys. Keep the original vault until you
+have verified the restored contents. See the [migration plan](docs/ITEM-SYNC-MIGRATION.md)
+for format limits and acceptance gates.
+
+The new service exports a locally stored snapshot (also available with `--offline`); it cannot yet certify a complete remote inventory. Keep the original v7 archive until restored contents have been checked. Its wire format, key encoding, validation limits and restoration semantics are defined in the [standalone specification](docs/formats/PORTABLE-BACKUP-v1.md). Old checkpoint import/export and cloud-zone deletion are unavailable in this backend.
+
 ## Build and provision
 
 These instructions require separate authorization from Koehn Consulting, Inc. The published source grants inspection and analysis rights only.
@@ -171,26 +111,9 @@ Register a separate `com.koehn.mop.CLI` App ID with access to the existing host 
 
 ## Platform checks
 `sp-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VAULT-NEXT-VALIDATION.md) for live CloudKit/Enclave probes, modeled scenarios and checks still requiring separate physical devices/accounts. Do not treat software fixtures or simulator builds as hardware evidence.
-## Remove a device or repeat enrollment testing
-On macOS, iOS, and iPadOS, **Settings → devices → Remove…** revokes the selected device across your personal vaults enrolled on the managing device. Removal rotates encryption material and retires the old device UUID. The removed device clears local access when it next verifies the removal online, then offers **Reconnect** instead of enrolling automatically. Reconnection creates fresh device keys. The final owner device cannot be removed.
-CLI equivalents for repeatable testing:
-```sh
-sp vault devices
-sp vault devices --remove DEVICE_UUID
-# On the removed device, detect revocation:
-sp vault sync --vault VAULT_UUID
-# Explicitly opt back in, then request enrollment:
-sp vault enrollment reconnect
-sp vault enrollment request --vault VAULT_UUID --name "Test iPad"
-```
+## Migration limitations
 
-Keep another enrolled device unlocked to complete the new request.
-
-## Import from another password manager
-
-Use **Import…** in the app, or `sp item import FILE --vault personal --dry-run`
-to preview a supported export. See [Importing password-manager data](docs/IMPORT.md)
-for supported formats, conflict handling, and migration limits.
+Cross-account sharing, recovery and document imports require further integration. Their historical guides describe the previous backend. Cloud software credential bytes can survive portable restore, but account registration management is not yet connected. The separate `local` vault and its hardware-backed operations remain available.
 
 ## Public website and build shortcuts
 
@@ -213,7 +136,7 @@ and deployment configuration.
 
 See the website’s [vault capability comparison](https://2ndpass.app/docs.html#vault-capabilities)
 for supported secret types, key operations, synchronization, and recovery by vault type.
-The [website guide source](website/src/docs.md#vault-capabilities) tracks the current implementation.
+The website guide describes the earlier feature set; the migration status above takes precedence during this source cutover.
 
 Cloud vaults support usable passkeys and generated/imported SSH keys. Choose storage
 explicitly when creating a credential. See [cloud key credentials](docs/CLOUD-KEY-CREDENTIALS.md)

@@ -1,3 +1,5 @@
+> Historical validation only. The v7 service and engine have now been removed; `MopVaultNextCheck` and its old CloudKit/removal probes were retired. The separate `sp-keychain-check` hardware probe remains. Current item-backend evidence and outstanding device checks are recorded in [the migration status](ITEM-SYNC-MIGRATION.md).
+
 > Superseded for format and storage by [Vault v7](VAULT-V7.md). The material below records the v6 design and validation history.
 
 # Next vault: implementation and validation status

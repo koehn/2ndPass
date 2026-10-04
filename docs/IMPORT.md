@@ -100,36 +100,27 @@ then Choose File in the item editor; choose Save File to export it. The Document
 template creates a standalone item with an attachment. Files remain concealed
 and are never rendered as text or automatically opened.
 
-The complete filename and binary contents are encrypted with a per-field key.
-Attachment ciphertext is stored as a separate immutable CloudKit asset. Signed
-revisions contain its digest, size, and device/recovery key envelopes, so swapping
-or corrupting the asset fails verification. Attachment bytes do not count against
-the **16 MiB revision limit**. Each file is currently limited to **8 MiB**.
+The complete filename and binary contents are encrypted inside the item's
+signed envelope using its per-item encryption key. Each file is limited to
+**8 MiB**, and attachment data counts toward the item's payload size. Large
+item envelopes are transported as CloudKit assets; these are chunks of the
+complete envelope, not independently downloaded attachment records.
 
-In **Settings → Advanced → Attachments on this device**, choose **On demand**
-(the default) or **During sync**. The preference is local to this device and shared
-with its CLI; it is not synced through iCloud. Downloads cache encrypted bytes;
-opening/exporting a file decrypts it after authentication. Cached files work
-offline. Switching to on-demand keeps already downloaded files. AutoFill never
-loads external attachment bytes, regardless of this setting.
+Attachment ciphertext downloads with the item during synchronization, even if
+you never open the attachment. There is no **On demand** / **During sync**
+preference in the current app. Opening or exporting an attachment decrypts its
+locally stored contents after authentication. Once the item has downloaded,
+its attachments can be opened offline. AutoFill does not expose attachment
+contents; its attachment restriction does not prevent the app from syncing them.
 
-Uploads complete before publishing a revision referencing them. Membership
-removal and recovery rotate attachment encryption along with other records;
-adding a member rewraps keys without downloading the file. These operations and
-backup export may need attachments downloaded regardless of the preference.
-Encrypted backups include every referenced blob, including Recently Deleted
-items, and are bounded to 256 MiB. Import comparison may also download attachments
-to compare their contents. Failed downloads stop operations that require them.
+Adding a new device updates recipient key wrappers in each item envelope.
+Although the attachment ciphertext is unchanged, publishing the updated envelope
+can transfer it again. Independent attachment storage and download-on-demand
+are not implemented in the item-level backend.
 
-Inline attachment records within the supported v7 format remain readable. The next content or
-membership revision moves their ciphertext into separate assets. Historical
-revisions/backups are unchanged. Update every client before writing the new
-`attachment-blobs-1` capability. Production CloudKit schema must include the new
-`MopV7Attachment` record type before release.
-
-Deleting an attachment removes its reference from subsequent revisions. Historical
-blobs are retained for recovery; automatic history/blob garbage collection is not
-yet implemented. Removing an account from this device clears its attachment cache.
+Portable encrypted backups include attachment contents and have a **256 MiB**
+archive limit. The former v7 attachment-blob format and download preference do
+not describe the current backend; see [the migration notes](ITEM-SYNC-MIGRATION.md).
 
 1PUX attachments are matched by document ID and filename inside `files/`.
 Missing, ambiguous, oversized, or size-mismatched files are reported by name and

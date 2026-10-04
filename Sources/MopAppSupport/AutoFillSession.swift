@@ -12,7 +12,7 @@ public enum AutoFillSessionError: Error, Equatable, Sendable { case expired, end
     private let now: () -> TimeInterval
     private let deadline: TimeInterval
     private var ended = false
-    public init(service: any VaultService = NativeVaultService(allowsAttachments: false), usageStore: any ItemUsageStoring = ItemUsageStore(), now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+    public init(service: any VaultService = ItemVaultService(allowsAttachments: false), usageStore: any ItemUsageStoring = ItemUsageStore(), now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.usageStore = usageStore
         self.service = service; self.now = now; deadline = now() + 60
         service.lock()

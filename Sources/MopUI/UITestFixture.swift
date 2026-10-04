@@ -31,7 +31,7 @@ final class UITestVaultService: VaultService, Sendable {
             var result = VaultResult()
             switch operation {
             case .discover:
-                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-vault-v7", enrolled: ProcessInfo.processInfo.environment["MOP_UI_ENROLLMENT"] != "1")]
+                result.vaults = [.init(id: Self.vaultID, name: "personal", format: "mop-items-v2", enrolled: ProcessInfo.processInfo.environment["MOP_UI_ENROLLMENT"] != "1")]
                 result.defaultVault = Self.vaultID
                 return result
             case .catalog:

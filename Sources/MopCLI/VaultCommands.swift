@@ -5,18 +5,49 @@ import MopCore
 import MopVaultNext
 import MopAppSupport
 
+enum PortableBackupInputFailure: Error, Equatable {
+    case archiveMissing, keyMissing
+    var message: String {
+        switch self {
+        case .archiveMissing: "Portable archive file not found. Supply the path to the exported .moparchive file."
+        case .keyMissing: "Backup key file not found. Supply its saved path with --key-file."
+        }
+    }
+}
+
+private func readPortableBackupInput(_ path: String, key: Bool = false) throws -> Data {
+    do { return try LocalFile.read(URL(fileURLWithPath: path), limit: key ? 4096 : PortableArchive.maximumSize) }
+    catch MopError.vaultMissing {
+        throw key ? PortableBackupInputFailure.keyMissing : PortableBackupInputFailure.archiveMissing
+    }
+}
+
+struct CloudConfirmationPending: Error {
+    let mutationIDs: [UUID]
+    var message: String {
+        "Saved locally; iCloud confirmation is pending. Do not repeat the write. Run sp vault sync to retry delivery."
+        + (mutationIDs.isEmpty ? "" : " Mutation receipts: " + mutationIDs.map(\.uuidString).joined(separator: ", "))
+    }
+}
+private func requireCloudConfirmation(_ result: VaultResult) throws -> VaultResult {
+    if result.saveStatus == .pending { throw CloudConfirmationPending(mutationIDs: result.mutationIDs) }
+    return result
+}
+
 struct VaultOptions: ParsableArguments {
     @Option(help: "Vault name or UUID.") var vault: String?
-    @Option(help: "Device-local state directory; never synchronize it.", completion: .directory) var stateDirectory: String?
-    @Flag(help: "Read a previously verified encrypted checkpoint. Remote revocation cannot be checked.") var offline = false
-    var stateURL: URL { stateDirectory.map { URL(fileURLWithPath: $0) } ?? AppStorageLocation.defaultState }
+    @Flag(help: "Read or edit the previously authenticated local vault inventory without network access.") var offline = false
+    @Flag(help: "Return after the durable local save; do not wait for iCloud confirmation.") var localSave = false
+    var stateURL: URL { AppStorageLocation.defaultState }
     var selection: String? { vault }
     func validate() throws { if let vault, UUID(uuidString: vault) == nil { try VaultName.validate(vault) } }
     func requireOnline() throws { try CloudVaultBoundary.requireCloud(vault); guard !offline else { throw MopError.offlineWrite } }
-    func native() -> NativeVaultService { NativeVaultService(state: stateURL) }
+    func native() -> ItemVaultService {
+        ItemVaultService(delivery: (localSave || offline) ? .local : .cloudConfirmed(timeout: .seconds(20)))
+    }
     func execute(_ operation: VaultOperation, selection: String? = nil) async throws -> VaultResult {
         let service = native(); defer { service.lock() }
-        return try await service.execute(operation, vault: selection ?? vault, offline: offline)
+        return try requireCloudConfirmation(await service.execute(operation, vault: selection ?? vault, offline: offline))
     }
     func open() async throws -> CommandStore { CommandStore(options: self) }
     var service: AsyncSecretService { AsyncSecretService { CommandStore(options: self) } }
@@ -35,7 +66,7 @@ final class CommandStore: AsyncSecretStore {
     func perform(_ operation: VaultOperation, reference: SecretReference? = nil) async throws -> VaultResult {
         try CloudVaultBoundary.requireCloud(options.vault)
         try CloudVaultBoundary.requireCloud(reference?.vault)
-        return try await service.execute(operation, vault: options.vault ?? reference?.vault, offline: options.offline)
+        return try requireCloudConfirmation(await service.execute(operation, vault: options.vault ?? reference?.vault, offline: options.offline))
     }
     func read(_ reference: SecretReference) async throws -> SecretBytes {
         let result = try await perform(.read(reference), reference: reference)
@@ -68,7 +99,7 @@ private func emit(_ result: VaultResult) throws {
 private func readFile(_ path: String) throws -> Data { try LocalFile.read(URL(fileURLWithPath: path), limit: 24 * 1024 * 1024) }
 
 struct Vault: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal and shared vaults.", subcommands: [Devices.self, Enrollment.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Export.self, Fingerprint.self, Members.self, Invite.self, Accept.self, Approve.self, RemoveMember.self, RemoveDevice.self, Role.self, Recovery.self, ReconcileShare.self, Import.self, DeleteVault.self])
+    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal and shared vaults.", subcommands: [Devices.self, Enrollment.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Export.self, Backup.self, RestoreBackup.self, Fingerprint.self, Members.self, Invite.self, Accept.self, Approve.self, RemoveMember.self, RemoveDevice.self, Role.self, Recovery.self, ReconcileShare.self, Import.self, DeleteVault.self])
     struct Devices: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "List or remove devices across enrolled personal vaults.")
         @OptionGroup var storage: VaultOptions
@@ -76,15 +107,9 @@ struct Vault: AsyncParsableCommand {
         func validate() throws {
             if let remove, UUID(uuidString: remove) == nil { throw MopError.invalidProcess }
         }
-        func run() async throws {
-            let operation: VaultManagement = remove.map { .removeAccountDevice(UUID(uuidString: $0)!) } ?? .devices
-            let result = try await storage.execute(.manage(operation))
-            struct Row: Encodable { let id: UUID; let name: String; let isCurrent: Bool }
-            let rows = result.devices.map { Row(id: $0.id, name: $0.name, isCurrent: $0.isCurrent) }
-            try IO.output(String(decoding: JSONEncoder().encode(rows), as: UTF8.self) + "\n")
-            IO.diagnostic(result.message + "\n")
-        }
+        func run() async throws { throw ItemVaultServiceFailure.unavailable }
     }
+
     struct Enrollment: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Manage own-device iCloud enrollment and explicit reconnection.")
         @OptionGroup var storage: VaultOptions
@@ -97,27 +122,9 @@ struct Vault: AsyncParsableCommand {
                   !["approve", "decline"].contains(action) || requestID.flatMap(UUID.init(uuidString:)) != nil,
                   !["approve", "confirm"].contains(action) || code != nil else { throw MopError.invalidProcess }
         }
-        func run() async throws {
-            let operation: VaultManagement
-            switch action {
-            case "request": operation = .requestEnrollment(name: name)
-            case "reconnect": operation = .reconnect
-            case "restart": operation = .restartEnrollment(name: name)
-            case "cancel": operation = .cancelEnrollment
-            case "status": operation = .checkEnrollment
-            case "confirm": operation = .confirmEnrollment(code: code!)
-            case "inbox": operation = .enrollmentInbox
-            case "approve": operation = .approveEnrollment(id: UUID(uuidString: requestID!)!, code: code!)
-            case "decline": operation = .rejectEnrollment(id: UUID(uuidString: requestID!)!)
-            default: throw MopError.invalidProcess
-            }
-            let result = try await storage.execute(.manage(operation))
-            struct Row: Encodable { let id: UUID; let name: String; let code: String?; let readyForApproval: Bool }
-            let rows = result.enrollments.map { Row(id: $0.id, name: $0.request.name, code: $0.verificationCode, readyForApproval: $0.acceptance != nil) }
-            try IO.output(String(decoding: JSONEncoder().encode(rows), as: UTF8.self) + "\n")
-            IO.diagnostic(result.message + "\n")
-        }
+        func run() async throws { throw ItemVaultServiceFailure.unavailable }
     }
+
     struct Initialize: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "init", abstract: "Create a vault on this device. Offline recovery is optional.")
         @OptionGroup var storage: VaultOptions
@@ -162,6 +169,55 @@ struct Vault: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         @Argument(completion: .file()) var file: String
         func run() async throws { try emit(await storage.execute(.export(URL(fileURLWithPath: file)))) }
+    }
+    struct Backup: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Export a portable encrypted archive and a separate generated key. Neither output is overwritten.")
+        @OptionGroup var storage: VaultOptions
+        @Argument(completion: .file()) var file: String
+        @Option(help: "Separate destination for the generated backup key; protect this file like a password.", completion: .file()) var keyFile: String
+        func run() async throws {
+            let output = URL(fileURLWithPath: file).standardizedFileURL
+            let keyURL = URL(fileURLWithPath: keyFile).standardizedFileURL
+            guard output != keyURL, !FileManager.default.fileExists(atPath: output.path),
+                  !FileManager.default.fileExists(atPath: keyURL.path) else { throw MopError.duplicate }
+            let result = try await storage.execute(.exportPortable(output))
+            guard let key = result.value else { throw MopError.invalidVault }
+            do {
+                try OutputFile(url: keyURL, force: false, mode: 0o600, protectedFiles: [output], protectedDirectories: [storage.stateURL]).write(key)
+            } catch {
+                IO.diagnostic("The archive was written, but its key could not be saved. It is not a usable backup. Keep the source vault and repeat with new output paths.\n")
+                throw error
+            }
+            try IO.output(result.message + "\nKey saved separately to " + keyURL.path + "\n")
+        }
+    }
+    struct RestoreBackup: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "restore-backup", abstract: "Restore a portable backup into a new owner-only vault. Reuse --restore-id to resume after an interruption.")
+        @OptionGroup var storage: VaultOptions
+        @Argument(completion: .file()) var file: String
+        @Option(completion: .file()) var keyFile: String
+        @Option(help: "Name for the new restored vault.") var name: String
+        @Option(help: "Fresh destination UUID, retained for resumable restore.") var restoreID: String
+        @Flag(help: "Validate the archive without creating a vault.") var dryRun = false
+        func validate() throws {
+            try VaultName.validate(name)
+            guard UUID(uuidString: restoreID) != nil, storage.vault == nil else { throw MopError.invalidProcess }
+        }
+        func run() async throws {
+            let data = try readPortableBackupInput(file)
+            var keyData = try readPortableBackupInput(keyFile, key: true)
+            defer { SecretBytes.wipe(&keyData) }
+            let key = SecretBytes(copying: keyData)
+            let archive = try PortableArchive.open(data, recoveryKey: key)
+            if dryRun {
+                try IO.output("Archive verified: \(archive.items.count) items, \(archive.records.count) current/history records. Destination: \(restoreID).\n")
+                for exclusion in archive.exclusions { IO.diagnostic(exclusion + "\n") }
+                return
+            }
+            try storage.requireOnline()
+            IO.diagnostic("Restore destination: \(restoreID). Retain this UUID to resume an interrupted restore.\n")
+            try emit(await storage.execute(.restorePortable(document: data, key: key, name: name), selection: restoreID))
+        }
     }
     struct Fingerprint: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
@@ -311,7 +367,7 @@ struct Vault: AsyncParsableCommand {
         @Argument(completion: .file()) var file: String
         @Option var checkpoint: String
         @Option(help: "Actual zone owner record name for a shared database vault; omit for your own private vault.") var sharedOwner: String?
-        func run() async throws { try emit(await storage.execute(.manage(.importCheckpoint(document: LocalFile.read(URL(fileURLWithPath: file), limit: VerifiedVault.maximumBackupSize), fingerprint: checkpoint, sharedOwner: sharedOwner)))) }
+        func run() async throws { throw ItemVaultServiceFailure.unavailable }
     }
     struct DeleteVault: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "delete", abstract: "Delete the selected cloud vault. Backups and local ciphertext remain.")

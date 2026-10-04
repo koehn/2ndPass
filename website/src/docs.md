@@ -287,7 +287,7 @@ There is no automatic lookup in 1Password or Apple Passwords. Review flags, fiel
 
 ## Attachments
 
-In the item editor, add an Attachment field and choose a file. The Document template starts with an attachment. Files are encrypted, limited to 8 MiB each, and downloaded on demand by default. To prefetch, choose **Settings → Advanced → Attachments on this device → During sync**. Already cached encrypted files can be read offline.
+In the item editor, add an Attachment field and choose a file. The Document template starts with an attachment. Files are encrypted and limited to 8 MiB each. Attachment ciphertext downloads with its item during synchronization, even if you never open the file. Opening or exporting decrypts the locally stored contents after authentication; downloaded attachments work offline. The current app has no attachment download preference.
 
 For an existing item:
 
@@ -298,7 +298,7 @@ sp item attachment export sp://personal/Account/proof \
   --output ./proof.pdf
 ```
 
-Export creates a plaintext, owner-only file and refuses to overwrite an existing destination. AutoFill does not download attachment contents.
+Export creates a plaintext, owner-only file and refuses to overwrite an existing destination. AutoFill does not expose attachment contents. This does not prevent the app from downloading their ciphertext during synchronization.
 
 ## Sharing
 

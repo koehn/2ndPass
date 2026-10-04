@@ -40,7 +40,7 @@ private func localModel(localService: (any LocalVaultServing)? = nil,
 @MainActor
 private func finish(_ model: AppModel) async throws {
     for _ in 0..<500 {
-        if !model.busy && !model.refreshing && !model.enrollmentWorking && !model.loadingVaults { return }
+        if !model.busy && !model.refreshing && !model.loadingVaults { return }
         try await Task.sleep(for: .milliseconds(10))
     }
 }

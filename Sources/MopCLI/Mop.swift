@@ -2,6 +2,7 @@ import MopLocalIdentity
 import ArgumentParser
 import Foundation
 import MopCore
+import MopAppSupport
 
 @main
 struct Mop: AsyncParsableCommand {
@@ -36,6 +37,23 @@ struct Mop: AsyncParsableCommand {
             exit(withError: ExitCode(1))
         } catch let error as ImportFailure {
             IO.diagnostic("sp: \(error.errorDescription ?? "Import failed.")\n")
+            exit(withError: ExitCode(1))
+        } catch let error as PortableBackupInputFailure {
+            IO.diagnostic("sp: \(error.message)\n")
+            exit(withError: ExitCode(1))
+        } catch let error as PortableArchiveFailure {
+            IO.diagnostic("sp: \(error.errorDescription ?? "Portable archive operation failed.")\n")
+            exit(withError: ExitCode(1))
+        } catch let error as CloudConfirmationPending {
+            IO.diagnostic("sp: \(error.message)\n")
+            exit(withError: ExitCode(MopError.cloudUncertain.exitCode))
+        } catch let error as ItemVaultServiceFailure {
+            IO.diagnostic("sp: \(error.errorDescription ?? "Item vault operation unavailable.")\n")
+            exit(withError: ExitCode(1))
+        } catch let error as ItemVaultBootstrapFailure {
+            if case .committedButLocked = error {
+                IO.diagnostic("sp: Vault saved locally; the session locked before opening it. Unlock the saved vault instead of repeating the import.\n")
+            } else { IO.diagnostic("sp: Item vault setup is incomplete or its local trust does not match. No legacy vault was changed.\n") }
             exit(withError: ExitCode(1))
         } catch let error as MopError {
             IO.diagnostic("sp: \(error.errorDescription ?? "Operation failed.")\n")
@@ -76,7 +94,7 @@ struct Write: AsyncParsableCommand {
     @Flag(help: "Replace an existing field; fails if it does not exist.") var replace = false
 
     func run() async throws {
-        try storage.requireOnline()
+        try CloudVaultBoundary.requireCloud(storage.vault)
         let reference = try SecretReference(reference)
         try CloudVaultBoundary.requireCloud(reference.vault)
         let value = try IO.secret()
@@ -107,7 +125,7 @@ struct Delete: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Delete exactly one field after authentication.")
     @Argument var reference: String
 
-    func run() async throws { try storage.requireOnline(); try await storage.service.delete(SecretReference(reference)) }
+    func run() async throws { try CloudVaultBoundary.requireCloud(storage.vault); try await storage.service.delete(SecretReference(reference)) }
 }
 
 struct Run: AsyncParsableCommand {
@@ -162,7 +180,7 @@ struct Item: AsyncParsableCommand {
     struct Save: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         func run() async throws {
-            try storage.requireOnline()
+            try CloudVaultBoundary.requireCloud(storage.vault)
             let input = try IO.secret()
             let edit = try input.withFoundationData { try JSONDecoder().decode(ItemEdit.self, from: $0) }
             let store = try await storage.open(); defer { store.close() }

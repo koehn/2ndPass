@@ -37,7 +37,7 @@ struct SSHAgent: ParsableCommand {
         guard let purpose = LocalIdentityProtocol(rawValue: purpose), [.ssh, .gitSigning].contains(purpose) else { throw MopError.localIdentityCapability }
         let selections = try identities.map { try IdentitySelection($0, vault: vault) }
         let cloudVault = vault.flatMap { LocalVault.isLocal($0) ? nil : $0 } ?? selections.first.flatMap { LocalVault.isLocal($0.reference.vault) ? nil : $0.reference.vault }
-        let cloudService = NativeVaultService()
+        let cloudService = ItemVaultService()
         defer { cloudService.lock() }
         let session: SSHAgentSession
         if let cloudVault {

@@ -11,7 +11,6 @@ struct SheetRequest: Identifiable {
 struct VaultDetailsView: View {
     @Bindable var model: AppModel
     let target: VaultDescriptor
-    @AppStorage("developerToolsEnabled") private var developerTools = false
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(target.name ?? "Unnamed vault").font(.title2).bold()
@@ -20,28 +19,19 @@ struct VaultDetailsView: View {
                 GroupBox("Vault") {
                     VStack(alignment: .leading, spacing: 12) {
                         Button("Rename Vault…") { model.presentSheet(.renameVault, target: target) }
-                        Button("Export Encrypted Backup…") { model.chooseExportBackup(target: target) }
-                        Button("Share with Another Person…") { model.presentSheet(.shareAccount, target: target) }
+                        Button("Export Portable Backup…") { model.presentSheet(.portableBackup, target: target) }
+                        Button("Restore Portable Backup…") { model.presentSheet(.restoreBackup, target: target) }
+                        if model.canPresent(.shareAccount) { Button("Share with Another Person…") { model.presentSheet(.shareAccount, target: target) } }
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.disabled(model.busy || model.offline)
-                if developerTools {
-                    DisclosureGroup("Developer Security Details") {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(target.id).textSelection(.enabled)
-                            Button("Show Checkpoint") { model.management(.fingerprint, keepSheet: true, target: target) }
-                            Button("Verify Members and Devices") { model.loadMembers(target: target) }
-                            ForEach(model.membersVaultID == target.id ? model.members : []) { member in Text(member.id + " · " + member.role).textSelection(.enabled) }
-                            SharingView(model: model, setup: false, target: target)
-                        }.disabled(model.busy || model.offline)
-                    }
-                }
                 Divider()
-                Button("Delete Vault…", role: .destructive) { model.presentSheet(.deleteVault, target: target) }
+                if model.canPresent(.deleteVault) { Button("Delete Vault…", role: .destructive) { model.presentSheet(.deleteVault, target: target) }
                     .disabled(model.busy || model.offline)
+                }
             } else if target.enrolled {
                 Button("Unlock to Manage Vault") { model.unlock() }.disabled(!model.canUnlock)
             } else {
-                Button("Connect This Device…") { model.presentSheet(.enrollDevice, target: target) }
+                if model.canPresent(.enrollDevice) { Button("Retry Connection") { model.enrollmentAction(.automaticEnrollment, vaultID: target.id) } }
             }
             if model.lastBackupVaultID == target.id, let url = model.lastBackupURL {
                 Text("Backup saved: " + url.lastPathComponent).textSelection(.enabled)
