@@ -285,7 +285,7 @@ public actor EncryptedItemRepository {
                   let data = row.value(forKey: "value") as? Data else { return nil }
             let expected = try JSONDecoder().decode(Int.self, from: data)
             let request = NSFetchRequest<NSFetchRequestResult>(entityName: "Item")
-            request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
+            request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@ AND healthItemID == nil",
                 scope.account, scope.vaultID as NSUUID, scope.database, scope.zoneOwner)
             if try context.count(for: request) - 1 >= expected {
                 context.delete(row)
@@ -414,11 +414,18 @@ public actor EncryptedItemRepository {
         }
     }
 
-    public func commitLocalMutation(_ version: EncryptedItemVersion) throws -> PendingItemMutation {
+    public func commitLocalMutation(_ version: EncryptedItemVersion, expectedHealthParentVersion: UUID? = nil) throws -> PendingItemMutation {
         try validate(version)
         return try transaction {
             try assertNoAdmission(VaultScope(version.scope))
             try touchVaultBoundary(VaultScope(version.scope))
+            if let expectedHealthParentVersion {
+                guard let parent = version.healthItemID else { throw ItemRepositoryError.staleLocalVersion }
+                let parentScope = ItemScope(account: version.scope.account, vaultID: version.scope.vaultID, itemID: parent,
+                    database: version.scope.database, zoneOwner: version.scope.zoneOwner)
+                guard let row = try fetchOne("Item", key: parentScope.storageKey),
+                      try decodeVersion(row).versionID == expectedHealthParentVersion else { throw ItemRepositoryError.staleLocalVersion }
+            }
             let current = try fetchOne("Item", key: version.scope.storageKey)
             let previous = try current.map(decodeVersion)
             guard previous?.versionID == version.baseVersionID else { throw ItemRepositoryError.staleLocalVersion }
@@ -443,8 +450,8 @@ public actor EncryptedItemRepository {
     }
 
     public func commitLocalMutation(_ version: EncryptedItemVersion,
-                                    authorization: any RepositoryWritePermit) throws -> PendingItemMutation {
-        try authorization.withWritePermission { try commitLocalMutation(version) }
+                                    authorization: any RepositoryWritePermit, expectedHealthParentVersion: UUID? = nil) throws -> PendingItemMutation {
+        try authorization.withWritePermission { try commitLocalMutation(version, expectedHealthParentVersion: expectedHealthParentVersion) }
     }
 
     /// Additive membership catch-up preserves the latest local plaintext while
@@ -476,17 +483,18 @@ public actor EncryptedItemRepository {
     }
 
     public func itemRevisionIndex(account: String, vaultID: UUID, database: String = "private",
-                                   zoneOwner: String = "__defaultOwner__") throws -> [UUID: UUID] {
+                                   zoneOwner: String = "__defaultOwner__", includeHealth: Bool = false) throws -> [UUID: UUID] {
         try transaction { try revisionIndexInTransaction(VaultScope(account: account, vaultID: vaultID,
-            database: database, zoneOwner: zoneOwner)) }
+            database: database, zoneOwner: zoneOwner), includeHealth: includeHealth) }
     }
 
-    private func revisionIndexInTransaction(_ scope: VaultScope) throws -> [UUID: UUID] {
+    private func revisionIndexInTransaction(_ scope: VaultScope, includeHealth: Bool = true) throws -> [UUID: UUID] {
         let request = NSFetchRequest<NSDictionary>(entityName: "Item")
         request.resultType = .dictionaryResultType
         request.propertiesToFetch = ["itemID", "versionID"]
         request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
             scope.account, scope.vaultID as NSUUID, scope.database, scope.zoneOwner)
+        if !includeHealth { request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [request.predicate!, NSPredicate(format: "healthItemID == nil")]) }
         var index: [UUID: UUID] = [:]
         for row in try context.fetch(request) {
             guard let item = row["itemID"] as? UUID, let version = row["versionID"] as? UUID else { throw ItemRepositoryError.corruptStore }
@@ -546,7 +554,7 @@ public actor EncryptedItemRepository {
                 guard try fetchOne("StateBlob", key: "display-key:" + scope.storageKey)?.value(forKey: "value") as? Data == keyEnvelope else {
                     throw ItemRepositoryError.staleLocalVersion
                 }
-                let index = try revisionIndexInTransaction(scope)
+                let index = try revisionIndexInTransaction(scope, includeHealth: true)
                 for value in rows {
                     guard index[value.itemID] == value.versionID else { throw ItemRepositoryError.staleLocalVersion }
                     guard !value.ciphertext.isEmpty, value.ciphertext.count <= 16 * 1024 * 1024 else { throw ItemRepositoryError.invalidScope }
@@ -585,13 +593,13 @@ public actor EncryptedItemRepository {
                 let key = "local-name-index:" + scope.storageKey
                 let existing = try fetchOne("StateBlob", key: key)
                 if existing?.value(forKey: "value") as? Data == bytes {
-                    guard try revisionIndexInTransaction(scope) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
+                    guard try revisionIndexInTransaction(scope, includeHealth: false) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
                     return
                 }
                 // Read/dirty the serialization boundary before projecting items:
                 // a concurrent writer between these operations then fails this save.
                 try touchVaultBoundary(scope)
-                guard try revisionIndexInTransaction(scope) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
+                guard try revisionIndexInTransaction(scope, includeHealth: false) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
                 let row = existing ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
                 row.setValue(key, forKey: "key")
                 row.setValue(bytes, forKey: "value")
@@ -621,6 +629,14 @@ public actor EncryptedItemRepository {
             request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
                 account, vaultID as NSUUID, database, zoneOwner)
             request.sortDescriptors = [NSSortDescriptor(key: "itemID", ascending: true)]
+            return try context.fetch(request).map(decodeVersion)
+        }
+    }
+
+    public func healthItems(account: String, vaultID: UUID, database: String = "private", zoneOwner: String = "__defaultOwner__") throws -> [EncryptedItemVersion] {
+        try transaction {
+            let request = NSFetchRequest<NSManagedObject>(entityName: "Item")
+            request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@ AND healthItemID != nil", account, vaultID as NSUUID, database, zoneOwner)
             return try context.fetch(request).map(decodeVersion)
         }
     }
@@ -1188,6 +1204,7 @@ public actor EncryptedItemRepository {
         object.setValue(version.versionID, forKey: "versionID")
         object.setValue(version.baseVersionID, forKey: "baseVersionID")
         object.setValue(version.ciphertext, forKey: "ciphertext")
+        object.setValue(version.healthItemID, forKey: "healthItemID")
         object.setValue(version.isTombstone, forKey: "isTombstone")
         object.setValue(String(version.generation), forKey: "generation")
         object.setValue(Int64(version.ciphertext.count), forKey: "ciphertextSize")
@@ -1206,7 +1223,7 @@ public actor EncryptedItemRepository {
               let tombstone = object.value(forKey: "isTombstone") as? Bool else { throw ItemRepositoryError.corruptStore }
         return EncryptedItemVersion(scope: ItemScope(account: account, vaultID: vault, itemID: item, database: database, zoneOwner: owner),
             versionID: version, baseVersionID: object.value(forKey: "baseVersionID") as? UUID,
-            ciphertext: ciphertext, isTombstone: tombstone, generation: generation)
+            ciphertext: ciphertext, isTombstone: tombstone, generation: generation, healthItemID: object.value(forKey: "healthItemID") as? UUID)
     }
 
     private func blobKey(_ account: String, _ name: String) -> String {

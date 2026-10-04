@@ -177,7 +177,7 @@ private func serviceLocation() throws -> URL {
     let reopened = try PortableArchive.open(Data(contentsOf: exportURL), recoveryKey: key)
     #expect(reopened.records == original.records)
     #expect(result.message.contains("local snapshot"))
-    #expect(service.capabilities == [.portableBackup, .enrollment])
+    #expect(service.capabilities == [.portableBackup, .enrollment, .passwordCheckCache])
     await #expect(throws: ItemVaultServiceFailure.unavailable) {
         try await service.execute(.manage(.requestEnrollment(name: "old")), vault: id.uuidString, offline: false)
     }
@@ -525,4 +525,52 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     let check: @Sendable () throws -> Void
     init(_ check: @escaping @Sendable () throws -> Void) { self.check = check }
     func withWritePermission<T>(_ body: () throws -> T) throws -> T { try check(); return try body() }
+}
+
+@MainActor @Test func itemServiceStoresHealthSeparatelyWithoutRewritingItems() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let service = ItemVaultService(backend: backend)
+    #expect(service.capabilities.contains(.passwordCheckCache))
+    _ = try await service.execute(.create(name: "health"), vault: id.uuidString, offline: false)
+    let empty = try await service.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog()
+    let item = VaultItem(name: "login", fields: [ItemField(path: "password", type: .password, value: "password")])
+    _ = try await service.execute(.save(ItemEdit(revision: empty.revision, item: item, create: true)), vault: id.uuidString, offline: true)
+    let before = try await service.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog()
+    let session = try await backend.open(id), itemID = try #require(before.items[0].storageID.flatMap(UUID.init(uuidString:)))
+    let original = try #require(try await repository.item(session.binding.item(itemID)))
+    let metadataBefore = try await session.vaultMetadata().versionID
+    let report = try await PasswordHealthSession().scan(catalogs: [id.uuidString: before], service: service, breach: UnusedHealthBreach(), enabled: false)
+    let checks = try #require(report.cachedChecks[id.uuidString])
+    _ = try await service.execute(.savePasswordChecks(checks, revision: before.revision), vault: id.uuidString, offline: true)
+    let saved = try await service.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog()
+    #expect(saved.security?.passwordChecks == checks)
+    #expect(saved.items[0].fields[0].passwordQuality == checks.first?.strengthResult?.quality)
+    #expect(saved.items[0].fields[0].passwordQuality != nil)
+    #expect(try await session.vaultMetadata().versionID == metadataBefore)
+    let health = try await repository.healthItems(account: session.binding.account, vaultID: id)
+    #expect(health.count == 1 && health.first?.healthItemID == itemID)
+    #expect(try await session.catalog().count == 1)
+    #expect(try await session.revisionIndex().count == 2)
+    #expect(try await session.exportPortableLocalSnapshot().items.count == 1)
+    let restarted = ItemVaultService(backend: backend)
+    #expect(try await restarted.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().items[0].fields[0].passwordQuality == saved.items[0].fields[0].passwordQuality)
+    #expect(try await restarted.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().security?.passwordChecks == checks)
+    let check = try #require(checks.first)
+    var newer = check
+    newer.breachResult = CachedBreachResult(exposed: true, checkedAt: Date())
+    _ = try await session.saveHealthChecks([newer], itemID: itemID, expectedItemVersion: original.versionID)
+    _ = try await session.saveHealthChecks([check], itemID: itemID, expectedItemVersion: original.versionID)
+    #expect(try await session.healthChecks().first?.breachResult == newer.breachResult)
+    #expect(saved.revision == before.revision)
+    #expect(try await repository.item(session.binding.item(itemID))?.ciphertext == original.ciphertext)
+    await #expect(throws: MopError.vaultConflict) {
+        try await service.execute(.savePasswordChecks(checks, revision: "stale"), vault: id.uuidString, offline: true)
+    }
+}
+private struct UnusedHealthBreach: BreachChecking {
+    func contains(_ password: Data, force: Bool) async throws -> Bool { Issue.record("Disabled breach check called"); return false }
+    func clear() async {}
 }

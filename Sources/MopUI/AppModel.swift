@@ -18,11 +18,17 @@ final class AppModel {
     var securityVisible = false
     var healthReport = PasswordHealthReport()
     var healthChecking = false
+    var healthScheduled = false
+    @ObservationIgnored var healthNotBefore: ContinuousClock.Instant?
+    @ObservationIgnored var healthLastInteraction = ContinuousClock.now
+    let healthStartupDelay: Duration
+    let healthIdleDelay: Duration
     var healthRestoringCache = false
     var healthProgress = 0.0
     var healthToken = UUID()
     @ObservationIgnored var healthSession = PasswordHealthSession()
     @ObservationIgnored var healthRequest: String?
+    @ObservationIgnored var healthRequestCache: [String: [CachedPasswordCheck]] = [:]
     @ObservationIgnored var healthPublishing: UUID?
     var healthCacheNotice: String?
     @ObservationIgnored var healthSessionGeneration: Int?
@@ -102,6 +108,7 @@ final class AppModel {
     private var nextRetentionSweep = Date.distantPast
     @ObservationIgnored private let wallNow: () -> Date
     var passwordQualities: [String: PasswordQuality] = [:]
+    var passwordQualitySource: [String]?
     private var launchAttempted = false
     var page: AppPage {
         get { securityVisible ? .security : collection == .recentlyDeleted ? .recentlyDeleted : .secrets }
@@ -436,7 +443,7 @@ final class AppModel {
     var editorGeneration = 0
     var itemDraft: ItemDraft? {
         didSet {
-            if itemDraft != nil { healthTask?.cancel(); healthToken = UUID(); healthChecking = false }
+            if itemDraft != nil { healthTask?.cancel(); healthToken = UUID(); healthChecking = false; healthScheduled = false }
             else if oldValue != nil { refreshHealth(); reconcileDeferredStoreChange() }
         }
     }
@@ -461,9 +468,10 @@ final class AppModel {
          documents: any DocumentAccessing = SystemDocumentAccess(),
          usageStore: any ItemUsageStoring = ItemUsageStore(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init,
+         automaticTimer: Bool = true, healthStartupDelay: Duration = .seconds(30), healthIdleDelay: Duration = .seconds(5), wallNow: @escaping () -> Date = Date.init,
          localService: (any LocalVaultServing)? = nil,
          authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { try await LocalAuthorization.authorizeAsync(reason: $0, ids: $1, purposes: $2, operations: $3) }) {
+        self.healthStartupDelay = healthStartupDelay; self.healthIdleDelay = healthIdleDelay
         self.breachClient = breachClient
         self.localService = localService
         self.authorizeLocal = authorizeLocal
@@ -539,6 +547,8 @@ final class AppModel {
         }
     }
     func activity() {
+        service.userActivity()
+        healthLastInteraction = .now
         checkExpiration()
         guard isActive else { return }
         if service.isAuthenticated { lastActivity = now() }
@@ -733,7 +743,7 @@ final class AppModel {
         set {
             guard !busy, (newValue != selectedRow || vaultDetailsTarget != nil), allowTransition(.item(newValue)) else { return }
             vaultDetailsTarget = nil
-            cancelItemEditing(); selected = nil; passwordQualities = [:]
+            cancelItemEditing(); selected = nil; passwordQualities = [:]; passwordQualitySource = nil
             selectedLocalIdentityID = nil
             guard let newValue else { selectedItem = nil; return }
             if newValue.vault == LocalVault.id, collection == .all,
@@ -852,7 +862,7 @@ final class AppModel {
         }
         self.catalog = catalog; self.references = refs.sorted()
         if !vault.isEmpty { catalogs[vault] = catalog }
-        passwordQualities = [:]
+        if passwordQualitySource != passwordQualityIdentity { passwordQualities = [:]; passwordQualitySource = nil }
     }
     // MARK: - Device-local vault
 
@@ -1040,6 +1050,7 @@ final class AppModel {
             try self.applyCatalog(result.requireCatalog())
             self.selectedItem = item.name; self.selected = nil; self.sheet = nil
             if self.itemDraft?.id == draftID { self.itemDraft = nil }
+            self.refreshHealth(afterSave: true)
             self.conceal(); self.notice = originalName != nil && originalName != item.name ? "Item renamed. Update references that use the old name." : result.message
         }
     }
@@ -1126,8 +1137,9 @@ final class AppModel {
         if busy && !authenticated { lock(clearClipboard: false) }
         checkExpiration()
     }
-    func deactivate() { isActive = false; visibilityGeneration += 1; conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil }
+    func deactivate() { service.setMaintenanceActive(false); isActive = false; visibilityGeneration += 1; conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil }
     func activate() {
+        service.setMaintenanceActive(true)
         checkExpiration(); isActive = true
         reloadUsage()
         if service.isAuthenticated, !busy { lastActivity = now() }
@@ -1142,7 +1154,7 @@ final class AppModel {
         selectedLocalIdentityID = nil
         generation += 1; editorGeneration += 1; itemDraft = nil; draftConflict = false
         selectedDeleted = nil; itemToDelete = nil
-        conceal(); catalog = nil; passwordQualities = [:]; references = []; selected = nil; members = []
+        conceal(); catalog = nil; passwordQualities = [:]; passwordQualitySource = nil; references = []; selected = nil; members = []
         selectedItem = nil; sheet = nil; notice = nil
         importing = false; importStatus = nil; importFraction = nil; importReport = nil; importFailed = false
         vaultDetailsTarget = nil; deleteConfirmation = false; documentRequest = nil; error = nil
@@ -1358,7 +1370,7 @@ final class AppModel {
         guard !busy, !authenticated, isActive, !deviceRemoved else { return }
         launchUnlockAvailable = false; accessNeedsRepair = false
         cancelItemEditing(); conceal(); catalog = nil; catalogs = [:]; deletedCatalogs = [:]
-        passwordQualities = [:]; references = []; authenticated = false
+        passwordQualities = [:]; passwordQualitySource = nil; references = []; authenticated = false
         perform { token in try await self.unlockContents(token) }
     }
     private func connectDiscoveredVaults(_ token: Int) async throws {
@@ -1443,7 +1455,7 @@ final class AppModel {
             // The selected vault must verify before opening the session.
             service.lock(); lastActivity = nil; authenticated = false
             catalog = nil; catalogs = [:]; deletedCatalogs = [:]; references = []
-            passwordQualities = [:]; conceal(); clearClipboard()
+            passwordQualities = [:]; passwordQualitySource = nil; conceal(); clearClipboard()
             throw error
         }
     }
@@ -1540,18 +1552,38 @@ final class AppModel {
             self.reconcileDeferredStoreChange()
         }
     }
+    var passwordQualityIdentity: [String]? {
+        guard authenticated, let item = selectedTypedItem, let catalog,
+              item.fields.contains(where: { $0.type == .password }) else { return nil }
+        return [String(generation), String(service.sessionGeneration), vault, item.name] + item.fields.flatMap { field in
+            if field.type == .password { return [field.path, field.recordVersion ?? catalog.revision] }
+            if field.type == .username || field.type == .email { return [field.path, field.value ?? ""] }
+            return []
+        }
+    }
+    func passwordQuality(for path: String) -> PasswordQuality? {
+        guard passwordQualitySource == passwordQualityIdentity else { return nil }
+        return passwordQualities[path]
+    }
     func loadPasswordQuality() async {
-        passwordQualities = [:]
-        guard authenticated, service.isAuthenticated, let item = selectedTypedItem,
-              item.fields.contains(where: { $0.type == .password }) else { return }
+        guard let request = passwordQualityIdentity, service.isAuthenticated, let item = selectedTypedItem else {
+            passwordQualities = [:]; passwordQualitySource = nil; return
+        }
+        let passwords = item.fields.filter { $0.type == .password }
+        if passwords.allSatisfy({ $0.passwordQuality != nil }) {
+            passwordQualities = Dictionary(uniqueKeysWithValues: passwords.compactMap { field in field.passwordQuality.map { (field.path, $0) } })
+            passwordQualitySource = request
+            return
+        }
+        if passwordQualitySource == request && !passwordQualities.isEmpty { return }
+        passwordQualities = [:]; passwordQualitySource = nil
         let token = generation, id = vault, name = item.name
         do {
-            let result = try await service.execute(.passwordQuality(item: name), vault: id, offline: false)
-            guard current(token), !Task.isCancelled, vault == id, selectedItem == name else { return }
-            passwordQualities = result.passwordQuality
+            let result = try await service.execute(.passwordQuality(item: name), vault: id, offline: true)
+            guard current(token), !Task.isCancelled, passwordQualityIdentity == request else { return }
+            passwordQualities = result.passwordQuality; passwordQualitySource = request
         } catch {
-            // Scores are optional. Authentication/account failures still clear the
-            // session through the service and expiry check; never expose diagnostics.
+            // Scores are optional; never expose service diagnostics.
             checkExpiration()
         }
     }
@@ -1863,7 +1895,7 @@ final class AppModel {
     func createVault(name: String) {
         guard !offline, !busy else { return }
         restoreLastSelection = false
-        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; references = []; selected = nil; members = []; authenticated = false
+        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; passwordQualitySource = nil; references = []; selected = nil; members = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.

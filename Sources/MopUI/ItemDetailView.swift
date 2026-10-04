@@ -141,6 +141,7 @@ struct ItemDetailView: View {
         }.padding(20).frame(maxWidth: 760, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear { if creating { focusedField = "item-name" } }
+        .task(id: model.passwordQualityIdentity) { await model.loadPasswordQuality() }
         .task(id: model.copyFeedback?.id) {
             guard let feedback = model.copyFeedback else { return }
             do { try await Task.sleep(for: .seconds(2)) } catch { return }
@@ -346,7 +347,7 @@ struct ItemDetailView: View {
                         }
                     }
                     PasswordStrengthView(password: edits(field) ? field.passwordToEstimate : nil,
-                                         storedScore: field.storedPasswordQuality)
+                                         storedScore: field.storedPasswordQuality ?? model.passwordQuality(for: field.path))
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
             if editingItem && !isTemplate(field) {
@@ -452,21 +453,30 @@ struct ItemDetailView: View {
             } else if field.type == .password {
                 HStack {
                     Group {
-                        if revealedEditor == field.id && model.isActive && model.authenticated {
+                        if model.isActive && model.authenticated {
                             TextField(placeholder, text: valueBinding(field))
                         } else {
                             SecureField(placeholder, text: valueBinding(field))
                         }
-                    }.accessibilityLabel("\(field.path) value")
-                    Button {
-                        revealedEditor = revealedEditor == field.id ? nil : field.id
-                        if revealedEditor != nil { model.recordSelectedItemUsage() }
-                    } label: {
-                        Image(systemName: revealedEditor == field.id ? "eye.slash" : "eye")
                     }
-                    .buttonStyle(.borderless)
-                    .accessibilityLabel(revealedEditor == field.id ? "Conceal password input" : "Reveal password input")
-                    .disabled(!model.isActive || !model.authenticated)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .accessibilityLabel("\(field.path) value")
+                    Button {
+                        model.activity()
+                        guard model.isActive, model.authenticated,
+                              let value = model.itemDraft?.fields.first(where: { $0.id == field.id })?.value else { return }
+                        model.clipboard.copy(SecretBytes(utf8: value), concealed: true)
+                        if let ref = reference(field) { model.copyFeedback = .init(reference: ref, message: "Copied") }
+                        model.recordSelectedItemUsage()
+                    } label: {
+                        Image(systemName: "doc.on.doc").mopControlTarget()
+                    }
+                    .buttonStyle(.borderless).foregroundStyle(Color.accentColor)
+                    .help("Copy password").accessibilityLabel("Copy \(field.path) value")
+                    .disabled(!model.isActive || !model.authenticated || field.value == nil)
                 }
             } else if [.privateKey, .recoveryCodes].contains(field.type) {
                 VStack(alignment: .leading) {

@@ -192,8 +192,91 @@ private actor RefreshBreach: BreachChecking {
     #expect(await breach.count == 5)
     _ = try await PasswordHealthSession().scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, force: true, at: now.addingTimeInterval(201))
     #expect(await breach.count == 7)
-    catalog.security?.passwordChecks?[0].batch = UUID()
+    catalog.security?.passwordChecks?[0].reuseResult?.batch = UUID()
     #expect(!PasswordHealthSession().canRestoreCloudResults(catalogs: ["v": catalog], enabled: true, at: now.addingTimeInterval(201)))
-    catalog.security?.passwordChecks?[0].checkedAt = now.addingTimeInterval(999999)
+    catalog.security?.passwordChecks?[0].strengthResult?.checkedAt = now.addingTimeInterval(999999)
     #expect(!PasswordHealthSession().canRestoreCloudResults(catalogs: ["v": catalog], enabled: true, at: now))
+}
+
+@MainActor @Test func dailyBreachRefreshDoesNotReevaluateStrengthOrReuse() async throws {
+    var estimates = 0
+    func scanner() -> PasswordHealthSession {
+        PasswordHealthSession { _, _ in estimates += 1; return .weak }
+    }
+    let service = HealthService(["v:a/password": "password", "v:b/password": "password"])
+    let breach = HealthBreach()
+    var first = ItemField(path: "password", type: .password); first.recordVersion = "a"
+    var second = first; second.recordVersion = "b"
+    var catalog = ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "a", fields: [first]), VaultItem(name: "b", fields: [second])])
+    let now = Date(timeIntervalSince1970: 100000)
+    let initial = try await scanner().scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: now)
+    catalog.security = VaultSecurityMetadata(); catalog.security?.passwordChecks = initial.cachedChecks["v"]
+    let nextSession = scanner(), tomorrow = now.addingTimeInterval(86401)
+    let daily = try await nextSession.scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: tomorrow)
+    #expect(estimates == 2)
+    #expect(await breach.count == 4)
+    #expect(daily.cachedChecks["v"]?.map(\.strengthResult) == initial.cachedChecks["v"]?.map(\.strengthResult))
+    #expect(daily.cachedChecks["v"]?.map(\.reuseResult) == initial.cachedChecks["v"]?.map(\.reuseResult))
+    catalog.security?.passwordChecks = daily.cachedChecks["v"]
+    let disabled = try await scanner().scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: false, at: now.addingTimeInterval(86400 * 90))
+    #expect(disabled.usedCloudCache && service.reads.withLock { $0 } == 4)
+    #expect(estimates == 2)
+    // An account-context edit changes strength inputs, but neither password bytes nor reuse.
+    catalog.revision = "2"; catalog.items[0].fields.append(ItemField(path: "username", type: .username, value: "alice"))
+    let context = try await nextSession.scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: tomorrow)
+    #expect(estimates == 3)
+    #expect(await breach.count == 4)
+    #expect(context.cachedChecks["v"]?.map(\.reuseResult) == daily.cachedChecks["v"]?.map(\.reuseResult))
+    catalog.revision = "3"; catalog.items[0].fields[0].recordVersion = "changed"
+    _ = try await nextSession.scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: tomorrow)
+    #expect(estimates == 4)
+    #expect(await breach.count == 5)
+    _ = try await nextSession.scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, force: true, at: tomorrow)
+    #expect(estimates == 4)
+    #expect(await breach.count == 7)
+}
+
+@MainActor @Test func anotherItemsUpdateDoesNotRestartSuccessfulHIBPClockOnAnotherDevice() async throws {
+    let service = HealthService(["v:a/password": "one-password", "v:b/password": "another-password"])
+    let breach = HealthBreach()
+    var a = ItemField(path: "password", type: .password); a.recordVersion = "a"
+    var b = a; b.recordVersion = "b"
+    var catalog = ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "a", fields: [a]), VaultItem(name: "b", fields: [b])])
+    let now = Date(timeIntervalSince1970: 100000)
+    let first = try await PasswordHealthSession().scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: now)
+    catalog.security = VaultSecurityMetadata(); catalog.security?.passwordChecks = first.cachedChecks["v"]
+    catalog.revision = "2"; catalog.items[1].fields[0].recordVersion = "b-changed"
+    let second = try await PasswordHealthSession().scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: now.addingTimeInterval(100))
+    #expect(await breach.count == 3)
+    #expect(second.cachedChecks["v"]?.first { $0.record == "a" }?.breachResult?.checkedAt == now)
+    catalog.security?.passwordChecks = second.cachedChecks["v"]
+    _ = try await PasswordHealthSession().scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: now.addingTimeInterval(86399))
+    #expect(await breach.count == 3)
+    let expired = try await PasswordHealthSession().scan(catalogs: ["v": catalog], service: service, breach: breach, enabled: true, at: now.addingTimeInterval(86400))
+    #expect(await breach.count == 4)
+    #expect(expired.cachedChecks["v"]?.first { $0.record == "b-changed" }?.breachResult?.checkedAt == now.addingTimeInterval(100))
+}
+
+@MainActor @Test func healthScannerPublishesBoundedBatchesWithProvisionalReuse() async throws {
+    let names = (0..<25).map { String(format: "item%02d", $0) }
+    let service = HealthService(Dictionary(uniqueKeysWithValues: names.map { ("v:\($0)/password", SecretBytes(utf8: "password")) }))
+    let items = names.map { name in
+        var field = ItemField(path: "password", type: .password); field.recordVersion = name
+        return VaultItem(name: name, fields: [field])
+    }
+    let catalog = ItemCatalog(vault: "v", revision: "1", items: items)
+    let batches = Mutex<[Int]>([])
+    let report = try await PasswordHealthSession().scan(catalogs: ["v": catalog], service: service,
+        breach: HealthBreach(), enabled: false, batch: { partial in
+            #expect(partial.state == .incomplete && partial.completedAt == nil)
+            #expect(partial.cachedChecks["v"]?.allSatisfy { $0.reuseResult == nil } == true)
+            #expect(!partial.findings.contains { $0.kinds.contains(.reused) })
+            batches.withLock { $0.append(partial.checked) }
+        })
+    let counts = batches.withLock { $0 }
+    #expect(counts.first == 1 && counts.count >= 3)
+    #expect(zip(counts, counts.dropFirst()).allSatisfy { $1 > $0 && $1 - $0 <= 10 })
+    #expect(counts.last.map { 25 - $0 <= 10 } == true)
+    #expect(report.checked == 25 && report.state == .checked)
+    #expect(report.findings.allSatisfy { $0.kinds.contains(.reused) })
 }

@@ -39,14 +39,16 @@ public struct EncryptedItemVersion: Codable, Equatable, Sendable {
     public let baseVersionID: UUID?
     public let ciphertext: Data
     public let isTombstone: Bool
+    public let healthItemID: UUID?
     public let generation: UInt64
 
     public init(scope: ItemScope, versionID: UUID = UUID(), baseVersionID: UUID?,
-                ciphertext: Data, isTombstone: Bool = false, generation: UInt64 = 1) {
+                ciphertext: Data, isTombstone: Bool = false, generation: UInt64 = 1, healthItemID: UUID? = nil) {
         self.scope = scope
         self.versionID = versionID
         self.baseVersionID = baseVersionID
         self.ciphertext = ciphertext
+        self.healthItemID = healthItemID
         self.isTombstone = isTombstone
         self.generation = generation
     }

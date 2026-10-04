@@ -141,12 +141,16 @@ public protocol VaultService: Sendable {
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult
     func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult
     func readLocal(_ reference: SecretReference, vault: String?, itemID: String?) async throws -> VaultResult
+    func userActivity()
+    func setMaintenanceActive(_ active: Bool)
     func displayCatalog(vault: String) async throws -> VaultResult
     /// A verified, explicitly stale catalog for initial display, if available.
     func cachedCatalog(vault: String) async throws -> VaultResult?
 }
 
 public extension VaultService {
+    func userActivity() {}
+    func setMaintenanceActive(_ active: Bool) {}
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] { [] }
     func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws { throw ItemVaultServiceFailure.unavailable }
     func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes { throw ItemVaultServiceFailure.unavailable }

@@ -68,7 +68,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private let delivery: ItemVaultDelivery
     private let allowsAttachments: Bool
     private let publisher: (any AutoFillPublishing)?
-    private let displayBatchSize: Int
+    private let idleWork: IdleWorkQueue
     private let catalogGate = OperationGate()
     private struct CatalogUpdate: Sendable { let id: UUID; let task: Task<Void, Never> }
     private let catalogUpdates = Mutex<[UUID: CatalogUpdate]>([:])
@@ -87,16 +87,19 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private var accountObserver: NSObjectProtocol?
 
     public init(backend: any ItemVaultServiceBackend, delivery: ItemVaultDelivery = .local, allowsAttachments: Bool = true,
-                publisher: (any AutoFillPublishing)? = nil, displayBatchSize: Int = 32) {
+                publisher: (any AutoFillPublishing)? = nil, displayBatchSize: Int = 32,
+                idleDelay: Duration = .seconds(3), idleSpacing: Duration = .milliseconds(100)) {
         self.backend = backend; self.delivery = delivery; self.allowsAttachments = allowsAttachments; self.publisher = publisher
-        self.displayBatchSize = min(64, max(1, displayBatchSize))
+        self.idleWork = IdleWorkQueue(delay: idleDelay, spacing: idleSpacing)
         accountObserver = NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: nil) { [weak self] _ in self?.lock() }
     }
     public convenience init(state: URL? = nil, allowsAttachments: Bool = true, delivery: ItemVaultDelivery = .local) {
         self.init(backend: NativeItemVaultServiceBackend(state: state), delivery: delivery, allowsAttachments: allowsAttachments,
             publisher: state == nil && Bundle.main.object(forInfoDictionaryKey: "MopPublishesAutoFill") as? Bool == true ? AutoFillPublisher.shared : nil)
     }
-    public var capabilities: Set<VaultServiceCapability> { [.portableBackup, .enrollment] }
+    public var capabilities: Set<VaultServiceCapability> { [.portableBackup, .enrollment, .passwordCheckCache] }
+    public func userActivity() { idleWork.activity() }
+    public func setMaintenanceActive(_ active: Bool) { idleWork.setActive(active) }
     public func invalidateDiscovery() { backend.invalidateDiscovery() }
     public func requestSynchronization() async throws {
         guard authenticatedAt != nil else { return }
@@ -125,6 +128,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
     private func displayChanged() { displayListeners.withLock { Array($0.values) }.forEach { $0.yield(()) } }
     public func lock() {
+        idleWork.activity()
         state.withLock { value in
             value.generation += 1; value.authenticated = nil
             catalogCache.withLock { $0.removeAll() }
@@ -145,7 +149,9 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         try Task.checkCancellation()
     }
     private func opened(_ id: UUID, token: Int, offline: Bool) async throws -> ItemVaultSession {
+        let opening = authenticatedAt == nil
         let session = try await backend.open(id, offline: offline)
+        if opening { idleWork.activity() }
         try checked(token)
         state.withLock { value in if value.generation == token, value.authenticated == nil { value.authenticated = ProcessInfo.processInfo.systemUptime } }
         return session
@@ -225,15 +231,12 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             try checked(token)
             return try await displayResult(cached, index: index, session: session)
         }
-        _ = try await catalog(session, limit: displayBatchSize)
+        _ = try await catalog(session, limit: 0)
         try checked(token)
         let current = try await session.revisionIndex()
         guard let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
-        var result = try await displayResult(cached, index: current, session: session)
-        if result.catalogTotalCount != nil {
-            if !displaySettled(cached, index: current) { startCatalogUpdater(session, token: token) }
-        }
-        else { result.autoFillStatus = await publish(result.catalog, session: session, token: token) }
+        let result = try await displayResult(cached, index: current, session: session)
+        startCatalogUpdater(session, token: token)
         try checked(token)
         return result
     }
@@ -283,7 +286,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                     var staleRetries = 0
                     while !Task.isCancelled {
                         do {
-                            guard let complete = try await self?.advanceCatalogProjection(session, token: token) else { break }
+                            guard let self else { break }
+                            let complete = try await self.idleWork.run {
+                                try await self.advanceCatalogProjection(session, token: token)
+                            }
                             staleRetries = 0
                             if complete { break }
                         } catch ItemRepositoryError.staleLocalVersion where staleRetries < 2 {
@@ -315,14 +321,25 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
     private func advanceCatalogProjection(_ session: ItemVaultSession, token: Int) async throws -> Bool {
         try checked(token)
-        _ = try await catalog(session, limit: displayBatchSize)
+        _ = try await catalog(session, limit: 1)
         let index = try await session.revisionIndex()
         try checked(token)
         guard let cached = catalogCache.withLock({ $0[session.binding.vaultID] }), cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
         let complete = cached.versions == index
+        let settled = complete || displaySettled(cached, index: index)
+        if settled {
+            let enriched = try await withHealth(cached.catalog, session: session)
+            try checked(token)
+            catalogCache.withLock { values in
+                guard let current = values[session.binding.vaultID], current.session == cached.session,
+                      current.versions == cached.versions else { return }
+                values[session.binding.vaultID] = CachedCatalog(session: cached.session, versions: cached.versions,
+                    catalog: enriched, entries: cached.entries, waiting: cached.waiting, metadata: cached.metadata)
+            }
+            if complete { _ = await publish(enriched, session: session, token: token) }
+        }
         displayChanged()
-        if complete { _ = await publish(cached.catalog, session: session, token: token) }
-        return complete || displaySettled(cached, index: index)
+        return settled
     }
 
     public func execute(_ operation: VaultOperation, vault: String?, offline: Bool = false) async throws -> VaultResult {
@@ -337,7 +354,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         switch operation {
         case .manage(.automaticEnrollment), .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.checkEnrollment), .manage(.enrollmentInbox), .manage(.approveEnrollment), .manage(.confirmEnrollment), .manage(.cancelEnrollment), .manage(.rejectEnrollment), .manage(.devices): break
         case .discover, .catalog, .recentlyDeleted, .read, .save, .write, .delete, .create, .restorePortable,
-             .trashItem, .restoreItem, .rename, .exportPortable, .sync, .readHistory, .restoreHistory, .clearHistory, .passwordQuality: break
+             .trashItem, .restoreItem, .rename, .exportPortable, .sync, .readHistory, .restoreHistory, .clearHistory, .passwordQuality, .savePasswordChecks: break
         default: throw ItemVaultServiceFailure.unavailable
         }
         do { return try await executeCore(operation, vault: vault, offline: offline) }
@@ -437,6 +454,27 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 let value = try await session.reveal(itemID: entry.itemID, recordID: id, expectedVersion: entry.versionID)
                 result.passwordQuality[field.path] = PasswordEstimator.estimate(String(decoding: try value.validatedUTF8(), as: UTF8.self), userInputs: [name])
             }
+        case .savePasswordChecks(let checks, let expectedRevision):
+            let entries = try await metadataEntries(session)
+            guard try revision(entries) == expectedRevision else { throw MopError.vaultConflict }
+            let live = Set(entries.filter { !$0.catalog.item.isArchived && $0.catalog.item.deletion == nil }.flatMap { entry in
+                entry.catalog.item.fields.filter { $0.type == .password || ($0.path == entry.catalog.item.autoFill?.password && [.concealed, .text, .username, .email].contains($0.type)) }
+                    .compactMap { entry.catalog.references[SecretReference.encode(entry.catalog.item.name) + "/" + $0.path] }
+            })
+            guard Set(checks.map(\.record)).count == checks.count, checks.allSatisfy({ live.contains($0.record) }) else { throw MopError.vaultConflict }
+            for check in checks { try check.validate() }
+            var mutations: [UUID] = []
+            let storedChecks = Dictionary(uniqueKeysWithValues: try await session.healthChecks().map { ($0.record, $0) })
+            for entry in entries {
+                let ids = Set(entry.catalog.references.values)
+                let subset = checks.filter { ids.contains($0.record) }
+                if !subset.isEmpty && subset.allSatisfy({ storedChecks[$0.record] == $0 }) { continue }
+                if let mutation = try await session.saveHealthChecks(subset, itemID: entry.itemID, expectedItemVersion: entry.versionID) {
+                    mutations.append(mutation.id)
+                }
+            }
+            if !mutations.isEmpty { return await saved(session, token: token, mutations: mutations) }
+            assignCatalog(try await catalog(session), to: &result)
         case .save(let edit):
             let mutation = try await save(edit, session: session); return await saved(session, token: token, mutations: [mutation])
         case .write(let reference, let value, let replace):
@@ -618,7 +656,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         if let previous, previous.versions == index {
             try checked(token)
             guard session.isUnlocked else { throw MopError.authentication }
-            return previous.catalog
+            return limit == nil ? try await withHealth(previous.catalog, session: session) : previous.catalog
         }
         let itemIDs = Set(index.keys).subtracting([ItemVaultSession.metadataRecordID])
         var waiting = (previous?.waiting ?? [:]).filter { itemIDs.contains($0.key) && index[$0.key] == $0.value }
@@ -692,6 +730,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         var result = ItemCatalog(vault: metadata.name, revision: try revision(ordered), items: ordered.compactMap { visible[$0.itemID] })
         result.canEdit = true; result.security = metadata.security ?? VaultSecurityMetadata()
         result.security?.histories = ordered.flatMap { $0.catalog.histories }
+        if limit == nil { result = try await withHealth(result, session: session) }
         result.securityEnabled = true; result.canUpgradeSecurity = false
         result.usageScope = session.memberID.uuidString
         var versions = Dictionary(uniqueKeysWithValues: ordered.map { ($0.itemID, $0.versionID) })
@@ -708,6 +747,32 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
         return result
     }
+    private func withHealth(_ catalog: ItemCatalog, session: ItemVaultSession) async throws -> ItemCatalog {
+        // Preserve the latest successful timestamp for each independent check.
+        let conflicts = try await session.healthConflicts()
+        if !conflicts.isEmpty {
+            let adapter = try await backend.conflictAdapter()
+            for conflict in conflicts { try await session.resolveHealthConflict(conflict, coordinator: adapter) }
+        }
+        var result = catalog
+        if result.security == nil { result.security = VaultSecurityMetadata() }
+        let live = Set(catalog.items.filter { !$0.isArchived && $0.deletion == nil }.flatMap { $0.fields.compactMap(\.recordVersion) })
+        result.security?.passwordChecks = try await session.healthChecks().filter { live.contains($0.record) }
+        let checks = Dictionary((result.security?.passwordChecks ?? []).map { ($0.record, $0) }, uniquingKeysWith: { _, value in value })
+        for itemIndex in result.items.indices {
+            let item = result.items[itemIndex]
+            let context = [item.name, item.fields.first { [.username, .email].contains($0.type) }?.value ?? ""]
+            for fieldIndex in item.fields.indices where item.fields[fieldIndex].type == .password {
+                result.items[itemIndex].fields[fieldIndex].passwordQuality = nil
+                guard let record = item.fields[fieldIndex].recordVersion,
+                      let strength = checks[record]?.strengthResult, strength.context == context,
+                      strength.evaluator == 1 else { continue }
+                result.items[itemIndex].fields[fieldIndex].passwordQuality = strength.quality
+            }
+        }
+        return result
+    }
+
     private func assignCatalog(_ catalog: ItemCatalog, to result: inout VaultResult) {
         var active = catalog, deleted = catalog
         active.items.removeAll { $0.deletion != nil }

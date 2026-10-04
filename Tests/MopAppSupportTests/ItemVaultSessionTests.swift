@@ -424,3 +424,77 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     #expect(throws: MopError.cloudPermission) { try session.validate(pending.version, direction: .sending) }
     #expect(try await repository.pendingMutations(account: "session-account").count == 1)
 }
+
+@Test func healthCompanionsAuthenticateSyncAndRewrapWithoutEnteringItemCatalog() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-health-sync-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("owner.sqlite"))
+    let owner = try SessionDevice(), joining = try SessionDevice(member: owner.identity.member)
+    let root = try sessionAuthority(owner: owner)
+    let genesis = try MembershipEnvelope.genesis(vault: root.id, membership: root.membership, owner: owner)
+    let history = try TrustedMembershipHistory(genesis: genesis, vault: root.id, pinnedDigest: genesis.digest())
+    let binding = ItemVaultBinding(account: "health-sync", database: "private", zoneOwner: "__defaultOwner__", vaultID: root.id)
+    let session = try ItemVaultSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: owner))
+    _ = try await session.saveMetadata(VaultEnvelopeMetadata(name: "test"), expectedBase: nil)
+    let archive = try sessionArchive()
+    let item = try await session.save(archive, expectedBase: nil)
+    let record = try #require(archive.references.values.first), now = Date()
+    var check = CachedPasswordCheck(record: record, context: ["Login", ""], weak: false, exposed: true,
+        checkedAt: now, breachCheckedAt: now, reuseGroup: nil, scope: String(repeating: "a", count: 64), batch: UUID())
+    check.breachResult = CachedBreachResult(exposed: true, checkedAt: now)
+    check.strengthResult?.quality = .veryStrong
+    let saved = try #require(try await session.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID))
+    try session.validate(saved.version, direction: .receiving)
+    let wrongParent = EncryptedItemVersion(scope: saved.version.scope, versionID: saved.version.versionID,
+        baseVersionID: saved.version.baseVersionID, ciphertext: saved.version.ciphertext, generation: saved.version.generation, healthItemID: UUID())
+    #expect(throws: (any Error).self) { try session.validate(wrongParent, direction: .receiving) }
+    let wrongKind = EncryptedItemVersion(scope: saved.version.scope, versionID: saved.version.versionID, baseVersionID: nil,
+        ciphertext: saved.version.ciphertext, generation: saved.version.generation)
+    #expect(throws: (any Error).self) { try session.validate(wrongKind, direction: .receiving) }
+    await #expect(throws: ItemRepositoryError.staleLocalVersion) {
+        try await session.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: UUID())
+    }
+    #expect(try await session.healthChecks() == [check])
+    let unwraps = SessionUnwrapCounter()
+    let reopened = try ItemVaultSession(repository: repository, binding: binding, history: history,
+        device: SessionDevice(copying: owner, unwrapCounter: unwraps))
+    #expect(try await reopened.healthChecks() == [check])
+    #expect(unwraps.value.withLock { $0 } == 1) // One local index key, no companion-key unwrap.
+    #expect(try await reopened.healthChecks() == [check])
+    #expect(unwraps.value.withLock { $0 } == 1)
+    reopened.lock()
+    let address = VaultCloudAddress(vaultID: root.id, zoneName: "health", ownerName: binding.zoneOwner)
+    let cloud = try CloudKitSyncAdapter.makeRecord(saved.version, address: address)
+    #expect(try CloudKitSyncAdapter.unverifiedVersion(from: cloud, account: binding.account, database: binding.database, address: address) == saved.version)
+    let request = try DeviceEnrollmentRequest.create(scope: EnrollmentScope(container: "iCloud.test", environment: "Development",
+        account: binding.account, vault: root.id, member: owner.identity.member), device: joining)
+    let prepared = try await session.prepareAdmission(request: request)
+    #expect(prepared.approval.expectedItemCount == 1)
+    #expect(prepared.versions.count == 3)
+    let joinedHistory = try prepared.approval.verifiedHistory()
+    let target = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("joining.sqlite"))
+    let joined = try ItemVaultSession(repository: target, binding: binding, history: joinedHistory, device: joining)
+    for version in prepared.versions {
+        try joined.validate(version, direction: .receiving)
+        try await target.applyRemote(version, serverSystemFields: Data([1]))
+    }
+    #expect(try await joined.catalog().count == 1)
+    #expect(try await joined.revisionIndex().count == 2)
+    #expect(try await joined.healthChecks() == [check])
+    let receiver = ItemVaultService(backend: SyncedHealthBackend(session: joined))
+    let received = try await receiver.execute(.catalog, vault: root.id.uuidString, offline: true).requireCatalog()
+    #expect(received.items.first?.fields.first?.passwordQuality == .veryStrong)
+    #expect(try await joined.exportPortableLocalSnapshot().items.count == 1)
+    joined.lock()
+    await #expect(throws: MopError.authentication) { try await joined.healthChecks() }
+}
+
+private struct SyncedHealthBackend: ItemVaultServiceBackend {
+    let session: ItemVaultSession
+    func inventory() async throws -> [VaultDescriptor] { [] }
+    func open(_ vaultID: UUID) async throws -> ItemVaultSession { session }
+    func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession { throw MopError.invalidVault }
+    func requestSync() async throws {}
+    func lock() { session.lock() }
+}

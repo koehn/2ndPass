@@ -50,7 +50,7 @@ enum RepositoryModel {
          attribute("versionID", .UUIDAttributeType), attribute("baseVersionID", .UUIDAttributeType, optional: true),
          attribute("generation", .stringAttributeType),
          attribute("ciphertextSize", .integer64AttributeType),
-         attribute("ciphertext", .binaryDataAttributeType), attribute("isTombstone", .booleanAttributeType)]
+         attribute("ciphertext", .binaryDataAttributeType), attribute("healthItemID", .UUIDAttributeType, optional: true), attribute("isTombstone", .booleanAttributeType)]
     }
 
     private static func attribute(_ name: String, _ type: NSAttributeType, optional: Bool = false) -> NSAttributeDescription {

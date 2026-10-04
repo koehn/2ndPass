@@ -37,6 +37,7 @@ private struct CloudItemWireEnvelope: Codable {
     let baseVersionID: UUID?
     let ciphertext: Data
     let isTombstone: Bool
+    let healthItemID: UUID?
     let generation: UInt64
 }
 
@@ -647,7 +648,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         let version = EncryptedItemVersion(scope: ItemScope(account: account, vaultID: wire.vaultID, itemID: wire.itemID,
             database: databaseName, zoneOwner: record.recordID.zoneID.ownerName),
             versionID: wire.versionID, baseVersionID: wire.baseVersionID, ciphertext: wire.ciphertext,
-            isTombstone: wire.isTombstone, generation: wire.generation)
+            isTombstone: wire.isTombstone, generation: wire.generation, healthItemID: wire.healthItemID)
         guard let address = address(for: version.scope),
               record.recordID.zoneID == address.zoneID,
               record.recordID.recordName == version.scope.itemID.uuidString else { throw CloudSyncAdapterError.invalidBinding }
@@ -738,7 +739,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         } else { record = CKRecord(recordType: recordType, recordID: id) }
         let wire = CloudItemWireEnvelope(vaultID: version.scope.vaultID, itemID: version.scope.itemID,
             versionID: version.versionID, baseVersionID: version.baseVersionID, ciphertext: version.ciphertext,
-            isTombstone: version.isTombstone, generation: version.generation)
+            isTombstone: version.isTombstone, healthItemID: version.healthItemID, generation: version.generation)
         let data = try JSONEncoder().encode(wire)
         guard data.count <= maximumWireBytes else { throw ItemRepositoryError.oversizedCiphertext }
         if data.count <= maximumInlineBytes {
@@ -786,7 +787,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         return EncryptedItemVersion(scope: ItemScope(account: account, vaultID: wire.vaultID, itemID: wire.itemID,
             database: database, zoneOwner: address.ownerName), versionID: wire.versionID,
             baseVersionID: wire.baseVersionID, ciphertext: wire.ciphertext, isTombstone: wire.isTombstone,
-            generation: wire.generation)
+            generation: wire.generation, healthItemID: wire.healthItemID)
     }
 
     /// Conflict error records are not guaranteed to carry downloaded asset files.

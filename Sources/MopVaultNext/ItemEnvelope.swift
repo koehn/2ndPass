@@ -564,6 +564,9 @@ public struct VaultEnvelopeMetadata: Codable, Equatable, Sendable {
         guard security?.histories.isEmpty ?? true,
               Set(security?.accounts.map(\.id) ?? []).count == (security?.accounts.count ?? 0),
               exclusions.count <= 128, exclusions.allSatisfy({ $0.utf8.count <= 4096 }) else { throw MopError.invalidVault }
+        let checks = security?.passwordChecks ?? []
+        guard checks.count <= 262_144, Set(checks.map(\.record)).count == checks.count else { throw MopError.invalidVault }
+        for check in checks { try check.validate() }
         for account in security?.accounts ?? [] { try account.validate() }
     }
 }

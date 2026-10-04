@@ -128,43 +128,79 @@ execution, and the full SALE-8 accessibility/appearance/device-size review. Thes
 checks do not establish production CloudKit deployment, cross-account permissions,
 or permanent deletion of previously retained encrypted copies.
 
-### Incremental checking and freshness
+### Independent check lifecycles (2026-10-04)
 
-Successful password-health results and their timestamps are cached inside each
-upgraded vault's encrypted security metadata and synchronize through normal iCloud
-revisions. A complete cache for the same accessible active fields can be reused for
-24 hours after checking, including after lock, app restart, or on another device,
-without reading password values or making HIBP requests. Check Now bypasses freshness.
-The UI retains the original check date and identifies saved iCloud results.
+Only HIBP results expire with time: successful checks are refreshed after 24 hours
+while unlocked, with retry backoff on failure. Check Now bypasses that expiry and
+the automatic startup delay. It does not discard valid strength or reuse results.
+Strength results remain valid for the same secret record, account context, and
+estimator version. Reuse results remain valid for the same set of accessible active
+secret records; adding, replacing, archiving, deleting, or losing access to a
+credential can change another item's reuse finding. Account-label changes do not
+invalidate reuse or an unchanged password's HIBP result.
 
-Each result is bound to its immutable secret record, account context, evaluator
-version, and a scan scope derived from active record identities. Scope contains no
-password hashes. Reuse groups use random identifiers; a shared batch identifier
-prevents partial cross-vault synchronization from being mistaken for a complete
-reuse result. Changed values, account context, accessible fields, archive/deletion,
-or expired results invalidate the applicable cache. When reuse needs rebuilding,
-only session-keyed fingerprints are used; those fingerprints are never persisted.
+Strength, breach, and reuse have independently dated results in per-item encrypted
+health companions. A successful HIBP result is bound to the immutable password
+record and remains valid across devices for 24 hours. Editing another item, updating
+reuse groups, or changing an account label does not reset that clock. A replacement
+password is immediately eligible; a failed request does not advance the successful
+check timestamp. Check Now remains an explicit refresh override. Simultaneously
+checking devices or devices that have not received cloud updates can still duplicate
+requests; synchronization is not a distributed request lock.
 
-Cache publication is revision-bound and uses owner/editor permissions. Readers can
-consume saved results. It is skipped during editing, foreground work, or offline;
-failed publication leaves local results available and is reported separately.
-Unchanged catalog assignments, item selection, and cache-only revision publication
-do not restart checks. Previously successful breach evidence keeps its original
-check date when a refresh fails; retries back off from one minute to one hour.
+Health companions use signed, domain-separated encryption and the existing CloudKit
+item transport, with authenticated parent-item routing. They sync independently of
+login content and vault settings, and do not change item edit versions or dates.
+Each device maintains an encrypted local security index keyed by companion versions,
+using its existing device-wrapped catalog-cache key. Decrypted index state is cleared
+on lock; reopening unchanged results needs one local index-key unwrap. No password hashes or session fingerprints are persisted.
+A changed companion refreshes the security projection even when item versions are
+unchanged. Competing writes retain the latest successful timestamp independently
+for each check. Partial or mixed-batch reuse evidence is not accepted as complete;
+strength and breach evidence can still be cached independently.
 
-The optional `passwordChecks` metadata is disposable and introduces no new required
-feature or vault upgrade. Older clients may discard it, causing a later recheck,
-without losing vault contents. Existing security-feature upgrade requirements still
-apply to vaults that have not been upgraded. Encryption, sharing permissions, normal
-size limits, and encrypted backup retention apply to cached results too. Lock and
-account changes clear decrypted session caches and cancel scheduled work; encrypted
-results remain in the vault for reuse after authentication. Key rotation may discard
-derived results because record identities change.
+Companions are excluded from item counts, secret references, search, AutoFill, and
+portable backups (restored vaults recompute derived results). Device admission and
+membership catch-up reencrypt them for admitted recipients. No legacy-client
+compatibility is promised for the new record kind. Real CloudKit propagation and
+simultaneous-device behavior still require device acceptance testing.
 
-Cloud-cache validation: all 476 Swift tests passed, including fresh-session reuse
-with zero password reads/HIBP requests, forced and expired checks, changed-record
-invalidation, mixed synchronization batches, encrypted backup round trips, viewer
-write denial, stale publication rejection, and two-client synchronization using the
-in-memory cloud transport. macOS app/AutoFill and iOS Simulator builds passed.
-These automated tests do not substitute for physical-device iCloud synchronization
-acceptance.
+Automatic work waits 30 seconds after unlock, then waits for five seconds without
+user activity and for foreground work, editing, and backgrounding to end. It yields
+again between fields. Restoring already-valid cached results does not need this delay
+and does not show a checking thermometer. Delayed work is canceled on lock or session
+change. These checks run while the app is unlocked; this is not an OS background-job
+guarantee when the app is closed or locked.
+
+Validation for the October 4 lifecycle/storage update: the full Swift suite passed
+with the documented sandbox accommodations. Focused regressions cover another
+item changing without restarting a password's 24-hour breach clock, unchanged
+item ciphertext and metadata, stale cache writers, encrypted local-index reuse,
+wire binding, admission rewrapping, and startup/idle deferral. macOS app/AutoFill
+and iOS Simulator app/extension builds passed with signing disabled. This does not
+replace the physical-device and real CloudKit acceptance checks listed above.
+
+Scanning publishes incremental reports: the first completed field is shown and
+queued immediately, then completed work is flushed after ten additional fields or
+one second between completed-field boundaries, with a final flush at completion.
+Each batch updates the Security UI and durably queues changed encrypted observations
+for iCloud; it does not wait for cloud delivery. Partial writes preserve evidence
+for unvisited fields. Reuse comparison remains incomplete until the scan completes.
+Session/revision guards prevent stale publication, and committed batches survive
+cancellation or locking. Own-cache updates do not restart the running scan.
+
+After a successful item save, changed-password checks bypass the automatic
+startup/idle grace period without forcing HIBP refreshes for unchanged passwords.
+Fields needing strength evaluation run first. Their local strength results reach
+the detail warning, Weak Passwords list, and All Findings list before waiting for
+HIBP; a strong replacement clears the weak finding once evaluated. Other valid
+findings can keep the item in All Findings. The remaining network/reuse work keeps
+its incomplete state until finished.
+
+Strength observations include the full five-level rating, not just the weak-finding
+boolean. Receiving devices project that rating onto the matching current field
+only when its account context and evaluator match. The detail meter uses this synced
+rating directly; older observations without a rating fall back to local password
+estimation without requiring an online vault open. Software tests cover encrypted
+admission/receipt and the receiving catalog projection; physical iCloud propagation
+still needs device verification.

@@ -44,8 +44,9 @@ struct SecurityHealthView: View {
                         if let date = model.healthReport.completedAt { Text("Checked \(date.formatted())").font(.caption).foregroundStyle(.secondary) }
                         if model.healthReport.usedCloudCache { Text("Using saved iCloud results").font(.caption).foregroundStyle(.secondary) }
                         if let notice = model.healthCacheNotice { Text(notice).font(.caption).foregroundStyle(.secondary) }
+                        if model.healthScheduled { Text("Automatic checks will run when idle.").font(.caption).foregroundStyle(.secondary) }
                         if !model.breachChecksEnabled { Text("Breach checks disabled").font(.caption) }
-                        else if model.healthReport.breachChecked < model.healthReport.total && !model.healthChecking {
+                        else if model.healthReport.breachChecked < model.healthReport.total && !model.healthChecking && !model.healthScheduled {
                             Label("Breach check incomplete or unavailable", systemImage: "wifi.exclamationmark").font(.caption)
                         }
                         HStack {
@@ -60,7 +61,7 @@ struct SecurityHealthView: View {
                     }
                     DisclosureGroup("Breach check settings") {
                         Toggle("Check exposed passwords with HIBP", isOn: $model.breachChecksEnabled)
-                        Text(model.supports(.passwordCheckCache) ? "Results sync encrypted with each vault and are reused for 24 hours. Vault members can see them." : "Results remain available during this unlocked session. Synchronizing cached results is not yet available.").font(.caption)
+                        Text(model.supports(.passwordCheckCache) ? "Results sync encrypted with each vault. Breach checks refresh daily; strength and reuse update when credentials change. Vault members can see them." : "Results remain available during this unlocked session. Synchronizing cached results is not yet available.").font(.caption)
                         Text("HIBP receives a five-character password hash prefix and your network address. Your password and account details are not sent.").font(.caption)
                     }
                 }

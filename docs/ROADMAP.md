@@ -36,7 +36,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   the recovery documentation when implemented. Implementation and automated checks
   are recorded in [offline recovery](OFFLINE-RECOVERY.md); production schema deployment,
   physical-platform acceptance, and independent cryptographic review remain pending.
-- [ ] **SALE-2 — Password security health.** Provide a screen showing passwords
+- [X] **SALE-2 — Password security health.** Provide a screen showing passwords
   found in Have I Been Pwned (HIBP), reused passwords, weak/simple passwords, and
   actionable guidance for resolving findings. Acceptance: findings identify
   affected accounts, refresh after corrections, and distinguish an unavailable
@@ -83,7 +83,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   locked, and destructive-confirmation states. Resolve visual and interaction
   defects before sale; representative screenshots alone are not sign-off for
   unreviewed screens or flows.
-- [ ] **SALE-9 — Portable export and independently restorable backups.** Provide
+- [X] **SALE-9 — Portable export and independently restorable backups.** Provide
   a documented portable export preserving secrets, custom fields, and attachments,
   with explicit handling of unsupported/non-exportable credentials. Provide an
   encrypted backup that can be restored using the offline master recovery key
@@ -93,7 +93,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   into a new account without depending on access to the old account; distinguish
   this backup restore from same-account recovery of a live cloud vault. Explain
   plaintext export exposure and device-local key exclusions.
-- [ ] **SALE-10 — Offline creation and editing.** Allow new credentials and
+- [X] **SALE-10 — Offline creation and editing.** Allow new credentials and
   changes to existing items to be saved while offline or while iCloud is
   unavailable. Acceptance: encrypted pending changes survive app/device restarts,
   remain usable locally, and show clear pending-sync versus confirmed-sync status.

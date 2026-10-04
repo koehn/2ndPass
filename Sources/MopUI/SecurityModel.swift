@@ -46,18 +46,20 @@ extension AppModel {
             }
         }
     }
-    func refreshHealth(force: Bool = false) {
+    func refreshHealth(force: Bool = false, afterSave: Bool = false) {
         guard !isUpdatingCatalog else { return }
         guard healthPublishing == nil else { return }
         guard authenticated, !catalogs.isEmpty else { clearHealth(); return }
         guard itemDraft == nil else { return }
         if healthSessionGeneration != service.sessionGeneration {
             clearHealth(); healthSessionGeneration = service.sessionGeneration
+            healthNotBefore = ContinuousClock.now.advanced(by: healthStartupDelay)
         }
         let request = "\(service.sessionGeneration):\(breachChecksEnabled):" + catalogs.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value.revision)" }.joined(separator: "|")
-        if !force {
-            if healthChecking && healthRequest == request { return }
-            if !healthChecking && healthSession.isCurrent(catalogs: catalogs, enabled: breachChecksEnabled) {
+        let cacheSnapshot = catalogs.mapValues { $0.security?.passwordChecks ?? [] }
+        if !force && !afterSave {
+            if (healthChecking || healthScheduled) && healthRequest == request && healthRequestCache == cacheSnapshot { return }
+            if !healthChecking && !healthScheduled && healthSession.isCurrent(catalogs: catalogs, enabled: breachChecksEnabled) {
                 let report = healthReport, snapshots = catalogs, token = healthToken, session = service.sessionGeneration
                 if !offline, !busy, report.cachedChecks.contains(where: { id, checks in
                     snapshots[id]?.canEdit == true && snapshots[id]?.securityEnabled == true && snapshots[id]?.security?.passwordChecks != checks
@@ -71,30 +73,48 @@ extension AppModel {
             }
         }
         healthWakeTask?.cancel(); healthWakeTask = nil
-        healthTask?.cancel(); healthToken = UUID(); healthRequest = request
+        healthTask?.cancel(); healthToken = UUID(); healthRequest = request; healthRequestCache = cacheSnapshot
         let token = healthToken, session = service.sessionGeneration, snapshots = catalogs
         let revisions = snapshots.mapValues(\.revision)
         let service = service, breach = breachClient, enabled = breachChecksEnabled, scanner = healthSession
         healthProgress = 0
         healthRestoringCache = !force && scanner.canRestoreCloudResults(catalogs: snapshots, enabled: enabled)
-        healthChecking = true
-        healthTask = Task { [weak self] in
+        healthChecking = false; healthScheduled = true
+        let deadline = healthNotBefore ?? .now
+        healthTask = Task(priority: .utility) { [weak self] in
             do {
-                try await Task.sleep(for: .milliseconds(250))
-                // Foreground editing and saving take precedence over background reads.
-                while self?.busy == true {
-                    try await Task.sleep(for: .milliseconds(50))
+                if !force && !afterSave {
+                    let delay = ContinuousClock.now.duration(to: deadline)
+                    if delay > .zero { try await Task.sleep(for: delay) }
+                }
+                while self?.healthWorkAllowed(force: force || afterSave) == false {
+                    try await Task.sleep(for: .milliseconds(100))
                 }
                 try Task.checkCancellation()
-                let report = try await scanner.scan(catalogs: snapshots, service: service, breach: breach, enabled: enabled, force: force) { [weak self] fraction in
+                guard self?.healthToken == token else { return }
+                self?.healthScheduled = false; self?.healthChecking = true
+                let report = try await scanner.scan(catalogs: snapshots, service: service, breach: breach, enabled: enabled, force: force, eagerLocalResults: afterSave, progress: { [weak self] fraction in
                     guard let self, !Task.isCancelled, self.healthToken == token,
                           self.service.sessionGeneration == session, self.catalogs.mapValues(\.revision) == revisions else { return }
                     self.healthProgress = fraction
-                }
+                }, beforeWork: { [weak self] in
+                    while self?.healthWorkAllowed(force: force || afterSave) == false {
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    guard self?.healthToken == token else { throw CancellationError() }
+                    try Task.checkCancellation()
+                }, batch: { [weak self] partial in
+                    guard let self, !Task.isCancelled, self.authenticated, self.healthToken == token,
+                          self.service.sessionGeneration == session, self.catalogs.mapValues(\.revision) == revisions else {
+                        throw CancellationError()
+                    }
+                    self.healthReport = partial
+                    await self.persistHealthCache(partial, snapshots: self.catalogs, token: token, session: session, partial: true)
+                })
                 guard let self, !Task.isCancelled, self.authenticated, self.healthToken == token,
                       self.service.sessionGeneration == session, self.catalogs.mapValues(\.revision) == revisions else { return }
                 self.healthReport = report; self.healthChecking = false
-                await self.persistHealthCache(report, snapshots: snapshots, token: token, session: session)
+                await self.persistHealthCache(report, snapshots: self.catalogs, token: token, session: session)
                 guard self.healthToken == token, !Task.isCancelled else { return }
                 if !self.healthSession.isCurrent(catalogs: self.catalogs, enabled: self.breachChecksEnabled) {
                     self.refreshHealth()
@@ -102,27 +122,41 @@ extension AppModel {
                 self.scheduleHealthRefresh()
             } catch {
                 guard let self, self.healthToken == token else { return }
-                self.healthChecking = false
+                self.healthChecking = false; self.healthScheduled = false
             }
         }
     }
-    private func persistHealthCache(_ report: PasswordHealthReport, snapshots: [String: ItemCatalog], token: UUID, session: Int) async {
+    private func healthWorkAllowed(force: Bool) -> Bool {
+        authenticated && isActive && !busy && itemDraft == nil &&
+        (force || healthLastInteraction.duration(to: .now) >= healthIdleDelay)
+    }
+    private func persistHealthCache(_ report: PasswordHealthReport, snapshots: [String: ItemCatalog], token: UUID, session: Int, partial: Bool = false) async {
         guard supports(.passwordCheckCache) else { return }
         guard healthPublishing == nil else { return }
         guard !offline else { healthCacheNotice = "Results are local until iCloud is available."; return }
         healthCacheNotice = nil
         healthPublishing = token
         defer { if healthPublishing == token { healthPublishing = nil } }
-        for (id, checks) in report.cachedChecks.sorted(by: { $0.key < $1.key }) {
-            guard let source = snapshots[id], source.securityEnabled == true, source.canEdit == true,
-                  source.security?.passwordChecks != checks else { continue }
+        for (id, batchChecks) in report.cachedChecks.sorted(by: { $0.key < $1.key }) {
+            guard let source = snapshots[id], source.securityEnabled == true, source.canEdit == true else { continue }
+            var checks = batchChecks
+            if partial {
+                guard !batchChecks.isEmpty else { continue }
+                // This API replaces the vault's cache. Retain evidence for fields
+                // not yet visited, including other fields of the same item.
+                var merged = Dictionary((source.security?.passwordChecks ?? []).map { ($0.record, $0) }, uniquingKeysWith: { _, newer in newer })
+                for check in batchChecks { merged[check.record] = check }
+                checks = merged.values.sorted { $0.record < $1.record }
+            }
+            guard source.security?.passwordChecks != checks else { continue }
             guard !Task.isCancelled, authenticated, !busy, itemDraft == nil, healthToken == token, service.sessionGeneration == session,
                   catalogs[id]?.revision == source.revision else { return }
             do {
                 let result = try await service.execute(.savePasswordChecks(checks, revision: source.revision), vault: id, offline: false)
                 guard !Task.isCancelled, authenticated, healthToken == token, service.sessionGeneration == session,
                       catalogs[id]?.revision == source.revision, let updated = result.catalog else { return }
-                healthSession.adoptCacheRevision(vault: id, from: source.revision, to: updated.revision)
+                healthSession.adoptCacheRevision(vault: id, from: source.revision, to: updated.revision, checks: updated.security?.passwordChecks ?? [])
+                healthRequestCache[id] = updated.security?.passwordChecks ?? []
                 catalogs[id] = updated
                 if vault == id { try applyCatalog(updated) }
             } catch {
@@ -145,15 +179,15 @@ extension AppModel {
     func clearHealth() {
         healthTask?.cancel(); healthTask = nil; healthToken = UUID(); healthPublishing = nil
         healthWakeTask?.cancel(); healthWakeTask = nil
-        healthSession.clear(); healthSession = PasswordHealthSession(); healthRequest = nil; healthSessionGeneration = nil
-        healthChecking = false; healthRestoringCache = false; healthProgress = 0; healthReport = PasswordHealthReport(); historySelection = nil; healthCacheNotice = nil
+        healthSession.clear(); healthSession = PasswordHealthSession(); healthRequest = nil; healthRequestCache = [:]; healthSessionGeneration = nil
+        healthChecking = false; healthScheduled = false; healthNotBefore = nil; healthRestoringCache = false; healthProgress = 0; healthReport = PasswordHealthReport(); historySelection = nil; healthCacheNotice = nil
         // Invalidates in-flight cache writes as well as cached ranges.
         let old = breachClient
         Task { await old.clear() }
     }
     func openHealthFinding(_ finding: PasswordHealthFinding) {
         guard authenticated, !busy, itemDraft == nil, let source = catalogs[finding.vaultID] else { return }
-        conceal(); selectedLocalIdentityID = nil; passwordQualities = [:]
+        conceal(); selectedLocalIdentityID = nil; passwordQualities = [:]; passwordQualitySource = nil
         collection = .vault(finding.vaultID); vault = finding.vaultID
         try? applyCatalog(source); selectedItem = finding.item
         selected = try? SecretReference(vault: source.vault, relativePath: SecretReference.encode(finding.item) + "/" + finding.path)

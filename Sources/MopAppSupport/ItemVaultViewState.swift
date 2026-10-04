@@ -96,8 +96,8 @@ import MopVaultNext
                 entries = catalog
                 displayedVersions = Dictionary(uniqueKeysWithValues: catalog.map { ($0.itemID, $0.versionID) })
             }
-            conflictedItems = conflicts
-            pendingItems = Set(pending.map(\.itemID))
+            conflictedItems = conflicts.intersection(Set(versions.keys))
+            pendingItems = Set(pending.map(\.itemID)).intersection(Set(versions.keys))
             status = .ready
         } catch {
             guard generation == token, !Task.isCancelled else { return }

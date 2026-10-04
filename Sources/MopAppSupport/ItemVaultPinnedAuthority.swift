@@ -32,7 +32,15 @@ struct ItemVaultPinnedAuthority: Sendable {
         // Every accepted edge is additive-only: earlier authors remain authorized.
         // Signed per-item generations still reject replay of an older value.
         let membership = state.membership
-        if version.scope.itemID == ItemVaultSession.metadataRecordID {
+        if let parent = version.healthItemID {
+            guard parent != ItemVaultSession.metadataRecordID, version.scope.itemID == ItemHealthEnvelope.recordID(for: parent) else {
+                throw ItemVaultSessionFailure.invalidEnvelopeBinding
+            }
+            let value = try ItemHealthEnvelope.decode(version.ciphertext, vault: binding.vaultID, item: parent,
+                membership: membership, membershipStateDigest: digest)
+            guard value.header.version == version.versionID, value.header.base == version.baseVersionID,
+                  value.header.generation == version.generation else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
+        } else if version.scope.itemID == ItemVaultSession.metadataRecordID {
             let value = try VaultMetadataEnvelope.decode(version.ciphertext, vault: binding.vaultID,
                 membership: membership, membershipStateDigest: digest)
             guard value.header.version == version.versionID, value.header.base == version.baseVersionID,
