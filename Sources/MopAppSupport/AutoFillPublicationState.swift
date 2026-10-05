@@ -4,6 +4,20 @@ import MopCore
 
 /// Public suggestion metadata only. Never persist catalog titles, references or secrets.
 struct AutoFillPublicationState: Codable {
+    /// An untrusted routing hint only. The selected item must reproduce the
+    /// requested identity from its authenticated, current contents before reveal.
+    static func itemID(for identifier: String, directory: URL) throws -> UUID {
+        guard let vault = AutoFillEntry.vaultID(identifier) else { throw MopError.notFound }
+        let cache = try LocalDirectory(directory: directory)
+        return try cache.locked {
+            let data = try LocalFile.read(directory.appendingPathComponent("projection.json"), privateFile: true)
+            let state = try JSONDecoder().decode(Self.self, from: data)
+            guard state.schema == currentSchema else { throw MopError.notFound }
+            let matches = (state.items[vault] ?? [:]).filter { $0.value.identities.contains { $0.id == identifier } }
+            guard matches.count == 1, let key = matches.keys.first, let id = UUID(uuidString: key) else { throw MopError.notFound }
+            return id
+        }
+    }
     static let currentSchema = 1
     var schema = currentSchema
     struct Item: Codable {

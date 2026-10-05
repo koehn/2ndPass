@@ -68,6 +68,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private let delivery: ItemVaultDelivery
     private let allowsAttachments: Bool
     private let publisher: (any AutoFillPublishing)?
+    private let autoFillDirectory: URL?
     private let idleWork: IdleWorkQueue
     private let catalogGate = OperationGate()
     private struct CatalogUpdate: Sendable { let id: UUID; let task: Task<Void, Never> }
@@ -88,7 +89,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
 
     public init(backend: any ItemVaultServiceBackend, delivery: ItemVaultDelivery = .local, allowsAttachments: Bool = true,
                 publisher: (any AutoFillPublishing)? = nil,
-                idleDelay: Duration = .seconds(3), idleSpacing: Duration = .milliseconds(100)) {
+                idleDelay: Duration = .seconds(3), idleSpacing: Duration = .milliseconds(100), autoFillDirectory: URL? = nil) {
+        self.autoFillDirectory = autoFillDirectory
         self.backend = backend; self.delivery = delivery; self.allowsAttachments = allowsAttachments; self.publisher = publisher
         self.idleWork = IdleWorkQueue(delay: idleDelay, spacing: idleSpacing)
         accountObserver = NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: nil) { [weak self] _ in self?.lock() }
@@ -98,6 +100,23 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             publisher: state == nil && Bundle.main.object(forInfoDictionaryKey: "MopPublishesAutoFill") as? Bool == true ? AutoFillPublisher.shared : nil)
     }
     public var capabilities: Set<VaultServiceCapability> { [.portableBackup, .enrollment, .passwordCheckCache] }
+    public func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult) {
+        guard kind != .passkey, let vault = AutoFillEntry.vaultID(recordIdentifier), let id = UUID(uuidString: vault) else { throw MopError.notFound }
+        let item = try AutoFillPublicationState.itemID(for: recordIdentifier, directory: autoFillDirectory ?? AutoFillStorage.directory())
+        let token = sessionGeneration
+        let session = try await opened(id, token: token, offline: true)
+        let row = try await session.displayItem(itemID: item)
+        try checked(token)
+        // References require a lowercase vault name; the UUID is sufficient for
+        // this internal reference because routing already used the selected vault.
+        let catalog = ItemCatalog(vault: vault.lowercased(), revision: "", items: [row.item])
+        guard let entry = AutoFillEntry.entries(catalog: catalog, vaultID: vault).first(where: {
+            $0.recordIdentifier == recordIdentifier && $0.kind == kind
+        }) else { throw MopError.notFound }
+        let result = try await read(entry.reference, entry: row.entry, session: session)
+        try checked(token)
+        return (entry, result)
+    }
     public func userActivity() { idleWork.activity() }
     public func setMaintenanceActive(_ active: Bool) { idleWork.setActive(active) }
     public func invalidateDiscovery() { backend.invalidateDiscovery() }

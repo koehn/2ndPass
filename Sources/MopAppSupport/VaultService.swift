@@ -124,6 +124,7 @@ public enum VaultServiceCapability: CaseIterable, Hashable, Sendable {
 }
 
 public protocol VaultService: Sendable {
+    func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult)
     var capabilities: Set<VaultServiceCapability> { get }
     func changes() async -> AsyncStream<Void>
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview]
@@ -149,6 +150,9 @@ public protocol VaultService: Sendable {
 }
 
 public extension VaultService {
+    func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult) {
+        throw ItemVaultServiceFailure.unavailable
+    }
     func userActivity() {}
     func setMaintenanceActive(_ active: Bool) {}
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] { [] }

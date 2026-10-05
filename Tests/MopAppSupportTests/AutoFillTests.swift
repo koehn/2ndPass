@@ -201,6 +201,9 @@ private actor PublishedAutoFillIdentities {
 }
 
 private final class CodeReadService: VaultService, Sendable {
+    func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult) {
+        try await resolveTestAutoFill(recordIdentifier, kind: kind, catalog: catalog, service: self)
+    }
     enum Outcome: Sendable { case missingExpiry, expired, invalidSeed, cancel, valid }
     let outcome: Outcome
     let catalog: ItemCatalog
@@ -362,6 +365,9 @@ private actor AutoFillPublishingSwitch {
 }
 
 private final class PickerService: VaultService, Sendable {
+    func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult) {
+        try await resolveTestAutoFill(recordIdentifier, kind: kind, catalog: catalog, service: self)
+    }
     struct State { var authenticated = false; var prompts = 0; var reads = 0 }
     let state = Mutex(State())
     let usage = ItemUsageIdentity(account: UUID().uuidString, vault: UUID().uuidString, item: UUID().uuidString)
@@ -378,6 +384,12 @@ private final class PickerService: VaultService, Sendable {
         }
         return result
     }
+}
+private func resolveTestAutoFill(_ identifier: String, kind: AutoFillKind, catalog: ItemCatalog,
+                                 service: any VaultService) async throws -> (AutoFillEntry, VaultResult) {
+    guard let vault = AutoFillEntry.vaultID(identifier),
+          let entry = AutoFillEntry.entries(catalog: catalog, vaultID: vault).first(where: { $0.recordIdentifier == identifier && $0.kind == kind }) else { throw MopError.notFound }
+    return (entry, try await service.execute(.read(entry.reference), vault: vault, offline: true))
 }
 @MainActor @Test func autoFillCachedPickerDefersAuthenticationUntilOneFill() async throws {
     let service = PickerService()

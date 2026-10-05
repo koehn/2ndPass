@@ -301,6 +301,70 @@ private func performanceDocument(itemCount: Int) -> PortableVaultArchive {
     return document
 }
 
+@Test(arguments: [1, 80], [AutoFillKind.password, .oneTimeCode])
+func autoFillDirectReadUnwrapsOnlySelectedItemAndRejectsStaleHints(itemCount: Int, kind: AutoFillKind) async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let location = directory.appendingPathComponent("items.sqlite")
+    let repository = try EncryptedItemRepository(storeURL: location)
+    let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
+    var document = performanceDocument(itemCount: itemCount)
+    let otpRecord = UUID().uuidString
+    document.items[0].fields.append(ItemField(path: "otp", type: .otp))
+    document.references["Login0/otp"] = otpRecord
+    document.records[otpRecord] = PortableArchiveRecord(itemID: document.itemIDs["Login0"]!, bytes: SecretBytes(utf8: "JBSWY3DPEHPK3PXP"))
+    let archive = try PortableArchive.seal(document)
+    _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let initial = ItemVaultService(backend: backend)
+    let catalog = try await initial.execute(.catalog, vault: vault.uuidString, offline: true).requireCatalog()
+    let target = try #require(catalog.items.first { $0.name == "Login0" })
+    let itemID = try #require(target.storageID.flatMap(UUID.init(uuidString:)))
+    let identity = try #require(AutoFillEntry.entries(catalog: catalog, vaultID: vault.uuidString).first { $0.reference.item == "Login0" && $0.kind == kind })
+    let suggestions = directory.appendingPathComponent("suggestions")
+    let publisher = AutoFillPublisher(directory: suggestions, publish: { _ in })
+    try await publisher.publish(catalog: catalog, vaultID: vault.uuidString)
+    #expect(try AutoFillPublicationState.itemID(for: identity.recordIdentifier, directory: suggestions) == itemID)
+    initial.lock()
+    let reopened = try EncryptedItemRepository(storeURL: location)
+    let fresh = try await backend.reopened(repository: reopened)
+    let service = ItemVaultService(backend: fresh, autoFillDirectory: suggestions)
+    let before = fresh.unwrapCount
+    let (entry, result) = try await AutoFillAccess.resolve(recordIdentifier: identity.recordIdentifier, kind: kind, service: service)
+    #expect(entry.username == "alice")
+    if kind == .password { #expect(result.value == SecretBytes(utf8: "target-secret")) }
+    else {
+        #expect(result.value?.count == 6)
+        #expect(result.otpExpiresAt != nil && result.otpPeriod == 30)
+    }
+    #expect(result.usageIdentity?.item == itemID.uuidString)
+    #expect(fresh.unwrapCount - before == 2) // Selected metadata + selected password, for either vault size.
+
+    let session = try await fresh.open(vault)
+    let current = try await session.catalog(itemID: itemID)
+    _ = try await session.replaceField(itemID: itemID, expectedBase: current.versionID, path: "username", value: SecretBytes(utf8: "changed"))
+    let beforeStale = fresh.unwrapCount
+    await #expect(throws: MopError.notFound) {
+        try await AutoFillAccess.resolve(recordIdentifier: identity.recordIdentifier, kind: kind, service: service)
+    }
+    #expect(fresh.unwrapCount - beforeStale == 1) // Reject before decrypting the password.
+
+    if itemCount > 1 {
+        let file = suggestions.appendingPathComponent("projection.json")
+        var state = try JSONDecoder().decode(AutoFillPublicationState.self, from: Data(contentsOf: file))
+        let otherID = try #require(catalog.items.first { $0.name == "Login1" }?.storageID)
+        let hint = state.items[vault.uuidString]?[itemID.uuidString]
+        state.items[vault.uuidString]?[itemID.uuidString] = nil
+        state.items[vault.uuidString]?[otherID] = hint
+        try LocalFile.write(JSONEncoder().encode(state), to: file, replace: true)
+        let beforeTamper = fresh.unwrapCount
+        await #expect(throws: MopError.notFound) {
+            try await AutoFillAccess.resolve(recordIdentifier: identity.recordIdentifier, kind: kind, service: service)
+        }
+        #expect(fresh.unwrapCount - beforeTamper == 1)
+    }
+    service.lock()
+}
+
 private actor CatalogPublicationRecorder: AutoFillPublishing {
     private(set) var itemCounts: [Int] = []
     private(set) var retainedVaults: [Set<String>] = []

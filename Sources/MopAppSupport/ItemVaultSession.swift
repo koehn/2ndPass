@@ -312,6 +312,24 @@ public final class ItemVaultSession: @unchecked Sendable {
         return try await background { [self] in try catalogEntry(version) }
     }
 
+    /// Read only the chosen item's metadata and visible fields; no revision-index
+    /// scan, display-cache hydration, or background catalog preparation.
+    public func displayItem(itemID: UUID) async throws -> ItemVaultDisplayEntry {
+        try permit.check()
+        guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
+        guard let version = try await repository.item(binding.item(itemID)) else { throw MopError.notFound }
+        return try await background(priority: .userInitiated) { [self] in
+            try permit.check()
+            let value = try envelope(version)
+            let state = try readableState(value.header.membership)
+            let projection = try permit.withDevice { device in
+                try value.displayCatalog(device: device, membership: state.membership, membershipStateDigest: value.header.membership)
+            }
+            return ItemVaultDisplayEntry(entry: ItemVaultCatalogEntry(itemID: itemID, versionID: version.versionID,
+                catalog: projection.catalog), item: projection.item)
+        }
+    }
+
     private struct NameIndexContext: Encodable {
         let binding: ItemVaultBinding
         let membership: String

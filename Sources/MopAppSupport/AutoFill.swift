@@ -487,11 +487,8 @@ public enum AutoFillAccess {
 
     static func resolve(recordIdentifier: String, kind: AutoFillKind, service: any VaultService) async throws -> (AutoFillEntry, VaultResult) {
         try Task.checkCancellation()
-        guard recordIdentifier.hasPrefix(kind.prefix + ":"), let id = AutoFillEntry.vaultID(recordIdentifier) else { throw MopError.notFound }
-        let result = try await service.execute(.catalog, vault: id, offline: true)
-        let catalog = try result.requireCatalog()
-        guard let entry = AutoFillEntry.entries(catalog: catalog, vaultID: id).first(where: { $0.recordIdentifier == recordIdentifier && $0.kind == kind }) else { throw MopError.notFound }
-        let secret = try await service.execute(.read(entry.reference), vault: id, offline: true)
+        guard recordIdentifier.hasPrefix(kind.prefix + ":"), AutoFillEntry.vaultID(recordIdentifier) != nil else { throw MopError.notFound }
+        let (entry, secret) = try await service.resolveAutoFill(recordIdentifier: recordIdentifier, kind: kind)
         try Task.checkCancellation()
         return (entry, secret)
     }
