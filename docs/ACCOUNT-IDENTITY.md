@@ -1,35 +1,11 @@
-# Account and device identity in v7
+# Account and device identity
 
-An account is a stable namespace derived from CloudKit container, environment and the account's opaque record ID. It groups approved devices and a vault role. It is not a key and does not authorize decryption by itself.
+An account scope derives from the CloudKit container, environment and opaque account record ID. It is a namespace, not a decryption key.
 
-Every device generates independent Secure Enclave agreement and signing keys. Device-only opaque representations live in the provisioned Data Protection Keychain group. App, CLI and AutoFill on that device use the same identity namespace. For another device on the same Apple Account, choose the vaults in Connect This Device and choose Connect. 2ndPass exchanges signed requests and grants automatically through the private iCloud database while an existing owner device is unlocked. No manual approval or comparison screen is involved in this same-account flow. Cross-account sharing still requires independently verified invitations and explicit owner approval.
+Each device generates independent Secure Enclave agreement and signing keys. Device-only Keychain representations and the App Group store are shared by the signed app, CLI and AutoFill on that device; authentication remains per-client.
 
-Same-account enrollment relies on Apple's authenticated iCloud environment plus
-code signing, provisioning and CloudKit container entitlements, then on an
-owner's signed 2ndPass membership grant. Knowing Apple Account credentials alone
-does not authorize arbitrary container writes. An attacker able to operate an
-authorized client and access that user's private 2ndPass database may gain
-membership if an unlocked, online owner processes the exchange. Avoiding a second
-human ceremony is deliberate; no private iCloud Keychain trust-circle API is
-queried. See the [full model](SECURITY.md#composed-apple--2ndpass-trust-model).
+Same-account private vaults are discovered and connected automatically. Keep an existing device unlocked while admission completes. The private iCloud database is an explicit bootstrap trust channel: signed requests bind scope and device keys, and the joining device verifies the signed grant, original request and metadata decryption before pinning authority. Existing pins cannot be replaced by discovery.
 
-Cross-account vault sharing is not yet implemented as a supported feature.
-Preliminary code would include enrollment in the shared zone; account-private
-mailbox isolation is a design detail to address when completing sharing, not a
-current product vulnerability. See
-[the design review](SECURITY.md#shared-zone-enrollment-exposure).
+An attacker with write access through the trusted account/container channel may gain admission when an existing unlocked device processes the request. Signing-key possession is not hardware attestation. Observed account changes invalidate local bindings; offline clients cannot observe remote changes.
 
-Ordinary device requests bind account scope and both public keys. Manual
-cross-account enrollment requires independently compared fingerprints. Proof of
-signing-key possession is not remote attestation; the shipping ordinary device
-provider requires Secure Enclave keys, but custom clients can submit software keys.
-
-Offline recovery uses a separate account-wide authority derived from the user's
-offline secret and this account scope. A fresh installation must sign into the
-same Apple Account. Its recovery bootstrap trusts authenticated private CloudKit
-for initial vault provenance and freshness, validates the available signed chain,
-and proves access with the offline private key. It does not use an email address
-as identity, recover the Apple Account, or restore data into another account.
-See [offline recovery](OFFLINE-RECOVERY.md).
-
-The synchronized software-account anchor and key namespace from v5 are not used or deleted. No code for opening those identities is included in the v7 application build graph. See [architecture](VAULT-NEXT.md), [security](SECURITY.md), and [enrollment commands](../README.md).
+Cross-account sharing, device removal and account recovery are unavailable. Portable restore creates a new vault from an archive and its separate key. See [security](SECURITY.md), [architecture](VAULT.md) and [backups](BACKUPS.md).

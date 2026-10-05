@@ -4,22 +4,9 @@ Implementation scope: SALE-2, SALE-3, and a first increment of SALE-11. Physical
 Secure Enclave, cross-device/CloudKit, accessibility, and real-service acceptance
 remain release gates. Automated software-key tests do not establish those properties.
 
-## Compatibility and upgrade
+## Current integration
 
-New vaults enable `secret-history-1` and `credential-redundancy-1`. Existing v7
-vaults can still be read and checked without modification. Their owner can choose
-Upgrade Vault from Security, acknowledge the old-client incompatibility, and choose
-a backup folder. The service exports an encrypted backup without replacing an
-existing file, reopens and verifies it against the current checkpoint, and only
-then publishes an upgrade revision. A stale revision, failed backup, or publication
-conflict does not silently replace the current cloud head. Keep the recovery copy
-separately. Update the app, companion CLI, and extensions on every device first.
-
-This is a **breaking v7 schema extension**, not a v8 cryptographic replacement.
-Old clients reject the required features. Flags cannot be removed by a later
-revision. There is no in-place downgrade or attempt to recover passwords overwritten
-before upgrading. Old backups remain readable in updated clients; restoring a
-backup must not bypass checkpoint trust or replace a newer live head.
+Password-check caching and per-item history read/restore/clear use the item service. Credential-account registration and redundancy management remain unavailable. All participating clients should use compatible item schemas. Hardware and real-service acceptance remain separate from software tests.
 
 ## Password checks
 
@@ -50,56 +37,15 @@ breached. A matching password is described as appearing in known breach data.
 
 ## Account and credential evidence
 
-Registration records live inside the encrypted catalog of an explicitly selected
-cloud vault, with its normal membership permissions and visible sharing audience.
-They are not counted as credential items. Records identify service/account, optional
-linked item, protocol, public credential identifier, device, confirmation state/date,
-and confirming actor. Local private keys never enter these records. Passkey metadata
-prefills the relying party and account when linking; similar names are not merged.
-
-Each registration is generated, explicitly confirmed by the user after registering
-and testing it at the service, or removed/revoked. Generating a key, returning a
-WebAuthn registration response, or producing a local signature is not service
-acceptance. An alternate requires distinct confirmed credentials on different
-devices; two keys on one device do not qualify. Manually entered external devices
-and keys are labeled. A confirmation is dated user evidence, not live verification.
-
-Removing a vault device invalidates its registration evidence. A successfully loaded
-local inventory can invalidate records for keys no longer on the current device;
-network/listing failures are not evidence of deletion. Unlinked identities remain
-unknown. Recovery/reissuance procedures are stored separately and do not count as
-registered alternates. Read-only or offline views cannot update evidence.
+Credential-account registration and redundancy management are not connected to the current service. The planned workflow distinguishes generated keys from credentials actually registered and tested at an external service. An alternate must be a distinct confirmed credential on another device; two keys on one device do not establish device redundancy. No software record can back up a device-local hardware private key.
 
 ## History semantics and schema
 
-Eligible fields are `.password` and `.concealed`, covering password and API-token
-values and raw CLI secrets. Every engine write compares actual bytes before retaining
-a predecessor. Item drafts and failed cloud publication do not commit history.
-The newest twenty previous values per field are kept without age expiry. Existing
-vault capacity limits still apply; exceeding them fails the write rather than
-silently pruning below the retention rule.
+Eligible password and concealed-field edits retain previous values in the encrypted item envelope. Local commit establishes the change and its history; delayed or failed cloud delivery does not undo that commit. Item drafts alone do not create history.
 
-The encrypted `CatalogPayload.security` contains `histories` and `accounts`.
-Each eligible field has a stable `historyID` UUID. Its history retains that UUID,
-item UUID, current field path, and entries containing an
-encrypted-record ID and replacement date. Item and field renaming changes live reference
-paths but not history identities. Field-path swaps preserve each field’s history. History records use the existing item key and
-field authenticated context. They are excluded from current reference enumeration,
-AutoFill, normal search, and normal secret reads. Validation requires disjoint
-current/history record ownership and matching item keys. Rotation remaps both
-current and historical record IDs; membership and offline recovery cover both.
-No new CloudKit record type is introduced.
+History is associated with stable field identities and excluded from ordinary secret references, search and AutoFill. Explicit history reads require authentication. Restore is an ordinary edit that retains its predecessor. Portable archives preserve retained history and trash/restore preserves the item contents.
 
-Readers can reveal/copy previous values; editors and owners can restore or clear.
-Restore is another ordinary write and preserves its predecessor. Reveal is concealed
-on inactivity/app switching and after thirty seconds; copying uses the existing
-secret clipboard policy. Field deletion and item purge remove live history; trash
-and restore retain it. Existing encrypted backup/restore includes history.
-
-**Clear History is not permanent erasure from old revisions, backups, or copies.**
-Restoring a value does not change the service or reactivate a revoked token. Full
-item snapshots, imported historical values, permanent historical-copy deletion,
-and the broader SALE-11/SALE-9 acceptance remain separate work.
+Clearing history affects the current stored item; it cannot erase values from exported archives, remote copies or a recipient's memory. Live account recovery and permanent vault deletion are unavailable. Physical conflict/history preservation and deletion semantics remain release acceptance work.
 
 ## Validation evidence — October 2, 2026
 

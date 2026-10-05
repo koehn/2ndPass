@@ -16,6 +16,7 @@ import MopLocalIdentity
     private var expiryTask: Task<Void, Never>?
     private var observations: [AccountObservation] = []
     private var pendingList = false
+    private var savingLogin = false
     private var pendingIdentity: AutoFillIdentity?
     private var retryIdentity: AutoFillIdentity?
     private var retryField: CredentialField?
@@ -26,7 +27,7 @@ import MopLocalIdentity
     private let model = CredentialListModel()
 
     override func loadView() {
-        let content = CredentialRootView(model: model, saveLogin: { [weak self] in self?.saveLogin() }, reloadLoginVaults: { [weak self] in self?.loadLoginVaults() }, passkeyPerform: { [weak self] in self?.performPasskey($0, vault: $1) }, select: { [weak self] in self?.fill($0, field: $1) },
+        let content = CredentialRootView(model: model, createLogin: { [weak self] in self?.createLogin() }, saveLogin: { [weak self] in self?.saveLogin() }, reloadLoginVaults: { [weak self] in self?.loadLoginVaults() }, passkeyPerform: { [weak self] in self?.performPasskey($0, vault: $1) }, select: { [weak self] in self?.fill($0, field: $1) },
                                          retry: { [weak self] in self?.retry() },
                                          chooseAnother: { [weak self] in self?.prepareList(kind: self?.model.kind) },
                                          cancel: { [weak self] in self?.cancel() },
@@ -70,7 +71,7 @@ import MopLocalIdentity
             let application = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             let process = application?.processIdentifier
             Task { @MainActor in
-                guard let self, self.session != nil else { return }
+                guard let self, self.session != nil || self.savingLogin else { return }
                 let foreground = Self.userApplication(NSWorkspace.shared.frontmostApplication)
                 guard self.focus.shouldInterrupt(activated: process, foreground: foreground) else { return }
                 self.interrupt("The active application changed. Retry to authenticate again.")
@@ -116,27 +117,32 @@ import MopLocalIdentity
         loadLoginVaults()
     }
     #endif
+    private func createLogin() {
+        let website = model.hosts.count == 1 ? model.hosts.first! : ""
+        stop()
+        model.saveAndFill = true
+        model.loginDraft = AutoFillLoginDraft(name: website, username: "", password: "", website: website)
+        model.message = nil
+        updatePreferredContentSize()
+        loadLoginVaults()
+    }
     private func loadLoginVaults() {
         guard model.loginDraft != nil else { return }
         let token = generation
         model.loading = true; model.message = nil; model.loginVaults = []; model.loginVault = ""
         task = Task {
-            defer { if token == generation { model.loading = false } }
-            do {
-                let result = try await cloudPasskeyService.execute(.discover, vault: nil, offline: false)
-                var available: [VaultDescriptor] = []
-                var unavailable = false
-                for vault in result.vaults where vault.enrolled && vault.supported {
-                    do {
-                        let catalog = try await cloudPasskeyService.execute(.catalog, vault: vault.id, offline: false).requireCatalog()
-                        if catalog.canEdit == true { available.append(vault) }
-                    } catch { unavailable = true }
-                    guard token == generation, !Task.isCancelled else { return }
+            defer {
+                if token == generation {
+                    cloudPasskeyService.lock()
+                    model.loading = false
                 }
+            }
+            do {
+                let available = try await cloudPasskeyService.loginDestinations()
                 guard token == generation, !Task.isCancelled else { return }
                 model.loginVaults = available
-                if available.isEmpty { model.message = "No writable vaults are available. Open 2ndPass to connect a vault, then try again." }
-                else if unavailable { model.message = "Some vaults could not be opened. You can retry or choose an available vault." }
+                if available.count == 1 { model.loginVault = available[0].id }
+                if available.isEmpty { model.message = "No connected vaults are available. Open 2ndPass to connect a vault, then try again." }
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
                 model.message = "Vaults could not be loaded. Try again."
@@ -144,22 +150,71 @@ import MopLocalIdentity
         }
     }
     private func saveLogin() {
-        #if os(iOS)
-        guard #available(iOS 26.2, *), !model.loading, let draft = model.loginDraft,
+        guard !model.loading, let draft = model.loginDraft,
               draft.canSave, model.loginVaults.contains(where: { $0.id == model.loginVault }) else { return }
+        let fillAfterSave = model.saveAndFill
+        guard !fillAfterSave || draft.canSaveAndFill else { return }
+        if !fillAfterSave {
+            #if os(iOS)
+            guard #available(iOS 26.2, *) else { return }
+            #else
+            return
+            #endif
+        }
         let token = generation, vault = model.loginVault
         model.loading = true; model.message = nil
+        savingLogin = true
+        cloudPasskeyService.lock()
+        #if os(macOS)
+        focus.begin(application: Self.userApplication(NSWorkspace.shared.frontmostApplication))
+        #endif
+        expiryTask?.cancel()
+        expiryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(60)) } catch { return }
+            guard let self, self.generation == token else { return }
+            self.interrupt("Saving timed out. Check 2ndPass before creating this login again; it may already have been saved.")
+        }
         task = Task {
-            defer { if token == generation { model.loading = false } }
+            defer {
+                if token == generation {
+                    cloudPasskeyService.lock()
+                    model.loading = false; savingLogin = false; expiryTask?.cancel(); expiryTask = nil
+                }
+            }
             do {
-                let catalog = try await draft.save(vault: vault, service: cloudPasskeyService)
+                let catalog: ItemCatalog
+                let credential: ASPasswordCredential?
+                if fillAfterSave {
+                    let saved = try await draft.saveAndPrepareFill(vault: vault, service: cloudPasskeyService)
+                    catalog = saved.catalog; credential = saved.credential
+                } else {
+                    catalog = try await draft.save(vault: vault, service: cloudPasskeyService)
+                    credential = nil
+                }
                 guard token == generation, !Task.isCancelled else { return }
-                // Saving succeeded even if the system's suggestion store is unavailable.
-                // The containing app can refresh that public index later.
-                try? await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault)
+                // Do not mutate Safari's suggestions during its pending fill.
+                // Persist the picker metadata; app activation publishes it later.
+                // Failure here does not undo the already committed login.
+                if fillAfterSave {
+                    try? await AutoFillPublisher.shared.stage(catalog: catalog, vaultID: vault)
+                } else {
+                    try? await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault)
+                }
                 guard token == generation, !Task.isCancelled else { return }
                 model.loginDraft = nil; cloudPasskeyService.lock()
-                extensionContext.completeSavePasswordRequest(completionHandler: nil)
+                if let credential {
+                    if let item = catalog.items.first(where: { $0.name == draft.name.trimmingCharacters(in: .whitespacesAndNewlines) }),
+                       let usage = catalog.usageIdentity(for: item, vaultID: vault) {
+                        await ItemUsageLogging.record([usage], store: ItemUsageStore())
+                    }
+                    guard token == generation, !Task.isCancelled else { return }
+                    finish()
+                    extensionContext.completeRequest(withSelectedCredential: credential, completionHandler: nil)
+                } else {
+                    #if os(iOS)
+                    if #available(iOS 26.2, *) { extensionContext.completeSavePasswordRequest(completionHandler: nil) }
+                    #endif
+                }
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
                 if let failure = error as? MopError, case .duplicate = failure {
@@ -167,7 +222,6 @@ import MopLocalIdentity
                 } else { model.message = error.localizedDescription }
             }
         }
-        #endif
     }
     private func prepareList(kind: AutoFillKind?) {
         stop(); pendingIdentity = nil; retryIdentity = nil; retryField = nil
@@ -184,7 +238,7 @@ import MopLocalIdentity
                 guard token == generation, !Task.isCancelled else { return }
                 guard !identities.isEmpty else {
                     model.loading = false
-                    model.message = "No suggestions are available. Open 2ndPass, unlock it, then choose Settings → AutoFill → Refresh Suggestions."
+                    model.message = kind == .password ? "No saved logins are available. Create a login to get started." : "No suggestions are available. Open 2ndPass to check your saved items."
                     updatePreferredContentSize(); return
                 }
                 // Browsing uses only published metadata. Start authentication and its
@@ -390,7 +444,7 @@ import MopLocalIdentity
     #endif
     private func updatePreferredContentSize() {
         #if os(macOS)
-        preferredContentSize = model.showsPicker ? NSSize(width: 480, height: 640) : NSSize(width: 440, height: model.message == nil ? 300 : 440)
+        preferredContentSize = model.loginDraft != nil || model.showsPicker ? NSSize(width: 480, height: 640) : NSSize(width: 440, height: model.message == nil ? 300 : 440)
         #endif
     }
     private func fill(_ identity: AutoFillIdentity, field: CredentialField? = nil) {
@@ -455,6 +509,7 @@ import MopLocalIdentity
         model.entries = []; model.loading = false
     }
     private func stop() {
+        savingLogin = false; model.saveAndFill = false
         model.loginDraft = nil; model.loginVaults = []; model.loginVault = ""
         passkeyAuthorization?.revoke(); passkeyAuthorization = nil; passkeyRequest = nil; passkeyParameters = nil
         model.passkeyRP = nil; model.passkeys = []; model.cloudPasskeys = []; model.passkeyVaults = []; cloudPasskeyService.lock()
@@ -470,7 +525,7 @@ import MopLocalIdentity
     }
     #endif
     private func interrupt(_ reason: String = "AutoFill paused because the device locked, slept, or the request entered the background. Retry to authenticate again.") {
-        guard session != nil || model.passkeyRP != nil || model.loginDraft != nil else { return }
+        guard session != nil || savingLogin || model.passkeyRP != nil || model.loginDraft != nil else { return }
         stop(); model.message = reason; updatePreferredContentSize()
     }
     private func identityNotFound() {
@@ -483,6 +538,7 @@ import MopLocalIdentity
 
 private enum CredentialField { case username, password, code }
 @MainActor @Observable private final class CredentialListModel {
+    var saveAndFill = false
     var loginDraft: AutoFillLoginDraft?
     var loginVaults: [VaultDescriptor] = []
     var loginVault = ""
@@ -502,6 +558,7 @@ private enum CredentialField { case username, password, code }
 
 private struct CredentialRootView: View {
     @Bindable var model: CredentialListModel
+    let createLogin: () -> Void
     let saveLogin: () -> Void
     let reloadLoginVaults: () -> Void
     let passkeyPerform: (String?, String) -> Void
@@ -516,13 +573,14 @@ private struct CredentialRootView: View {
         } else if let rp = model.passkeyRP {
             LocalPasskeyPrompt(relyingParty: rp, registration: model.passkeyRegistration, identities: model.passkeys, cloud: model.cloudPasskeys, vaults: model.passkeyVaults, busy: model.loading, message: model.message, perform: passkeyPerform, cancel: cancel, resize: resizePasskey)
         } else {
-            CredentialListView(model: model, select: select, retry: retry, chooseAnother: chooseAnother, cancel: cancel)
+            CredentialListView(model: model, createLogin: createLogin, select: select, retry: retry, chooseAnother: chooseAnother, cancel: cancel)
         }
     }
 }
 
 private struct CredentialListView: View {
     @Bindable var model: CredentialListModel
+    let createLogin: () -> Void
     let select: (AutoFillIdentity, CredentialField?) -> Void
     let retry: () -> Void
     let chooseAnother: () -> Void
@@ -581,6 +639,10 @@ private struct CredentialListView: View {
                         Button("Fill") { fillSelected() }.keyboardShortcut(.defaultAction).disabled(selection == nil || model.loading)
                     }
                 }
+            }
+            if model.showsPicker && model.kind == .password && !model.textInsertion {
+                Button("Create Login…", systemImage: "plus", action: createLogin)
+                    .disabled(model.loading).accessibilityIdentifier("autofill-create-login")
             }
             Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
         }.padding(24).frame(minWidth: 280, minHeight: model.showsPicker ? 300 : 120)
@@ -665,20 +727,38 @@ private struct SaveLoginView: View {
     let save: () -> Void
     let reload: () -> Void
     let cancel: () -> Void
+    @State private var generating = false
     private func field(_ key: WritableKeyPath<AutoFillLoginDraft, String>) -> Binding<String> {
         Binding(get: { model.loginDraft?[keyPath: key] ?? "" }, set: { model.loginDraft?[keyPath: key] = $0 })
     }
     var body: some View {
         VStack(spacing: 0) {
-            AutoFillDialogHeader(title: "Save Login", subtitle: model.loginDraft?.website ?? "")
+            AutoFillDialogHeader(title: model.saveAndFill ? "Create Login" : "Save Login", subtitle: model.loginDraft?.website ?? "")
                 .padding()
             Form {
                 Section {
+                    if model.saveAndFill && model.hosts.count != 1 {
+                        if model.hosts.isEmpty {
+                            TextField("Website", text: field(\.website)).autocorrectionDisabled()
+                        } else {
+                            Picker("Website", selection: field(\.website)) {
+                                Text("Choose a website…").tag("")
+                                ForEach(model.hosts.sorted(), id: \.self) { Text($0).tag($0) }
+                            }
+                        }
+                    }
                     TextField("Name", text: field(\.name))
                         .accessibilityIdentifier("save-login-name")
                     TextField("Username", text: field(\.username))
                         .autocorrectionDisabled()
                     SecureField("Password", text: field(\.password))
+                    Button("Generate Password…", systemImage: "dice") { generating = true }
+                        .accessibilityIdentifier("autofill-generate-password")
+                        .popover(isPresented: $generating) {
+                            AutoFillPasswordGenerator(use: { password in
+                                model.loginDraft?.password = password; generating = false
+                            }, cancel: { generating = false })
+                        }
                     Picker("Save in", selection: $model.loginVault) {
                         Text("Choose a vault…").tag("")
                         ForEach(model.loginVaults, id: \.id) { vault in Text(vault.name ?? vault.id).tag(vault.id) }
@@ -698,10 +778,54 @@ private struct SaveLoginView: View {
                 Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
                 Spacer()
                 if model.loading { ProgressView().controlSize(.small).accessibilityLabel("Saving or loading vaults") }
-                Button("Save Login", action: save).buttonStyle(.borderedProminent)
+                Button(model.saveAndFill ? "Save and Fill" : "Save Login", action: save).buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(model.loading || model.loginDraft?.canSave != true || model.loginVault.isEmpty)
+                    .accessibilityIdentifier("autofill-save-login")
+                    .disabled(model.loading || (model.saveAndFill ? model.loginDraft?.canSaveAndFill : model.loginDraft?.canSave) != true || model.loginVault.isEmpty)
             }.padding()
         }
+    }
+}
+
+private struct AutoFillPasswordGenerator: View {
+    let use: (String) -> Void
+    let cancel: () -> Void
+    @State private var options = PasswordOptions()
+    @State private var candidate = ""
+    @State private var message: String?
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Generate Password").font(.headline)
+                Stepper("Length: \(options.length)", value: $options.length, in: 8...128)
+                Toggle("Lowercase", isOn: $options.lowercase)
+                Toggle("Uppercase", isOn: $options.uppercase)
+                Toggle("Numbers", isOn: $options.numbers)
+                Toggle("Symbols", isOn: $options.symbols)
+                Toggle("Exclude similar characters", isOn: $options.readable)
+                Text(candidate).font(.system(.body, design: .monospaced))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Generated password: " + candidate)
+                if let message { Text(message).foregroundStyle(.red) }
+                HStack {
+                    Button("Regenerate", action: generate)
+                    Spacer()
+                    Button("Cancel", action: cancel)
+                    Button("Use Password") { use(candidate) }
+                        .buttonStyle(.borderedProminent).disabled(candidate.isEmpty)
+                }
+                Text("Use Password updates the draft. Save the login to store it in your vault.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(20)
+        }.frame(idealWidth: 420, idealHeight: 440)
+            .onAppear(perform: generate)
+            .onChange(of: options) { _, _ in generate() }
+            .onDisappear { candidate = "" }
+    }
+    private func generate() {
+        candidate = ""; message = nil
+        do { candidate = try PasswordGenerator.generate(options) }
+        catch PasswordGenerator.Failure.invalidOptions { message = "Select at least one character group." }
+        catch { message = "Secure password generation failed. Try again." }
     }
 }

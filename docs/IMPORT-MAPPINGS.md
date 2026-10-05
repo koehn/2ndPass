@@ -1,5 +1,7 @@
 # Import type mappings
 
+General document import is not connected to the current item service. The mappings below describe parser behavior and design requirements, not an available end-to-end import workflow. See [import status](IMPORT.md).
+
 Bank Account and Address are compound **field types**, usable on any item. Both
 are concealed. Values are JSON objects; account numbers, routing numbers, postal
 codes, and other textual identifiers retain leading zeroes and whitespace.

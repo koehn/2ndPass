@@ -50,13 +50,13 @@ Secret references use `sp://`, spelled out because a URI scheme cannot start wit
 
 Passkeys are implemented in both cloud and local vaults. Cloud passkeys sync across enrolled devices; local passkeys, SSH keys, Git signing keys, and certificate identities keep their private keys in one device’s Secure Enclave. Choosing where keys live is part of the product: local keys cannot be exported or recovered, so register an independent credential on another device. See [vault capabilities](docs.html#vault-capabilities).
 
-Each device has its own Secure Enclave private key. iCloud carries encrypted vault data using your Apple Account, without a separate 2ndPass-hosted vault service. Those choices come with real tradeoffs: Apple-only platforms, an Apple platform and provisioned private-container trust boundary during device enrollment, and an offline master recovery copy. Read the [security explanation](security.html) before deciding whether they fit your needs.
+Each device has its own Secure Enclave private key. iCloud carries encrypted vault data using your Apple Account, without a separate 2ndPass-hosted vault service. Those choices come with real tradeoffs: Apple-only platforms, an Apple platform and provisioned private-container trust boundary during device enrollment, and portable backups with separately stored keys. Read the [security explanation](security.html) before deciding whether they fit your needs.
 
 ## Op
 
 ### Can I replace `op` with `sp`?
 
-For supported workflows, yes: read a secret, launch a process with resolved environment variables, or populate a configuration template. Import your data and update your references and commands using the [migration guide](docs.html#from-op).
+For supported workflows, yes: read a secret, launch a process with resolved environment variables, or populate a configuration template. Restore a portable archive and update your references and commands using the [migration guide](docs.html#from-op).
 
 It is not a drop-in implementation of every `op` command. There is no automatic lookup in a 1Password account. Check each integration rather than creating a blanket shell alias.
 
@@ -76,7 +76,7 @@ Build and installation documentation is for the copyright holder and separately 
 
 The project targets macOS 15+ and iOS/iPadOS 18+ with supported Secure Enclave hardware. The command-line tool runs on Mac. There is no Windows, Linux, Android, or browser vault client.
 
-Passwords, TOTP codes, typed items, encrypted attachments, imports, and developer integrations are implemented. Cross-account vault sharing is not yet implemented as a supported feature; preliminary code exists. Cloud and device-local passkeys, an SSH agent, and Git SSH signing are implemented. AutoFill can save new logins on iOS/iPadOS 26.2 and later. System AutoFill for cards/identities and password generation inside AutoFill are not implemented. Compare [vault capabilities](docs.html#vault-capabilities) and [CLI workflows](docs.html#cli); physical-device acceptance remains outstanding. Enrollment-mailbox isolation is a design detail to address when completing sharing, not a current product vulnerability; see [release status](security.html#status).
+Passwords, TOTP, typed items, encrypted attachments, local offline saves, portable archives and developer integrations use the item service. Same-account connection is automatic. General document import, sharing, device removal, account recovery and credential-account management are unavailable. Cloud-key workflows require further physical acceptance. AutoFill can save new logins on iOS/iPadOS 26.2 and later; cards/identities and in-extension password generation are not implemented. See [capabilities](docs.html#vault-capabilities).
 
 ## Account
 
@@ -90,26 +90,15 @@ We do not collect personal data through the website or app. This website uses no
 
 ### Can I use it offline?
 
-Previously verified cached data can be read offline. Writes need connectivity. An offline device cannot know about later changes or revoked access. Attachments need to have been downloaded before going offline.
+Previously stored data can be read and edited offline. Encrypted local saves survive restarts and queue cloud delivery. An offline device cannot know about later changes or revoked access. Attachments need to have been downloaded before going offline.
 
 ## Ready
 
 ### Should I move everything today?
 
-2ndPass is a development preview. An independent security audit and several physical-device acceptance checks are still outstanding. Evaluate it alongside your current password manager, verify imported records, and establish recovery before depending on it.
+2ndPass is a development preview. An independent security audit and several physical-device acceptance checks are still outstanding. Evaluate it alongside your current password manager, verify restored records, and keep portable backups with their separate keys before depending on it.
 
 
 ## Offline recovery after device loss
 
-Generate and verify an offline recovery copy before losing access to your devices.
-On a replacement device, sign into the same Apple Account and import the copy or
-enter its code. Read-only recovery can open healthy data while unavailable
-attachments postpone completion. Complete each vault to rotate encryption and enroll the replacement device while
-preserving existing devices, accounts, and roles. Keep both copies during key replacement until
-coverage is complete.
-
-The private recovery secret and copied ciphertext suffice for offline decryption;
-protect the copy separately from your devices. It cannot restore Apple Account
-access or missing cloud data. Account-loss recovery requires a separately exported
-backup; backup restoration is outside this feature. Physical-device acceptance
-and cryptographic review remain pending.
+Account-wide live-vault recovery is unavailable. Restore a portable archive with its separate generated key into a new vault, or connect through an existing unlocked device on the same Apple Account. Device-local keys cannot be restored. See [backups](docs.html#recovery).

@@ -78,7 +78,7 @@ before completion; an expired result requires a fresh authenticated Retry.
 
 ## Storage and refresh
 
-The app, CLI, and extension share device-local App Group `MopV7` checkpoints and the
+The app, CLI, and extension share the encrypted device-local App Group Core Data store and the
 non-synchronizable hardware key namespace. Account changes invalidate offline access
 and clear suggestions. Removed/stale suggestions cannot bypass catalog resolution.
 Offline filling uses the last verified catalog and cannot establish remote freshness.
@@ -182,27 +182,14 @@ The implementation never lies about backups to bypass that restriction. See
 
 ## Cloud-vault passkeys
 
-Registration now offers an explicit cloud/device-local destination. Cloud passkeys
-are saved before the registration response and indexed alongside local passkeys.
-The sign-in picker reads only published suggestion metadata; listing accounts does
-not open cloud vaults or request authentication. Cloud entries use the label
-“Cloud vault” because vault names remain encrypted. Selecting an account requires
-authentication and a fresh lookup; stale suggestions cannot authorize signing.
-When exactly one cloud or device-local passkey matches, sign-in skips the account
-picker. Cloud sign-in uses one fresh vault authentication for user verification
-and key access, then locks that operation's session when it finishes. Multiple
-matches still require an account selection; browsing them does not authenticate.
-Assertions re-resolve the selected vault credential and enforce exact RP and
-allow-list matching after authentication. See [Cloud key credentials](CLOUD-KEY-CREDENTIALS.md)
-for compatibility, synchronization, recovery, and acceptance requirements.
+Cloud passkeys use the item service through authenticated catalog/read/save operations. Registration offers a cloud or device-local destination. Signing re-resolves the credential and enforces the requested relying party and credential allow-list. Cloud publication and physical-platform acceptance remain separate from local-save success. See [cloud key credentials](CLOUD-KEY-CREDENTIALS.md).
 
 ## Saving new logins
 
 On iOS/iPadOS 26.2 and later, system save-password requests open a branded **Save
 Login** form with the supplied website, username, concealed password, and suggested
 name. Choose a writable cloud vault and confirm the name before saving. No vault
-is selected implicitly. Shared-vault members receive access through the existing
-vault membership rules. The extension authenticates through the normal vault
+is selected implicitly. The extension authenticates through the normal vault
 service, rechecks write permission at save time, and confirms completion only after
 the encrypted save succeeds. The public AutoFill index receives no password.
 

@@ -1,18 +1,30 @@
 import Foundation
+import AuthenticationServices
 import MopCore
 
-/// A transient draft supplied by the system's save-password ceremony.
+/// A transient draft from the picker or the system's save-password ceremony.
 /// Never persisted outside the encrypted vault or placed in the suggestion index.
 public struct AutoFillLoginDraft: Sendable {
     public var name: String
     public var username: String
     public var password: String
-    public let website: String
+    public var website: String
     public init(name: String, username: String, password: String, website: String) {
         self.name = name; self.username = username; self.password = password; self.website = website
     }
     public var canSave: Bool {
         !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !password.isEmpty && AutoFillEntry.website(website) != nil
+    }
+    public var canSaveAndFill: Bool { canSave && !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// A new login is durably saved before any credential is returned for filling.
+    /// Discovery/generation never authorize this operation; authenticate freshly.
+    public func saveAndPrepareFill(vault: String, service: any VaultService) async throws -> (credential: ASPasswordCredential, catalog: ItemCatalog) {
+        guard canSaveAndFill else { throw AutoFillLoginSaveError.invalidDraft }
+        service.lock()
+        defer { service.lock() }
+        let catalog = try await save(vault: vault, service: service)
+        try Task.checkCancellation()
+        return (ASPasswordCredential(user: username, password: password), catalog)
     }
     public func save(vault: String, service: any VaultService) async throws -> ItemCatalog {
         guard UUID(uuidString: vault) != nil, canSave else { throw AutoFillLoginSaveError.invalidDraft }

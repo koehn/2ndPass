@@ -117,6 +117,29 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
     #expect(try await repository.mutationReceipt(id: confirmed.mutationIDs[0], account: "service")?.status == .cloudConfirmed)
 }
 
+@Test(arguments: [1, 80])
+func loginDestinationsUseCurrentMetadataWithoutReadingLoginItems(itemCount: Int) async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
+    let session = try await backend.create(name: "original", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let current = try await session.vaultMetadata()
+    var metadata = current.value; metadata.name = "renamed"
+    _ = try await session.saveMetadata(metadata, expectedBase: current.versionID)
+    #expect(try await backend.inventory().first?.name == "original")
+    let service = ItemVaultService(backend: backend)
+    let before = backend.unwrapCount
+    let destinations = try await service.loginDestinations()
+    #expect(destinations == [VaultDescriptor(id: id.uuidString, name: "renamed", format: "mop-items-v2", enrolled: true)])
+    #expect(backend.unwrapCount - before == 1)
+    let latest = try await session.vaultMetadata()
+    metadata.name = "renamed-again"
+    _ = try await session.saveMetadata(metadata, expectedBase: latest.versionID)
+    #expect(try await service.loginDestinations().first?.name == "renamed-again")
+}
+
 private func serviceLocation() throws -> URL {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-item-service-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -363,6 +386,31 @@ func autoFillDirectReadUnwrapsOnlySelectedItemAndRejectsStaleHints(itemCount: In
         #expect(fresh.unwrapCount - beforeTamper == 1)
     }
     service.lock()
+}
+
+@Test func deletingLoginRemovesSuggestionsBeforeReturningWithoutIdleWork() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
+    _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let suggestions = directory.appendingPathComponent("suggestions")
+    let systemRows = Mutex<[AutoFillIdentity]>([])
+    let publisher = AutoFillPublisher(directory: suggestions, publish: { rows in systemRows.withLock { $0 = rows } })
+    let service = ItemVaultService(backend: backend, publisher: publisher, idleDelay: .seconds(3600))
+    let catalog = try await service.execute(.catalog, vault: vault.uuidString, offline: true).requireCatalog()
+    try await publisher.publish(catalog: catalog, vaultID: vault.uuidString)
+    let removed = Set(AutoFillEntry.entries(catalog: ItemCatalog(vault: catalog.vault, revision: catalog.revision,
+        items: catalog.items.filter { $0.name == "Login0" }), vaultID: vault.uuidString).map(\.recordIdentifier))
+    #expect(!removed.isEmpty)
+    #expect(systemRows.withLock { $0.contains { removed.contains($0.id) } })
+    _ = try await service.execute(.trashItem(name: "Login0", revision: catalog.revision), vault: vault.uuidString, offline: true)
+    service.lock()
+    #expect(systemRows.withLock { !$0.isEmpty && $0.allSatisfy { !removed.contains($0.id) } })
+    #expect(try AutoFillIndex(directory: suggestions).load().allSatisfy { !removed.contains($0.id) })
+    try await publisher.reconcile()
+    #expect(systemRows.withLock { $0.allSatisfy { !removed.contains($0.id) } })
 }
 
 private actor CatalogPublicationRecorder: AutoFillPublishing {

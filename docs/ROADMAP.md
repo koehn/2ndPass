@@ -1,6 +1,6 @@
 # Project direction and roadmap
 
-**Current v7 update:** The coordinated hardware/shared-vault cutover is implemented. The current workflow is documented in [the README](../README.md) and [validation status](V7-VALIDATION-2026-09-27.md); remaining physical acceptance is not implied by historical build notes below.
+Current clients use independently encrypted item records, a shared device-local store and CKSyncEngine. Local saves, portable backup/restore and automatic same-account connection are implemented. User-reported enrollment and basic synchronization/offline-edit acceptance are recorded in [validation](VALIDATION.md). This remains a development preview.
 
 2ndPass is an Apple-native password and secrets manager built for the
 command line. It began with a practical need: keep passwords and other secrets
@@ -25,7 +25,7 @@ It supersedes earlier deferrals of passkeys and cross-account sharing for the
 paid release. Free/Pro packaging is the chosen direction (SALE-15); prices and
 subscription versus permanent-unlock purchase options remain undecided.
 
-- [X] **SALE-1 — Offline master recovery key.** Generate a recovery keypair and
+- [ ] **SALE-1 — Offline master recovery key.** Generate a recovery keypair and
   let the user retain the private key offline. Add the public key as an additional
   recovery recipient for the vault catalog, items, and attachments. Devices on
   the same iCloud account must be able to recover vault access using that key.
@@ -33,10 +33,8 @@ subscription versus permanent-unlock purchase options remain undecided.
   on supported platforms, including when all previously enrolled devices are
   unavailable. Define account binding, key replacement/revocation, and coverage
   of existing and newly written data. Review the changed threat model and update
-  the recovery documentation when implemented. Implementation and automated checks
-  are recorded in [offline recovery](OFFLINE-RECOVERY.md); production schema deployment,
-  physical-platform acceptance, and independent cryptographic review remain pending.
-- [X] **SALE-2 — Password security health.** Provide a screen showing passwords
+  the recovery documentation when implemented. Account recovery is currently unavailable; see [recovery status](OFFLINE-RECOVERY.md).
+- [ ] **SALE-2 — Password security health.** Provide a screen showing passwords
   found in Have I Been Pwned (HIBP), reused passwords, weak/simple passwords, and
   actionable guidance for resolving findings. Acceptance: findings identify
   affected accounts, refresh after corrections, and distinguish an unavailable
@@ -57,7 +55,7 @@ subscription versus permanent-unlock purchase options remain undecided.
 - [ ] **SALE-5 — Chrome extension.** Complete the equivalent Chrome integration
   and validate its installation, connection, unlock, credential workflows,
   origin matching, permission boundaries, and failure states on supported versions.
-- [X] **SALE-6 — Cloud-vault passkeys, SSH keys, and other key credentials.**
+- [ ] **SALE-6 — Cloud-vault passkeys, SSH keys, and other key credentials.**
   Let users explicitly choose cloud-vault storage for supported key types as an
   alternative to device-local storage. Acceptance: document the supported key
   types and protection/recovery differences; verify creation/import where
@@ -70,7 +68,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   iCloud accounts. Acceptance: complete invitations, acceptance, editor/viewer
   permissions, revocation, conflict handling, and reconnection with real accounts
   and physical devices. Resolve the documented
-  [enrollment-mailbox isolation requirement](SECURITY.md#shared-zone-enrollment-exposure)
+  [account and enrollment trust boundary](SECURITY.md#account-and-enrollment-trust)
   and explain that revocation cannot retract previously copied secrets.
 - [ ] **SALE-8 — Impeccable UI across platforms and devices (mandatory release
   gate).** Review and finish every screen, pane, dialog, and flow on macOS, iOS,
@@ -83,7 +81,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   locked, and destructive-confirmation states. Resolve visual and interaction
   defects before sale; representative screenshots alone are not sign-off for
   unreviewed screens or flows.
-- [X] **SALE-9 — Portable export and independently restorable backups.** Provide
+- [ ] **SALE-9 — Portable export and independently restorable backups.** Provide
   a documented portable export preserving secrets, custom fields, and attachments,
   with explicit handling of unsupported/non-exportable credentials. Provide an
   encrypted backup that can be restored using the offline master recovery key
@@ -93,7 +91,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   into a new account without depending on access to the old account; distinguish
   this backup restore from same-account recovery of a live cloud vault. Explain
   plaintext export exposure and device-local key exclusions.
-- [X] **SALE-10 — Offline creation and editing.** Allow new credentials and
+- [ ] **SALE-10 — Offline creation and editing.** Allow new credentials and
   changes to existing items to be saved while offline or while iCloud is
   unavailable. Acceptance: encrypted pending changes survive app/device restarts,
   remain usable locally, and show clear pending-sync versus confirmed-sync status.
@@ -115,7 +113,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   cancellation and failed saves without silent loss, and avoid duplicate records.
   Document platform limitations and provide a clear app handoff where native
   AutoFill cannot support a step.
-- [X] **SALE-13 — Existing SSH keys as usable cloud-vault credentials.** Import
+- [ ] **SALE-13 — Existing SSH keys as usable cloud-vault credentials.** Import
   existing OpenSSH private keys into cloud vaults and use them through the SSH
   agent and Git signing workflows, not merely as stored text. Existing private
   keys must never be imported into the device-local vault: that vault only holds
@@ -123,7 +121,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   and algorithms, handle encrypted private-key imports, and verify authentication
   and signing with SSH, Git, and representative IDE workflows. Verify key
   selection, unlock/approval, lock revocation, synchronization, and recovery.
-- [X] **SALE-14 — Mac App Store sandboxing and developer-tool distribution.**
+- [ ] **SALE-14 — Mac App Store sandboxing and developer-tool distribution.**
   Establish and validate an App Sandbox-compliant Mac App Store distribution
   architecture. Acceptance: prove clean-machine installation and updates preserve
   working CLI access, `sp run`, secret injection, SSH-agent sockets, Git signing,
@@ -131,7 +129,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   entitlements. Document any separately distributed companion and its installation
   and signing requirements. Validate the actual distribution artifacts; development
   builds alone do not establish sandbox compatibility or App Store acceptance.
-- [X] **SALE-15 — Free/Pro tiers and a single Pro entitlement.** Launch with a
+- [ ] **SALE-15 — Free/Pro tiers and a single Pro entitlement.** Launch with a
   useful Free tier and one Pro upgrade for Apple-using developers and engineers.
   Implement the packaging and entitlement rules below across the app, CLI,
   AutoFill, and browser integrations. Acceptance: verify purchases, restoration
@@ -192,11 +190,7 @@ export path suitable for moving to another tool. Document the vault format and
 recovery process so data access does not depend solely on the official app.
 Handle plaintext interchange files explicitly and explain their exposure.
 
-Import now supports common CSV exports, Bitwarden JSON, and 1Password 1PUX; see
-[Importing password-manager data](IMPORT.md). Portable third-party export remains
-planned; encrypted v7 2ndPass backup export remains available. For future format changes, prioritize preserving access to
-existing user data and provide an explicit compatibility or migration path.
-This does not change the current rejection of pre-v7 formats.
+Portable archive export/restore is available with an independent archive key. General CSV/JSON/1PUX import still needs service integration; parser code alone does not complete that workflow. Exports cannot yet certify complete remote inventory. See [import status](IMPORT.md) and [backups](BACKUPS.md).
 
 ### 2. Make runtime access exceptionally reliable
 
@@ -213,17 +207,7 @@ Complete the signed physical-device and Production CloudKit acceptance in
 account changes, and upgrades. Seek independent security review before promoting
 2ndPass for broad use as a primary credential store.
 
-Add offline item creation and editing as the next substantial enhancement.
-Persist encrypted local changes across restarts, make them available locally,
-and distinguish local saves from confirmed cloud synchronization. Reconcile
-against current account, ownership, and revision state before publishing.
-Merge independent edits where safe and preserve conflicting changes for explicit
-resolution rather than silently discarding a password. Keep vault deletion and
-ownership/recovery operations online-only initially.
-
-Offline editing requires application-level persistence and conflict handling;
-CloudKit cannot merge 2ndPass's encrypted contents. Current offline access remains
-read-only until that work is implemented and validated.
+Offline creation and editing commit encrypted changes locally and queue synchronization. Basic offline-edit delivery has user-reported physical acceptance. Complete concurrent-edit review, restart/interruption scenarios, receipt supersession and account-change handling without losing either version. Independent attachment transfer and bounded cleanup of staging, receipts and quarantine remain work.
 
 ### 4. Make distribution accessible
 
@@ -243,12 +227,6 @@ paid, maintained distribution can coexist.
 
 ## Current implementation boundaries
 
-Device hardware protection is implemented. Cross-account vault sharing remains
-an unfinished feature with preliminary code; mailbox isolation and cross-account
-physical-device validation are part of completing it. Removing
-access cannot retract secrets already copied by a recipient.
+Cross-account sharing, account recovery, device removal, permanent vault deletion, general document import and credential-account management are unavailable. Cloud-key creation/use routes through item reads and saves, and software credential bytes survive portable restore; full physical acceptance remains pending. Device-local hardware credentials remain separate and cannot be synchronized or restored.
 
-Cloud-vault passkeys and cross-account sharing are now prerequisites for paid
-App Store release, as tracked above. SALE-1 remains pending until offline recovery is implemented and validated. Future expansion
-beyond this checklist should follow the maintainer's needs or evidence from
-people actually using 2ndPass.
+The checklist boxes represent full release acceptance, not source implementation. All remain open until the described gates are evidenced. Implemented portions include password checks, basic history, portable archives, offline saves, distribution scaffolding and entitlement reporting. Free/Pro enforcement and purchase publication remain disabled in the preview. Complete the remaining integration and physical checks before treating any of these as release-ready.

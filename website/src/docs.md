@@ -2,7 +2,7 @@
 layout: guide.njk
 permalink: docs.html
 title: Documentation
-description: "Install 2ndPass, import passwords, use AutoFill, run commands with secrets, share vaults, and prepare recovery."
+description: "Install 2ndPass, use AutoFill, edit offline, run commands with secrets, and make portable backups."
 eyebrow: The field guide
 heading: "Make it part of your day."
 intro: "From your first vault to your next deploy. Practical guides for the app and the command line."
@@ -58,39 +58,23 @@ The [build README](https://github.com/koehn/2ndPass#build-and-provision), [Cloud
 
 ## First vault
 
-For the technical design, read the [vault protocol](vault.html) and its [validation record](vault-validation.html).
+Create a vault in the signed app, or use `sp vault init personal`. Existing private vaults on the same Apple Account connect automatically. Keep an existing device unlocked until key access arrives; items then download in the background. Restoring a portable archive creates an independent vault, not a second-device connection.
 
-
-The CLI equivalent is:
-
-```sh
-sp vault init personal
-sp vault list
-```
-
-If an existing vault is discovered but this device is not enrolled, the app offers **Connect this device**. Unlock 2ndPass on an existing owner device to let it process the enrollment request. [Learn about this trust boundary](security.html#icloud).
-
+Read the [vault architecture](vault.html) and [validation status](vault-validation.html).
 
 ## Vault capabilities
 
-Choose a cloud vault for secrets you need across devices, or the fixed **`local`** vault for identities whose private keys stay in this device’s Secure Enclave.
-
-| Secret or capability | Cloud vault | Device-local `local` vault |
+| Capability | Cloud vault | Device-local vault |
 | --- | --- | --- |
-| Logins, passwords, API tokens, database credentials, secure notes | Yes | No |
-| TOTP seeds and recovery codes | Yes, as concealed fields | No |
-| Payment cards, identities, documents, encrypted attachments | Yes | No |
-| Passkeys | Synced software P-256 keys | Device-bound Secure Enclave P-256 keys; platform compatibility limits apply |
-| SSH authentication and Git SSH signing | Generate Ed25519 or P-256; import Ed25519, P-256, or RSA 2048–8192-bit OpenSSH keys | Generate Secure Enclave P-256 keys only; no private-key import |
-| Certificate identities and certificate signing requests (CSR) | No usable certificate workflow; files/text can be stored as ordinary secrets | Generate keys, create CSRs, attach certificates; export public material |
-| Sync between devices | Yes, through iCloud | No |
-| Offline recovery copy | Covers owned cloud vaults when configured | No backup or recovery |
+| Passwords, notes, TOTP and typed fields | Encrypted item records | Not a general secrets store |
+| Same-account synchronization | Yes; local saves queue delivery | No |
+| Offline item edits | Yes | Local hardware operations only |
+| SSH/Git keys | Software keys, generated or imported | Hardware-generated keys only |
+| Passkeys | Software credentials; physical acceptance pending | Device-bound; platform limitations apply |
+| Portable backup | Local transferable contents and separate key | Private keys cannot be exported |
+| Account recovery, sharing, device removal | Unavailable | No key recovery |
 
-Cloud credential private keys are encrypted software keys, available to authorized clients during use. Local private keys cannot be exported, synchronized, or moved to a cloud vault. Device loss or erasure permanently loses local identities: register an independent credential on another device first. Passkey import/export is not implemented. Storing key text or a certificate file does not by itself create a usable credential.
-
-Encrypted checkpoint exports are backups of cloud ciphertext, not another selectable vault type. Import requires an already enrolled device and an independently recorded checkpoint digest; it does not restore a missing cloud zone. Offline recovery restores access to owned live cloud vaults, including their cloud credentials, but cannot restore an Apple Account or missing cloud data. Cross-account sharing remains preliminary and is not a supported release feature.
-
-See [cloud credential formats and limitations](https://github.com/koehn/2ndPass/blob/main/docs/CLOUD-KEY-CREDENTIALS.md), [device-local identities](https://github.com/koehn/2ndPass/blob/main/docs/LOCAL-VAULT.md), and [recovery setup](#offline-recovery-after-device-loss). Hardware, live sync, and cross-account acceptance checks remain distinct from automated software tests.
+Cloud private keys enter authorized process memory. Local private keys stay in the Secure Enclave. Credential-account management and general document import remain unavailable. See [cloud credentials](https://github.com/koehn/2ndPass/blob/main/docs/CLOUD-KEY-CREDENTIALS.md) and [local identities](https://github.com/koehn/2ndPass/blob/main/docs/LOCAL-VAULT.md).
 
 ## CLI
 
@@ -100,7 +84,7 @@ See [cloud credential formats and limitations](https://github.com/koehn/2ndPass/
 - **Run tools with credentials:** `sp run` resolves references into a child process’s environment for local development, database clients, and API tools. Keep references in project files instead of literal secrets.
 - **Build configuration files:** `sp inject` fills [configuration templates](#templates) for tools such as npm.
 - **Authenticate and sign:** `sp ssh-agent` serves selected SSH or Git signing keys to a wrapped command or an agent-capable IDE. Cloud and device-local keys are supported.
-- **Manage vault data:** import supported password-manager exports, manage items and attachments, and configure offline recovery from the terminal.
+- **Manage vault data:** manage items and attachments, and export or restore portable archives.
 
 ```sh
 # Supply a stored token to GitHub CLI.
@@ -117,7 +101,7 @@ Install the CLI using [the Mac setup instructions](#start). Run `sp --help`, `sp
 
 ## Key credentials
 
-Create passkeys from a website’s registration flow: select 2ndPass, then explicitly choose a cloud vault or **This Device — Secure Enclave**. Cloud registration requires a successful online save. Local passkeys are device-bound and may encounter platform compatibility restrictions; they are not backed up.
+Create passkeys from a website’s registration flow: select 2ndPass, then explicitly choose a cloud vault or **This Device — Secure Enclave**. Cloud registration and publication need end-to-end physical acceptance; a durable local save alone is not cloud confirmation. Local passkeys are device-bound and may encounter platform compatibility restrictions; they are not backed up.
 
 Choose **New → New SSH Key** to generate or import a key and select its destination and purpose. SSH authentication (including Git fetch/push) and Git commit signing are distinct purposes. For cloud keys, supported imports are single-key OpenSSH files, including bcrypt/AES-256-CTR encrypted files. Legacy PEM/PKCS#1/PKCS#8 files are not supported. Existing SSH text items need an explicit Save to validate and convert their key material.
 
@@ -140,24 +124,9 @@ The app’s credential details provide commands for the actual key and vault. Ea
 
 ## Import
 
-Choose **Import…** from the Mac File menu or the app’s New menu. Select your export and destination vault, review records and warnings, then import. Existing entries are not overwritten; duplicates and conflicts are reported and skipped.
+General CSV, JSON and 1PUX document import is not connected to the current service. Parser support in the source is not a supported import workflow. Keep your source manager available.
 
-| Source | Supported input |
-| --- | --- |
-| 1Password | CSV or 1PUX v3; prefer 1PUX for richer fields and attachments |
-| Bitwarden | CSV or unencrypted JSON; prefer JSON for richer items |
-| Apple Passwords / Safari | Password CSV; extract the CSV from Safari ZIP exports first |
-| Chrome | Password CSV |
-| LastPass | Generic password / secure-note CSV |
-
-Preview a batch before importing:
-
-```sh
-sp item import export.1pux --vault personal --dry-run
-sp item import export.1pux --vault personal --yes
-```
-
-Source exports contain **plaintext secrets**. Store them carefully, verify the import, then remove unwanted copies yourself. 2ndPass does not delete the source export. Passkeys and password history are not migrated. Check every warning before closing your old account. See the [complete import guide](https://github.com/koehn/2ndPass/blob/main/docs/IMPORT.md) for supported fields, limits, and attachment handling.
+You can restore a portable `.moparchive` with its separate generated key; see [backups](#recovery). Restore preserves transferable contents and creates a new owned vault.
 
 ## Items
 
@@ -165,7 +134,7 @@ Use the app’s New menu to create logins, notes, API credentials, cards, identi
 
 - **Vaults:** keep separate sets of credentials. Commands that manage a vault require a selection when there is more than one.
 - **Archive:** keep an item without showing it in normal lists or AutoFill. Use the Archived filter to find it again.
-- **Recently Deleted:** restore items for 30 days. Expired entries are removed when the app is unlocked and online.
+- **Recently Deleted:** inspect and restore trashed items. Permanent deletion is not currently available.
 - **Concealed fields:** passwords, tokens, OTP seeds, and recovery codes are hidden by default.
 
 Save edits before locking. Unsaved drafts are not persisted across a security lock or restart. Usable SSH/Git credentials work with the separately installed `sp ssh-agent`; existing SSH text items require explicit validation and conversion when saved. Cards and identities do not have system AutoFill integration.
@@ -278,10 +247,10 @@ The workflow will feel familiar, but **2ndPass is not a drop-in implementation o
 
 | Existing habit | 2ndPass approach |
 | --- | --- |
-| `op read` | Store/import the item, then use `sp read sp://…` |
+| `op read` | Store or restore the item, then use `sp read sp://…` |
 | `op run` | Update references and use `sp run --env-file FILE -- COMMAND` |
 | `op inject` | Use `{{ sp://… }}` placeholders with `sp inject` |
-| A 1Password export | Review a 1PUX or CSV import into a selected vault |
+| A 1Password export | Document import integration remains planned |
 
 There is no automatic lookup in 1Password or Apple Passwords. Review flags, field paths, and dotenv behavior for each script. Do not blindly alias `op` to `sp`. See [more integration recipes](https://github.com/koehn/2ndPass/blob/main/docs/EXAMPLES.md) for Docker, GitHub, npm, and SSH.
 
@@ -302,97 +271,33 @@ Export creates a plaintext, owner-only file and refuses to overwrite an existing
 
 ## Sharing
 
-**Your devices:** open 2ndPass on the new device, select the existing vault, and connect. Keep an enrolled owner device unlocked to process the request. Apple account/device security, signing, provisioning and CloudKit entitlements protect the private per-user namespace used for bootstrap. An owner then grants membership cryptographically. Account credentials alone do not authorize arbitrary enrollment writes; see the [precise enrollment threat](security.html#icloud). No extra human comparison is required for this ordinary flow.
+Devices on the same Apple Account connect automatically while an existing device is unlocked. No access-request approval or comparison code is required. The authenticated private iCloud container is an explicit enrollment trust channel; see [account trust](security.html#icloud).
 
-**Another person:** use **Share with another person**. Choose editor or viewer access, exchange the invitation/acceptance files, verify the identity details requested by the app, and complete approval. An iCloud share invitation alone does not grant decryption rights. Both people need compatible clients.
-
-**Removal:** use **Settings → devices** for enrolled personal devices, or the vault’s membership controls for other people. Removal rotates per-item keys and the catalog key and rewrites all retained field ciphertext, including recently deleted items and attachments. It cannot revoke plaintext or old backups already copied by a recipient; change the underlying service password when necessary.
-
-Cross-account vault sharing is not yet implemented as a supported feature; the
-controls and commands above describe preliminary code. The
-[mailbox design detail](security.html#devices) must be addressed when implementing
-sharing, followed by physical two-account validation. It is not a current product
-vulnerability. See the [enrollment and sharing commands](https://github.com/koehn/2ndPass#add-devices-and-share).
+Cross-account sharing, device removal and permanent vault deletion are unavailable. Removing a stored credential cannot retract secrets already copied or revoke it at the external service.
 
 ## Recovery
 
-Set up an [offline recovery copy](#offline-recovery-after-device-loss) to recover access after device loss. It covers owned live cloud vaults, including cloud passkeys and SSH/Git keys; it does not recover device-local identities.
-
-Save an encrypted backup and independently record the trusted checkpoint:
+Export the locally stored inventory with a separate generated key:
 
 ```sh
-sp vault export --vault personal personal-backup.json
-sp vault fingerprint --vault personal
+sp vault backup --offline --vault VAULT_UUID /path/vault.moparchive --key-file /separate/path/vault.key
+sp vault restore-backup /path/vault.moparchive --key-file /separate/path/vault.key --name restored --restore-id NEW_UUID --dry-run
+sp vault restore-backup /path/vault.moparchive --key-file /separate/path/vault.key --name restored --restore-id NEW_UUID
 ```
 
+Generate a fresh restore UUID and retain it for retries. Keep the archive and key separately; both are needed. Restore creates a new owned vault and does not restore device-local keys or membership. Verify restored contents before discarding the source. Exports cannot currently certify complete remote inventory. See the [backup guide](https://github.com/koehn/2ndPass/blob/main/docs/BACKUPS.md).
 
 ## Troubleshooting
 
 - **Signing error:** use the separately installed, signed and provisioned CLI through its installed symlink. An unsigned binary cannot access the vault. Keep identifiers and CloudKit environments consistent.
 - **Waiting for another device:** unlock 2ndPass on an enrolled owner device. Locked or suspended apps cannot grant access. Check connectivity and use Retry.
-- **Offline:** use `sp read --offline sp://personal/item/password` for previously verified local data. Offline access is read-only and cannot learn about revocation or prove freshness.
+- **Offline:** use `sp read --offline sp://personal/item/password` for previously verified local data. Local saves also work offline and queue cloud delivery. Offline access cannot learn about remote changes or prove freshness.
 - **Conflicting edit:** keep the draft, refresh, and resolve the conflict. Do not assume your write overwrote another device’s changes.
-- **Uncertain write:** use `sp vault sync --vault personal` to reconcile before retrying a mutation.
+- **Pending write:** CLI confirmation normally waits up to 20 seconds. A timeout leaves the local save queued; do not repeat it. Use `sp vault sync --vault personal`. `--local-save` returns after local commit.
 - **Need a flag:** use `sp --help`, `sp COMMAND --help`, or `man sp`.
 
 Report reproducible problems in the [repository’s issue tracker](https://github.com/koehn/2ndPass/issues). Never include passwords, tokens, plaintext exports, or sensitive vault contents in a report.
 
 ## Offline recovery after device loss
 
-Set up recovery before losing access to your devices:
-
-1. Unlock 2ndPass and open **Settings → Recovery → Set Up or Verify Recovery…**.
-2. Select **Generate a New Recovery Copy**.
-3. Choose **Save Recovery File…** or **Print Recovery Copy…**, or write down the
-   displayed code. Store your copy offline, separate from your devices and iCloud.
-4. Use **Import Recovery File…** to load the saved file, or re-enter your
-   written copy in **Recovery code**.
-5. Select **Verify Copy and Activate**, then **Check Coverage**. If any vault is
-   unfinished, select **Resume Incomplete Changes** until every vault is complete.
-
-Recovery applies to all your owned iCloud vaults, regardless of the selected vault.
-
-On a replacement device, sign into the same Apple Account. Open
-**Settings → Recovery → Recover Vault Access…** (or choose recovery during
-onboarding), then import the copy or enter its code. Read-only recovery can open healthy data while unavailable
-attachments postpone completion. Complete each vault to rotate encryption and enroll the replacement device while
-preserving existing devices, accounts, and roles. Keep both copies during key replacement until
-coverage is complete.
-
-The private recovery secret and copied ciphertext suffice for offline decryption;
-protect the copy separately from your devices. It cannot restore Apple Account
-access or missing cloud data. Account-loss recovery requires a separately exported
-backup; backup restoration is outside this feature. Physical-device acceptance
-and cryptographic review remain pending.
-
-The recovery dialog first checks this device’s existing key. If it can already
-open your vaults, the dialog confirms that access is working and disables recovery.
-Closing setup or recovery clears the offline copy from the session without locking
-the app. Explicit locking and normal security locking still clear recovery access.
-
-### Test recovery using your existing devices
-
-Save and verify your offline copy first. Keep it outside the app. Quit or lock
-2ndPass on all other enrolled devices during the test, and stay signed into the
-same Apple Account. Completing recovery preserves existing device and account access.
-
-**With another owner device available:** Remove the test device in
-**Settings → Devices**. Open the test device online so it clears its old access.
-Choose **Recover with Offline Copy…** on the removed-device screen, import your
-file or enter your code, browse the recovered data, and complete each vault.
-Do not choose Reconnect during the test.
-
-**With only one device available:** Open **Settings → Recovery → Set Up or Verify
-Recovery…**, expand **Test recovery on this device**, and import your saved copy.
-Select **Reset This Device for Recovery Testing…** and confirm. The app verifies
-recovery for all owned vaults and their cloud attachments before clearing local
-iCloud vault keys, cloud checkpoints, and cached iCloud data. Local-only vaults
-and their keys remain unchanged. It preserves iCloud data and blocks
-automatic enrollment. Enter your copy again in the recovery dialog, check your
-data, then complete each vault. This cannot be undone; you need the offline copy
-to regain access. If verification fails, device keys remain intact.
-
-After either test, verify normal reads and writes, lock and restart the app, and
-verify access without entering the offline copy. Repeat with the other copy
-format to test both file and paper recovery. Reinstalling alone does not reliably
-clear device keys. A simulator does not validate physical Secure Enclave behavior.
+Account-wide recovery of a live cloud vault is unavailable. Prepare a [portable archive and its separate key](#recovery) for independent restoration. If another enrolled device remains available, keep it unlocked while a new device connects on the same Apple Account. Device-local Secure Enclave keys cannot be recovered; register independent credentials on another device.

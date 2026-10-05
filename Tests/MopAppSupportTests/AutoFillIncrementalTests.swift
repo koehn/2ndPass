@@ -33,6 +33,29 @@ private func publisher(_ root: URL, _ store: SuggestionStore,
         save: { try await store.save($0) }, remove: { await store.remove($0) }, local: local)
 }
 
+@Test func stagedLoginSurvivesRestartWithoutChangingSystemSuggestionsDuringFill() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), first = publisher(root, store), vault = UUID().uuidString
+    let old = suggestionItem(UUID(), user: "existing")
+    let oldVersion = UUID()
+    try await first.publish(catalog: suggestionCatalog([(old, oldVersion)]), vaultID: vault)
+    let added = suggestionItem(UUID(), user: "new-login")
+    try await first.stage(catalog: suggestionCatalog([(old, oldVersion), (added, UUID())]), vaultID: vault)
+    #expect(await store.replacements == 1)
+    #expect(await store.saves.isEmpty)
+    #expect(await store.removals.isEmpty)
+    #expect(await store.rows.values.map(\.username) == ["existing"])
+    let rows = try AutoFillIndex(directory: root).load()
+    #expect(Set(rows.map(\.username)) == ["existing", "new-login"])
+    let identity = try #require(rows.first { $0.username == "new-login" })
+    #expect(try AutoFillPublicationState.itemID(for: identity.id, directory: root) == UUID(uuidString: added.storageID!))
+    let restarted = publisher(root, store)
+    try await restarted.reconcile()
+    #expect(Set(await store.rows.values.map(\.username)) == ["existing", "new-login"])
+    #expect(await store.replacements == 2)
+}
+
 @Test func automaticReconciliationRepairsMissingSystemSuggestionsWithoutCatalogOrUnlock() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }

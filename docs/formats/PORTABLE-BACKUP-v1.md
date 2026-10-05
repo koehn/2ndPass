@@ -3,7 +3,7 @@
 This is a standalone recovery specification for `.moparchive` files produced by
 2ndPass in October 2026. It intentionally contains enough information to recreate
 a decoder after reverting the application source. It describes the portable
-logical archive, **not** a v7 `.mopfile` checkpoint, CloudKit record or offline
+logical archive, **not** a CloudKit record or offline
 recovery private key. The archive and its separate key file are both required.
 Neither original device keys nor the original CloudKit zone are required.
 

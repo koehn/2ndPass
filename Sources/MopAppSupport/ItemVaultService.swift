@@ -120,6 +120,23 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     public func userActivity() { idleWork.activity() }
     public func setMaintenanceActive(_ active: Bool) { idleWork.setActive(active) }
     public func invalidateDiscovery() { backend.invalidateDiscovery() }
+    /// Setup names are immutable trust data, not current display names. Resolve
+    /// destinations from authenticated metadata without reading any login items.
+    public func loginDestinations() async throws -> [VaultDescriptor] {
+        let token = sessionGeneration
+        let inventory = try await backend.inventory(offline: false)
+        try checked(token)
+        var destinations: [VaultDescriptor] = []
+        for vault in inventory where vault.enrolled && vault.supported {
+            guard let id = UUID(uuidString: vault.id) else { throw MopError.invalidVault }
+            let session = try await opened(id, token: token, offline: false)
+            let metadata = try await session.vaultMetadata()
+            try checked(token)
+            destinations.append(VaultDescriptor(id: vault.id, name: metadata.value.name,
+                format: vault.format, enrolled: true))
+        }
+        return destinations.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
+    }
     public func requestSynchronization() async throws {
         guard authenticatedAt != nil else { return }
         let token = sessionGeneration
@@ -821,9 +838,16 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         result.mutationIDs = mutations
         result.saveStatus = .local
         await delivered(&result)
-        if sessionGeneration == token, session.isUnlocked, let value = try? await catalog(session) { assignCatalog(value, to: &result) }
+        if sessionGeneration == token, session.isUnlocked, let value = try? await catalog(session) {
+            assignCatalog(value, to: &result)
+            // Publish committed edits before returning to the UI. Idle work can
+            // be delayed or cancelled when the user switches apps or locks.
+            // Include tombstones so partial publication removes their identities;
+            // absence alone must not delete suggestions still downloading.
+            result.autoFillStatus = await publish(value, session: session, token: token, complete: false)
+        }
         startCatalogUpdater(session, token: token)
-        result.autoFillStatus = await publisher?.status()
+        if result.autoFillStatus == nil { result.autoFillStatus = await publisher?.status() }
         if sessionGeneration != token || !session.isUnlocked { result.catalog = nil; result.deletedCatalog = nil }
         return result
     }

@@ -1,6 +1,8 @@
+> Historical source-review evidence; use the original Git revision to reproduce it. This is not the current architecture or release acceptance. See [current security](../SECURITY.md) and [validation](../VALIDATION.md).
+
 # Security documentation audit — 2026-09-29
 
-Scope: current working-tree v7 implementation and repository/website documentation.
+Scope: current implementation at the recorded revision and repository/website documentation.
 This is a source-based documentation and threat-model audit, not an independent
 professional security audit or live penetration test. Existing and concurrently
 arriving application/test changes were preserved. This task changed prose and
@@ -35,7 +37,7 @@ Website source was updated and built locally, not deployed to the public host.
 - Documented recovery as a security/availability tradeoff, without a vendor-held
   recovery master key; corrected the suggestion that the shipping recovery command
   runs offline (only the pure recovery computation is independent of transport).
-- Corrected active v6 schema/format/runbook references to v7; marked historical
+- Corrected schema/format/runbook references at the recorded revision; marked historical
   reports and benchmarks without rewriting their recorded results. In particular,
   `IMPORT.md` incorrectly claimed current v6 readability.
 - Kept Apple Passwords comparisons conservative: Apple also uses hardware-backed

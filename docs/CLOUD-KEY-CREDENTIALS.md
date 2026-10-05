@@ -3,7 +3,7 @@
 Choose **New → New SSH Key** to generate or import a usable key. Choose **Save in**
 on every creation; no destination is silently selected. Create passkeys from a
 website's registration flow, select 2ndPass, and choose a cloud vault or **This
-Device — Secure Enclave**. New cloud credentials require an iCloud connection.
+Device — Secure Enclave**. Cloud-key workflows request online access; local save and confirmed cloud publication are distinct states.
 
 The interface follows Apple's Passwords lists and credential details. SSH creation,
 import, public-key copying, and setup guidance also draw on
@@ -41,21 +41,9 @@ non-extractability of a Secure Enclave key. Typed public metadata stays in the
 encrypted catalog. Public AutoFill suggestions contain RP, username, credential ID,
 user handle, and an opaque vault-scoped locator, never a private key.
 
-Cloud credentials use existing vault membership, synchronization, encrypted caches,
-and offline recovery. A newly enrolled authorized device obtains the same private
-key and, for passkeys, the same credential ID. Recovery requires another enrolled
-device or configured offline recovery covering the owned vault. This is recovery
-of live cloud vaults, not a promise of independently restorable portable backups.
-See [Offline Recovery](OFFLINE-RECOVERY.md).
+Cloud credentials use encrypted item storage and same-account synchronization. Portable archives preserve transferable software key bytes. Account recovery, cross-account sharing and device removal are unavailable. Credential-account registration evidence is separate from key creation/use and remains unconnected. See [backups](BACKUPS.md).
 
-Owners and editors can create/import/change/delete credentials. Viewers can use
-credentials. Only owners manage membership. Sharing a vault shares its usable keys;
-there is no separate use-only cryptographic permission that prevents members from
-copying decrypted software keys. Inspect the vault's members before saving there.
-Revocation stops access after the client observes it; it cannot retract copies or
-instantly reach an offline client. Archived/deleted items are excluded from agent
-selection and AutoFill suggestions on refresh. Revoking a credential at its website
-or server is separate from deleting it in 2ndPass.
+Archived/deleted items are excluded from selection and suggestions on refresh. Deleting an item does not revoke the credential at its website or server.
 
 Local keys remain generated inside the Secure Enclave. They cannot be imported,
 exported, moved into cloud storage, synchronized, or recovered on another device.
@@ -65,9 +53,7 @@ Local passkeys now report `BE=0, BS=0`. The earlier development override reporte
 backup flags that did not match their actual storage. Existing local records are
 retained, but sites may require re-registration following that correction. Apple
 platform acceptance of device-bound provider credentials must be tested; do not
-work around rejection by falsely setting backup flags. Cloud passkeys report
-`BE=1, BS=1` only after successful cloud publication, with UP/UV set and a zero
-signature counter. No registration response is delivered after a failed save.
+work around rejection by falsely setting backup flags. Cloud passkeys use backup flags with UP/UV and a zero signature counter. Verify publication and backup-flag semantics end to end before release: local save success alone does not establish cloud delivery. No registration response is delivered after a failed save.
 
 ## SSH and Git
 
@@ -111,10 +97,7 @@ adding keys through `ssh-add`: use the import workflow instead.
 
 ## Compatibility and validation
 
-Vaults containing typed credentials require `key-credentials-1`. Older clients
-reject these vault revisions instead of silently discarding credential metadata.
-The feature remains required after deletion. Upgrade all participating clients
-before creating the first typed credential.
+Use compatible app, CLI and AutoFill builds together. Physical cloud-key use and publication behavior need end-to-end acceptance with the item service; retained cryptographic tests alone are not proof of delivery.
 
 Automated software tests cover generation/import, encrypted files and wrong
 passphrases, RSA SHA-2, real OpenSSH agent listing, real Git commit/tag signing and

@@ -331,7 +331,7 @@ public actor AutoFillPublisher: AutoFillPublishing {
             catch CloudSyncAdapterError.engineAlreadyOwned { try await Task.sleep(for: .milliseconds(50)) }
         }
     }
-    private func update(scope: String? = nil, retainingScopes: Set<String>? = nil, force: Bool = false,
+    private func update(scope: String? = nil, retainingScopes: Set<String>? = nil, force: Bool = false, deferSystemUpdate: Bool = false,
                         _ transform: (inout AutoFillPublicationState, [AutoFillIdentity]) -> [AutoFillIdentity]) async throws {
         try await gate.enter()
         var status = rememberedStatus(); status.phase = .updating; status.message = nil; health = status
@@ -358,7 +358,7 @@ public actor AutoFillPublisher: AutoFillPublishing {
             let desired = AutoFillPublicationState.unique(entries + projection.local)
             if let scope { status.catalogsNeedingRefresh?.remove(scope) }
             if let retainingScopes { status.catalogsNeedingRefresh = status.catalogsNeedingRefresh?.intersection(retainingScopes) }
-            let incremental = await supportsIncremental()
+            let incremental = deferSystemUpdate ? false : await supportsIncremental()
             let full = force || wasDisabled || !incremental || projection.requiresReconciliation || projection.published == nil
             let previous = projection.published ?? []
             let old = Dictionary(previous.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
@@ -371,6 +371,17 @@ public actor AutoFillPublisher: AutoFillPublishing {
             // crash between these writes is repaired without resurrecting old rows.
             try index.update { _ in entries }
             indexed = true
+            if deferSystemUpdate {
+                // An active fill must not change the host's suggestion store.
+                // App activation reconciles this durable desired checkpoint.
+                projection.requiresReconciliation = true
+                try saveProjection(projection, directory: directory)
+                status.phase = .notUpdated
+                status.message = "Saved suggestions will be published when 2ndPass next becomes active."
+                record(status)
+                await gate.leave()
+                return
+            }
             if await enabled() {
                 if full || !removed.isEmpty || !saved.isEmpty {
                     projection.requiresReconciliation = true
@@ -409,6 +420,13 @@ public actor AutoFillPublisher: AutoFillPublishing {
     }
     public func publish(catalog: ItemCatalog, vaultID: String) async throws {
         try await publish(catalog: catalog, vaultID: vaultID, complete: true, removing: [])
+    }
+    /// Keep the picker and routing metadata current without touching the system
+    /// identity store while Safari is waiting for a selected credential.
+    public func stage(catalog: ItemCatalog, vaultID: String) async throws {
+        try await update(scope: vaultID, deferSystemUpdate: true) { state, old in
+            state.project(catalog, vaultID: vaultID, complete: true, removing: [], previous: old)
+        }
     }
     public func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String> = []) async throws {
         try await update(scope: vaultID) { state, old in

@@ -23,9 +23,7 @@ Formerly Mop. See [branding and upgrade compatibility](docs/BRANDING.md) for ret
 
 2ndPass is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. These clients now use independently encrypted item records in a shared device-local Core Data store. CKSyncEngine transfers committed changes through one synchronization owner per account/database. Saves are durable locally before cloud delivery.
 
-**This source is undergoing a coordinated, pre-release backend replacement.** The old v7 service has been removed. Existing v7 cloud vaults are not automatically opened or modified: restore a portable backup into a new vault. Same-account private vaults are discovered and connected automatically through iCloud while an existing device is unlocked. Shared vaults, recovery, device removal, permanent vault deletion and general document import remain unavailable. Do not replace your only working client until the [migration acceptance gates](docs/ITEM-SYNC-MIGRATION.md) pass.
-
-The [portable archive specification](docs/formats/PORTABLE-BACKUP-v1.md) documents how to regenerate an exporter/reader after a Git rollback. Keep its independent copy with the archive and key. Historical v7 security documents are reference material, not the current backend contract.
+**Development preview.** Same-account private vaults connect automatically through iCloud while an existing device is unlocked. Shared vaults, account recovery, device removal, permanent vault deletion and general document import are unavailable. See the [vault architecture](docs/VAULT.md), [backup guide](docs/BACKUPS.md) and [validation gates](docs/VALIDATION.md).
 
 ## Recent items
 
@@ -56,9 +54,9 @@ sp read --offline sp://personal/service/token
 Local operations use the encrypted Core Data store and a device-only account binding. They cannot detect unobserved remote revocation or prove freshness. Observed account changes invalidate that binding. GUI, CLI and AutoFill share the device-local App Group store; cloud clients no longer accept an isolated `--state-directory`. CLI writes normally wait up to 20 seconds for their exact cloud delivery receipts. Use `--local-save` to return after the durable local commit; `--offline` prevents network use. A delivery timeout leaves the local save queued and exits nonzero with receipt IDs and a pending message; do not repeat the write. GUI saves report local durability, not an unconfirmed cloud upload.
 The GUI retains an authenticated session context until lock/expiry, while releasing hardware key handles and individual secret keys after operations. CLI commands own their session. AutoFill always starts fresh authentication and locks after filling. Plaintext necessarily reaches 2ndPass, clipboard destinations, and commands receiving secrets.
 `read` releases plaintext to stdout or a selected file; `inject` produces plaintext configuration on stdout or disk. `run` supplies plaintext environment variables to a child: that program, its dependencies and inheriting descendants become trusted with the secret. Environments can leak through diagnostics or privileged host access. Default masking only filters exact secret bytes in stdout/stderr; it does not constrain transformed output, files or network traffic. 2ndPass cannot control a child's use of plaintext. See [CLI boundaries](docs/SECURITY.md#cli-and-extension-disclosure-boundaries).
-## Recovery during migration
+## Recovery
 
-Use portable backups and retain their separate archive keys. Offline account recovery is not yet connected. Same-account device connection is automatic; no access request, approval screen or comparison code is needed.
+Use portable backups and retain their separate archive keys. Account recovery is unavailable. Same-account device connection is automatic; no access request, approval screen or comparison code is needed.
 
 ## Backups and deletion
 Portable backups contain transferable vault contents and use a newly generated
@@ -73,10 +71,10 @@ sp vault restore-backup /path/vault.moparchive --key-file /separate/path/vault.k
 
 Generate and retain a fresh restore UUID for retries. Restore does not reinstate
 sharing or export Secure Enclave private keys. Keep the original vault until you
-have verified the restored contents. See the [migration plan](docs/ITEM-SYNC-MIGRATION.md)
+have verified the restored contents. See the [backup guide](docs/BACKUPS.md)
 for format limits and acceptance gates.
 
-The new service exports a locally stored snapshot (also available with `--offline`); it cannot yet certify a complete remote inventory. Keep the original v7 archive until restored contents have been checked. Its wire format, key encoding, validation limits and restoration semantics are defined in the [standalone specification](docs/formats/PORTABLE-BACKUP-v1.md). Old checkpoint import/export and cloud-zone deletion are unavailable in this backend.
+The service exports a locally stored snapshot (also available with `--offline`); it cannot yet certify a complete remote inventory. Keep the original archive until restored contents have been checked. Its wire format, key encoding, validation limits and restoration semantics are defined in the [standalone specification](docs/formats/PORTABLE-BACKUP-v1.md). Permanent cloud-vault deletion is unavailable.
 
 ## Build and provision
 
@@ -110,10 +108,10 @@ The GUI installer places the sandboxed app at `/Applications/2ndPass.app`; it co
 Register a separate `com.koehn.mop.CLI` App ID with access to the existing host Keychain group, App Group, and CloudKit container. The host and AutoFill extension need their AutoFill capability and shared App Group as well. See [CLI provisioning and Homebrew releases](docs/HOMEBREW.md) for exact capabilities and notarized release commands. Both packages default to Production and reject profiles that do not authorize the requested resources. Keep the CLI inside its own signed bundle; expose it through a symlink.
 
 ## Platform checks
-`sp-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VAULT-NEXT-VALIDATION.md) for live CloudKit/Enclave probes, modeled scenarios and checks still requiring separate physical devices/accounts. Do not treat software fixtures or simulator builds as hardware evidence.
-## Migration limitations
+`sp-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VALIDATION.md) for automated and physical-device acceptance requirements. Do not treat software fixtures or simulator builds as hardware evidence.
+## Current limitations
 
-Cross-account sharing, recovery and document imports require further integration. Their historical guides describe the previous backend. Cloud software credential bytes can survive portable restore, but account registration management is not yet connected. The separate `local` vault and its hardware-backed operations remain available.
+Cross-account sharing, recovery and document imports require further integration. Cloud software credential bytes can survive portable restore, but account registration management is not yet connected. The separate `local` vault and its hardware-backed operations remain available.
 
 ## Public website and build shortcuts
 
@@ -136,10 +134,9 @@ and deployment configuration.
 
 See the website’s [vault capability comparison](https://2ndpass.app/docs.html#vault-capabilities)
 for supported secret types, key operations, synchronization, and recovery by vault type.
-The website guide describes the earlier feature set; the migration status above takes precedence during this source cutover.
 
-Cloud vaults support usable passkeys and generated/imported SSH keys. Choose storage
-explicitly when creating a credential. See [cloud key credentials](docs/CLOUD-KEY-CREDENTIALS.md)
+
+Cloud vaults support software passkeys and generated/imported SSH keys through item reads and saves. Credential-account registration management remains unavailable; cloud-key physical acceptance is still required. See [cloud key credentials](docs/CLOUD-KEY-CREDENTIALS.md)
 for supported formats, SSH/Git setup, protection, sharing, and outstanding acceptance.
 
 The vault named exactly `local` holds Secure Enclave SSH, Git signing, certificate,

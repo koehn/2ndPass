@@ -3,7 +3,6 @@ import { RenderPlugin } from '@11ty/eleventy';
 export default function (eleventyConfig) {
   eleventyConfig.addPlugin(RenderPlugin);
   eleventyConfig.addPassthroughCopy({ 'src/assets': 'assets' });
-  eleventyConfig.addPassthroughCopy({ '../docs/profiling/v7-*.jsonl': 'profiling' });
   eleventyConfig.amendLibrary('md', (md) => {
     const original = md.renderer.rules.heading_open;
     md.renderer.rules.heading_open = (tokens, index, options, env, self) => {

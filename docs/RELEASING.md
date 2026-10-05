@@ -16,10 +16,10 @@ resources; `scripts/install-cli.sh` installs them independently. See
 
 Keep the existing bundle ID, Keychain groups, CloudKit container, and environment
 consistent across Mac/mobile builds and updates. The branding change does not
-migrate identities or vault formats. The separate v7 cutover has no v6 reader or migration. See [branding and identity](BRANDING.md).
+migrate identities or vault formats. See [branding and identity](BRANDING.md).
 
 Before release, update versions and complete the current checks in
-[validation](VAULT-NEXT-VALIDATION.md), including the outstanding physical-device,
+[validation](VALIDATION.md), including the outstanding physical-device,
 AutoFill, recovery, cross-account sharing, and Production CloudKit acceptance.
 Historical audit results do not establish current release readiness. 2ndPass has
 not yet received an independent security audit. Review both protocol correctness

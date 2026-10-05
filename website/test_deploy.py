@@ -1,9 +1,9 @@
-"""Deployment accepts published measurements without exposing arbitrary logs."""
+"""Deployment rejects logs and private data."""
 from pathlib import Path
 import tempfile
 import unittest
 
-from deploy import PUBLIC_PROFILING, validate_output
+from deploy import validate_output
 
 
 class PublicOutputTests(unittest.TestCase):
@@ -19,22 +19,21 @@ class PublicOutputTests(unittest.TestCase):
         path.write_text('{}\n')
         return path
 
-    def test_published_measurements_are_allowed(self):
-        for name in PUBLIC_PROFILING:
-            self.write(name)
+    def test_public_assets_are_allowed(self):
+        self.write('assets/site.css')
         validate_output(self.output)
 
     def test_unreviewed_logs_and_wrong_locations_are_rejected(self):
-        for name in ('profiling/private.jsonl', 'profiling/v7-private.jsonl',
-                     'v7-cloud-2026-09-27.jsonl', 'credentials.json'):
+        for name in ('profiling/private.jsonl', 'profiling/engine.jsonl',
+                     'cloud.jsonl', 'credentials.json'):
             with self.subTest(name=name):
                 path = self.write(name)
                 with self.assertRaisesRegex(ValueError, 'Unexpected public output'):
                     validate_output(self.output)
                 path.unlink()
 
-    def test_allowlisted_name_cannot_be_a_symlink(self):
-        path = self.output / sorted(PUBLIC_PROFILING)[0]
+    def test_asset_cannot_be_a_symlink(self):
+        path = self.output / 'assets/site.css'
         path.parent.mkdir()
         path.symlink_to(self.output / 'index.html')
         with self.assertRaisesRegex(ValueError, 'Unexpected public output'):
