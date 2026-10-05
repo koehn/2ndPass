@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import CryptoKit
 import MopLocalIdentity
 import Synchronization
@@ -457,7 +458,7 @@ private actor Barrier {
         let generation = model.editorGeneration
         model.lock()
         #expect(!service.isAuthenticated && !model.authenticated)
-        #expect(model.catalog == nil && model.references.isEmpty && model.revealed == nil)
+        #expect(model.catalog == nil && model.itemFields.isEmpty && model.revealed == nil)
         #expect(model.sheet == nil && model.search.isEmpty && !model.deleteConfirmation)
         #expect(model.editorGeneration > generation)
     }
@@ -555,7 +556,9 @@ private actor Barrier {
         model.authenticated = true
         model.renameVault(to: "private"); try await finish(model)
         #expect(model.authenticated && model.vaultName == "private")
-        #expect(model.references.allSatisfy { $0.vault == "private" })
+        model.selectedItem = "github"
+        #expect(!model.itemFields.isEmpty)
+        #expect(model.itemFields.allSatisfy { $0.vault == "private" })
     }
     @Test func lockDuringSaveDiscardsCompletionAndDoesNotReopenSheet() async throws {
         let barrier = Barrier()
@@ -614,7 +617,7 @@ extension AppModelTests {
         let model = model(service); try model.applyCatalog(Self.catalog)
         let reference = try SecretReference("sp://personal/github/extra")
         model.write(reference: reference, value: "new", replace: false); try await finish(model)
-        #expect(model.items == ["github"] && model.catalog?.revision == "r2")
+        #expect(model.catalog?.items.map(\.name) == ["github"] && model.catalog?.revision == "r2")
     }
     @Test func lockBeforeTaskStartsDoesNotBeginAuthentication() async throws {
         let service = FakeService()
@@ -726,7 +729,7 @@ extension AppModelTests {
         model.beginItemEditing(); model.itemDraft?.name = "GitHub account"
         model.saveItemDraft(); try await finish(model)
         #expect(model.selectedItem == "GitHub account" && model.itemDraft == nil)
-        #expect(model.references.allSatisfy { $0.item == "GitHub account" })
+        #expect(model.itemFields.allSatisfy { $0.item == "GitHub account" })
     }
 }
 
@@ -2944,4 +2947,34 @@ private actor EditedPasswordBreachClient: BreachChecking {
     #expect(app.passwordQuality(for: "password") == .veryWeak)
     #expect(calls.withLock { $0 } == 1)
     app.lock()
+}
+
+
+extension AppModelTests {
+    @Test func itemSelectionReusesCatalogsAndBuildsOnlySelectedFieldReferences() throws {
+        let service = FakeService(), model = model(service)
+        let firstVault = model.vault, otherVault = UUID().uuidString
+        let first = VaultItem(name: "first", fields: [ItemField(path: "username", value: "alice")])
+        let second = VaultItem(name: "Second item", fields: [
+            ItemField(path: "section/last%20field", value: "last"),
+            ItemField(path: "first", value: "first")])
+        try model.applyCatalog(ItemCatalog(vault: "personal", revision: "1", items: [first, second]))
+        model.catalogs[otherVault] = ItemCatalog(vault: "work", revision: "2", items: [second])
+        model.selectedRow = .init(vault: firstVault, name: first.name)
+        let catalogChanged = Mutex(false), catalogsChanged = Mutex(false), vaultChanged = Mutex(false)
+        withObservationTracking { _ = model.catalog } onChange: { catalogChanged.withLock { $0 = true } }
+        withObservationTracking { _ = model.catalogs } onChange: { catalogsChanged.withLock { $0 = true } }
+        withObservationTracking { _ = model.vault } onChange: { vaultChanged.withLock { $0 = true } }
+        model.selectedRow = .init(vault: firstVault, name: second.name)
+        #expect(!catalogChanged.withLock { $0 } && !catalogsChanged.withLock { $0 } && !vaultChanged.withLock { $0 })
+        #expect(model.itemFields.map(\.description) == [
+            "sp://personal/Second%20item/section/last%20field", "sp://personal/Second%20item/first"])
+        model.selectedRow = .init(vault: otherVault, name: second.name)
+        #expect(model.catalog?.revision == "2" && model.vault == otherVault)
+        #expect(!catalogsChanged.withLock { $0 })
+        #expect(model.itemFields.count == 2 && model.itemFields.allSatisfy { $0.vault == "work" })
+        model.selectedRow = nil
+        #expect(model.itemFields.isEmpty)
+        #expect(service.state.withLock { $0.operations.isEmpty })
+    }
 }

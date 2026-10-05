@@ -138,7 +138,7 @@ private final class FakeLocalService: LocalVaultServing {
         #expect(store.events == ["list"])
         #expect(cloud.recorded().isEmpty)
         #expect(model.catalog == nil)
-        #expect(model.references.isEmpty)
+        #expect(model.itemFields.isEmpty)
     }
 
     @Test func forbiddenOperationsAreRejectedForLocal() {

@@ -118,7 +118,6 @@ final class AppModel {
     }
     var selectedItem: String? { didSet { rememberSelection() } }
     var catalog: ItemCatalog? { didSet { invalidateItemSearch() } }
-    var references: [SecretReference] = []
 
     // Device-local vault: fixed, Secure Enclave-backed, non-exportable. It has no
     // account, sync, or recovery and is independent of the cloud session state.
@@ -600,11 +599,7 @@ final class AppModel {
     }
     var selectedVaultDescriptor: VaultDescriptor? { vaults.first { $0.id == vault } }
     var canExportBackup: Bool { !isLocalVaultSelected && !allVaults && !vault.isEmpty && (selectedVaultDescriptor?.supported == true || authenticated) }
-    var vaultName: String { isLocalVaultSelected ? LocalVault.name : (catalog?.vault ?? references.first?.vault ?? vaults.first { $0.id == vault }?.name ?? "") }
-    var filtered: [SecretReference] {
-        references.filter { search.isEmpty || $0.description.localizedCaseInsensitiveContains(search) }
-    }
-    var items: [String] { Array(Set(filtered.map(\.item))).sorted() }
+    var vaultName: String { isLocalVaultSelected ? LocalVault.name : (catalog?.vault ?? vaults.first { $0.id == vault }?.name ?? "") }
     // Revisions keep Observation informed even when the underlying cache is reused.
     private var itemSearchRevision = 0
     private var deletedSearchRevision = 0
@@ -753,8 +748,11 @@ final class AppModel {
                 return
             }
             if let cached = catalogs[newValue.vault] {
-                vault = newValue.vault
-                try? applyCatalog(cached)
+                // Selection reuses the display projection; it is not a catalog update.
+                if vault != newValue.vault || catalog == nil {
+                    vault = newValue.vault
+                    catalog = cached
+                }
                 selectedItem = newValue.name
             }
         }
@@ -849,18 +847,18 @@ final class AppModel {
     }
     var selectedTypedItem: VaultItem? { catalog?.items.first { $0.name == selectedItem } }
     var itemFields: [SecretReference] {
-        let refs = references.filter { $0.item == selectedItem }.sorted()
-        let paths = selectedTypedItem?.fields.map { SecretReference.encode(selectedItem ?? "") + "/" + $0.path } ?? []
-        return refs.sorted { (paths.firstIndex(of: $0.relativePath) ?? Int.max) < (paths.firstIndex(of: $1.relativePath) ?? Int.max) }
+        guard let catalog, let item = selectedTypedItem else { return [] }
+        return item.fields.compactMap { field in
+            try? SecretReference(vault: catalog.vault,
+                relativePath: SecretReference.encode(item.name) + "/" + field.path)
+        }
     }
     func metadata(_ ref: SecretReference) -> ItemField? {
         catalog?.items.first { $0.name == ref.item }?.fields.first { ref.relativePath == SecretReference.encode(ref.item) + "/" + $0.path }
     }
     func applyCatalog(_ catalog: ItemCatalog) throws {
-        let refs = try catalog.items.flatMap { item in
-            try item.fields.map { try SecretReference(vault: catalog.vault, relativePath: SecretReference.encode(item.name) + "/" + $0.path) }
-        }
-        self.catalog = catalog; self.references = refs.sorted()
+        try VaultName.validate(catalog.vault)
+        self.catalog = catalog
         if !vault.isEmpty { catalogs[vault] = catalog }
         if passwordQualitySource != passwordQualityIdentity { passwordQualities = [:]; passwordQualitySource = nil }
     }
@@ -1154,7 +1152,7 @@ final class AppModel {
         selectedLocalIdentityID = nil
         generation += 1; editorGeneration += 1; itemDraft = nil; draftConflict = false
         selectedDeleted = nil; itemToDelete = nil
-        conceal(); catalog = nil; passwordQualities = [:]; passwordQualitySource = nil; references = []; selected = nil; members = []
+        conceal(); catalog = nil; passwordQualities = [:]; passwordQualitySource = nil; selected = nil; members = []
         selectedItem = nil; sheet = nil; notice = nil
         importing = false; importStatus = nil; importFraction = nil; importReport = nil; importFailed = false
         vaultDetailsTarget = nil; deleteConfirmation = false; documentRequest = nil; error = nil
@@ -1370,7 +1368,7 @@ final class AppModel {
         guard !busy, !authenticated, isActive, !deviceRemoved else { return }
         launchUnlockAvailable = false; accessNeedsRepair = false
         cancelItemEditing(); conceal(); catalog = nil; catalogs = [:]; deletedCatalogs = [:]
-        passwordQualities = [:]; passwordQualitySource = nil; references = []; authenticated = false
+        passwordQualities = [:]; passwordQualitySource = nil; authenticated = false
         perform { token in try await self.unlockContents(token) }
     }
     private func connectDiscoveredVaults(_ token: Int) async throws {
@@ -1430,14 +1428,14 @@ final class AppModel {
             catalogs = loaded; deletedCatalogs = deleted; retentionDate = wallNow()
             guard !loaded.isEmpty else {
                 service.lock(); authenticated = false; lastActivity = nil
-                catalog = nil; references = []; vault = ""
+                catalog = nil; vault = ""
                 status = vaults.isEmpty ? "Create your first vault" : "Connect this device to a vault to get started."
                 sheet = vaults.isEmpty ? .createVault : nil
                 return
             }
             if vault.isEmpty { vault = ids.first(where: { loaded[$0] != nil }) ?? "" }
             if let catalog = loaded[vault] { try applyCatalog(catalog) }
-            else { catalog = nil; references = [] }
+            else { catalog = nil }
             authenticated = true; accessNeedsRepair = false; connectionUnlockPending = false
             if openingSession { restoreSelection() }
             if lastActivity == nil { lastActivity = now() }
@@ -1446,7 +1444,7 @@ final class AppModel {
                 vaults.append(VaultDescriptor(id: id, name: catalog.vault, format: "mop-items-v2", enrolled: true))
             }
             if catalogLoadProgress[vault] == nil, let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
-            if catalogLoadProgress[vault] == nil, let selected, !references.contains(selected) { self.selected = nil }
+            if catalogLoadProgress[vault] == nil, let selected, !itemFields.contains(selected) { self.selected = nil }
             let date = dates.values.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
             status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
             loadRemainingCatalogs(ids.filter { (loaded[$0] == nil || cachedVaults.contains($0)) && requestedVaultIDs.contains($0) }, token: token)
@@ -1454,7 +1452,7 @@ final class AppModel {
         } catch {
             // The selected vault must verify before opening the session.
             service.lock(); lastActivity = nil; authenticated = false
-            catalog = nil; catalogs = [:]; deletedCatalogs = [:]; references = []
+            catalog = nil; catalogs = [:]; deletedCatalogs = [:]
             passwordQualities = [:]; passwordQualitySource = nil; conceal(); clearClipboard()
             throw error
         }
@@ -1494,7 +1492,7 @@ final class AppModel {
                         self.restoreSelection()
                         if self.vault == id {
                             if self.catalogLoadProgress[id] == nil, let item = self.selectedItem, !fresh.items.contains(where: { $0.name == item }) { self.selectedItem = nil }
-                            if self.catalogLoadProgress[id] == nil, let selected = self.selected, !self.references.contains(selected) { self.selected = nil }
+                            if self.catalogLoadProgress[id] == nil, let selected = self.selected, !self.itemFields.contains(selected) { self.selected = nil }
                         }
                         if result.usingCache { self.cachedVaults.insert(id) } else { self.cachedVaults.remove(id) }
                         self.offline = !self.cachedVaults.isEmpty
@@ -1536,7 +1534,7 @@ final class AppModel {
                                     self.error = MopError.cloudAccount.errorDescription
                                     group.cancelAll(); return
                                 }
-                                // Preserve references when discovery fails.
+                                // Preserve the displayed catalog when discovery fails.
                             }
                         }
                         // A slow/unavailable secondary vault must not close the
@@ -1872,7 +1870,7 @@ final class AppModel {
                 if let next = loaded[vault] { try applyCatalog(next) }
                 if selectedItem == nil && selectedDeleted == nil { restoreSelection() }
                 if catalogLoadProgress[vault] == nil, let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
-                if catalogLoadProgress[vault] == nil, let selected, !references.contains(selected) { self.selected = nil }
+                if catalogLoadProgress[vault] == nil, let selected, !itemFields.contains(selected) { self.selected = nil }
                 let date = dates.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
                 status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
             } catch {
@@ -1898,7 +1896,7 @@ final class AppModel {
     func createVault(name: String) {
         guard !offline, !busy else { return }
         restoreLastSelection = false
-        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; passwordQualitySource = nil; references = []; selected = nil; members = []; authenticated = false
+        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; passwordQualitySource = nil; selected = nil; members = []; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
@@ -1954,7 +1952,7 @@ final class AppModel {
     func deleteVault(target: VaultDescriptor, confirmation: String) {
         guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.deleteVault) ?? ""; return }
         guard !offline, !busy, confirmation == (target.name ?? target.id) else { return }
-        conceal(); clearClipboard(); catalog = nil; references = []; selected = nil; selectedItem = nil; authenticated = false
+        conceal(); clearClipboard(); catalog = nil; selected = nil; selectedItem = nil; authenticated = false
         perform { token in
             _ = try await self.service.execute(.deleteVault, vault: target.id, offline: false)
             guard self.current(token) else { return }
