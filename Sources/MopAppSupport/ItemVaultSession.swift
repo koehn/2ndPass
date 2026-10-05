@@ -230,7 +230,16 @@ public final class ItemVaultSession: @unchecked Sendable {
     /// Bulk symmetric decryption only; no per-item hardware operations or network.
     /// Exact source versions are reconciled before these rows enter the UI.
     func cachedDisplayRows(expectedVersions: [UUID: UUID]) async throws -> [ItemVaultDisplayEntry] {
-        let envelope = try await displayCacheEnvelope(), context = try displayCacheContext()
+        try permit.check()
+        guard let envelope = try await repository.displayCatalogKey(scope: nameIndexScope) else { return [] }
+        let context = try displayCacheContext()
+        do { try permit.withDisplayKey(envelope: envelope, context: context) { _ in () } }
+        catch {
+            try permit.check()
+            if Authentication.requiresRenewal(error) || error as? MopError == .authentication { throw error }
+            // Creating a replacement key belongs to idle cache preparation, not unlock.
+            return []
+        }
         let rows = try await repository.displayCatalogRows(scope: nameIndexScope)
         return try await background { [self] in
             var result: [ItemVaultDisplayEntry] = []

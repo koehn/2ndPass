@@ -87,7 +87,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private var accountObserver: NSObjectProtocol?
 
     public init(backend: any ItemVaultServiceBackend, delivery: ItemVaultDelivery = .local, allowsAttachments: Bool = true,
-                publisher: (any AutoFillPublishing)? = nil, displayBatchSize: Int = 32,
+                publisher: (any AutoFillPublishing)? = nil,
                 idleDelay: Duration = .seconds(3), idleSpacing: Duration = .milliseconds(100)) {
         self.backend = backend; self.delivery = delivery; self.allowsAttachments = allowsAttachments; self.publisher = publisher
         self.idleWork = IdleWorkQueue(delay: idleDelay, spacing: idleSpacing)
@@ -229,6 +229,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
         if let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session), cached.versions == index {
             try checked(token)
+            startCatalogUpdater(session, token: token)
             return try await displayResult(cached, index: index, session: session)
         }
         _ = try await catalog(session, limit: 0)
@@ -321,24 +322,33 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
     private func advanceCatalogProjection(_ session: ItemVaultSession, token: Int) async throws -> Bool {
         try checked(token)
+        let previous = catalogCache.withLock { $0[session.binding.vaultID] }
         _ = try await catalog(session, limit: 1)
         let index = try await session.revisionIndex()
         try checked(token)
         guard let cached = catalogCache.withLock({ $0[session.binding.vaultID] }), cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
         let complete = cached.versions == index
         let settled = complete || displaySettled(cached, index: index)
+        var changed = previous?.versions != cached.versions || previous?.waiting != cached.waiting
         if settled {
             let enriched = try await withHealth(cached.catalog, session: session)
             try checked(token)
-            catalogCache.withLock { values in
-                guard let current = values[session.binding.vaultID], current.session == cached.session,
-                      current.versions == cached.versions else { return }
-                values[session.binding.vaultID] = CachedCatalog(session: cached.session, versions: cached.versions,
-                    catalog: enriched, entries: cached.entries, waiting: cached.waiting, metadata: cached.metadata)
+            changed = changed || enriched.security != cached.catalog.security
+            try state.withLock { state in
+                guard state.generation == token, session.isUnlocked else { throw MopError.authentication }
+                catalogCache.withLock { values in
+                    guard let current = values[session.binding.vaultID], current.session == cached.session,
+                          current.versions == cached.versions else { return }
+                    values[session.binding.vaultID] = CachedCatalog(session: cached.session, versions: cached.versions,
+                        catalog: enriched, entries: cached.entries, waiting: cached.waiting, metadata: cached.metadata)
+                }
             }
-            if complete { _ = await publish(enriched, session: session, token: token) }
+            let downloading = try await session.initialDownloadExpectedCount() != nil
+            _ = await publish(enriched, session: session, token: token, complete: complete && !downloading)
+        } else {
+            _ = await publish(cached.catalog, session: session, token: token, complete: false)
         }
-        displayChanged()
+        if changed { displayChanged() }
         return settled
     }
 
@@ -429,7 +439,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 }
                 if let value = try? await catalog(session) { assignCatalog(value, to: &result) }
             }
-            result.autoFillStatus = await publish(result.catalog, session: session, token: token)
+            startCatalogUpdater(session, token: token)
+            result.autoFillStatus = await publisher?.status()
             if sessionGeneration != token || !session.isUnlocked { result.catalog = nil; result.deletedCatalog = nil }
             return result
         default: break
@@ -785,16 +796,16 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         result.saveStatus = .local
         await delivered(&result)
         if sessionGeneration == token, session.isUnlocked, let value = try? await catalog(session) { assignCatalog(value, to: &result) }
-        result.autoFillStatus = await publish(result.catalog, session: session, token: token)
+        startCatalogUpdater(session, token: token)
+        result.autoFillStatus = await publisher?.status()
         if sessionGeneration != token || !session.isUnlocked { result.catalog = nil; result.deletedCatalog = nil }
         return result
     }
-    private func publish(_ catalog: ItemCatalog?, session: ItemVaultSession, token: Int) async -> AutoFillPublicationStatus? {
-        guard let publisher, var catalog, sessionGeneration == token, session.isUnlocked else { return nil }
-        catalog.items.removeAll { $0.deletion != nil }
+    private func publish(_ catalog: ItemCatalog?, session: ItemVaultSession, token: Int, complete: Bool = true) async -> AutoFillPublicationStatus? {
+        guard let publisher, let catalog, sessionGeneration == token, session.isUnlocked else { return nil }
         // Suggestions intentionally survive lock, but contain only eligible public
         // metadata. Every credential use still authenticates in the extension.
-        do { try await publisher.publish(catalog: catalog, vaultID: session.binding.vaultID.uuidString) }
+        do { try await publisher.publish(catalog: catalog, vaultID: session.binding.vaultID.uuidString, complete: complete, removing: []) }
         catch { return await publisher.status() }
         return await publisher.status()
     }

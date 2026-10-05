@@ -24,6 +24,29 @@ failure is reported separately and never makes a successful vault save fail.
 Unavailable vaults retain their prior suggestions during a partial refresh. Catalog
 eligibility alone is not proof that the system accepted publication.
 
+Unlock returns the verified local display cache before rebuilding missing rows.
+Maintenance starts after three seconds without interaction, prepares one item at a
+time, and leaves at least 100 ms between units. Activity postpones the next unit;
+app deactivation pauses it and locking cancels it. Password-health metadata is
+loaded during idle maintenance rather than twice on the launch path. Health scans
+retain their separate startup/idle delays, including restoration of saved results.
+
+AutoFill projection rows track opaque item IDs, source versions, and generated
+identities. Unchanged versions reuse their identities. The publisher durably keeps
+desired metadata separate from the last successfully published identities. It uses
+`ASCredentialIdentityStore` incremental save/remove operations when supported;
+unchanged suggestions require no system write. Partial catalogs never turn absent
+items into deletions; removals require explicit item IDs, an authoritative changed
+row (including archive/deletion), or a complete inventory.
+
+Cloud identities and local passkeys share a publication coordinator and an
+app-group filesystem lease across app and extension processes. An unavailable
+local inventory preserves its previous suggestions. Publication failures retain
+the desired state for retry. An interrupted/uncertain system update, missing or
+invalid publication checkpoint, schema change, explicit Refresh Suggestions, or
+lack of incremental support uses full reconciliation. Explicit refresh repairs
+system-store resets that cannot be inferred from unchanged source versions.
+
 Only website, username, kind, and opaque locator leave the encrypted catalog.
 Item/vault names, field paths, passwords, OTP seeds, and keys are not published or
 written to the shared index. Publication health stores a timestamp, generic status, and opaque IDs of vaults

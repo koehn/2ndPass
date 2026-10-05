@@ -93,7 +93,7 @@ public final class LocalVaultService: LocalVaultServing {
         guard LocalVaultPolicy.isAllowed(.deleteItem) else { throw MopError.localOperationForbidden }
         let suggestion = try store.read(id: id).passkeySuggestion
         try store.delete(id: id, authorization: authorization)
-        if let suggestion { ASCredentialIdentityStore.shared.removeCredentialIdentities([suggestion], completion: nil) }
+        if suggestion != nil { Task { try? await AutoFillPublisher.shared.refreshLocalPasskeys() } }
     }
 
     // MARK: - Forbidden operations

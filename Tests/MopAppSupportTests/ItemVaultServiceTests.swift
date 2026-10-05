@@ -312,11 +312,13 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
     let archive = try PortableArchive.seal(performanceDocument(itemCount: total))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
     let publisher = CatalogPublicationRecorder()
-    let service = ItemVaultService(backend: backend, publisher: publisher, displayBatchSize: 1)
+    let service = ItemVaultService(backend: backend, publisher: publisher, idleDelay: .milliseconds(100), idleSpacing: .zero)
     let events = await service.changes()
     let initial = try await service.displayCatalog(vault: id.uuidString)
-    #expect(initial.catalogLoadedCount == 1 && initial.catalogTotalCount == total)
-    let loaded = try #require(initial.catalog?.items.first), itemID = try #require(loaded.storageID)
+    #expect(initial.catalogLoadedCount == 0 && initial.catalogTotalCount == total)
+    #expect(await publisher.itemCounts.isEmpty)
+    let populated = try await waitForDisplay(service, vault: id) { !($0.catalog?.items.isEmpty ?? true) }
+    let loaded = try #require(populated.catalog?.items.first), itemID = try #require(loaded.storageID)
     let reference = try SecretReference(vault: "performance", relativePath: loaded.name + "/password")
     let revealed = try await service.readLocal(reference, vault: id.uuidString, itemID: itemID)
     #expect(revealed.value == SecretBytes(utf8: "target-secret"))
@@ -356,9 +358,9 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 64))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
     let publisher = CatalogPublicationRecorder()
-    let service = ItemVaultService(backend: backend, publisher: publisher, displayBatchSize: 1)
+    let service = ItemVaultService(backend: backend, publisher: publisher, idleDelay: .milliseconds(100), idleSpacing: .zero)
     let initial = try await service.displayCatalog(vault: id.uuidString)
-    #expect(initial.catalogLoadedCount == 1)
+    #expect(initial.catalogLoadedCount == 0)
     service.lock()
     #expect(service.authenticatedAt == nil)
     #expect(try await service.cachedCatalog(vault: id.uuidString) == nil)
@@ -439,7 +441,7 @@ func persistentDisplayCatalogOpensWholeListWithConstantHardwareWork(itemCount: I
     original.lock()
     let reopened = try EncryptedItemRepository(storeURL: url)
     let fresh = try await backend.reopened(repository: reopened)
-    let service = ItemVaultService(backend: fresh, displayBatchSize: 1)
+    let service = ItemVaultService(backend: fresh, idleDelay: .milliseconds(100), idleSpacing: .zero)
     let before = fresh.unwrapCount
     let result = try await service.displayCatalog(vault: id.uuidString)
     #expect(result.catalog?.items.count == itemCount)
@@ -474,7 +476,10 @@ func persistentDisplayCatalogOpensWholeListWithConstantHardwareWork(itemCount: I
     let reopened = try EncryptedItemRepository(storeURL: url), fresh = try await backend.reopened(repository: reopened)
     let service = ItemVaultService(backend: fresh)
     let before = fresh.unwrapCount
-    let result = try await service.displayCatalog(vault: id.uuidString)
+    let initial = try await service.displayCatalog(vault: id.uuidString)
+    #expect(initial.catalog?.items.count == 39 && initial.catalogTotalCount == 40)
+    #expect(fresh.unwrapCount - before <= 2) // No item rebuild before initial display.
+    let result = try await waitForDisplay(service, vault: id) { $0.catalogTotalCount == nil }
     #expect(result.catalog?.items.count == 40 && result.catalogTotalCount == nil)
     #expect(result.catalog?.items.first(where: { $0.storageID == item.storageID })?.metadata?.favorite == true)
     #expect(fresh.unwrapCount - before <= 3) // Only the changed item needs a hardware unwrap.
@@ -505,7 +510,10 @@ func persistentDisplayCatalogOpensWholeListWithConstantHardwareWork(itemCount: I
     let reopened = try EncryptedItemRepository(storeURL: url), fresh = try await backend.reopened(repository: reopened)
     let service = ItemVaultService(backend: fresh)
     let before = fresh.unwrapCount
-    let result = try await service.displayCatalog(vault: id.uuidString)
+    let initial = try await service.displayCatalog(vault: id.uuidString)
+    #expect(initial.catalog?.items.count == 39 && initial.catalogTotalCount == 40)
+    #expect(fresh.unwrapCount - before <= 2) // No item rebuild before initial display.
+    let result = try await waitForDisplay(service, vault: id) { $0.catalogTotalCount == nil }
     #expect(result.catalog?.items.count == 40 && result.catalogTotalCount == nil)
     #expect(fresh.unwrapCount - before <= 3)
     let active = try await fresh.open(id)
@@ -573,4 +581,58 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
 private struct UnusedHealthBreach: BreachChecking {
     func contains(_ password: Data, force: Bool) async throws -> Bool { Issue.record("Disabled breach check called"); return false }
     func clear() async {}
+}
+
+/// Observe actual display transitions, bounded so a stalled updater fails the test.
+func waitForDisplay(_ service: ItemVaultService, vault: UUID,
+                    until ready: (VaultResult) -> Bool) async throws -> VaultResult {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+    while true {
+        let result = try await service.displayCatalog(vault: vault.uuidString)
+        if ready(result) { return result }
+        guard ContinuousClock.now < deadline else {
+            Issue.record("Timed out waiting for idle catalog preparation")
+            throw CancellationError()
+        }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+@Test func cachedLaunchDefersAutoFillUntilIdleAndLockCancelsPublication() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 3))
+    _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let original = ItemVaultService(backend: backend)
+    _ = try await original.execute(.catalog, vault: id.uuidString)
+    original.lock()
+    let publisher = CatalogPublicationRecorder()
+    let reopened = try await backend.reopened(repository: repository)
+    let service = ItemVaultService(backend: reopened, publisher: publisher, idleDelay: .milliseconds(100), idleSpacing: .zero)
+    service.setMaintenanceActive(false)
+    let initial = try await service.displayCatalog(vault: id.uuidString)
+    #expect(initial.catalog?.items.count == 3)
+    #expect(await publisher.itemCounts.isEmpty)
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(await publisher.itemCounts.isEmpty)
+    service.setMaintenanceActive(true)
+    service.userActivity()
+    try await Task.sleep(for: .milliseconds(20))
+    #expect(await publisher.itemCounts.isEmpty)
+    let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+    while await publisher.itemCounts.isEmpty, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(await publisher.itemCounts == [3])
+    service.lock()
+    let nextBackend = try await reopened.reopened(repository: repository)
+    let next = ItemVaultService(backend: nextBackend, publisher: publisher, idleDelay: .milliseconds(100))
+    next.setMaintenanceActive(false)
+    _ = try await next.displayCatalog(vault: id.uuidString)
+    next.lock()
+    next.setMaintenanceActive(true)
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(await publisher.itemCounts == [3])
 }

@@ -308,9 +308,7 @@ import MopLocalIdentity
                     guard case .passkey(let metadata) = identity.metadata else { throw MopError.invalidLocalIdentity }
                     let response = ASPasskeyRegistrationCredential(relyingParty: rp, clientDataHash: request.clientDataHash, credentialID: metadata.credentialID, attestationObject: try LocalWebAuthn.attestation(metadata: metadata, publicKey: identity.publicKey))
                     guard token == generation, !Task.isCancelled, auth.isActive else { return }
-                    if let suggestion = identity.passkeySuggestion {
-                        try await ASCredentialIdentityStore.shared.saveCredentialIdentities([suggestion])
-                    }
+                    try await AutoFillPublisher.shared.refreshLocalPasskeys()
                     guard token == generation, !Task.isCancelled, auth.isActive else { return }
                     // Keep the local record if the platform rejects delivery: never destroy a key
                     // that a relying party may already have registered. It can be deleted in local.

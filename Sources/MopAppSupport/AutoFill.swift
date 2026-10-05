@@ -4,6 +4,7 @@ import Foundation
 import CryptoKit
 import MopCore
 import MopKeychain
+import MopSync
 
 public enum AutoFillKind: String, Codable, Sendable, CaseIterable {
     case password, oneTimeCode, passkey
@@ -229,7 +230,13 @@ public struct AutoFillPublicationStatus: Codable, Equatable, Sendable {
 public protocol AutoFillPublishing: Sendable {
     func status() async -> AutoFillPublicationStatus
     func publish(catalog: ItemCatalog, vaultID: String) async throws
+    func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>) async throws
     func refresh() async throws
+}
+public extension AutoFillPublishing {
+    func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>) async throws {
+        if complete { try await publish(catalog: catalog, vaultID: vaultID) }
+    }
 }
 
 /// All app-side publication is serialized, including full-store replacements.
@@ -239,19 +246,32 @@ public actor AutoFillPublisher: AutoFillPublishing {
     private let indexDirectory: URL?
     private let publishIdentities: @Sendable ([AutoFillIdentity]) async throws -> Void
     private let enabled: @Sendable () async -> Bool
+    private let supportsIncremental: @Sendable () async -> Bool
+    private let saveIdentities: @Sendable ([AutoFillIdentity]) async throws -> Void
+    private let removeIdentities: @Sendable ([AutoFillIdentity]) async throws -> Void
+    private let localIdentities: @Sendable () throws -> [AutoFillIdentity]
     private var health: AutoFillPublicationStatus?
     init(directory: URL? = nil, publish: (@Sendable ([AutoFillIdentity]) async throws -> Void)? = nil,
-         enabled: (@Sendable () async -> Bool)? = nil) {
+         enabled: (@Sendable () async -> Bool)? = nil,
+         incremental: (@Sendable () async -> Bool)? = nil,
+         save: (@Sendable ([AutoFillIdentity]) async throws -> Void)? = nil,
+         remove: (@Sendable ([AutoFillIdentity]) async throws -> Void)? = nil,
+         local: (@Sendable () throws -> [AutoFillIdentity])? = nil) {
         indexDirectory = directory
         if let enabled { self.enabled = enabled }
         else if publish != nil { self.enabled = { true } }
         else { self.enabled = { await ASCredentialIdentityStore.shared.state().isEnabled } }
-        publishIdentities = publish ?? { entries in
-            let identities = Self.combinedIdentities(entries) {
-                try LocalIdentityStore.open().list().compactMap(\.passkeySuggestion)
-            }
-            try await ASCredentialIdentityStore.shared.replaceCredentialIdentities(identities)
-        }
+        if let incremental { supportsIncremental = incremental }
+        else if publish != nil { supportsIncremental = { false } }
+        else { supportsIncremental = { await ASCredentialIdentityStore.shared.state().supportsIncrementalUpdates } }
+        publishIdentities = publish ?? { try await ASCredentialIdentityStore.shared.replaceCredentialIdentities($0.map(\.identity)) }
+        saveIdentities = save ?? { try await ASCredentialIdentityStore.shared.saveCredentialIdentities($0.map(\.identity)) }
+        removeIdentities = remove ?? { try await ASCredentialIdentityStore.shared.removeCredentialIdentities($0.map(\.identity)) }
+        if let local { localIdentities = local }
+        else if publish != nil { localIdentities = { [] } }
+        else { localIdentities = {
+            try LocalIdentityStore.open().list().compactMap(\.passkeySuggestion).compactMap { AutoFillIdentity(identity: $0) }
+        } }
     }
     nonisolated static func combinedIdentities(_ entries: [AutoFillIdentity], local: () throws -> [ASPasskeyCredentialIdentity]) -> [any ASCredentialIdentity] {
         // Cloud suggestions do not depend on access to this device's hardware keys.
@@ -283,55 +303,126 @@ public actor AutoFillPublisher: AutoFillPublishing {
         if health?.phase != value.phase { record(value) }
         return value
     }
-    private func update(scope: String? = nil, retainingScopes: Set<String>? = nil, _ transform: ([AutoFillIdentity]) -> [AutoFillIdentity]) async throws {
+    private func loadProjection(_ directory: URL) throws -> AutoFillPublicationState {
+        let file = directory.appendingPathComponent("projection.json")
+        guard FileManager.default.fileExists(atPath: file.path) else { return AutoFillPublicationState() }
+        // Read/permission failures are not cache corruption and must fail closed.
+        let data = try LocalFile.read(file, privateFile: true)
+        guard let state = try? JSONDecoder().decode(AutoFillPublicationState.self, from: data),
+              state.schema == AutoFillPublicationState.currentSchema else { return AutoFillPublicationState() }
+        return state
+    }
+    private func saveProjection(_ state: AutoFillPublicationState, directory: URL) throws {
+        let file = directory.appendingPathComponent("projection.json")
+        let data = try JSONEncoder().encode(state)
+        guard data.count <= 32 * 1024 * 1024 else { throw MopError.invalidVault }
+        try LocalFile.write(data, to: file, replace: FileManager.default.fileExists(atPath: file.path))
+    }
+    private func lease(_ directory: URL) async throws -> SynchronizationLease {
+        while true {
+            try Task.checkCancellation()
+            do { return try SynchronizationLease(url: directory.appendingPathComponent("publication.lock")) }
+            catch CloudSyncAdapterError.engineAlreadyOwned { try await Task.sleep(for: .milliseconds(50)) }
+        }
+    }
+    private func update(scope: String? = nil, retainingScopes: Set<String>? = nil, force: Bool = false,
+                        _ transform: (inout AutoFillPublicationState, [AutoFillIdentity]) -> [AutoFillIdentity]) async throws {
         try await gate.enter()
-        var state = rememberedStatus(); state.phase = .updating; state.message = nil; health = state
+        var status = rememberedStatus(); status.phase = .updating; status.message = nil; health = status
         var indexed = false
         do {
-            try Task.checkCancellation()
-            let entries = try AutoFillIndex(directory: directory()).update(transform)
+            let directory = try directory()
+            let ownership = try await lease(directory)
+            defer { withExtendedLifetime(ownership) {} }
+            // Another app-group process may have published since our last operation.
+            health = nil; status = rememberedStatus()
+            let wasDisabled = status.phase == .disabled
+            status.phase = .updating; status.message = nil
+            var projection = try loadProjection(directory)
+            let index = AutoFillIndex(directory: directory)
+            let indexedRows: [AutoFillIdentity]
+            do { indexedRows = try index.load() }
+            catch MopError.invalidVault { projection.requiresReconciliation = true; indexedRows = [] }
+            let recovered = projection.items.values.flatMap { $0.values.flatMap(\.identities) }
+            let previousDesired = projection.desiredCloud ?? AutoFillPublicationState.unique(indexedRows + recovered)
+            let entries = transform(&projection, previousDesired)
+            projection.desiredCloud = entries
+            // A failed local inventory read is not proof that local passkeys were deleted.
+            if let local = try? localIdentities() { projection.local = AutoFillPublicationState.unique(local) }
+            let desired = AutoFillPublicationState.unique(entries + projection.local)
+            if let scope { status.catalogsNeedingRefresh?.remove(scope) }
+            if let retainingScopes { status.catalogsNeedingRefresh = status.catalogsNeedingRefresh?.intersection(retainingScopes) }
+            let incremental = await supportsIncremental()
+            let full = force || wasDisabled || !incremental || projection.requiresReconciliation || projection.published == nil
+            let previous = projection.published ?? []
+            let old = Dictionary(previous.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+            let new = Dictionary(desired.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+            let removed = previous.filter { new[$0.id] == nil || new[$0.id] != $0 }
+            let saved = desired.filter { old[$0.id] != $0 }
+            // Desired metadata is durable before any system call. Confirmed state stays separate.
+            try saveProjection(projection, directory: directory)
+            // The picker index is derived from the durable desired checkpoint. A
+            // crash between these writes is repaired without resurrecting old rows.
+            try index.update { _ in entries }
             indexed = true
-            if let scope { state.catalogsNeedingRefresh?.remove(scope) }
-            if let retainingScopes { state.catalogsNeedingRefresh = state.catalogsNeedingRefresh?.intersection(retainingScopes) }
             if await enabled() {
-                try await publishIdentities(entries)
-                state.phase = .current; state.lastSuccess = Date()
-                if state.catalogsNeedingRefresh?.isEmpty == false {
-                    state.phase = .failed
-                    state.message = "Some vault suggestions still need an update. Choose Refresh Suggestions to retry."
+                if full || !removed.isEmpty || !saved.isEmpty {
+                    projection.requiresReconciliation = true
+                    try saveProjection(projection, directory: directory)
+                    if full { try await publishIdentities(desired) }
+                    else {
+                        if !removed.isEmpty { try await removeIdentities(removed) }
+                        if !saved.isEmpty { try await saveIdentities(saved) }
+                    }
+                    projection.published = desired; projection.requiresReconciliation = false
+                    try saveProjection(projection, directory: directory)
+                    status.lastSuccess = Date()
                 }
-            } else { state.phase = .disabled }
-            record(state)
+                status.phase = .current
+                if status.catalogsNeedingRefresh?.isEmpty == false {
+                    status.phase = .failed
+                    status.message = "Some vault suggestions still need an update. Choose Refresh Suggestions to retry."
+                }
+            } else {
+                projection.requiresReconciliation = true
+                try saveProjection(projection, directory: directory)
+                status.phase = .disabled
+            }
+            record(status)
             await gate.leave()
         } catch {
             if !indexed, let scope {
-                if state.catalogsNeedingRefresh == nil { state.catalogsNeedingRefresh = [] }
-                state.catalogsNeedingRefresh?.insert(scope)
+                if status.catalogsNeedingRefresh == nil { status.catalogsNeedingRefresh = [] }
+                status.catalogsNeedingRefresh?.insert(scope)
             }
-            state.phase = .failed
-            state.message = "Suggestions could not be updated. Your saved vault changes are safe. Try Refresh Suggestions."
-            record(state)
+            status.phase = .failed
+            status.message = "Suggestions could not be updated. Your saved vault changes are safe. Try Refresh Suggestions."
+            record(status)
             await gate.leave(); throw error
         }
     }
     public func publish(catalog: ItemCatalog, vaultID: String) async throws {
-        try await update(scope: vaultID) { old in
-            old.filter { AutoFillEntry.vaultID($0.recordIdentifier) != vaultID }
-                + AutoFillEntry.entries(catalog: catalog, vaultID: vaultID).map(AutoFillIdentity.init)
-                + catalog.items.compactMap { AutoFillIdentity(passkey: $0, vaultID: vaultID) }
+        try await publish(catalog: catalog, vaultID: vaultID, complete: true, removing: [])
+    }
+    public func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String> = []) async throws {
+        try await update(scope: vaultID) { state, old in
+            state.project(catalog, vaultID: vaultID, complete: complete, removing: itemIDs, previous: old)
         }
     }
-    public func refresh() async throws { try await update { $0 } }
+    /// Explicit repair handles system-store resets even when no source items changed.
+    public func refresh() async throws { try await update(force: true) { _, old in old } }
+    public func refreshLocalPasskeys() async throws { try await update { _, old in old } }
     func prune(keeping vaultIDs: Set<String>) async throws {
-        try await update(retainingScopes: vaultIDs) { old in
-            old.filter { identity in
-                guard let id = AutoFillEntry.vaultID(identity.recordIdentifier) else { return false }
-                return vaultIDs.contains(id)
-            }
+        try await update(retainingScopes: vaultIDs) { state, old in
+            state.items = state.items.filter { vaultIDs.contains($0.key) }
+            return old.filter { AutoFillEntry.vaultID($0.id).map { vaultIDs.contains($0) } ?? false }
         }
     }
     func remove(vaultID: String) async throws {
-        try await update(scope: vaultID) { $0.filter { AutoFillEntry.vaultID($0.recordIdentifier) != vaultID } }
+        try await update(scope: vaultID) { state, old in
+            state.items[vaultID] = nil
+            return old.filter { AutoFillEntry.vaultID($0.id) != vaultID }
+        }
     }
 }
 

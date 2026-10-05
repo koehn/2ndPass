@@ -1785,6 +1785,9 @@ final class AppModel {
                     } catch { failures += 1 }
                     guard self.current(token) else { return }
                 }
+                do { try await AutoFillPublisher.shared.refresh() }
+                catch { failures += 1 }
+                guard self.current(token) else { return }
                 self.autoFillRefreshMessage = failures == 0 ? "Suggestions refreshed." : "Could not refresh \(failures) vault(s). Existing suggestions for those vaults were retained. Try again when available."
             }
         }

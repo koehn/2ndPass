@@ -119,8 +119,8 @@ private struct JoinedDisplayBackend: ItemVaultServiceBackend {
     await #expect(throws: ItemVaultSessionFailure.pendingAdmission) { try await admitted.catalog() }
     await #expect(throws: ItemVaultSessionFailure.pendingAdmission) { try await admitted.exportPortableLocalSnapshot() }
     #expect(try await admitted.prepareMembershipCatchUp().isEmpty)
-    let displayService = ItemVaultService(backend: JoinedDisplayBackend(session: admitted))
-    let pendingDisplay = try await displayService.displayCatalog(vault: scope.binding.vaultID.uuidString)
+    let displayService = ItemVaultService(backend: JoinedDisplayBackend(session: admitted), idleDelay: .milliseconds(100), idleSpacing: .zero)
+    let pendingDisplay = try await waitForDisplay(displayService, vault: scope.binding.vaultID) { $0.catalogWaitingCount == historical.count }
     #expect(pendingDisplay.catalog?.items.isEmpty == true)
     #expect(pendingDisplay.catalogLoadedCount == 0)
     #expect(pendingDisplay.catalogTotalCount == historical.count)
@@ -136,7 +136,7 @@ private struct JoinedDisplayBackend: ItemVaultServiceBackend {
         try admitted.validate(version, direction: .receiving)
         try await joiningRepository.applyRemote(version, serverSystemFields: Data([1]))
     }
-    let availableDisplay = try await displayService.displayCatalog(vault: scope.binding.vaultID.uuidString)
+    let availableDisplay = try await waitForDisplay(displayService, vault: scope.binding.vaultID) { $0.catalogTotalCount == nil }
     #expect(!availableDisplay.catalogDownloading)
     #expect(try await progressRepository.initialDownloadExpectedCount(scope: scope.repositoryScope) == nil)
     #expect(availableDisplay.catalogTotalCount == nil)
