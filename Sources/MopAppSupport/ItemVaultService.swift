@@ -400,6 +400,13 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             else { let discovery = try await backend.discover(); result.vaults = discovery.vaults; result.discoveryComplete = discovery.complete }
             try checked(token)
             result.defaultVault = result.vaults.count == 1 ? result.vaults.first?.id : nil
+            // Offline inventory is a complete local enrollment snapshot. Online
+            // discovery may be partial; absence then is not evidence of removal.
+            if offline || result.discoveryComplete, let publisher {
+                try? await publisher.prune(keeping: Set(result.vaults.map(\.id)))
+                result.autoFillStatus = await publisher.status()
+                try checked(token)
+            }
             return result
         case .manage(.devices) where vault == nil:
             guard !offline else { throw MopError.offlineWrite }

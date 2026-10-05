@@ -1138,6 +1138,7 @@ final class AppModel {
     func deactivate() { service.setMaintenanceActive(false); isActive = false; visibilityGeneration += 1; conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil }
     func activate() {
         service.setMaintenanceActive(true)
+        Task { try? await AutoFillPublisher.shared.reconcile() }
         checkExpiration(); isActive = true
         reloadUsage()
         if service.isAuthenticated, !busy { lastActivity = now() }
@@ -1775,7 +1776,13 @@ final class AppModel {
             guard accepted, let self else { return }
             self.perform { token in
                 var failures = 0
-                for vault in self.vaults where vault.enrolled {
+                // Reconcile against current local enrollment, not the cached UI
+                // list or the persisted suggestions left by an older vault.
+                let inventory = try await self.service.execute(.discover, vault: nil, offline: true)
+                guard self.current(token) else { return }
+                do { try await AutoFillPublisher.shared.prune(keeping: Set(inventory.vaults.map(\.id))) }
+                catch { failures += 1 }
+                for vault in inventory.vaults where vault.enrolled {
                     do {
                         let result = try await self.service.execute(.catalog, vault: vault.id, offline: self.offline)
                         guard self.current(token) else { return }

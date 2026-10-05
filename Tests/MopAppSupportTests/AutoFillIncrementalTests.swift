@@ -32,6 +32,24 @@ private func publisher(_ root: URL, _ store: SuggestionStore,
     AutoFillPublisher(directory: root, publish: { await store.replace($0) }, incremental: { incremental },
         save: { try await store.save($0) }, remove: { await store.remove($0) }, local: local)
 }
+
+@Test func automaticReconciliationRepairsMissingSystemSuggestionsWithoutCatalogOrUnlock() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), first = publisher(root, store), vault = UUID().uuidString
+    let catalog = try suggestionCatalog([(suggestionItem(UUID(), user: "alice"), UUID())])
+    try await first.publish(catalog: catalog, vaultID: vault)
+    await store.reset()
+    // The durable checkpoint and picker still contain Alice; only Apple's
+    // store was reset. A fresh app instance must detect this automatically.
+    let restarted = publisher(root, store)
+    try await restarted.reconcile()
+    #expect(await store.rows.values.map(\.username) == ["alice"])
+    #expect(await store.replacements == 2)
+    try await restarted.reconcile()
+    #expect(await store.replacements == 3)
+    #expect(await store.saves.isEmpty)
+}
 private func suggestionItem(_ id: UUID, user: String) -> VaultItem {
     var item = VaultItem(name: "Private-title-" + id.uuidString, type: .login, fields: [
         ItemField(path: "username", type: .username, value: user),
@@ -43,6 +61,24 @@ private func suggestionItem(_ id: UUID, user: String) -> VaultItem {
 private func suggestionCatalog(_ items: [(VaultItem, UUID)]) throws -> ItemCatalog {
     let versions = Dictionary(uniqueKeysWithValues: items.map { ($0.0.storageID!, $0.1.uuidString) })
     return ItemCatalog(vault: "private-vault", revision: try JSONEncoder().encode(versions).base64EncodedString(), items: items.map(\.0))
+}
+
+@Test func pruningObsoleteVaultSuggestionsSurvivesRefreshAndRestart() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), current = UUID().uuidString, obsolete = UUID().uuidString
+    let local = try #require(AutoFillIdentity(identity: ASPasskeyCredentialIdentity(
+        relyingPartyIdentifier: "example.test", userName: "local", credentialID: Data(repeating: 1, count: 32),
+        userHandle: Data([1]), recordIdentifier: "local/" + UUID().uuidString)))
+    let first = publisher(root, store, local: { [local] })
+    try await first.publish(catalog: suggestionCatalog([(suggestionItem(UUID(), user: "current"), UUID())]), vaultID: current)
+    try await first.publish(catalog: suggestionCatalog([(suggestionItem(UUID(), user: "obsolete"), UUID())]), vaultID: obsolete)
+    try await first.prune(keeping: [current])
+    #expect(Set(await store.rows.values.map(\.username)) == ["current", "local"])
+    let restarted = publisher(root, store, local: { [local] })
+    try await restarted.refresh()
+    #expect(Set(await store.rows.values.map(\.username)) == ["current", "local"])
+    #expect(try AutoFillIndex(directory: root).load().map(\.username) == ["current"])
 }
 
 @Test func incrementalSuggestionsReuseVersionsAndPublishOnlyChangedIdentitiesAcrossRestart() async throws {

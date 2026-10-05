@@ -440,7 +440,8 @@ import MopLocalIdentity
         finish(); model.loading = false
         switch error as? MopError {
         case .authentication: model.message = "Authentication was cancelled. Retry when you are ready."
-        case .notFound, .vaultMissing: model.message = "This account was changed or removed. Choose another account, or refresh suggestions in 2ndPass."
+        case .notFound: model.message = "This account was changed or removed. Choose another account, or refresh suggestions in 2ndPass."
+        case .vaultMissing: model.message = "This suggestion belongs to a vault that is no longer available on this device. Open 2ndPass and refresh suggestions, then choose the account again."
         case .deviceRemoved, .deviceRemovalPending, .notVaultMember: model.message = "This device is no longer connected to the vault. Open 2ndPass and reconnect before trying again."
         case .invalidIdentity, .signing: model.message = "AutoFill needs setup. Open 2ndPass, connect this device, then enable 2ndPass in Settings → AutoFill."
         case .invalidOTP: model.message = "The verification code expired or is unavailable. Retry to generate a fresh code."

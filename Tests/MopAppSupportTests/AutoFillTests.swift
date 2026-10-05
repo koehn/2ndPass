@@ -11,6 +11,18 @@ private func login() -> VaultItem {
         ItemField(path: "password", type: .password, value: "must-not-be-indexed"),
         ItemField(path: "website", type: .website, value: "https://Example.COM/login?secret=private")])
 }
+
+@Test func autoFillIdentityRejectsUnexpectedObjectsBeforeReadingProperties() throws {
+    // Like the SFPasskeyCredentialIdentity in the macOS crash report, this
+    // object has no recordIdentifier selector. Conversion must not message it.
+    #expect(AutoFillIdentity(identity: NSObject()) == nil)
+    let entry = try #require(AutoFillEntry.entries(
+        catalog: ItemCatalog(vault: "personal", revision: "", items: [login()]), vaultID: UUID().uuidString).first)
+    #expect(AutoFillIdentity(identity: entry.identity) == AutoFillIdentity(entry: entry))
+    let passkey = ASPasskeyCredentialIdentity(relyingPartyIdentifier: "example.test", userName: "alice",
+        credentialID: Data(repeating: 1, count: 32), userHandle: Data([1]), recordIdentifier: "local/passkey")
+    #expect(AutoFillIdentity(identity: passkey)?.kind == .passkey)
+}
 @Test func autoFillIndexesOnlyLoginMetadataAndOpaqueLocators() throws {
     let id = UUID().uuidString
     var item = login()

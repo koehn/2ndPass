@@ -128,7 +128,11 @@ public struct AutoFillIdentity: Codable, Equatable, Identifiable, Sendable {
         website = rp; username = user; kind = .passkey; self.credentialID = credentialID; userHandle = handle
         recordIdentifier = "mop-passkey-v7:" + vaultID + ":" + SHA256.hash(data: credentialID).map { String(format: "%02x", $0) }.joined()
     }
-    public init?(identity: any ASCredentialIdentity) {
+    public init?(identity: AnyObject) {
+        // Some macOS store results are internal objects that do not implement
+        // the advertised protocol. Never send selectors before checking the type.
+        guard identity is ASPasswordCredentialIdentity || identity is ASOneTimeCodeCredentialIdentity || identity is ASPasskeyCredentialIdentity,
+              let identity = identity as? any ASCredentialIdentity else { return nil }
         guard let identifier = identity.recordIdentifier else { return nil }
         recordIdentifier = identifier
         if let password = identity as? ASPasswordCredentialIdentity {
@@ -232,8 +236,10 @@ public protocol AutoFillPublishing: Sendable {
     func publish(catalog: ItemCatalog, vaultID: String) async throws
     func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>) async throws
     func refresh() async throws
+    func prune(keeping vaultIDs: Set<String>) async throws
 }
 public extension AutoFillPublishing {
+    func prune(keeping vaultIDs: Set<String>) async throws {}
     func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>) async throws {
         if complete { try await publish(catalog: catalog, vaultID: vaultID) }
     }
@@ -411,8 +417,15 @@ public actor AutoFillPublisher: AutoFillPublishing {
     }
     /// Explicit repair handles system-store resets even when no source items changed.
     public func refresh() async throws { try await update(force: true) { _, old in old } }
+    /// Repair system-store drift using public suggestion metadata, without opening a vault.
+    public func reconcile() async throws {
+        // macOS can return private objects without ASCredentialIdentity getters
+        // from enumeration. Reassert our metadata instead of trusting either
+        // those objects or a checkpoint that survives a system-store reset.
+        try await update(force: true) { _, old in old }
+    }
     public func refreshLocalPasskeys() async throws { try await update { _, old in old } }
-    func prune(keeping vaultIDs: Set<String>) async throws {
+    public func prune(keeping vaultIDs: Set<String>) async throws {
         try await update(retainingScopes: vaultIDs) { state, old in
             state.items = state.items.filter { vaultIDs.contains($0.key) }
             return old.filter { AutoFillEntry.vaultID($0.id).map { vaultIDs.contains($0) } ?? false }

@@ -16,6 +16,10 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
     var unwrapCount: Int { unwraps.value.withLock { $0 } }
     let confirmsDelivery = Mutex(false)
     let locksAfterCreate = Mutex(false)
+    let discoveryComplete = Mutex(true)
+    func discover() async throws -> ItemVaultDiscovery {
+        try await ItemVaultDiscovery(vaults: inventory(), complete: discoveryComplete.withLock { $0 })
+    }
     let waitedMutations = Mutex<[[UUID]]>([])
     init(repository: EncryptedItemRepository) throws {
         self.repository = repository; inventoryStore = MemoryItemInventory(); owner = Mutex(try SessionDevice())
@@ -299,9 +303,29 @@ private func performanceDocument(itemCount: Int) -> PortableVaultArchive {
 
 private actor CatalogPublicationRecorder: AutoFillPublishing {
     private(set) var itemCounts: [Int] = []
+    private(set) var retainedVaults: [Set<String>] = []
+    func prune(keeping vaultIDs: Set<String>) async throws { retainedVaults.append(vaultIDs) }
     func status() async -> AutoFillPublicationStatus { AutoFillPublicationStatus() }
     func publish(catalog: ItemCatalog, vaultID: String) async throws { itemCounts.append(catalog.items.count) }
     func refresh() async throws {}
+}
+
+@Test func discoveryPrunesObsoleteSuggestionsOnlyWithAuthoritativeInventory() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    _ = try await backend.create(name: "current", id: id, archiveData: nil, recoveryKey: nil)
+    let publisher = CatalogPublicationRecorder()
+    let service = ItemVaultService(backend: backend, publisher: publisher)
+    backend.discoveryComplete.withLock { $0 = false }
+    _ = try await service.execute(.discover, vault: nil, offline: false)
+    #expect(await publisher.retainedVaults.isEmpty)
+    _ = try await service.execute(.discover, vault: nil, offline: true)
+    #expect(await publisher.retainedVaults == [Set([id.uuidString])])
+    backend.discoveryComplete.withLock { $0 = true }
+    _ = try await service.execute(.discover, vault: nil, offline: false)
+    #expect(await publisher.retainedVaults == [Set([id.uuidString]), Set([id.uuidString])])
 }
 
 @Test func progressiveCatalogReturnsPartialThenNotifiesCompleteAndNeverPublishesPartialAutoFill() async throws {
