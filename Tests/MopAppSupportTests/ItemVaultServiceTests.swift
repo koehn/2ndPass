@@ -422,6 +422,35 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
     func refresh() async throws {}
 }
 
+@Test func manualAutoFillRefreshUsesCatalogPublicationAndRepairsEmptyPicker() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
+    _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let suggestions = directory.appendingPathComponent("suggestions")
+    let systemRows = Mutex<[AutoFillIdentity]>([])
+    let publisher = AutoFillPublisher(directory: suggestions, publish: { rows in systemRows.withLock { $0 = rows } })
+    let service = ItemVaultService(backend: backend, publisher: publisher, idleDelay: .seconds(3600))
+    service.setMaintenanceActive(false)
+    #expect(try AutoFillIndex(directory: suggestions).load().isEmpty)
+    let status = try await service.refreshAutoFillSuggestions(offline: true)
+    #expect(status.phase == .current)
+    let repaired = try AutoFillIndex(directory: suggestions).load()
+    #expect(!repaired.isEmpty)
+    #expect(systemRows.withLock { $0 } == repaired)
+    // Normal catalog publication and explicit repair produce the same identities.
+    _ = try await service.execute(.catalog, vault: vault.uuidString, offline: true)
+    #expect(try AutoFillIndex(directory: suggestions).load() == repaired)
+    let recorder = CatalogPublicationRecorder()
+    let counted = ItemVaultService(backend: backend, publisher: recorder)
+    _ = try await counted.refreshAutoFillSuggestions(offline: true)
+    #expect(await recorder.itemCounts == [2])
+    #expect(await recorder.retainedVaults == [Set([vault.uuidString])])
+    service.lock(); counted.lock()
+}
+
 @Test func discoveryPrunesObsoleteSuggestionsOnlyWithAuthoritativeInventory() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }

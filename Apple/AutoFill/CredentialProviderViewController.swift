@@ -238,7 +238,7 @@ import MopLocalIdentity
                 guard token == generation, !Task.isCancelled else { return }
                 guard !identities.isEmpty else {
                     model.loading = false
-                    model.message = kind == .password ? "No saved logins are available. Create a login to get started." : "No suggestions are available. Open 2ndPass to check your saved items."
+                    model.message = kind == .password ? "No login suggestions are available. If you already saved a login, open and unlock 2ndPass, then choose Settings → AutoFill → Refresh Suggestions. Return here and Retry to reload the list." : "No suggestions are available. Open 2ndPass to check your saved items."
                     updatePreferredContentSize(); return
                 }
                 // Browsing uses only published metadata. Start authentication and its

@@ -1772,28 +1772,14 @@ final class AppModel {
     var autoFillRefreshMessage: String?
     func refreshAutoFillSuggestions() {
         guard authenticated, service.isAuthenticated, !busy, !refreshing else { return }
-        requestTransition(.refresh) { [weak self] accepted in
+        requestTransition(.refreshSuggestions) { [weak self] accepted in
             guard accepted, let self else { return }
             self.perform { token in
-                var failures = 0
-                // Reconcile against current local enrollment, not the cached UI
-                // list or the persisted suggestions left by an older vault.
-                let inventory = try await self.service.execute(.discover, vault: nil, offline: true)
+                self.autoFillRefreshMessage = nil
+                let status = try await self.service.refreshAutoFillSuggestions(offline: self.offline)
                 guard self.current(token) else { return }
-                do { try await AutoFillPublisher.shared.prune(keeping: Set(inventory.vaults.map(\.id))) }
-                catch { failures += 1 }
-                for vault in inventory.vaults where vault.enrolled {
-                    do {
-                        let result = try await self.service.execute(.catalog, vault: vault.id, offline: self.offline)
-                        guard self.current(token) else { return }
-                        if let catalog = result.catalog { try await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault.id) }
-                    } catch { failures += 1 }
-                    guard self.current(token) else { return }
-                }
-                do { try await AutoFillPublisher.shared.refresh() }
-                catch { failures += 1 }
-                guard self.current(token) else { return }
-                self.autoFillRefreshMessage = failures == 0 ? "Suggestions refreshed." : "Could not refresh \(failures) vault(s). Existing suggestions for those vaults were retained. Try again when available."
+                self.autoFillRefreshMessage = status.phase == .current ? "Suggestions refreshed." :
+                    status.message ?? (status.phase == .disabled ? "Enable 2ndPass in AutoFill settings to show suggestions." : "Suggestions could not be refreshed. Try again.")
             }
         }
     }
@@ -2013,7 +1999,7 @@ enum PendingTransition {
     case recent(ItemCollection)
     case credentials(ItemCollection)
     case vaultTarget(String), sheet(AppSheet), presentation(SheetRequest), details(VaultDescriptor?), refresh, trash(ItemRow)
-    case closeWindow, quit
+    case refreshSuggestions, closeWindow, quit
 }
 
 extension AppModel {
@@ -2130,7 +2116,9 @@ extension AppModel {
             if collection == .all { openLocalVault() }
             discover()
         case .trash(let row): trashItem(row)
-        case .closeWindow, .quit: break
+        // These transitions delegate their work to the completion. Starting a
+        // general refresh here would set busy and suppress the suggestion rebuild.
+        case .refreshSuggestions, .closeWindow, .quit: break
         }
         completion?(true)
     }

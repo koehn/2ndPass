@@ -19,7 +19,10 @@ writing clients are not supported for preserving the new mappings.
 Settings → AutoFill shows provider enabled state, publication health, and the last
 successful system suggestion update. Enable AutoFill uses Apple’s supported prompt;
 Open AutoFill Settings and Open Verification Code Settings use supported settings
-APIs. Refresh Suggestions rebuilds from authenticated catalogs. A publication
+APIs. Refresh Suggestions asks the vault service to reload authenticated catalogs
+through its normal publication path; the UI does not maintain a separate indexer.
+The picker’s Retry reloads the shared index, so repair an empty index with Refresh
+Suggestions in the main app first. A publication
 failure is reported separately and never makes a successful vault save fail.
 Unavailable vaults retain their prior suggestions during a partial refresh. Catalog
 eligibility alone is not proof that the system accepted publication.

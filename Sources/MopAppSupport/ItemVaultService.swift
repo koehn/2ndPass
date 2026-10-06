@@ -99,6 +99,35 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         self.init(backend: NativeItemVaultServiceBackend(state: state), delivery: delivery, allowsAttachments: allowsAttachments,
             publisher: state == nil && Bundle.main.object(forInfoDictionaryKey: "MopPublishesAutoFill") as? Bool == true ? AutoFillPublisher.shared : nil)
     }
+    /// Explicit repair uses the same discovery pruning and catalog publication as
+    /// automatic updates. The UI never projects or publishes a second inventory.
+    public func refreshAutoFillSuggestions(offline: Bool) async throws -> AutoFillPublicationStatus {
+        guard let publisher else { throw ItemVaultServiceFailure.unavailable }
+        let token = sessionGeneration
+        let inventory = try await execute(.discover, vault: nil, offline: true)
+        try checked(token)
+        var failed = inventory.autoFillStatus?.phase == .failed
+        for vault in inventory.vaults where vault.enrolled {
+            do {
+                let result = try await execute(.catalog, vault: vault.id, offline: offline)
+                if result.catalog == nil || result.autoFillStatus?.phase == .failed { failed = true }
+            } catch {
+                try checked(token)
+                failed = true
+            }
+            try checked(token)
+        }
+        // Reassert the same durable projection if the OS discarded its store.
+        do { try await publisher.refresh() } catch { failed = true }
+        try checked(token)
+        var status = await publisher.status()
+        if failed {
+            status.phase = .failed
+            status.message = "Some suggestions could not be refreshed. Existing suggestions for unavailable vaults were retained. Try again when available."
+        }
+        return status
+    }
+
     public var capabilities: Set<VaultServiceCapability> { [.portableBackup, .enrollment, .passwordCheckCache] }
     public func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult) {
         guard kind != .passkey, let vault = AutoFillEntry.vaultID(recordIdentifier), let id = UUID(uuidString: vault) else { throw MopError.notFound }

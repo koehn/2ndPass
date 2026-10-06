@@ -25,6 +25,7 @@ private final class FakeService: VaultService, Sendable {
         var capabilities = Set(VaultServiceCapability.allCases)
         var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
         var displayResult: VaultResult?
+        var suggestionRefreshes = 0
         var syncRequests = 0
         var syncFails = false
         var displayCalls = 0
@@ -50,6 +51,11 @@ private final class FakeService: VaultService, Sendable {
     func readLocal(_ reference: SecretReference, vault: String?, itemID: String?) async throws -> VaultResult {
         state.withLock { $0.exactReadIDs.append(itemID) }
         return try await readLocal(reference, vault: vault)
+    }
+    func refreshAutoFillSuggestions(offline: Bool) async throws -> AutoFillPublicationStatus {
+        state.withLock { $0.suggestionRefreshes += 1 }
+        var status = AutoFillPublicationStatus(); status.phase = .current
+        return status
     }
     func requestSynchronization() async throws {
         let fail = state.withLock { $0.syncRequests += 1; return $0.syncFails }
@@ -100,6 +106,17 @@ private actor Barrier {
         model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)]
         return model
     }
+    @Test func refreshSuggestionsUsesServiceWithoutStartingCompetingDiscovery() async throws {
+        let service = FakeService()
+        service.authenticate()
+        let app = model(service); app.authenticated = true
+        app.refreshAutoFillSuggestions()
+        try await finish(app)
+        #expect(app.autoFillRefreshMessage == "Suggestions refreshed.")
+        #expect(service.state.withLock { $0.suggestionRefreshes } == 1)
+        #expect(service.state.withLock { $0.operations.isEmpty })
+    }
+
     @Test func conflictAppearsWithoutMountingListAndUpdatesWhileEditing() async throws {
         let service = FakeService()
         let app = model(service)
@@ -1587,7 +1604,7 @@ extension AppModelTests {
 
 extension AppModelTests {
     @Test func everyDestructiveNavigationEntryPointPreservesDraftUntilDecision() throws {
-        for route in ["item", "vault", "settings-vault", "sheet", "refresh", "trash"] {
+        for route in ["item", "vault", "settings-vault", "sheet", "refresh", "refresh-suggestions", "trash"] {
             let service = FakeService(), app = try editingModel(service)
             let other = UUID().uuidString
             app.vaults.append(VaultDescriptor(id: other, name: "other", format: "mop-items-v2", enrolled: true))
@@ -1599,6 +1616,7 @@ extension AppModelTests {
             case "settings-vault": #expect(!app.prepareVaultAction(other))
             case "sheet": app.presentSheet(.createVault)
             case "refresh": app.refresh()
+            case "refresh-suggestions": app.refreshAutoFillSuggestions()
             default:
                 app.trashItem(ItemRow(id: .init(vault: originalVault, name: "original"), vaultName: "personal", item: app.selectedTypedItem!))
             }
