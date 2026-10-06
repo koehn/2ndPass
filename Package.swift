@@ -37,7 +37,7 @@ let package = Package(
         .target(name: "MopAppSupport", dependencies: ["MopCredentials", "MopLocalIdentity", "ZIPFoundation", "MopCore", "MopAuth", "MopKeychain", "MopVaultNext", "MopSync"]),
         .target(name: "MopUI", dependencies: ["MopSubscriptions", "MopLocalIdentity", "MopAppSupport", "MopCore", "MopVaultNext"], resources: [.process("Resources")]),
         .executableTarget(name: "MopApp", dependencies: ["MopUI"]),
-        .testTarget(name: "MopAppSupportTests", dependencies: ["MopLocalIdentity", "MopAppSupport", "MopCore", "MopVaultNext"]),
+        .testTarget(name: "MopAppSupportTests", dependencies: ["MopUI", "MopLocalIdentity", "MopAppSupport", "MopCore", "MopVaultNext"]),
         .testTarget(name: "MopAppTests", dependencies: ["MopLocalIdentity", "MopUI", "MopAppSupport", "MopCore"]),
         .target(name: "MopAuth", dependencies: ["MopCore"]),
         .target(name: "MopSync", dependencies: ["MopCore"]),

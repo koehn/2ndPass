@@ -19,21 +19,14 @@ final class AppModel {
     var healthReport = PasswordHealthReport()
     var healthChecking = false
     var healthScheduled = false
-    @ObservationIgnored var healthNotBefore: ContinuousClock.Instant?
-    @ObservationIgnored var healthLastInteraction = ContinuousClock.now
-    let healthStartupDelay: Duration
-    let healthIdleDelay: Duration
-    var healthRestoringCache = false
-    var healthProgress = 0.0
     var healthToken = UUID()
     @ObservationIgnored var healthSession = PasswordHealthSession()
-    @ObservationIgnored var healthRequest: String?
-    @ObservationIgnored var healthRequestCache: [String: [CachedPasswordCheck]] = [:]
-    @ObservationIgnored var healthPublishing: UUID?
+    var healthPublishing: UUID?
     var healthCacheNotice: String?
     @ObservationIgnored var healthSessionGeneration: Int?
     @ObservationIgnored var healthWakeTask: Task<Void, Never>?
-    @ObservationIgnored var healthTask: Task<Void, Never>?
+    @ObservationIgnored var healthCacheDirty = false
+    @ObservationIgnored var healthCacheTask: Task<Void, Never>?
     @ObservationIgnored var breachClient: any BreachChecking = PwnedPasswordsClient()
     var breachChecksEnabled = true {
         didSet { defaults.set(breachChecksEnabled, forKey: "breachChecksEnabled"); refreshHealth() }
@@ -83,7 +76,7 @@ final class AppModel {
     let documents: any DocumentAccessing
     let clipboard: any SecretClipboardAccess
     var keyCreationPresented = false
-    var isActive = true { didSet { if oldValue != isActive { refreshConflicts() } } }
+    var isActive = true { didSet { if oldValue != isActive { refreshConflicts(); refreshHealth() } } }
     var vaults: [VaultDescriptor] = []
     var vault = "" {
         didSet {
@@ -204,7 +197,7 @@ final class AppModel {
     var authenticated = false { didSet { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() }; refreshConflicts() } }
     var revealed: SecretBytes?
     @ObservationIgnored private var storeChangesTask: Task<Void, Never>?
-    var busy = false
+    var busy = false { didSet { if oldValue != busy { refreshHealth() } } }
     private(set) var localOperation = false
     // Local projection refreshes are not evidence of network activity. Keep the
     // indicator stable across the whole initial connection/download instead.
@@ -259,7 +252,7 @@ final class AppModel {
     }
     var refreshing = false
     struct CatalogLoadProgress { let loaded: Int; let total: Int; var waiting: Int = 0; var downloading = false }
-    private(set) var catalogLoadProgress: [String: CatalogLoadProgress] = [:]
+    private(set) var catalogLoadProgress: [String: CatalogLoadProgress] = [:] { didSet { refreshHealth() } }
     private(set) var catalogUpdatePaused = false
     var isUpdatingCatalog: Bool { !catalogLoadProgress.isEmpty }
     var hasCatalogDownloads: Bool { catalogLoadProgress.values.contains { $0.downloading || $0.waiting > 0 } }
@@ -306,7 +299,7 @@ final class AppModel {
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var catalogLoadTask: Task<Void, Never>?
     private var catalogLoadGeneration = 0
-    private(set) var loadingVaults = false
+    private(set) var loadingVaults = false { didSet { if oldValue != loadingVaults { refreshHealth() } } }
     private func cancelCatalogLoading() {
         catalogLoadGeneration += 1
         catalogLoadTask?.cancel(); catalogLoadTask = nil; loadingVaults = false
@@ -474,8 +467,8 @@ final class AppModel {
     var editorGeneration = 0
     var itemDraft: ItemDraft? {
         didSet {
-            if itemDraft != nil { healthTask?.cancel(); healthToken = UUID(); healthChecking = false; healthScheduled = false }
-            else if oldValue != nil { refreshHealth(); reconcileDeferredStoreChange() }
+            refreshHealth()
+            if itemDraft == nil && oldValue != nil { reconcileDeferredStoreChange() }
         }
     }
     var passwordGeneratorOptions = PasswordOptions() {
@@ -499,10 +492,9 @@ final class AppModel {
          documents: any DocumentAccessing = SystemDocumentAccess(),
          usageStore: any ItemUsageStoring = ItemUsageStore(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         automaticTimer: Bool = true, healthStartupDelay: Duration = .seconds(30), healthIdleDelay: Duration = .seconds(5), wallNow: @escaping () -> Date = Date.init,
+         automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init,
          localService: (any LocalVaultServing)? = nil,
          authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { try await LocalAuthorization.authorizeAsync(reason: $0, ids: $1, purposes: $2, operations: $3) }) {
-        self.healthStartupDelay = healthStartupDelay; self.healthIdleDelay = healthIdleDelay
         self.breachClient = breachClient
         self.localService = localService
         self.authorizeLocal = authorizeLocal
@@ -584,7 +576,6 @@ final class AppModel {
     }
     func activity() {
         service.userActivity()
-        healthLastInteraction = .now
         checkExpiration()
         guard isActive else { return }
         if service.isAuthenticated { lastActivity = now() }

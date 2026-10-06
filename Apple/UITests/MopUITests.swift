@@ -21,6 +21,9 @@ import XCTest
         let security = app.staticTexts["Security"].firstMatch
         if !app.buttons["Check Now"].waitForExistence(timeout: 5), security.exists { security.tap() }
         XCTAssertTrue(app.buttons["Check Now"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["password-health-strength"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["password-health-reuse"].exists)
+        XCTAssertTrue(app.staticTexts["password-health-breach"].exists)
         let finding = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'security-finding-'")).firstMatch
         for _ in 0..<5 {
             if finding.exists && finding.isHittable { break }

@@ -2624,7 +2624,7 @@ extension AppModelTests {
     }
     service.authenticate()
     let app = AppModel(breachClient: TestBreachClient(), service: service,
-        defaults: UserDefaults(suiteName: "health-race-" + UUID().uuidString)!, automaticTimer: false, healthStartupDelay: .zero, healthIdleDelay: .zero)
+        defaults: UserDefaults(suiteName: "health-race-" + UUID().uuidString)!, automaticTimer: false)
     let catalog = ItemCatalog(vault: "personal", revision: "a", items: [VaultItem(name: "login", fields: [ItemField(path: "password", type: .password)])])
     app.catalogs = ["v": catalog]; app.authenticated = true
     while !(await gate.entered) { try await Task.sleep(for: .milliseconds(10)) }
@@ -2637,7 +2637,7 @@ extension AppModelTests {
 }
 
 @MainActor @Test func observedLocalRemovalInvalidatesOfflineBackupProjection() {
-    let app = AppModel(breachClient: TestBreachClient(), service: FakeService(), automaticTimer: false, healthStartupDelay: .zero, healthIdleDelay: .zero)
+    let app = AppModel(breachClient: TestBreachClient(), service: FakeService(), automaticTimer: false)
     var account = CredentialAccount(service: "service", account: "alice")
     var local = CredentialRegistration(protocolName: "ssh", publicIdentifier: "a", deviceID: "here", deviceLabel: "Mac", localIdentityID: UUID())
     local.state = .confirmed
@@ -2651,18 +2651,24 @@ extension AppModelTests {
     #expect(app.credentialAccounts(in: "v")[0].hasConfirmedAlternate) // A listing failure is not evidence of deletion.
 }
 
-@MainActor @Test func healthRefreshDuringEditingKeepsTheSavedValueReport() {
-    let service = FakeService(); service.authenticate()
-    let app = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false, healthStartupDelay: .zero, healthIdleDelay: .zero)
+@MainActor @Test func healthRefreshDuringEditingProjectsSavedEvidence() async throws {
+    let service = FakeService { operation, _, _ in
+        var result = VaultResult()
+        if case .read = operation { result.value = "password" }
+        return result
+    }
+    service.authenticate()
+    let app = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false)
     let item = VaultItem(name: "login", fields: [ItemField(path: "password", type: .password)])
     app.catalogs = ["v": ItemCatalog(vault: "v", revision: "1", items: [item])]
     app.authenticated = true
-    app.healthReport.checked = 1; app.healthReport.total = 1
-    app.healthReport.completedAt = Date(timeIntervalSince1970: 100)
+    await waitForHealth(app)
+    let checkedAt = app.healthReport.completedAt
     app.itemDraft = ItemDraft(vault: "v", revision: "1", item: item)
     app.refreshHealth()
     #expect(app.healthReport.checked == 1)
-    #expect(app.healthReport.completedAt == Date(timeIntervalSince1970: 100))
+    #expect(app.healthReport.completedAt == checkedAt)
+    #expect(app.healthReport.findings.contains { $0.kinds.contains(.weak) })
     app.lock()
 }
 
@@ -2676,7 +2682,7 @@ extension AppModelTests {
         return VaultResult()
     }
     service.authenticate()
-    let app = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false, healthStartupDelay: .zero, healthIdleDelay: .zero)
+    let app = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false)
     let catalog = ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "login", fields: [ItemField(path: "password", type: .password)])])
     app.catalogs = ["v": catalog]; app.authenticated = true
     let token = app.healthToken
@@ -2694,7 +2700,7 @@ extension AppModelTests {
     #expect(app.healthToken == token)
     #expect(!app.healthChecking)
     app.refreshHealth(force: true)
-    #expect(app.healthToken != token)
+    #expect(app.healthToken == token) // Manual refresh preserves the authenticated session.
     app.lock()
     #expect(app.healthWakeTask == nil)
     #expect(app.healthReport.findings.isEmpty)
@@ -2723,67 +2729,66 @@ extension AppModelTests {
         return result
     }
     service.authenticate()
-    let app = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false, healthStartupDelay: .zero, healthIdleDelay: .zero)
+    let app = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false)
     app.breachChecksEnabled = false; app.catalogs = ["v": initial]; app.authenticated = true
-    await app.healthTask?.value
+    await waitForHealth(app)
     #expect(reads.withLock { $0 } == 1)
     #expect(writes.withLock { $0 } == 1)
     #expect(app.catalogs["v"]?.revision == "saved")
     app.refreshHealth()
     #expect(!app.healthChecking)
     app.lock()
-    let reopened = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false, healthStartupDelay: .zero, healthIdleDelay: .zero)
+    let reopened = AppModel(breachClient: TestBreachClient(), service: service, automaticTimer: false)
     service.authenticate()
     reopened.breachChecksEnabled = false
     reopened.catalogs = ["v": stored.withLock { $0 }]; reopened.authenticated = true
-    await reopened.healthTask?.value
+    await waitForHealth(reopened)
     #expect(reopened.healthReport.usedCloudCache)
     #expect(reads.withLock { $0 } == 1)
     #expect(writes.withLock { $0 } == 1)
     reopened.lock()
 }
 
-@MainActor @Test func automaticHealthWaitsForStartupAndIdleButManualCheckBypassesDelay() async throws {
+@MainActor @Test func automaticHealthStartsWithoutStartupOrIdleDelay() async throws {
     let reads = Mutex(0)
     let service = FakeService { operation, _, _ in
         if case .read = operation { reads.withLock { $0 += 1 }; var result = VaultResult(); result.value = "password"; return result }
         return VaultResult()
     }
     service.authenticate()
-    let app = AppModel(breachClient: TestBreachClient(), service: service, now: { 1 }, automaticTimer: false,
-        healthStartupDelay: .seconds(30), healthIdleDelay: .seconds(5))
+    let app = AppModel(breachClient: TestBreachClient(), service: service, now: { 1 }, automaticTimer: false)
     app.catalogs = ["v": ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "login", fields: [ItemField(path: "password", type: .password)])])]
     app.authenticated = true
-    try await Task.sleep(for: .milliseconds(100))
-    #expect(app.healthScheduled && !app.healthChecking)
-    #expect(reads.withLock { $0 } == 0)
+    await waitForHealth(app)
+    #expect(!app.healthChecking)
+    #expect(reads.withLock { $0 } == 1)
     app.refreshHealth(force: true)
-    await app.healthTask?.value
+    await waitForHealth(app)
     #expect(reads.withLock { $0 } == 1)
     app.lock()
     #expect(!app.healthScheduled)
 }
 
-@MainActor @Test func automaticHealthYieldsToForegroundWorkAndUserActivity() async throws {
+@MainActor @Test func automaticHealthYieldsToForegroundWorkButNotUserActivity() async throws {
     let reads = Mutex(0)
     let service = FakeService { operation, _, _ in
         if case .read = operation { reads.withLock { $0 += 1 }; var result = VaultResult(); result.value = "password"; return result }
         return VaultResult()
     }
     service.authenticate()
-    let app = AppModel(breachClient: TestBreachClient(), service: service, now: { 1 }, automaticTimer: false,
-        healthStartupDelay: .zero, healthIdleDelay: .seconds(30))
+    let app = AppModel(breachClient: TestBreachClient(), service: service, now: { 1 }, automaticTimer: false)
+    app.busy = true
     app.catalogs = ["v": ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "login", fields: [ItemField(path: "password", type: .password)])])]
+    app.busy = true
     app.authenticated = true
     app.activity()
     try await Task.sleep(for: .milliseconds(100))
     #expect(app.healthScheduled && reads.withLock { $0 } == 0)
     app.busy = true
-    app.healthLastInteraction = ContinuousClock.now.advanced(by: .seconds(-31))
     try await Task.sleep(for: .milliseconds(100))
     #expect(reads.withLock { $0 } == 0)
     app.busy = false
-    await app.healthTask?.value
+    await waitForHealth(app)
     #expect(reads.withLock { $0 } == 1)
     app.lock()
 }
@@ -2820,37 +2825,41 @@ extension AppModelTests {
         return result
     }
     service.authenticate()
-    let app = AppModel(breachClient: SuccessfulBatchBreachClient(), service: service, automaticTimer: false,
-        healthStartupDelay: .zero, healthIdleDelay: .zero)
+    let app = AppModel(breachClient: SuccessfulBatchBreachClient(), service: service, automaticTimer: false)
     app.breachChecksEnabled = true; app.catalogs = ["v": initial]; app.authenticated = true
-    let task = app.healthTask, token = app.healthToken
+    let token = app.healthToken
     for _ in 0..<300 {
         if await gate.entered { break }
         try await Task.sleep(for: .milliseconds(10))
     }
     #expect(await gate.entered)
+    for _ in 0..<400 {
+        if stored.withLock({ $0.security?.passwordChecks?.first { $0.record == "a" }?.breachResult }) != nil { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
     #expect(app.healthChecking)
     #expect(app.healthReport.state == .incomplete)
     #expect(app.healthReport.findings.contains { $0.item == "a" && $0.kinds.contains(.weak) })
-    #expect(writes.withLock { $0 } == 1)
+    let committedWrites = writes.withLock { $0 }
+    #expect(committedWrites >= 1)
     let partial = stored.withLock { $0.security?.passwordChecks ?? [] }
     #expect(partial.first { $0.record == "a" }?.strengthResult != nil)
     #expect(partial.first { $0.record == "a" }?.breachResult != nil)
     #expect(partial.first { $0.record == "a" }?.reuseResult == nil)
-    #expect(partial.first { $0.record == "c" } == old)
+    #expect(partial.first { $0.record == "c" }?.strengthResult == old.strengthResult)
     app.refreshHealth()
     #expect(app.healthToken == token) // Our own batch must not restart the scan.
     if lockDuringScan { app.lock() }
     await gate.release()
-    await task?.value
+    await waitForHealth(app)
     if lockDuringScan {
         #expect(app.healthReport.findings.isEmpty)
-        #expect(writes.withLock { $0 } == 1) // The committed batch survives, late work does not publish.
+        #expect(writes.withLock { $0 } == committedWrites) // The committed batch survives, late work does not publish.
     } else {
         #expect(!app.healthChecking && app.healthToken == token)
         #expect(app.healthReport.state == .checked)
         #expect(reads.withLock { $0 } == 3)
-        #expect(writes.withLock { $0 } == 2)
+        #expect(writes.withLock { $0 } > committedWrites)
         #expect(stored.withLock { $0.security?.passwordChecks?.count } == 3)
         app.lock()
     }
@@ -2905,11 +2914,10 @@ private actor EditedPasswordBreachClient: BreachChecking {
     }
     service.authenticate()
     let app = AppModel(breachClient: EditedPasswordBreachClient(gate: gate), service: service,
-        defaults: UserDefaults(suiteName: "health-edited-" + UUID().uuidString)!, now: { 1 }, automaticTimer: false,
-        healthStartupDelay: .seconds(60), healthIdleDelay: .seconds(60))
+        defaults: UserDefaults(suiteName: "health-edited-" + UUID().uuidString)!, now: { 1 }, automaticTimer: false)
     app.vault = "v"; try app.applyCatalog(initial); app.authenticated = true
     app.refreshHealth(force: true)
-    await app.healthTask?.value
+    await waitForHealth(app)
     #expect(app.healthReport.findings.contains { $0.item == "login" && $0.kinds.contains(.weak) })
     reads.withLock { $0 = [] }
     var replacement = initial.items[0]; replacement.fields[0].value = "9k!Q7v#L2m@R8x$T4z%N6p"
@@ -2919,13 +2927,16 @@ private actor EditedPasswordBreachClient: BreachChecking {
         if await gate.entered { break }
         try await Task.sleep(for: .milliseconds(10))
     }
-    #expect(await gate.entered) // Saved edits bypass both 60-second delays.
+    #expect(await gate.entered)
+    for _ in 0..<400 {
+        if stored.withLock({ $0.security?.passwordChecks?.first { $0.record == "replacement" }?.strengthResult?.weak }) == false { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
     #expect(app.error == nil && app.healthChecking)
     #expect(!app.healthReport.findings.contains { $0.item == "login" }) // Both Weak and All use this list.
     #expect(stored.withLock { $0.security?.passwordChecks?.first { $0.record == "replacement" }?.strengthResult?.weak } == false)
     #expect(reads.withLock { $0 } == ["login"])
-    let task = app.healthTask
-    await gate.release(); await task?.value
+    await gate.release(); await waitForHealth(app)
     #expect(!app.healthReport.findings.contains { $0.item == "login" })
     #expect(app.healthReport.state == .checked)
     #expect(reads.withLock { $0 } == ["login"])
@@ -3156,3 +3167,51 @@ extension AppModelTests {
     }
 }
 #endif
+
+@MainActor private func waitForHealth(_ app: AppModel) async {
+    for _ in 0..<500 {
+        try? await Task.sleep(for: .milliseconds(10))
+        if !app.healthSession.hasRunningWork && !app.healthSession.hasPendingUpdates && !app.healthChecking && app.healthCacheTask == nil && app.healthPublishing == nil {
+            return
+        }
+    }
+    Issue.record("Password health did not settle")
+}
+
+@MainActor @Test func healthCacheConflictReconcilesAndRetriesWithoutRecheckingPassword() async throws {
+    var field = ItemField(path: "password", type: .password); field.recordVersion = "record"
+    var initial = ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "login", fields: [field])])
+    initial.canEdit = true; initial.securityEnabled = true; initial.security = VaultSecurityMetadata()
+    let stored = Mutex(initial), reads = Mutex(0), attempts = Mutex(0)
+    let service = FakeService { operation, _, _ in
+        var result = VaultResult()
+        switch operation {
+        case .read:
+            reads.withLock { $0 += 1 }; result.value = "password"
+        case .catalog:
+            result.catalog = stored.withLock { $0 }
+        case .savePasswordChecks(let checks, let revision):
+            let attempt = attempts.withLock { $0 += 1; return $0 }
+            if attempt == 1 {
+                stored.withLock { $0.revision = "remote-update" }
+                throw MopError.vaultConflict
+            }
+            result.catalog = stored.withLock {
+                #expect(revision == $0.revision)
+                $0.security?.passwordChecks = checks; $0.revision = "saved"; return $0
+            }
+        default: break
+        }
+        return result
+    }
+    service.authenticate()
+    let app = AppModel(breachClient: SuccessfulBatchBreachClient(), service: service,
+                       defaults: UserDefaults(suiteName: "health-conflict-" + UUID().uuidString)!, automaticTimer: false)
+    app.breachChecksEnabled = true; app.catalogs = ["v": initial]; app.authenticated = true
+    await waitForHealth(app)
+    #expect(attempts.withLock { $0 } == 2)
+    #expect(reads.withLock { $0 } == 1)
+    #expect(stored.withLock { $0.security?.passwordChecks?.first?.breachResult?.exposed } == true)
+    #expect(app.healthCacheNotice == nil)
+    app.lock()
+}

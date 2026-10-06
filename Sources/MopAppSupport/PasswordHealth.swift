@@ -177,23 +177,31 @@ public enum PasswordHealthScanner {
     private var observedCaches: [String: [CachedPasswordCheck]] = [:]
     private var previousEnabled: Bool?
     private var nextCheck: Date = .distantPast
-    private let estimate: (String, [String]) -> PasswordQuality
+    private let estimate: @Sendable (String, [String]) -> PasswordQuality
     private var liveCatalogs: [String: ItemCatalog] = [:]
+    private var liveFields: [Field] = []
+    private var liveScope = ""
+    private var liveByKey: [Key: Field] = [:]
     private var liveEnabled = true
+    private var didLiveWork = false
     private var liveAllowed = false
+    private var liveScopeComplete = true
     private var pausedItem: (String, String)?
     private var localTask: Task<Void, Never>?
     private var localKey: Key?
+    private var resetTask: Task<Void, Never>?
     private var networkTasks: [Key: Task<Void, Never>] = [:]
     private var forced: Set<Key> = []
     private var liveGeneration = UUID()
+    private let liveEvidenceBatch = UUID()
     private var publishTask: Task<Void, Never>?
     private var liveUpdate: (@MainActor (PasswordHealthReport) -> Void)?
     private var liveService: (any VaultService)?
     private var liveBreach: (any BreachChecking)?
     private var clock: @Sendable () -> Date = Date.init
+    var hasPendingUpdates: Bool { publishTask != nil || resetTask != nil }
     public var hasRunningWork: Bool { localTask != nil || !networkTasks.isEmpty }
-    public init(estimate: @escaping (String, [String]) -> PasswordQuality = { PasswordEstimator.estimate($0, userInputs: $1) }) {
+    public init(estimate: @escaping @Sendable (String, [String]) -> PasswordQuality = { PasswordEstimator.estimate($0, userInputs: $1) }) {
         self.estimate = estimate
     }
     public var nextRefreshDate: Date { nextCheck }
@@ -204,7 +212,7 @@ public enum PasswordHealthScanner {
         }
     }
     public func clear() {
-        stopLive(); liveCatalogs = [:]; liveUpdate = nil
+        stopLive(); liveCatalogs = [:]; liveFields = []; liveByKey = [:]; liveUpdate = nil
         entries.removeAll(); sessionKey = SymmetricKey(size: .bits256)
         revisions = [:]; observedCaches = [:]; producedCaches = [:]; previousEnabled = nil; nextCheck = .distantPast
     }
@@ -263,134 +271,38 @@ public enum PasswordHealthScanner {
         }
     }
     public func scan(catalogs: [String: ItemCatalog], service: any VaultService, breach: any BreachChecking,
-                     enabled: Bool, force: Bool = false, at now: Date = Date(), eagerLocalResults: Bool = false,
+                     enabled: Bool, force: Bool = false, at now: Date? = nil, eagerLocalResults: Bool = false,
                      progress: @MainActor @Sendable (Double) -> Void = { _ in },
                      beforeWork: @MainActor @Sendable () async throws -> Void = {},
                      batch: @MainActor @Sendable (PasswordHealthReport) async throws -> Void = { _ in }) async throws -> PasswordHealthReport {
-        let (fields, scope) = try snapshot(catalogs)
-        var values = fields.map { entry($0, now: now) }
-        let rebuildReuse = !validReuse(values, scope: scope)
-        var next = Date.distantFuture
-        var didWork = false
-        var lastBatchCount = 0
-        var lastBatchTime = ContinuousClock.now
-        let evidenceBatch = UUID()
-        progress(0)
-        // Start a daily refresh with fresh ranges; fields sharing a prefix can
-        // still share the response within this scan.
-        let expiredBreach = enabled && values.contains { value in
-            value.breach.map { now.timeIntervalSince($0.checkedAt) >= 86400 } == true &&
-                (value.failures == 0 || now >= value.retryAt)
-        }
-        if force || expiredBreach { await breach.clear() }
-        // Saved replacements get local feedback before unchanged or daily work.
-        let order = fields.indices.sorted { left, right in
-            let leftNeedsStrength = values[left].strength == nil
-            let rightNeedsStrength = values[right].strength == nil
-            return leftNeedsStrength != rightNeedsStrength ? leftNeedsStrength : left < right
-        }
-        for (position, i) in order.enumerated() {
-            try Task.checkCancellation()
-            let (vaultID, catalog, item, field) = fields[i]
-            var value = values[i]
-            let needsStrength = value.strength == nil
-            let needsFingerprint = rebuildReuse && value.fingerprint == nil
-            let due = value.failures > 0 ? value.retryAt : value.breach?.checkedAt.addingTimeInterval(86400) ?? .distantPast
-            let needsBreach = enabled && (force || now >= due)
-            if needsStrength || needsFingerprint || needsBreach {
-                await Task.yield()
-                try await beforeWork()
-                try Task.checkCancellation()
-                didWork = true
-                let reference = try SecretReference(vault: catalog.vault, relativePath: SecretReference.encode(item.name) + "/" + field.path)
-                if let secret = try? await service.readLocal(reference, vault: vaultID).value {
-                    var bytes = Data(secret)
-                    defer { SecretBytes.wipe(&bytes) }
-                    try Task.checkCancellation()
-                    if needsStrength {
-                        let inputs = context(item), quality = estimate(String(decoding: bytes, as: UTF8.self), inputs)
-                        value.strength = CachedStrengthResult(weak: quality == .weak || quality == .veryWeak, checkedAt: now, context: inputs, quality: quality)
-                    }
-                    if needsFingerprint { value.fingerprint = Data(HMAC<SHA256>.authenticationCode(for: bytes, using: sessionKey)) }
-                    if eagerLocalResults && needsStrength {
-                        // A slow or unavailable HIBP request must not retain the
-                        // previous password's weak warning after local evaluation.
-                        values[i] = value; entries[key(fields[i])] = value
-                        var localValues = values
-                        if rebuildReuse { for index in localValues.indices { localValues[index].reuse = nil } }
-                        var ignoredNext = Date.distantFuture
-                        var local = makeReport(catalogs: catalogs, fields: fields, values: localValues, scope: scope,
-                            enabled: enabled, now: now, didWork: true, evidenceBatch: evidenceBatch, next: &ignoredNext)
-                        local.state = .incomplete; local.completedAt = nil
-                        if enabled { local.breachState = .incomplete }
-                        let completedRecords = Set(order.prefix(position + 1).compactMap { fields[$0].3.recordVersion })
-                        local.cachedChecks = local.cachedChecks.mapValues { $0.filter { completedRecords.contains($0.record) } }
-                        try await batch(local)
-                        try Task.checkCancellation()
-                    }
-                    if needsBreach {
-                        do {
-                            let exposed = try await breach.contains(bytes, force: false)
-                            try Task.checkCancellation()
-                            value.breach = CachedBreachResult(exposed: exposed, checkedAt: now)
-                            value.failures = 0; value.retryAt = .distantPast
-                        } catch is CancellationError { throw CancellationError() }
-                        catch {
-                            try Task.checkCancellation()
-                            value.failures += 1
-                            value.retryAt = now.addingTimeInterval(min(3600, 60 * pow(2, Double(min(value.failures, 7) - 1))))
-                        }
-                    }
-                } else {
-                    try Task.checkCancellation()
-                    next = min(next, now.addingTimeInterval(60))
-                }
-            }
-            values[i] = value; entries[key(fields[i])] = value
-            progress(Double(position + 1) / Double(max(fields.count, 1)))
-            let completed = position + 1
-            if didWork, completed < fields.count,
-               lastBatchCount == 0 || completed - lastBatchCount >= 10 || lastBatchTime.duration(to: .now) >= .seconds(1) {
-                var partialValues = values
-                // Reuse is a comparison across the whole scope, not a per-item
-                // completion. Never publish a partial comparison as clean.
-                if rebuildReuse { for index in partialValues.indices { partialValues[index].reuse = nil } }
-                var ignoredNext = Date.distantFuture
-                var partial = makeReport(catalogs: catalogs, fields: fields, values: partialValues, scope: scope, enabled: enabled,
-                    now: now, didWork: didWork, evidenceBatch: evidenceBatch, next: &ignoredNext)
-                partial.state = .incomplete
-                if enabled { partial.breachState = .incomplete }
-                partial.completedAt = nil
-                let completedRecords = Set(order.prefix(completed).compactMap { fields[$0].3.recordVersion })
-                partial.cachedChecks = partial.cachedChecks.mapValues { $0.filter { completedRecords.contains($0.record) } }
-                try await batch(partial)
-                try Task.checkCancellation()
-                lastBatchCount = completed; lastBatchTime = .now
-            }
-        }
+        try await beforeWork()
         try Task.checkCancellation()
-        if rebuildReuse {
-            var groups: [Data: [Int]] = [:]
-            for i in values.indices { if let fingerprint = values[i].fingerprint { groups[fingerprint, default: []].append(i) } }
-            let batch = UUID()
-            // Incomplete comparison must never become a reusable clean result.
-            let complete = values.allSatisfy { $0.fingerprint != nil }
-            for i in values.indices { values[i].reuse = nil }
-            for indices in groups.values {
-                let distinct = Set(indices.map { key(fields[$0]).vault + ":" + key(fields[$0]).item })
-                let group = distinct.count > 1 ? UUID() : nil
-                for i in indices { values[i].reuse = CachedReuseResult(group: group, scope: complete ? scope : "", batch: batch, checkedAt: now) }
-            }
+        let stream = AsyncStream<PasswordHealthReport>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let fixedNow = now
+        progress(0)
+        reconcile(catalogs: catalogs, service: service, breach: breach, enabled: enabled,
+                  active: true, busy: false, force: force, now: { fixedNow ?? Date() }) { report in
+            stream.continuation.yield(report)
         }
-        for i in fields.indices { entries[key(fields[i])] = values[i] }
-        let live = Set(fields.map(key)); entries = entries.filter { live.contains($0.key) }
-        let report = makeReport(catalogs: catalogs, fields: fields, values: values, scope: scope, enabled: enabled, now: now,
-            didWork: didWork, evidenceBatch: evidenceBatch, next: &next)
-        producedCaches = report.cachedChecks
-        revisions = catalogs.mapValues(\.revision); observedCaches = catalogs.mapValues { $0.security?.passwordChecks ?? [] }
-        previousEnabled = enabled; nextCheck = next
-        progress(1)
-        return report
+        defer { stream.continuation.finish(); liveUpdate = nil }
+        return try await withTaskCancellationHandler {
+            for await report in stream.stream {
+                try Task.checkCancellation()
+                progress(Double(report.checked) / Double(max(1, report.total)))
+                if !hasRunningWork && !hasPendingUpdates {
+                    revisions = catalogs.mapValues(\.revision)
+                    observedCaches = catalogs.mapValues { $0.security?.passwordChecks ?? [] }
+                    previousEnabled = enabled
+                    progress(1)
+                    return report
+                }
+                try await batch(report)
+            }
+            throw CancellationError()
+        } onCancel: {
+            stream.continuation.finish()
+            Task { @MainActor [weak self] in self?.stopLive() }
+        }
     }
     private func makeReport(catalogs: [String: ItemCatalog], fields: [Field], values: [Entry], scope: String, enabled: Bool, now: Date,
                             didWork: Bool, evidenceBatch: UUID, next: inout Date) -> PasswordHealthReport {
@@ -434,4 +346,197 @@ public enum PasswordHealthScanner {
         return report
     }
 
+}
+
+extension PasswordHealthSession {
+    /// Reconcile saved evidence synchronously; workers never own catalog snapshots.
+    public func reconcile(catalogs: [String: ItemCatalog], service: any VaultService,
+                          breach: any BreachChecking, enabled: Bool, active: Bool, busy: Bool, scopeComplete: Bool = true,
+                          editingVault: String? = nil, editingItem: String? = nil, force: Bool = false,
+                          now: @escaping @Sendable () -> Date = Date.init,
+                          update: @escaping @MainActor (PasswordHealthReport) -> Void) {
+        didLiveWork = false
+        let wasEnabled = liveEnabled
+        liveCatalogs = catalogs; liveEnabled = enabled; liveAllowed = active && !busy; liveScopeComplete = scopeComplete
+        pausedItem = editingVault.flatMap { vault in editingItem.map { (vault, $0) } }
+        liveService = service; liveBreach = breach; liveUpdate = update; clock = now
+        guard let (fields, scope) = try? snapshot(catalogs) else { return }
+        liveFields = fields; liveScope = scope
+        liveByKey = Dictionary(fields.map { (key($0), $0) }, uniquingKeysWith: { _, latest in latest })
+        let live = Set(fields.map(key))
+        entries = entries.filter { live.contains($0.key) }
+        for field in fields { entries[key(field)] = entry(field, now: now()) }
+        // Keep obsolete jobs counted until they finish; version guards discard their results.
+        if (!active && hasRunningWork) || (wasEnabled && !enabled) || force {
+            for task in networkTasks.values { task.cancel() }
+            networkTasks.removeAll()
+            // Generation guards also reject transports which ignore cancellation.
+            liveGeneration = UUID()
+            localTask?.cancel(); localTask = nil; localKey = nil
+            let generation = liveGeneration
+            resetTask = Task { [weak self] in
+                await breach.clear()
+                guard let self, self.liveGeneration == generation else { return }
+                self.resetTask = nil; self.pumpLive()
+            }
+        }
+        if force && enabled { forced = live }
+        if !enabled { forced.removeAll() }
+        emitLive(immediate: true)
+        pumpLive()
+    }
+
+    private func stopLive() {
+        resetTask?.cancel(); resetTask = nil
+        liveGeneration = UUID(); localTask?.cancel(); localTask = nil; localKey = nil
+        for task in networkTasks.values { task.cancel() }
+        networkTasks.removeAll(); publishTask?.cancel(); publishTask = nil; forced.removeAll()
+    }
+    private func paused(_ field: Field) -> Bool {
+        pausedItem.map { $0.0 == field.0 && $0.1 == field.2.name } ?? false
+    }
+    private func breachDue(_ key: Key, _ value: Entry, now: Date) -> Bool {
+        liveEnabled && (forced.contains(key) || now >= (value.failures > 0 ? value.retryAt : value.breach?.checkedAt.addingTimeInterval(86400) ?? .distantPast))
+    }
+    private func currentField(_ key: Key, version: String) -> Field? {
+        guard let field = liveByKey[key], (field.3.recordVersion ?? field.1.revision) == version else { return nil }
+        return field
+    }
+    private func rebuildLiveReuse(_ fields: [Field], scope: String) {
+        // Loading is not a credential change. Keep the completed batch until
+        // the full scope can be compared; replacing it during each catalog
+        // refresh can leave different vaults persisted with different batches.
+        guard liveScopeComplete else { return }
+        let values = fields.compactMap { entries[key($0)] }
+        guard !validReuse(values, scope: scope) else { return }
+        for field in fields { entries[key(field)]?.reuse = nil }
+        guard values.count == fields.count, values.allSatisfy({ $0.fingerprint != nil }) else { return }
+        var groups: [Data: [Field]] = [:]
+        for field in fields { groups[entries[key(field)]!.fingerprint!, default: []].append(field) }
+        let batch = UUID(), now = clock()
+        for group in groups.values {
+            let distinct = Set(group.map { key($0).vault + ":" + key($0).item })
+            let id: UUID? = distinct.count > 1 ? UUID() : nil
+            for field in group { entries[key(field)]?.reuse = CachedReuseResult(group: id, scope: scope, batch: batch, checkedAt: now) }
+        }
+    }
+    private func pumpLive() {
+        guard let service = liveService, let breach = liveBreach else { return }
+        let fields = liveFields, scope = liveScope
+        rebuildLiveReuse(fields, scope: scope)
+        guard liveAllowed, resetTask == nil else { emitLive(); return }
+        let now = clock(), generation = liveGeneration
+        let needsReuse = !validReuse(fields.compactMap { entries[key($0)] }, scope: scope)
+        let ordered = fields.sorted { (entries[key($0)]?.strength == nil ? 0 : 1) < (entries[key($1)]?.strength == nil ? 0 : 1) }
+        if localTask == nil, let field = ordered.first(where: {
+            guard !paused($0), let value = entries[key($0)], now >= value.readRetry else { return false }
+            return value.strength == nil || (needsReuse && value.fingerprint == nil) || (breachDue(key($0), value, now: now) && value.lookup == nil)
+        }) {
+            let key = key(field), version = entries[key]!.version, inputs = context(field.2), sessionKey = sessionKey, estimate = estimate
+            didLiveWork = true
+            localKey = key
+            localTask = Task(priority: .utility) { [weak self] in
+                defer {
+                    if let self, self.liveGeneration == generation {
+                        self.localTask = nil; self.localKey = nil; self.pumpLive(); self.emitLive()
+                    }
+                }
+                do {
+                    guard let self, self.liveGeneration == generation, self.liveAllowed,
+                          let current = self.currentField(key, version: version), !self.paused(current) else { return }
+                    let reference = try SecretReference(vault: field.1.vault, relativePath: SecretReference.encode(field.2.name) + "/" + field.3.path)
+                    guard let secret = try await service.readLocal(reference, vault: field.0).value else { throw MopError.notFound }
+                    try Task.checkCancellation()
+                    let needsStrength = self.entries[key]?.strength == nil
+                    let result = await Task.detached(priority: .utility) {
+                        var bytes = Data(secret)
+                        defer { SecretBytes.wipe(&bytes) }
+                        let quality = needsStrength ? estimate(String(decoding: bytes, as: UTF8.self), inputs) : nil
+                        return (quality, Data(HMAC<SHA256>.authenticationCode(for: bytes, using: sessionKey)), BreachLookup(bytes))
+                    }.value
+                    try Task.checkCancellation()
+                    guard self.liveGeneration == generation, let current = self.currentField(key, version: version) else { return }
+                    if let quality = result.0, self.context(current.2) == inputs {
+                        self.entries[key]?.strength = CachedStrengthResult(weak: quality == .weak || quality == .veryWeak, checkedAt: self.clock(), context: inputs, quality: quality)
+                    }
+                    self.entries[key]?.fingerprint = result.1; self.entries[key]?.lookup = result.2
+                    self.entries[key]?.readRetry = .distantPast
+                } catch {
+                    if let self, !Task.isCancelled, self.liveGeneration == generation, self.currentField(key, version: version) != nil {
+                        self.entries[key]?.readRetry = self.clock().addingTimeInterval(60)
+                    }
+                }
+            }
+        }
+        for field in ordered where networkTasks.count < 2 {
+            let key = key(field)
+            guard !paused(field), networkTasks[key] == nil, let value = entries[key], let lookup = value.lookup,
+                  breachDue(key, value, now: now) else { continue }
+            let version = value.version
+            didLiveWork = true
+            forced.remove(key)
+            networkTasks[key] = Task(priority: .utility) { [weak self] in
+                defer {
+                    if let self, self.liveGeneration == generation {
+                        self.networkTasks[key] = nil; self.pumpLive(); self.emitLive()
+                    }
+                }
+                do {
+                    let exposed = try await breach.contains(lookup, force: false)
+                    try Task.checkCancellation()
+                    guard let self, self.liveGeneration == generation, self.currentField(key, version: version) != nil else { return }
+                    self.entries[key]?.breach = CachedBreachResult(exposed: exposed, checkedAt: self.clock())
+                    self.entries[key]?.failures = 0; self.entries[key]?.retryAt = .distantPast
+                } catch {
+                    if let self, !Task.isCancelled, self.liveGeneration == generation, self.currentField(key, version: version) != nil {
+                        let failures = (self.entries[key]?.failures ?? 0) + 1
+                        self.entries[key]?.failures = failures
+                        self.entries[key]?.retryAt = self.clock().addingTimeInterval(min(3600, 60 * pow(2, Double(min(failures, 7) - 1))))
+                    }
+                }
+            }
+        }
+        emitLive()
+    }
+    private func emitLive(immediate: Bool = false) {
+        if immediate { publishTask?.cancel(); publishTask = nil; publishLive(); return }
+        guard publishTask == nil else { return }
+        publishTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            guard let self else { return }
+            self.publishTask = nil; self.publishLive()
+        }
+    }
+    private func publishLive() {
+        let fields = liveFields, scope = liveScope
+        rebuildLiveReuse(fields, scope: scope)
+        let now = clock(), values = fields.map { field in
+            var value = entries[key(field)] ?? entry(field, now: clock())
+            // Hide an unconfirmed scope without destroying its saved evidence.
+            if !liveScopeComplete { value.reuse = nil }
+            return value
+        }
+        var next = Date.distantFuture
+        var report = makeReport(catalogs: liveCatalogs, fields: fields, values: values, scope: scope,
+                                enabled: liveEnabled, now: now, didWork: didLiveWork, evidenceBatch: liveEvidenceBatch, next: &next)
+        report.fields = fields.enumerated().map { index, field in
+            let value = values[index], key = key(field)
+            let execution: HealthExecution = !liveAllowed || paused(field) ? .paused : .queued
+            let strength: HealthFreshness = value.strength != nil ? .current : value.readRetry > now ? .unavailable : .pending
+            let reuse: HealthFreshness = value.reuse?.scope == scope ? .current : value.readRetry > now ? .unavailable : .pending
+            let breach: HealthFreshness = !liveEnabled ? .disabled : value.failures > 0 || value.readRetry > now ? .unavailable : value.breach.map { now.timeIntervalSince($0.checkedAt) < 86400 ? .current : .stale } ?? .pending
+            if value.readRetry > now { next = min(next, value.readRetry) }
+            return PasswordFieldHealth(vaultID: field.0, item: field.2.name, path: field.3.path,
+                strength: HealthCheckStatus(freshness: strength, execution: strength == .current ? .idle : localKey == key ? .running : execution),
+                reuse: HealthCheckStatus(freshness: reuse, execution: reuse == .current ? .idle : localKey == key ? .running : execution),
+                breach: HealthCheckStatus(freshness: breach, execution: networkTasks[key] != nil ? .running : breach == .current || breach == .disabled ? .idle : execution))
+        }
+        // Timer deadlines remain meaningful even when local evidence is absent.
+        for value in values where liveEnabled {
+            let due = value.failures > 0 ? value.retryAt : value.breach?.checkedAt.addingTimeInterval(86400)
+            if let due, due > now { next = min(next, due) }
+        }
+        nextCheck = next; producedCaches = report.cachedChecks
+        liveUpdate?(report)
+    }
 }

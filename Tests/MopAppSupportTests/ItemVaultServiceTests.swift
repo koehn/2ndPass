@@ -5,6 +5,7 @@ import MopCore
 @testable import MopSync
 @testable import MopVaultNext
 @testable import MopAppSupport
+@testable import MopUI
 
 private final class SoftwareItemBackend: ItemVaultServiceBackend {
     let repository: EncryptedItemRepository
@@ -760,6 +761,14 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     #expect(try await session.revisionIndex().count == 2)
     #expect(try await session.exportPortableLocalSnapshot().items.count == 1)
     let restarted = ItemVaultService(backend: backend)
+    // Startup uses the fast display projection, not the full .catalog operation.
+    // Its first result must already contain evidence, before the updater runs.
+    let startup = try await restarted.displayCatalog(vault: id.uuidString).requireCatalog()
+    #expect(startup.security?.passwordChecks == checks)
+    #expect(startup.items[0].fields[0].passwordQuality == saved.items[0].fields[0].passwordQuality)
+    #expect(await MainActor.run {
+        PasswordHealthSession().canRestoreCloudResults(catalogs: [id.uuidString: startup], enabled: false)
+    })
     #expect(try await restarted.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().items[0].fields[0].passwordQuality == saved.items[0].fields[0].passwordQuality)
     #expect(try await restarted.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().security?.passwordChecks == checks)
     let check = try #require(checks.first)
@@ -957,4 +966,94 @@ func savingOneItemDoesNotDecryptUnchangedItems(itemCount: Int) async throws {
     #expect(saved.items.first { $0.storageID == item.storageID }?.metadata?.favorite == true)
     #expect(saved.items.filter { $0.storageID != item.storageID } == catalog.items.filter { $0.storageID != item.storageID })
     service.lock()
+}
+
+private actor RestartHealthBreach: BreachChecking {
+    private(set) var requests = 0
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { requests += 1; return false }
+    func clear() async {}
+}
+
+@MainActor @Test(arguments: [false, true]) func passwordHealthSurvivesRepositoryAndSessionRestartAcrossVaults(useAppWriter: Bool) async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("items.sqlite")
+    let repository = try EncryptedItemRepository(storeURL: url)
+    let backend = try SoftwareItemBackend(repository: repository), service = ItemVaultService(backend: backend)
+    var catalogs: [String: ItemCatalog] = [:]
+    for number in 0..<2 {
+        let id = UUID().uuidString
+        _ = try await service.execute(.create(name: "health\(number)"), vault: id, offline: false)
+        var catalog = try await service.execute(.catalog, vault: id, offline: true).requireCatalog()
+        for item in 0..<3 {
+            let login = VaultItem(name: "login\(item)", fields: [ItemField(path: "username", type: .username, value: "alice"), ItemField(path: "password", type: .password, value: "password")])
+            catalog = try await service.execute(.save(ItemEdit(revision: catalog.revision, item: login, create: true)), vault: id, offline: false).requireCatalog()
+        }
+        catalogs[id] = catalog
+    }
+    let breach = RestartHealthBreach()
+    let app = AppModel(breachClient: breach, service: service,
+        defaults: UserDefaults(suiteName: "health-restart-" + UUID().uuidString)!, automaticTimer: false)
+    if useAppWriter {
+        app.catalogs = catalogs; app.authenticated = true
+        for _ in 0..<1000 {
+            try await Task.sleep(for: .milliseconds(10))
+            if !app.healthSession.hasRunningWork && !app.healthSession.hasPendingUpdates && app.healthCacheTask == nil && app.healthPublishing == nil { break }
+        }
+        #expect(app.healthCacheNotice == nil)
+        #expect(app.healthReport.checked == 6)
+    } else {
+        let report = try await PasswordHealthSession().scan(catalogs: catalogs, service: service, breach: breach, enabled: true)
+        for (id, catalog) in catalogs {
+            _ = try await service.execute(.savePasswordChecks(report.cachedChecks[id]!, revision: catalog.revision), vault: id, offline: false)
+        }
+    }
+    // A delayed batch contains only the records that worker has visited. Neither
+    // it nor an empty projection may erase evidence for omitted live passwords.
+    for (id, catalog) in catalogs {
+        let stored = try await service.execute(.catalog, vault: id, offline: true).requireCatalog()
+        let first = Array((stored.security?.passwordChecks ?? []).prefix(1))
+        _ = try await service.execute(.savePasswordChecks(first, revision: catalog.revision), vault: id, offline: false)
+        _ = try await service.execute(.savePasswordChecks([], revision: catalog.revision), vault: id, offline: false)
+        let session = try await backend.open(UUID(uuidString: id)!)
+        let entry = try #require(try await session.catalog().first)
+        _ = try await session.saveHealthChecks([], itemID: entry.itemID, expectedItemVersion: entry.versionID)
+    }
+    let reopenedRepository = try EncryptedItemRepository(storeURL: url)
+    let reopenedBackend = try await backend.reopened(repository: reopenedRepository)
+    app.lock(); service.lock()
+    let restarted = ItemVaultService(backend: reopenedBackend)
+    var restored: [String: ItemCatalog] = [:]
+    for id in catalogs.keys { restored[id] = try await restarted.displayCatalog(vault: id).requireCatalog() }
+    let scanner = PasswordHealthSession { _, _ in Issue.record("Unchanged password strength was recomputed"); return .weak }
+    #expect(scanner.canRestoreCloudResults(catalogs: restored, enabled: true))
+    let result = try await scanner.scan(catalogs: restored, service: restarted, breach: breach, enabled: true)
+    #expect(result.fields.allSatisfy { $0.strength.freshness == .current && $0.reuse.freshness == .current && $0.breach.freshness == .current })
+    #expect(result.usedCloudCache)
+    #expect(await breach.requests == 6)
+    restarted.lock()
+}
+
+@MainActor @Test func healthCacheWritesDoNotInvokeAutoFillIncludingNoOpBatches() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
+    _ = try await backend.create(name: "health", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let systemCalls = Mutex(0), localReads = Mutex(0), statusReads = Mutex(0)
+    let publisher = AutoFillPublisher(directory: directory.appendingPathComponent("suggestions"),
+        publish: { _ in systemCalls.withLock { $0 += 1 } }, enabled: { statusReads.withLock { $0 += 1 }; return true }, local: { localReads.withLock { $0 += 1 }; return [] })
+    let service = ItemVaultService(backend: backend, publisher: publisher, idleDelay: .seconds(3600))
+    defer { service.lock() }
+    let catalog = try await service.execute(.catalog, vault: vault.uuidString, offline: true).requireCatalog()
+    let report = try await PasswordHealthSession().scan(catalogs: [vault.uuidString: catalog], service: service, breach: UnusedHealthBreach(), enabled: false)
+    let calls = systemCalls.withLock { $0 }, reads = localReads.withLock { $0 }, statuses = statusReads.withLock { $0 }
+    for checks in [report.cachedChecks[vault.uuidString]!, []] {
+        let result = try await service.execute(.savePasswordChecks(checks, revision: catalog.revision), vault: vault.uuidString, offline: false)
+        #expect(try result.requireCatalog().security?.passwordChecks == report.cachedChecks[vault.uuidString])
+        #expect(systemCalls.withLock { $0 } == calls)
+        #expect(localReads.withLock { $0 } == reads)
+        #expect(statusReads.withLock { $0 } == statuses)
+    }
 }

@@ -210,7 +210,7 @@ public struct AutoFillIndex: Sendable {
 public enum AutoFillStorage {
     /// Account changes invalidate offline access as well as visible suggestions.
     public static func invalidate() async {
-        try? NativeItemCloudAccount.invalidateOfflineBinding()
+        NativeItemCloudAccount.invalidateOfflineBinding()
         try? await AutoFillPublisher.shared.prune(keeping: [])
     }
 

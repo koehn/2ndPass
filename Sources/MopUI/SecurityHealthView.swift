@@ -38,23 +38,18 @@ struct SecurityHealthView: View {
                     }
                     TextField("Search accounts", text: $query)
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("\(model.healthReport.checked) of \(model.healthReport.total) password fields checked in \(model.catalogs.count) of \(model.vaults.count) vaults.").font(.caption)
-                        if model.catalogs.count < model.vaults.count { Label("Incomplete: some vaults are unavailable or locked", systemImage: "exclamationmark.triangle") }
-                        if model.offline { Text("Using cached vault data. Corrections require a connection.").font(.caption) }
-                        if let date = model.healthReport.completedAt { Text("Checked \(date.formatted())").font(.caption).foregroundStyle(.secondary) }
-                        if model.healthReport.usedCloudCache { Text("Using saved iCloud results").font(.caption).foregroundStyle(.secondary) }
+                        Text("\(displayFields.count) password fields · \(availableVaultCount) of \(selectedVaultCount) vaults available").font(.caption)
+                        if availableVaultCount < selectedVaultCount { Label("Incomplete: some vaults are unavailable or locked", systemImage: "exclamationmark.triangle") }
+                        statusLine("Strength", statuses: displayFields.map(\.strength))
+                        statusLine("Reuse", statuses: displayFields.map(\.reuse))
+                        if model.breachChecksEnabled { statusLine("Breach", statuses: displayFields.map(\.breach)) }
+                        else { Text("Breach checks disabled").font(.caption) }
+                        if model.healthPublishing != nil { Text("Saving password health results…").font(.caption).accessibilityIdentifier("password-health-saving") }
                         if let notice = model.healthCacheNotice { Text(notice).font(.caption).foregroundStyle(.secondary) }
-                        if model.healthScheduled { Text("Automatic checks will run when idle.").font(.caption).foregroundStyle(.secondary) }
-                        if !model.breachChecksEnabled { Text("Breach checks disabled").font(.caption) }
-                        else if model.healthReport.breachChecked < model.healthReport.total && !model.healthChecking && !model.healthScheduled {
-                            Label("Breach check incomplete or unavailable", systemImage: "wifi.exclamationmark").font(.caption)
-                        }
                         HStack {
-                            if model.healthChecking && !model.healthRestoringCache {
-                                ProgressView("Checking passwords…", value: model.healthProgress, total: 1)
-                                    .progressViewStyle(.linear)
-                                    .accessibilityIdentifier("password-check-progress")
-                            }
+                            if model.healthChecking {
+                                ProgressView("Checking passwords…").accessibilityIdentifier("password-check-progress")
+                            } else if model.healthScheduled { Text("Checks pending or paused").font(.caption) }
                             Spacer()
                             Button("Check Now") { model.refreshHealth(force: true) }.disabled(model.healthChecking)
                         }
@@ -85,8 +80,8 @@ struct SecurityHealthView: View {
                     }
                     .accessibilityIdentifier("security-categories-menu")
                 }
-                Section("Accounts") {
-                    if findings.isEmpty { Text(model.healthChecking ? "Waiting for check results" : model.healthReport.completedAt == nil ? "Passwords have not been checked" : "No findings among checked items").foregroundStyle(.secondary) }
+                Section("Password findings") {
+                    if findings.isEmpty { Text(displayFields.isEmpty ? "No eligible password fields" : displayFields.contains { [$0.strength, $0.reuse, $0.breach].contains { $0.freshness != .current && $0.freshness != .disabled } } ? "No findings so far; some checks are incomplete" : "No findings among checked password fields").foregroundStyle(.secondary) }
                     ForEach(findings) { finding in
                         Button {
                             model.openHealthFinding(finding)
@@ -97,6 +92,9 @@ struct SecurityHealthView: View {
                                 Text([finding.account, finding.vaultName, finding.path].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption)
                                 if finding.kinds.contains(.exposed) {
                                     Text("This password appears in known breach data.")
+                                    if displayFields.first(where: { $0.vaultID == finding.vaultID && $0.item == finding.item && $0.path == finding.path })?.breach.freshness != .current {
+                                        Text("Previous exposure result · refresh needed").font(.caption)
+                                    }
                                     if let date = finding.breachCheckedAt {
                                         Text("Breach data checked \(date.formatted())").font(.caption).foregroundStyle(.secondary)
                                     }
@@ -129,10 +127,26 @@ struct SecurityHealthView: View {
             Text("Older apps, CLI companions, and extensions will stop opening this vault. Update all clients first. An encrypted backup will be written and verified before the upgrade; history starts now. There is no in-place downgrade.")
         }
     }
+    private var selectedVaultCount: Int { vault.isEmpty ? model.vaults.count : 1 }
+    private var availableVaultCount: Int { vault.isEmpty ? model.catalogs.count : model.catalogs[vault] == nil ? 0 : 1 }
+    private var displayFields: [PasswordFieldHealth] {
+        model.healthReport.fields.filter { vault.isEmpty || $0.vaultID == vault }
+    }
+    private func statusLine(_ name: String, statuses: [HealthCheckStatus]) -> some View {
+        let counts = [HealthFreshness.current, .pending, .stale, .unavailable].compactMap { state -> String? in
+            let count = statuses.filter { $0.freshness == state }.count
+            return count == 0 ? nil : "\(count) \(state.rawValue)"
+        }
+        let running = statuses.filter { $0.execution == .running }.count
+        let paused = statuses.filter { $0.execution == .paused }.count
+        let activity = running > 0 ? " · \(running) running" : paused > 0 ? " · \(paused) paused" : ""
+        return Text("\(name): " + (counts.isEmpty ? "No password fields" : counts.joined(separator: " · ")) + activity)
+            .font(.caption).accessibilityIdentifier("password-health-" + name.lowercased())
+    }
     private func findingCount(_ kind: PasswordHealthKind? = nil) -> Int {
-        Set(activeFindings.filter {
+        activeFindings.filter {
             (vault.isEmpty || $0.vaultID == vault) && (kind == nil || $0.kinds.contains(kind!))
-        }.map { ItemRow.ID(vault: $0.vaultID, name: $0.item) }).count
+        }.count
     }
     private var backupCount: Int {
         model.catalogs.keys.filter { vault.isEmpty || $0 == vault }.flatMap { model.credentialAccounts(in: $0) }.filter { !$0.hasConfirmedAlternate }.count +

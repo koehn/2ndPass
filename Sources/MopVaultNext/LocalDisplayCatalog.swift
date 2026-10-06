@@ -16,7 +16,7 @@ public struct LocalDisplayCatalogKey: Sendable {
         let wrappedKey: KeyEnvelope
     }
     private struct Envelope: Codable { let header: Header; let signature: Data }
-    private struct RowContext: Codable {
+    private struct RowContext: Encodable {
         let domain = "2ndpass-local-display-row-1"
         let keyID: UUID
         let context: Data

@@ -372,7 +372,11 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         cached.versions.merging(cached.waiting, uniquingKeysWith: { first, _ in first }) == index
     }
     private func displayResult(_ cached: CachedCatalog, index: [UUID: UUID], session: ItemVaultSession) async throws -> VaultResult {
-        var result = VaultResult(); assignCatalog(try cached.projection.catalog(), to: &result)
+        // Restore health evidence before exposing even the fast startup catalog.
+        // Otherwise an already-complete display projection looks like an unchecked
+        // vault until the background updater attaches its encrypted health rows.
+        let enriched = try await withHealth(cached.projection.catalog(), session: session)
+        var result = VaultResult(); assignCatalog(enriched, to: &result)
         if cached.versions != index {
             result.catalogTotalCount = index.keys.filter { $0 != ItemVaultSession.metadataRecordID }.count
             result.catalogLoadedCount = cached.entries.values.filter { index[$0.itemID] == $0.versionID }.count
@@ -596,16 +600,26 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             for check in checks { try check.validate() }
             var mutations: [UUID] = []
             let storedChecks = Dictionary(uniqueKeysWithValues: try await session.healthChecks().map { ($0.record, $0) })
+            // Health publications are incremental evidence, not replacement lists.
+            // A partial/stale client snapshot must never clear unvisited passwords.
+            var merged = storedChecks.filter { live.contains($0.key) }
+            for check in checks {
+                merged[check.record] = merged[check.record].map { check.retainingNewerResults(from: $0) } ?? check
+            }
             for entry in entries {
                 let ids = Set(entry.catalog.references.values)
-                let subset = checks.filter { ids.contains($0.record) }
+                let subset = merged.values.filter { ids.contains($0.record) }.sorted { $0.record < $1.record }
                 if !subset.isEmpty && subset.allSatisfy({ storedChecks[$0.record] == $0 }) { continue }
                 if let mutation = try await session.saveHealthChecks(subset, itemID: entry.itemID, expectedItemVersion: entry.versionID) {
                     mutations.append(mutation.id)
                 }
             }
-            if !mutations.isEmpty { return await saved(session, token: token, mutations: mutations) }
+            if !mutations.isEmpty { return await saved(session, token: token, mutations: mutations, deferPublication: true) }
             assignCatalog(try await catalog(session), to: &result)
+            // Health evidence changes no AutoFill identities. Even status() can
+            // wait on the OS identity store, so bypass the shared publication tail.
+            try checked(token)
+            return result
         case .save(let edit):
             let mutation = try await save(edit, session: session)
             timing?.mark("local mutation committed")

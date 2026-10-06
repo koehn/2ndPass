@@ -946,8 +946,17 @@ public final class ItemVaultSession: @unchecked Sendable {
                 let old = try healthEnvelope(previous)
                 let oldState = try readableState(old.header.membership)
                 let existing = try old.open(device: device, membership: oldState.membership, membershipStateDigest: old.header.membership)
-                let byRecord = Dictionary(uniqueKeysWithValues: existing.map { ($0.record, $0) })
-                ordered = ordered.map { check in byRecord[check.record].map { check.retainingNewerResults(from: $0) } ?? check }
+                // Re-read and merge at the commit boundary as well: another
+                // publisher can have added evidence since the service snapshot.
+                let live = Set(catalog.item.fields.filter {
+                    !catalog.item.isArchived && catalog.item.deletion == nil &&
+                    ($0.type == .password || ($0.path == catalog.item.autoFill?.password && [.concealed, .text, .username, .email].contains($0.type)))
+                }.compactMap { catalog.references[SecretReference.encode(catalog.item.name) + "/" + $0.path] })
+                var byRecord = Dictionary(uniqueKeysWithValues: existing.filter { live.contains($0.record) }.map { ($0.record, $0) })
+                for check in ordered {
+                    byRecord[check.record] = byRecord[check.record].map { check.retainingNewerResults(from: $0) } ?? check
+                }
+                ordered = byRecord.values.sorted { $0.record < $1.record }
                 if existing == ordered { return nil }
             } else if ordered.isEmpty { return nil }
             let sealed = try ItemHealthEnvelope.seal(ordered, vault: binding.vaultID, item: itemID,
