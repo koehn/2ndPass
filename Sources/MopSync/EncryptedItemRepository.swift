@@ -488,12 +488,17 @@ public actor EncryptedItemRepository {
             database: database, zoneOwner: zoneOwner), includeHealth: includeHealth) }
     }
 
-    private func revisionIndexInTransaction(_ scope: VaultScope, includeHealth: Bool = true) throws -> [UUID: UUID] {
+    public func healthRevisionIndex(scope: VaultScope) throws -> [UUID: UUID] {
+        try transaction { try revisionIndexInTransaction(scope, onlyHealth: true) }
+    }
+
+    private func revisionIndexInTransaction(_ scope: VaultScope, includeHealth: Bool = true, onlyHealth: Bool = false) throws -> [UUID: UUID] {
         let request = NSFetchRequest<NSDictionary>(entityName: "Item")
         request.resultType = .dictionaryResultType
         request.propertiesToFetch = ["itemID", "versionID"]
         request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
             scope.account, scope.vaultID as NSUUID, scope.database, scope.zoneOwner)
+        if onlyHealth { request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [request.predicate!, NSPredicate(format: "healthItemID != nil")]) }
         if !includeHealth { request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [request.predicate!, NSPredicate(format: "healthItemID == nil")]) }
         var index: [UUID: UUID] = [:]
         for row in try context.fetch(request) {

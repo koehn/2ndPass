@@ -93,59 +93,36 @@ struct ContentView: View {
                             if model.canPresent(.enrollDevice) { Button("Retry Connection") { model.enrollmentAction(.automaticEnrollment, vaultID: descriptor.id) } }
                         }
                     } else if model.authenticated {
-                        // Selection can be restored while catalogs change. Calling
-                        // ScrollViewProxy.scrollTo during that update traps in
-                        // SwiftUI's macOS OutlineListCoordinator. Let List manage
-                        // its selection without forcing an outline traversal.
-                        List(model.displayedItems, selection: $model.listSelection) { row in
-                            NavigationLink(value: row.id) {
-                                if model.conflictItems.contains(row.id) {
-                                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).accessibilityLabel("Sync conflict — review both versions")
-                                }
-                                VaultItemRowLabel(title: row.item.displayTitle, symbol: row.item.type.symbol,
-                                    subtitle: row.subtitle, vaultName: model.allVaults ? row.vaultName : nil,
-                                    recentDate: row.recentDate, searchDetail: row.searchDetail)
-                            }.tag(row.id).id(row.id)
-                                .listRowBackground(model.searchIsFocused && !model.search.isEmpty && model.searchHighlighted == row.id ? Color.accentColor.opacity(0.12) : nil)
-                                .contextMenu {
-                                    if let identity = row.localIdentity {
-                                        Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
-                                            .disabled(model.localDeleteInProgress || model.localCreating)
-                                    } else {
-                                        Button("Delete", role: .destructive) { model.itemToDelete = row }
-                                            .disabled(model.offline || model.busy)
+                        VaultItemList(model: model)
+                            .overlay {
+                                if model.displayedItems.isEmpty, let progress = model.catalogTransferStatus, !model.isLocalVaultSelected {
+                                    ContentUnavailableView {
+                                        Label("Getting vault items", systemImage: "icloud.and.arrow.down")
+                                    } description: {
+                                        Text(progress)
                                     }
-                                }
-                        }.disabled(model.busy).id(model.selectionGeneration)
-                        .overlay {
-                            if model.displayedItems.isEmpty, let progress = model.catalogTransferStatus, !model.isLocalVaultSelected {
-                                ContentUnavailableView {
-                                    Label("Getting vault items", systemImage: "icloud.and.arrow.down")
-                                } description: {
-                                    Text(progress)
-                                }
-                            } else if model.displayedItems.isEmpty && model.isUpdatingCatalog && !model.isLocalVaultSelected {
-                                ProgressView("Preparing local catalog…")
-                            } else if model.displayedItems.isEmpty {
-                                ContentUnavailableView {
-                                    Label(model.search.isEmpty ? emptyCollectionTitle : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")
-                                } description: {
-                                    if model.search.isEmpty && model.collection == .passkeys {
-                                        Text("Create a passkey when signing up or signing in on a website that supports them.")
-                                    }
-                                } actions: {
-                                    if !model.search.isEmpty { Button("Clear Search") { model.search = "" } }
-                                    else if model.collection == .sshKeys {
-                                        Button("Add SSH Key") { model.keyCreationPresented = true }
-                                            .disabled(model.offline || model.busy)
-                                    }
-                                    else if model.collection != .passkeys {
-                                        Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy)
-                                        Button("Import…") { model.beginImport() }.disabled(model.offline || model.busy)
+                                } else if model.displayedItems.isEmpty && model.isUpdatingCatalog && !model.isLocalVaultSelected {
+                                    ProgressView("Preparing local catalog…")
+                                } else if model.displayedItems.isEmpty {
+                                    ContentUnavailableView {
+                                        Label(model.search.isEmpty ? emptyCollectionTitle : "No Search Results", systemImage: model.search.isEmpty ? "key" : "magnifyingglass")
+                                    } description: {
+                                        if model.search.isEmpty && model.collection == .passkeys {
+                                            Text("Create a passkey when signing up or signing in on a website that supports them.")
+                                        }
+                                    } actions: {
+                                        if !model.search.isEmpty { Button("Clear Search") { model.search = "" } }
+                                        else if model.collection == .sshKeys {
+                                            Button("Add SSH Key") { model.keyCreationPresented = true }
+                                                .disabled(model.offline || model.busy)
+                                        }
+                                        else if model.collection != .passkeys {
+                                            Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy)
+                                            Button("Import…") { model.beginImport() }.disabled(model.offline || model.busy)
+                                        }
                                     }
                                 }
                             }
-                        }
                     } else {
                         Label(model.unlocking ? "Unlocking…" : "Items are locked", systemImage: "lock")
                             .foregroundStyle(.secondary).padding()

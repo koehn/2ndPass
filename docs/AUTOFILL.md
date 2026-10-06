@@ -2,7 +2,7 @@
 
 2ndPass includes a native credential provider extension for iOS/iPadOS 18+ and macOS
 15+. Enable 2ndPass in the system AutoFill/password-provider settings, then open and
-unlock 2ndPass. Each authenticated catalog refresh publishes login websites,
+unlock 2ndPass. Authenticated catalog changes publish login websites,
 usernames and opaque password/code credential identifiers to 2ndPass's Apple credential identity
 store. 2ndPass also writes the same metadata fields plus credential kind to a shared local index;
 the extension displays cached usernames and websites in its picker without authentication. It does not depend on Apple returning its stored suggestions to the extension.
@@ -28,27 +28,39 @@ Unavailable vaults retain their prior suggestions during a partial refresh. Cata
 eligibility alone is not proof that the system accepted publication.
 
 Unlock returns the verified local display cache before rebuilding missing rows.
-Maintenance starts after three seconds without interaction, prepares one item at a
-time, and leaves at least 100 ms between units. Activity postpones the next unit;
-app deactivation pauses it and locking cancels it. Password-health metadata is
-loaded during idle maintenance rather than twice on the launch path. Health scans
-retain their separate startup/idle delays, including restoration of saved results.
+Maintenance starts after three seconds without interaction, prepares at most 16 items
+per batch, and leaves at least 100 ms between batches. Item decryption yields between
+rows so selected-item reads can take priority. Activity postpones the next batch;
+app deactivation pauses it and locking cancels it. Row maps, ordering, and the pending
+work list survive between batches; only inserted or changed display rows are sorted.
+Full display snapshots (including histories and revision tokens) are built on demand
+and reused until the projection changes. Background partial publication builds only
+a batch-sized snapshot and revision token. Password-health metadata is
+loaded during idle maintenance and reused while its own source versions are unchanged.
+Display-progress events refresh only the affected cached catalog; they do not trigger
+discovery or conflict scans. A failed projection retains its error; Refresh retries
+without requiring a lock/unlock. Health scans retain their separate startup/idle
+delays, including restoration of saved results.
 
 AutoFill projection rows track opaque item IDs, source versions, and generated
 identities. Unchanged versions reuse their identities. The publisher durably keeps
 desired metadata separate from the last successfully published identities. It uses
 `ASCredentialIdentityStore` incremental save/remove operations when supported;
-unchanged suggestions require no system write. Partial catalogs never turn absent
+unchanged suggestions require no system or checkpoint write. Progressive publication
+submits changed rows in bounded batches. Partial catalogs never turn absent
 items into deletions; removals require explicit item IDs, an authoritative changed
-row (including archive/deletion), or a complete inventory.
+row (including archive/deletion), or a complete local inventory with no outstanding
+initial-download hint. Explicit refresh and extension saves use the same completeness
+checks. The hint does not certify a complete remote inventory.
 
 Cloud identities and local passkeys share a publication coordinator and an
-app-group filesystem lease across app and extension processes. An unavailable
-local inventory preserves its previous suggestions. Publication failures retain
+app-group filesystem lease across app and extension processes. Catalog publishers
+revalidate source versions after acquiring that lease, rejecting superseded snapshots.
+An unavailable local inventory preserves its previous suggestions. Publication failures retain
 the desired state for retry. An interrupted/uncertain system update, missing or
 invalid publication checkpoint, schema change, explicit Refresh Suggestions, or
-lack of incremental support uses full reconciliation. Explicit refresh repairs
-system-store resets that cannot be inferred from unchanged source versions.
+a changed projection without incremental support uses full reconciliation. Explicit
+refresh repairs system-store resets that cannot be inferred from unchanged source versions.
 
 Only website, username, kind, and opaque locator leave the encrypted catalog.
 Item/vault names, field paths, passwords, OTP seeds, and keys are not published or

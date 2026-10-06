@@ -232,3 +232,90 @@ private func suggestionCatalog(_ items: [(VaultItem, UUID)]) throws -> ItemCatal
     #expect(await store.rows.count == 2)
     #expect(await store.replacements == 1)
 }
+
+@Test(arguments: [true, false])
+func unchangedPublicationDoesNotRewriteCheckpoints(incremental: Bool) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), p = publisher(root, store, incremental: incremental)
+    let vault = UUID().uuidString
+    let catalog = try suggestionCatalog([(suggestionItem(UUID(), user: "alice"), UUID())])
+    try await p.publish(catalog: catalog, vaultID: vault)
+    let files = ["projection.json", "identities.json", "publication.json"].map { root.appendingPathComponent($0) }
+    let past = Date(timeIntervalSince1970: 1_000_000)
+    for file in files { try FileManager.default.setAttributes([.modificationDate: past], ofItemAtPath: file.path) }
+    try await p.publish(catalog: catalog, vaultID: vault)
+    for file in files {
+        let date = try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date
+        #expect(date == past, "Unchanged publication rewrote \(file.lastPathComponent)")
+    }
+    #expect(await store.replacements == 1)
+    #expect(await store.saves.isEmpty)
+    #expect(await store.removals.isEmpty)
+    // Explicit repair must still repair an externally reset OS store.
+    await store.reset()
+    try await p.refresh()
+    #expect(await store.rows.count == 1)
+}
+
+private actor PublicationBarrier {
+    private var release: CheckedContinuation<Void, Never>?
+    private var entered: CheckedContinuation<Void, Never>?
+    private var started = false
+    func hold() async {
+        started = true; entered?.resume(); entered = nil
+        await withCheckedContinuation { release = $0 }
+    }
+    func waitUntilEntered() async {
+        if started { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+    func resume() { release?.resume(); release = nil }
+}
+
+@Test func queuedStalePublicationValidatesAfterCrossProcessLease() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), barrier = PublicationBarrier(), vault = UUID().uuidString
+    let item = suggestionItem(UUID(), user: "old-user")
+    let old = try suggestionCatalog([(item, UUID())])
+    var newer = item; newer.fields[0].value = "new-user"
+    let fresh = try suggestionCatalog([(newer, UUID())])
+    let owner = AutoFillPublisher(directory: root, publish: { values in
+        await barrier.hold()
+        await store.replace(values)
+    })
+    let competing = publisher(root, store)
+    let first = Task { try await owner.publish(catalog: fresh, vaultID: vault) }
+    await barrier.waitUntilEntered()
+    let validations = Mutex(0), sourceStillCurrent = Mutex(true)
+    let stale = Task {
+        try await competing.publish(catalog: old, vaultID: vault, complete: false, removing: [], deferred: false) {
+            validations.withLock { $0 += 1 }
+            return sourceStillCurrent.withLock { $0 }
+        }
+    }
+    // Wait until the second publisher has entered update(), not merely until
+    // its Task exists. Freshness must be checked after the lease becomes free.
+    let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+    while await competing.status().phase != .updating, ContinuousClock.now < deadline { await Task.yield() }
+    #expect(await competing.status().phase == .updating)
+    #expect(validations.withLock { $0 } == 0)
+    sourceStillCurrent.withLock { $0 = false }
+    await barrier.resume()
+    try await first.value
+    #expect(try await stale.value == false)
+    #expect(validations.withLock { $0 } == 1)
+    #expect(await store.rows.values.map(\.username) == ["new-user"])
+    #expect(try AutoFillIndex(directory: root).load().map(\.username) == ["new-user"])
+}
+
+@Test func emptyProjectionRepairsCorruptPickerIndex() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), p = publisher(root, store), vault = UUID().uuidString
+    try await p.publish(catalog: suggestionCatalog([]), vaultID: vault)
+    try LocalFile.write(Data("corrupt".utf8), to: root.appendingPathComponent("identities.json"))
+    try await p.refresh()
+    #expect(try AutoFillIndex(directory: root).load().isEmpty)
+}

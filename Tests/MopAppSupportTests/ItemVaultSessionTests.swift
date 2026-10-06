@@ -7,7 +7,10 @@ import MopSync
 @testable import MopVaultNext
 @testable import MopAppSupport
 
-final class SessionUnwrapCounter: Sendable { let value = Mutex(0) }
+final class SessionUnwrapCounter: Sendable {
+    let value = Mutex(0)
+    let failure = Mutex<MopError?>(nil)
+}
 
 final class SessionDevice: DeviceOperations {
     let identity: DevicePublicKey
@@ -34,6 +37,7 @@ final class SessionDevice: DeviceOperations {
     func unwrap(_ envelope: KeyEnvelope, context: Data) throws -> SymmetricKey {
         guard let encryption else { throw MopError.authentication }
         unwraps.value.withLock { $0 += 1 }
+        if let failure = unwraps.failure.withLock({ $0 }) { throw failure }
         return try envelope.open(using: encryption, context: context)
     }
     func close() { encryption = nil; signing = nil }

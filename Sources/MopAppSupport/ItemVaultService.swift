@@ -71,18 +71,35 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private let autoFillDirectory: URL?
     private let idleWork: IdleWorkQueue
     private let catalogGate = OperationGate()
+    private let publicationGate = OperationGate()
+    private struct PublishedCatalog: Sendable {
+        let session: ObjectIdentifier
+        let versions: [String: String]
+        let complete: Bool
+    }
+    private let publishedCatalogs = Mutex<[UUID: PublishedCatalog]>([:])
     private struct CatalogUpdate: Sendable { let id: UUID; let task: Task<Void, Never> }
     private let catalogUpdates = Mutex<[UUID: CatalogUpdate]>([:])
-    private let catalogUpdateFailures = Mutex<[UUID: [UUID: UUID]]>([:])
-    private let displayListeners = Mutex<[UUID: AsyncStream<Void>.Continuation]>([:])
+    private struct CatalogFailure: Sendable {
+        let error: any Error
+        let retryAfter: ContinuousClock.Instant
+    }
+    private let catalogUpdateFailures = Mutex<[UUID: CatalogFailure]>([:])
+    private let displayListeners = Mutex<[UUID: AsyncStream<VaultChange>.Continuation]>([:])
     private let state = Mutex<(generation: Int, authenticated: TimeInterval?)>((0, nil))
     private struct CachedCatalog: Sendable {
         let session: ObjectIdentifier
-        let versions: [UUID: UUID]
-        let catalog: ItemCatalog
-        let entries: [UUID: ItemVaultCatalogEntry]
+        let projection: ItemCatalogProjection
+        let sourceVersions: [UUID: UUID]
+        let pending: ArraySlice<UUID>
+        let projectedIDs: Set<UUID>
         let waiting: [UUID: UUID]
-        let metadata: VaultEnvelopeMetadata
+        var versions: [UUID: UUID] { projection.versions }
+        var entries: [UUID: ItemVaultCatalogEntry] { projection.entries }
+        var metadata: VaultEnvelopeMetadata { projection.metadata }
+    }
+    func catalogProjectionWork(vault: UUID) -> (snapshots: Int, sortedRows: Int)? {
+        catalogCache.withLock { $0[vault]?.projection.work.value }
     }
     private let catalogCache = Mutex<[UUID: CachedCatalog]>([:])
     private var accountObserver: NSObjectProtocol?
@@ -109,8 +126,11 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         var failed = inventory.autoFillStatus?.phase == .failed
         for vault in inventory.vaults where vault.enrolled {
             do {
-                let result = try await execute(.catalog, vault: vault.id, offline: offline)
-                if result.catalog == nil || result.autoFillStatus?.phase == .failed { failed = true }
+                guard let id = UUID(uuidString: vault.id) else { throw MopError.invalidVault }
+                let session = try await opened(id, token: token, offline: offline)
+                let value = try await catalog(session)
+                let status = await publish(value, session: session, token: token, force: true)
+                if status?.phase == .failed { failed = true }
             } catch {
                 try checked(token)
                 failed = true
@@ -148,7 +168,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
     public func userActivity() { idleWork.activity() }
     public func setMaintenanceActive(_ active: Bool) { idleWork.setActive(active) }
-    public func invalidateDiscovery() { backend.invalidateDiscovery() }
+    public func invalidateDiscovery() {
+        catalogUpdateFailures.withLock { $0.removeAll() }
+        backend.invalidateDiscovery()
+    }
     /// Setup names are immutable trust data, not current display names. Resolve
     /// destinations from authenticated metadata without reading any login items.
     public func loginDestinations() async throws -> [VaultDescriptor] {
@@ -176,27 +199,43 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     public var sessionGeneration: Int { state.withLock { $0.generation } }
     public var authenticatedAt: TimeInterval? { state.withLock { $0.authenticated } }
     public func changes() async -> AsyncStream<Void> {
-        let id = UUID(), pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let source = await events()
+        let pump = Task {
+            for await _ in source {
+                guard !Task.isCancelled else { break }
+                pair.continuation.yield(())
+            }
+            pair.continuation.finish()
+        }
+        pair.continuation.onTermination = { _ in pump.cancel() }
+        return pair.stream
+    }
+    public func events() async -> AsyncStream<VaultChange> {
+        let id = UUID(), pair = AsyncStream<VaultChange>.makeStream()
         displayListeners.withLock { $0[id] = pair.continuation }
         let backend = self.backend
         let pump = Task {
             for await _ in await backend.changes() {
                 guard !Task.isCancelled else { break }
-                pair.continuation.yield(())
+                pair.continuation.yield(.store)
             }
         }
         pair.continuation.onTermination = { [weak self] _ in
             pump.cancel(); self?.displayListeners.withLock { $0[id] = nil }
         }
-        pair.continuation.yield(())
+        pair.continuation.yield(.store)
         return pair.stream
     }
-    private func displayChanged() { displayListeners.withLock { Array($0.values) }.forEach { $0.yield(()) } }
+    private func displayChanged(_ vault: UUID) {
+        displayListeners.withLock { Array($0.values) }.forEach { $0.yield(.display(vault: vault.uuidString)) }
+    }
     public func lock() {
         idleWork.activity()
         state.withLock { value in
             value.generation += 1; value.authenticated = nil
             catalogCache.withLock { $0.removeAll() }
+            publishedCatalogs.withLock { $0.removeAll() }
         }
         let loads = catalogUpdates.withLock { values in let current = Array(values.values); values.removeAll(); return current }
         loads.forEach { $0.task.cancel() }
@@ -262,6 +301,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         guard authenticatedAt != nil else { return nil }
         let token = sessionGeneration, id = try await select(vault, offline: true, authenticate: false)
         guard let session = await backend.existing(id), session.isUnlocked else { return nil }
+        if let failure = catalogUpdateFailures.withLock({ $0[id] }) { throw failure.error }
         guard let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) else { return nil }
         let index = try await session.revisionIndex()
         try checked(token)
@@ -285,7 +325,9 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let token = sessionGeneration, id = try await select(vault, offline: false)
         let session = try await opened(id, token: token, offline: false)
         let index = try await session.revisionIndex()
-        if catalogUpdateFailures.withLock({ $0[id] }) == index { throw ItemVaultServiceFailure.localStorageUnavailable }
+        if let failure = catalogUpdateFailures.withLock({ $0[id] }), ContinuousClock.now < failure.retryAfter {
+            throw failure.error
+        }
         catalogUpdateFailures.withLock { $0[id] = nil }
         if catalogUpdates.withLock({ $0[id] != nil }),
            let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) {
@@ -297,7 +339,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             startCatalogUpdater(session, token: token)
             return try await displayResult(cached, index: index, session: session)
         }
-        _ = try await catalog(session, limit: 0)
+        _ = try await prepareCatalog(session, limit: 0)
         try checked(token)
         let current = try await session.revisionIndex()
         guard let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
@@ -330,7 +372,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         cached.versions.merging(cached.waiting, uniquingKeysWith: { first, _ in first }) == index
     }
     private func displayResult(_ cached: CachedCatalog, index: [UUID: UUID], session: ItemVaultSession) async throws -> VaultResult {
-        var result = VaultResult(); assignCatalog(cached.catalog, to: &result)
+        var result = VaultResult(); assignCatalog(try cached.projection.catalog(), to: &result)
         if cached.versions != index {
             result.catalogTotalCount = index.keys.filter { $0 != ItemVaultSession.metadataRecordID }.count
             result.catalogLoadedCount = cached.entries.values.filter { index[$0.itemID] == $0.versionID }.count
@@ -366,15 +408,16 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                         await Task.yield()
                     }
                 } catch {
-                    if !Task.isCancelled, session.isUnlocked, self?.sessionGeneration == token,
-                       let index = try? await session.revisionIndex() {
+                    if !Task.isCancelled, session.isUnlocked, self?.sessionGeneration == token {
                         if let self {
                             let accepted = self.state.withLock { current in
                                 guard current.generation == token, session.isUnlocked, !Task.isCancelled else { return false }
-                                self.catalogUpdateFailures.withLock { $0[vault] = index }
+                                self.catalogUpdateFailures.withLock {
+                                    $0[vault] = CatalogFailure(error: error, retryAfter: .now.advanced(by: .seconds(2)))
+                                }
                                 return true
                             }
-                            if accepted { self.displayChanged() }
+                            if accepted { self.displayChanged(vault) }
                         }
                     }
                 }
@@ -388,7 +431,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private func advanceCatalogProjection(_ session: ItemVaultSession, token: Int) async throws -> Bool {
         try checked(token)
         let previous = catalogCache.withLock { $0[session.binding.vaultID] }
-        _ = try await catalog(session, limit: 1)
+        _ = try await prepareCatalog(session, limit: 16)
         let index = try await session.revisionIndex()
         try checked(token)
         guard let cached = catalogCache.withLock({ $0[session.binding.vaultID] }), cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
@@ -396,24 +439,24 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let settled = complete || displaySettled(cached, index: index)
         var changed = previous?.versions != cached.versions || previous?.waiting != cached.waiting
         if settled {
-            let enriched = try await withHealth(cached.catalog, session: session)
+            let snapshot = try cached.projection.catalog()
+            let enriched = try await withHealth(snapshot, session: session)
             try checked(token)
-            changed = changed || enriched.security != cached.catalog.security
+            changed = changed || enriched.security != snapshot.security
             try state.withLock { state in
                 guard state.generation == token, session.isUnlocked else { throw MopError.authentication }
                 catalogCache.withLock { values in
-                    guard let current = values[session.binding.vaultID], current.session == cached.session,
-                          current.versions == cached.versions else { return }
-                    values[session.binding.vaultID] = CachedCatalog(session: cached.session, versions: cached.versions,
-                        catalog: enriched, entries: cached.entries, waiting: cached.waiting, metadata: cached.metadata)
+                    guard values[session.binding.vaultID]?.projection === cached.projection else { return }
+                    cached.projection.installHealth(enriched)
                 }
             }
             let downloading = try await session.initialDownloadExpectedCount() != nil
             _ = await publish(enriched, session: session, token: token, complete: complete && !downloading)
         } else {
-            _ = await publish(cached.catalog, session: session, token: token, complete: false)
+            let batch = try cached.projection.catalog(for: cached.projectedIDs.sorted { $0.uuidString < $1.uuidString })
+            _ = await publish(batch, session: session, token: token, complete: false)
         }
-        if changed { displayChanged() }
+        if changed { displayChanged(session.binding.vaultID) }
         return settled
     }
 
@@ -711,7 +754,20 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
               cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
         return Array(cached.entries.values)
     }
-    private func catalog(_ session: ItemVaultSession, limit: Int? = nil) async throws -> ItemCatalog {
+    private func catalog(_ session: ItemVaultSession) async throws -> ItemCatalog {
+        let token = sessionGeneration
+        let cached = try await prepareCatalog(session, limit: nil)
+        let enriched = try await withHealth(cached.projection.catalog(), session: session)
+        try checked(token)
+        try state.withLock { current in
+            guard current.generation == token, session.isUnlocked else { throw MopError.authentication }
+            catalogCache.withLock { values in
+                if values[session.binding.vaultID]?.projection === cached.projection { cached.projection.installHealth(enriched) }
+            }
+        }
+        return enriched
+    }
+    private func prepareCatalog(_ session: ItemVaultSession, limit: Int?) async throws -> CachedCatalog {
         if limit == nil {
             let previous = catalogUpdates.withLock { $0.removeValue(forKey: session.binding.vaultID) }
             previous?.task.cancel()
@@ -728,7 +784,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
     }
     private static let catalogSignposter = OSSignposter(subsystem: "com.koehn.mop", category: "Catalog")
-    private func projectCatalog(_ session: ItemVaultSession, limit: Int?) async throws -> ItemCatalog {
+    private func projectCatalog(_ session: ItemVaultSession, limit: Int?) async throws -> CachedCatalog {
         let interval = Self.catalogSignposter.beginInterval("Build display catalog")
         defer { Self.catalogSignposter.endInterval("Build display catalog", interval) }
         let token = sessionGeneration
@@ -739,19 +795,24 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         if let previous, previous.versions == index {
             try checked(token)
             guard session.isUnlocked else { throw MopError.authentication }
-            return limit == nil ? try await withHealth(previous.catalog, session: session) : previous.catalog
+            return previous
         }
         let itemIDs = Set(index.keys).subtracting([ItemVaultSession.metadataRecordID])
-        var waiting = (previous?.waiting ?? [:]).filter { itemIDs.contains($0.key) && index[$0.key] == $0.value }
-        var entries = (previous?.entries ?? [:]).filter { itemIDs.contains($0.key) && previous?.versions[$0.key] == index[$0.key] }
-        var visible = Dictionary(uniqueKeysWithValues: (previous?.catalog.items ?? []).compactMap { item -> (UUID, VaultItem)? in
-            guard let id = item.storageID.flatMap(UUID.init(uuidString:)), entries[id] != nil else { return nil }
-            return (id, item)
-        })
+        let sameSource = previous?.sourceVersions == index
+        var waiting = previous?.waiting ?? [:]
+        var entries = previous?.entries ?? [:]
+        var visible = previous?.projection.items ?? [:]
+        if !sameSource {
+            waiting = waiting.filter { itemIDs.contains($0.key) && index[$0.key] == $0.value }
+            entries = entries.filter { itemIDs.contains($0.key) && $0.value.versionID == index[$0.key] }
+            visible = visible.filter { entries[$0.key] != nil }
+        }
+        var changedIDs: Set<UUID> = []
         if previous == nil {
             let cachedRows = try await session.cachedDisplayRows(expectedVersions: index)
             for row in cachedRows where index[row.entry.itemID] == row.entry.versionID {
                 entries[row.entry.itemID] = row.entry
+                changedIDs.insert(row.entry.itemID)
                 var item = row.item; item.storageID = row.entry.itemID.uuidString
                 for field in item.fields.indices {
                     item.fields[field].recordVersion = row.entry.catalog.references[SecretReference.encode(item.name) + "/" + item.fields[field].path]
@@ -759,8 +820,14 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 visible[row.entry.itemID] = item
             }
         }
-        let allChanged = itemIDs.filter { entries[$0] == nil && (limit == nil || waiting[$0] != index[$0]) }.sorted { $0.uuidString < $1.uuidString }
-        let changed = Set(limit.map { Array(allChanged.prefix($0)) } ?? allChanged)
+        let pending: ArraySlice<UUID>
+        if sameSource, limit != nil, let previous { pending = previous.pending }
+        else {
+            pending = itemIDs.filter { entries[$0] == nil && (limit == nil || waiting[$0] != index[$0]) }
+                .sorted { $0.uuidString < $1.uuidString }[...]
+        }
+        let changed = Set(limit.map { pending.prefix($0) } ?? pending)
+        let remaining: ArraySlice<UUID> = changed.count == pending.count ? [] : pending.dropFirst(changed.count)
         // One item-key unwrap hydrates metadata and its visible fields. Unchanged
         // item projections survive other item edits and receipt-only notifications.
         let rows: [ItemVaultDisplayEntry]
@@ -790,6 +857,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         for row in rows {
             waiting[row.entry.itemID] = nil
             entries[row.entry.itemID] = row.entry
+            changedIDs.insert(row.entry.itemID)
             var item = row.item; item.storageID = row.entry.itemID.uuidString
             for field in item.fields.indices {
                 item.fields[field].recordVersion = row.entry.catalog.references[SecretReference.encode(item.name) + "/" + item.fields[field].path]
@@ -807,28 +875,21 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             let current = try await session.vaultMetadata()
             metadata = current.value; metadataVersion = current.versionID
         }
-        let ordered = entries.values.sorted {
-            ($0.catalog.item.name, $0.itemID.uuidString) < ($1.catalog.item.name, $1.itemID.uuidString)
+        let projection = ItemCatalogProjection(previous: previous?.projection, entries: entries, items: visible,
+            changedIDs: changedIDs, metadata: metadata, metadataVersion: metadataVersion, usageScope: session.memberID.uuidString,
+            work: previous?.projection.work ?? ItemCatalogProjectionWork())
+        // Seed only complete authenticated projections. Ordering is already
+        // maintained by the projector; preparation never materializes a UI list.
+        if projection.versions == index && !rows.isEmpty {
+            try? await session.seedNameIndex(projection.orderedIDs.compactMap { entries[$0] }, versions: projection.versions)
         }
-        var result = ItemCatalog(vault: metadata.name, revision: try revision(ordered), items: ordered.compactMap { visible[$0.itemID] })
-        result.canEdit = true; result.security = metadata.security ?? VaultSecurityMetadata()
-        result.security?.histories = ordered.flatMap { $0.catalog.histories }
-        if limit == nil { result = try await withHealth(result, session: session) }
-        result.securityEnabled = true; result.canUpgradeSecurity = false
-        result.usageScope = session.memberID.uuidString
-        var versions = Dictionary(uniqueKeysWithValues: ordered.map { ($0.itemID, $0.versionID) })
-        versions[ItemVaultSession.metadataRecordID] = metadataVersion
-        // Seed only complete authenticated projections. Receipt-only refreshes
-        // return above, so they do not reseal or sign an unchanged index.
-        if versions == index && !rows.isEmpty { try? await session.seedNameIndex(ordered, versions: versions) }
+        let prepared = CachedCatalog(session: ObjectIdentifier(session), projection: projection, sourceVersions: index,
+            pending: remaining, projectedIDs: changedIDs, waiting: waiting)
         try state.withLock { current in
             guard current.generation == token, session.isUnlocked else { throw MopError.authentication }
-            catalogCache.withLock {
-                $0[session.binding.vaultID] = CachedCatalog(session: ObjectIdentifier(session), versions: versions,
-                    catalog: result, entries: entries, waiting: waiting, metadata: metadata)
-            }
+            catalogCache.withLock { $0[session.binding.vaultID] = prepared }
         }
-        return result
+        return prepared
     }
     private func withHealth(_ catalog: ItemCatalog, session: ItemVaultSession) async throws -> ItemCatalog {
         // Preserve the latest successful timestamp for each independent check.
@@ -880,13 +941,95 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         if sessionGeneration != token || !session.isUnlocked { result.catalog = nil; result.deletedCatalog = nil }
         return result
     }
-    private func publish(_ catalog: ItemCatalog?, session: ItemVaultSession, token: Int, complete: Bool = true) async -> AutoFillPublicationStatus? {
-        guard let publisher, let catalog, sessionGeneration == token, session.isUnlocked else { return nil }
-        // Suggestions intentionally survive lock, but contain only eligible public
-        // metadata. Every credential use still authenticates in the extension.
-        do { try await publisher.publish(catalog: catalog, vaultID: session.binding.vaultID.uuidString, complete: complete, removing: []) }
-        catch { return await publisher.status() }
+    /// Extension saves use the same completeness and freshness rules as app
+    /// publication; active fills stage metadata without touching the OS store.
+    public func publishAutoFillSuggestions(catalog: ItemCatalog, vault: String, deferred: Bool = false) async throws {
+        guard let id = UUID(uuidString: vault), let session = await backend.existing(id), session.isUnlocked else {
+            throw MopError.authentication
+        }
+        let token = sessionGeneration
+        try await publicationGate.enter(vault: vault)
+        do {
+            try await publishCurrent(catalog, session: session, token: token, complete: true,
+                                     publisher: AutoFillPublisher.shared, deferred: deferred)
+            await publicationGate.leave(vault: vault)
+        } catch {
+            await publicationGate.leave(vault: vault)
+            throw error
+        }
+    }
+
+    private func publish(_ catalog: ItemCatalog?, session: ItemVaultSession, token: Int, complete: Bool = true, force: Bool = false) async -> AutoFillPublicationStatus? {
+        guard let publisher, let catalog else { return nil }
+        do {
+            try await publicationGate.enter(vault: session.binding.vaultID.uuidString)
+            do {
+                try await publishCurrent(catalog, session: session, token: token, complete: complete, publisher: publisher, force: force)
+                await publicationGate.leave(vault: session.binding.vaultID.uuidString)
+            } catch {
+                await publicationGate.leave(vault: session.binding.vaultID.uuidString)
+                throw error
+            }
+        } catch { /* Publication is advisory; committed edits remain durable. */ }
         return await publisher.status()
+    }
+
+    private func publishCurrent(_ catalog: ItemCatalog, session: ItemVaultSession, token: Int, complete requestedComplete: Bool,
+                                publisher: any AutoFillPublishing, deferred: Bool = false, force: Bool = false) async throws {
+        try checked(token)
+        guard session.isUnlocked, let data = Data(base64Encoded: catalog.revision) else { return }
+        let versions = try JSONDecoder().decode([String: String].self, from: data)
+        let index = try await session.revisionIndex().filter { $0.key != ItemVaultSession.metadataRecordID }
+        let current = Dictionary(uniqueKeysWithValues: index.map { ($0.key.uuidString, $0.value.uuidString) })
+        guard versions.allSatisfy({ current[$0.key] == $0.value }) else { return }
+        let downloading = try await session.initialDownloadExpectedCount() != nil
+        let complete = requestedComplete && versions == current && !downloading
+        let vault = session.binding.vaultID
+        let previous = publishedCatalogs.withLock { $0[vault] }.flatMap { $0.session == ObjectIdentifier(session) ? $0 : nil }
+        let status = await publisher.status()
+        if !force, let previous, previous.versions == versions, (previous.complete || !complete), status.phase == .current { return }
+        var delta = catalog
+        if !force, !complete, let previous {
+            delta.items.removeAll { item in
+                guard let id = item.storageID else { return false }
+                return versions[id] == previous.versions[id]
+            }
+        }
+        // The publisher checks after acquiring its cross-process lease. An old
+        // caller cannot overwrite a newer projection after waiting for ownership.
+        let validate: @Sendable () async throws -> Bool = { [self] in
+            try checked(token)
+            guard session.isUnlocked else { return false }
+            let latest = try await session.revisionIndex().filter { $0.key != ItemVaultSession.metadataRecordID }
+            let expected = Dictionary(uniqueKeysWithValues: latest.map { ($0.key.uuidString, $0.value.uuidString) })
+            if complete, try await session.initialDownloadExpectedCount() != nil { return false }
+            try checked(token)
+            return complete ? expected == versions : versions.allSatisfy { expected[$0.key] == $0.value }
+        }
+        let batches: [ItemCatalog]
+        if !complete, delta.items.count > 16 {
+            batches = stride(from: 0, to: delta.items.count, by: 16).map { offset in
+                var batch = delta
+                batch.items = Array(delta.items[offset..<min(offset + 16, delta.items.count)])
+                return batch
+            }
+        } else { batches = [delta] }
+        var accepted = true
+        for batch in batches {
+            if try await !publisher.publish(catalog: batch, vaultID: vault.uuidString, complete: complete,
+                                             removing: [], deferred: deferred, validating: validate) {
+                accepted = false; break
+            }
+        }
+        if accepted {
+            state.withLock { value in
+                guard value.generation == token, session.isUnlocked else { return }
+                publishedCatalogs.withLock {
+                    let covered = complete ? versions : (previous?.versions ?? [:]).merging(versions, uniquingKeysWith: { _, latest in latest })
+                    $0[vault] = PublishedCatalog(session: ObjectIdentifier(session), versions: covered, complete: complete)
+                }
+            }
+        }
     }
     private func delivered(_ result: inout VaultResult) async {
         guard case .cloudConfirmed(let timeout) = delivery else { return }

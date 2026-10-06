@@ -53,7 +53,8 @@ private func localDescriptor() -> VaultDescriptor {
 private final class FakeLocalService: LocalVaultServing {
     var events: [String] = []
     var deleted: [UUID] = []
-    func list() throws -> [LocalIdentity] { events.append("list"); return [] }
+    var identities: [LocalIdentity] = []
+    func list() throws -> [LocalIdentity] { events.append("list"); return identities }
     func create(name: String, protocolType: LocalIdentityProtocol, authorization: LocalAuthorization) throws -> LocalIdentity {
         throw MopError.enclaveUnavailable
     }
@@ -204,4 +205,46 @@ private final class FakeLocalService: LocalVaultServing {
         #expect(model.localError == nil)
     }
 
+}
+
+extension LocalVaultModelTests {
+    @Test func localVaultAndItemSurviveRelaunchWithoutCloudAuthentication() async throws {
+        let suite = "local-selection-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = FakeLocalService()
+        let key = P256.Signing.PrivateKey().publicKey.x963Representation
+        let identity = try LocalIdentity(name: "Private local name", algorithm: .p256Signing, protocolType: .ssh, publicKey: key)
+        store.identities = [identity]
+        func makeModel() -> AppModel {
+            AppModel(breachClient: TestBreachClient(), service: CloudOnlyService(), defaults: defaults,
+                     automaticTimer: false, localService: store)
+        }
+        let first = makeModel()
+        first.chooseVault(LocalVault.id)
+        while first.localLoading { await Task.yield() }
+        first.selectedLocalIdentityID = identity.id
+        #expect(!first.authenticated)
+        let bytes = try #require(defaults.data(forKey: "lastSelection.local"))
+        #expect(!String(decoding: bytes, as: UTF8.self).contains(identity.name))
+        // Relaunch directly, without relying on lock or quit to save selection.
+        let next = makeModel()
+        next.start()
+        while next.localLoading { await Task.yield() }
+        try await finish(next)
+        #expect(next.collection == .local && next.vault == LocalVault.id)
+        #expect(next.selectedLocalIdentity?.id == identity.id)
+        next.lock()
+        let afterLock = makeModel()
+        afterLock.start()
+        while afterLock.localLoading { await Task.yield() }
+        try await finish(afterLock)
+        #expect(afterLock.selectedLocalIdentity?.id == identity.id)
+        store.identities = []
+        let missing = makeModel()
+        missing.start()
+        while missing.localLoading { await Task.yield() }
+        try await finish(missing)
+        #expect(missing.collection == .local && missing.selectedLocalIdentityID == nil)
+    }
 }

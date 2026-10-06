@@ -32,6 +32,7 @@ final class ItemSearchIndex {
     private let locale: Locale
     @ObservationIgnored private var lastQuery: String?
     @ObservationIgnored private var lastSnapshot: Snapshot?
+    @ObservationIgnored private var cachedAlphabetTargets: [AlphabetTarget<ItemRow.ID>]?
 
     init(rows: [ItemRow], deleted: Bool = false) {
         self.rows = rows
@@ -78,6 +79,14 @@ final class ItemSearchIndex {
         value.folding(options: .caseInsensitive, locale: locale).precomposedStringWithCanonicalMapping
     }
 
+    func alphabetTargets(_ text: String) -> [AlphabetTarget<ItemRow.ID>] {
+        let snapshot = search(text)
+        if let cachedAlphabetTargets { return cachedAlphabetTargets }
+        let targets = AlphabetTarget.build(snapshot.rows, title: { $0.item.displayTitle }, id: { $0.id })
+        cachedAlphabetTargets = targets
+        return targets
+    }
+
     func search(_ text: String) -> Snapshot {
         let query = Self.normalize(text.trimmingCharacters(in: .whitespacesAndNewlines), locale: locale)
         if query == lastQuery, let lastSnapshot { return lastSnapshot }
@@ -102,6 +111,7 @@ final class ItemSearchIndex {
         }
         lastQuery = query
         lastSnapshot = snapshot
+        cachedAlphabetTargets = nil
         return snapshot
     }
 }

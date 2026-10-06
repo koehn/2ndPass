@@ -100,11 +100,25 @@ private struct JoinedDisplayBackend: ItemVaultServiceBackend {
     // Metadata-only bootstrap must not present the cloud vault as empty, and
     // the hint must survive a process/store restart before any items arrive.
     #expect(prepared.approval.expectedItemCount == prepared.versions.count - 1)
-    let firstService = ItemVaultService(backend: JoinedDisplayBackend(session: admitted))
+    let suggestions = directory.appendingPathComponent("suggestions")
+    let publisher = AutoFillPublisher(directory: suggestions, publish: { _ in })
+    let prior = VaultItem(name: "Still downloading", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "retained-user"),
+        ItemField(path: "website", type: .website, value: "https://example.test"),
+        ItemField(path: "password", type: .password)
+    ])
+    try await publisher.publish(catalog: ItemCatalog(vault: "existing", revision: "", items: [prior]), vaultID: scope.binding.vaultID.uuidString)
+    let firstService = ItemVaultService(backend: JoinedDisplayBackend(session: admitted), publisher: publisher)
     let firstDisplay = try await firstService.displayCatalog(vault: scope.binding.vaultID.uuidString)
     #expect(firstDisplay.catalogDownloading)
     #expect(firstDisplay.catalogLoadedCount == 0)
     #expect(firstDisplay.catalogTotalCount == prepared.versions.count - 1)
+    // Both explicit catalog reads and repair must retain suggestions while
+    // only the metadata bootstrap has arrived, even though local rows are complete.
+    _ = try await firstService.execute(.catalog, vault: scope.binding.vaultID.uuidString)
+    #expect(try AutoFillIndex(directory: suggestions).load().map(\.username) == ["retained-user"])
+    _ = try await firstService.refreshAutoFillSuggestions(offline: true)
+    #expect(try AutoFillIndex(directory: suggestions).load().map(\.username) == ["retained-user"])
     let progressRepository = try EncryptedItemRepository(storeURL: joiningURL)
     #expect(try await progressRepository.initialDownloadExpectedCount(scope: scope.repositoryScope) == prepared.versions.count - 1)
     // Native change delivery may include historical ciphertext before the owner
@@ -142,6 +156,8 @@ private struct JoinedDisplayBackend: ItemVaultServiceBackend {
     #expect(availableDisplay.catalogTotalCount == nil)
     #expect(availableDisplay.catalogWaitingCount == nil)
     #expect(availableDisplay.catalog?.items.count == historical.count)
+    _ = try await firstService.execute(.catalog, vault: scope.binding.vaultID.uuidString)
+    #expect(try !AutoFillIndex(directory: suggestions).load().contains { $0.username == "retained-user" })
     let entry = try #require(try await admitted.catalog().first)
     let record = try #require(entry.catalog.references["Login/password"])
     #expect(try await admitted.reveal(itemID: entry.itemID, recordID: record) == SecretBytes(utf8: "session-secret"))

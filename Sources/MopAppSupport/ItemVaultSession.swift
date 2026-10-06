@@ -863,6 +863,8 @@ public final class ItemVaultSession: @unchecked Sendable {
     /// Derived evidence has its own encrypted heads and never changes item revisions.
     public func healthChecks() async throws -> [CachedPasswordCheck] {
         try permit.check()
+        let index = try await repository.healthRevisionIndex(scope: nameIndexScope)
+        if let cached = try permit.cachedHealthProjection(index) { return cached }
         let versions = try await repository.healthItems(account: binding.account, vaultID: binding.vaultID,
             database: binding.database, zoneOwner: binding.zoneOwner)
         guard !versions.isEmpty else { return [] }
@@ -901,8 +903,13 @@ public final class ItemVaultSession: @unchecked Sendable {
                 try await repository.saveDisplayCatalogRows(scope: nameIndexScope, rows: replacements, keyEnvelope: keyEnvelope, authorization: permit)
             } catch ItemRepositoryError.staleLocalVersion { /* A newer source will rebuild its derived row. */ }
         }
+        let result = checks.sorted { $0.record < $1.record }
+        let projected = Dictionary(uniqueKeysWithValues: versions.map { ($0.scope.itemID, $0.versionID) })
+        if try await repository.healthRevisionIndex(scope: nameIndexScope) == projected {
+            try permit.cacheHealthProjection(projected, checks: result)
+        }
         try permit.check()
-        return checks.sorted { $0.record < $1.record }
+        return result
     }
 
     public func healthConflicts() async throws -> [EncryptedItemConflict] {
@@ -1111,19 +1118,32 @@ final class ItemVaultPermit: RepositoryWritePermit, @unchecked Sendable {
         var device: (any DeviceOperations)?
         var displayKey: (envelope: Data, key: LocalDisplayCatalogKey)?
         var health: [UUID: (version: UUID, checks: [CachedPasswordCheck])] = [:]
+        var healthProjection: (versions: [UUID: UUID], checks: [CachedPasswordCheck])?
     }
     private let state: Mutex<State>
     init(device: any DeviceOperations) { state = Mutex(State(device: device)) }
     deinit { invalidate() }
     var isValid: Bool { state.withLock { $0.device != nil } }
     func invalidate() {
-        state.withLock { value in value.displayKey = nil; value.health.removeAll(); value.device?.close(); value.device = nil }
+        state.withLock { value in value.displayKey = nil; value.health.removeAll(); value.healthProjection = nil; value.device?.close(); value.device = nil }
     }
     func check() throws { try withWritePermission {} }
     func withWritePermission<T>(_ body: () throws -> T) throws -> T {
         try state.withLock { value in
             guard value.device != nil else { throw MopError.authentication }
             return try body()
+        }
+    }
+    func cachedHealthProjection(_ versions: [UUID: UUID]) throws -> [CachedPasswordCheck]? {
+        try state.withLock { value in
+            guard value.device != nil else { throw MopError.authentication }
+            return value.healthProjection.flatMap { $0.versions == versions ? $0.checks : nil }
+        }
+    }
+    func cacheHealthProjection(_ versions: [UUID: UUID], checks: [CachedPasswordCheck]) throws {
+        try state.withLock { value in
+            guard value.device != nil else { throw MopError.authentication }
+            value.healthProjection = (versions, checks)
         }
     }
     func withHealth(_ version: EncryptedItemVersion, _ read: (any DeviceOperations) throws -> [CachedPasswordCheck]) throws -> [CachedPasswordCheck] {

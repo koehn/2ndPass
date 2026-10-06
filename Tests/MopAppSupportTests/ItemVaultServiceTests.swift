@@ -14,6 +14,7 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
     private let names = Mutex<[UUID: String]>([:])
     private let unwraps = SessionUnwrapCounter()
     var unwrapCount: Int { unwraps.value.withLock { $0 } }
+    func failUnwraps(_ error: MopError?) { unwraps.failure.withLock { $0 = error } }
     let confirmsDelivery = Mutex(false)
     let locksAfterCreate = Mutex(false)
     let discoveryComplete = Mutex(true)
@@ -415,10 +416,20 @@ func autoFillDirectReadUnwrapsOnlySelectedItemAndRejectsStaleHints(itemCount: In
 
 private actor CatalogPublicationRecorder: AutoFillPublishing {
     private(set) var itemCounts: [Int] = []
+    private(set) var partialCounts: [Int] = []
+    private(set) var partialRevisionCounts: [Int] = []
     private(set) var retainedVaults: [Set<String>] = []
     func prune(keeping vaultIDs: Set<String>) async throws { retainedVaults.append(vaultIDs) }
     func status() async -> AutoFillPublicationStatus { AutoFillPublicationStatus() }
     func publish(catalog: ItemCatalog, vaultID: String) async throws { itemCounts.append(catalog.items.count) }
+    func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>) async throws {
+        if complete { itemCounts.append(catalog.items.count) }
+        else {
+            partialCounts.append(catalog.items.count)
+            let data = try #require(Data(base64Encoded: catalog.revision))
+            partialRevisionCounts.append(try JSONDecoder().decode([String: String].self, from: data).count)
+        }
+    }
     func refresh() async throws {}
 }
 
@@ -440,6 +451,13 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
     let repaired = try AutoFillIndex(directory: suggestions).load()
     #expect(!repaired.isEmpty)
     #expect(systemRows.withLock { $0 } == repaired)
+    // Explicit repair must rebuild routing rows even if this service previously
+    // published the same source versions and the OS/index still have identities.
+    try Data("corrupt".utf8).write(to: suggestions.appendingPathComponent("projection.json"))
+    _ = try await service.refreshAutoFillSuggestions(offline: true)
+    for identity in repaired {
+        _ = try AutoFillPublicationState.itemID(for: identity.id, directory: suggestions)
+    }
     // Normal catalog publication and explicit repair produce the same identities.
     _ = try await service.execute(.catalog, vault: vault.uuidString, offline: true)
     #expect(try AutoFillIndex(directory: suggestions).load() == repaired)
@@ -469,7 +487,7 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
     #expect(await publisher.retainedVaults == [Set([id.uuidString]), Set([id.uuidString])])
 }
 
-@Test func progressiveCatalogReturnsPartialThenNotifiesCompleteAndNeverPublishesPartialAutoFill() async throws {
+@Test func progressiveCatalogPublishesBoundedDeltasThenCompleteInventory() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
     let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
@@ -506,6 +524,8 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
     })
     #expect(complete)
     #expect(await publisher.itemCounts.allSatisfy { $0 == total })
+    #expect(await publisher.partialCounts.allSatisfy { $0 <= 16 })
+    #expect(await publisher.partialCounts.reduce(0, +) <= total + 16)
     let full = try await service.execute(.catalog, vault: id.uuidString, offline: true)
     #expect(full.catalogLoadedCount == nil && full.catalog?.items.count == total)
     service.lock()
@@ -800,4 +820,72 @@ func waitForDisplay(_ service: ItemVaultService, vault: UUID,
     next.setMaintenanceActive(true)
     try await Task.sleep(for: .milliseconds(150))
     #expect(await publisher.itemCounts == [3])
+}
+
+@Test func projectionFailurePreservesCauseAndRefreshRetriesWithoutRelocking() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
+    _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let service = ItemVaultService(backend: backend, idleDelay: .zero, idleSpacing: .zero)
+    defer { service.lock() }
+    service.setMaintenanceActive(false)
+    _ = try await service.displayCatalog(vault: id.uuidString)
+    backend.failUnwraps(.inputOutput)
+    service.setMaintenanceActive(true)
+    let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+    var failed = false
+    while ContinuousClock.now < deadline {
+        do { _ = try await service.cachedCatalog(vault: id.uuidString) }
+        catch {
+            #expect(error as? MopError == .inputOutput)
+            failed = true; break
+        }
+        await Task.yield()
+    }
+    #expect(failed)
+    let session = try await backend.open(id)
+    let originalVersions = try await session.revisionIndex()
+    backend.failUnwraps(nil)
+    service.invalidateDiscovery() // The ordinary Refresh action also resets the failure backoff.
+    let ready = try await waitForDisplay(service, vault: id) { $0.catalogLoadedCount == nil }
+    #expect(ready.catalog?.items.count == 2)
+    #expect(session.isUnlocked)
+    #expect(try await session.revisionIndex() == originalVersions)
+}
+
+@Test(arguments: [17, 257])
+func idlePreparationMaterializesOnlyRequestedSnapshots(itemCount: Int) async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
+    _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let publisher = CatalogPublicationRecorder()
+    let service = ItemVaultService(backend: backend, publisher: publisher, idleDelay: .zero, idleSpacing: .zero)
+    defer { service.lock() }
+    let initial = try await service.displayCatalog(vault: id.uuidString)
+    #expect(initial.catalog?.items.isEmpty == true)
+    // Observe completion at the publisher, without requesting intermediate UI
+    // snapshots. Background preparation must not build discarded aggregates.
+    let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+    while await publisher.itemCounts.isEmpty, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(await publisher.itemCounts == [itemCount])
+    let work = try #require(service.catalogProjectionWork(vault: id))
+    #expect(work.snapshots == 2) // Initial empty display and final inventory.
+    #expect(work.sortedRows == itemCount) // Each row sorted once, not once per batch.
+    #expect(await publisher.partialRevisionCounts.allSatisfy { $0 <= 16 })
+    #expect(await publisher.partialCounts.reduce(0, +) <= itemCount)
+    let first = try #require(try await service.cachedCatalog(vault: id.uuidString)?.catalog)
+    let second = try #require(try await service.cachedCatalog(vault: id.uuidString)?.catalog)
+    #expect(first.items.count == itemCount && first.items == second.items)
+    #expect(service.catalogProjectionWork(vault: id)?.snapshots == 2)
+    let full = try await service.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog()
+    #expect(full.items == first.items && full.revision == first.revision)
+    #expect(service.catalogProjectionWork(vault: id)?.snapshots == 2)
 }

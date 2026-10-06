@@ -123,11 +123,17 @@ public enum VaultServiceCapability: CaseIterable, Hashable, Sendable {
     case enrollment, deviceRemoval, sharing, recovery, securityUpgrade, importDocuments, credentialAccounts, vaultDeletion, portableBackup, passwordCheckCache
 }
 
+public enum VaultChange: Sendable {
+    case store
+    case display(vault: String)
+}
+
 public protocol VaultService: Sendable {
     func refreshAutoFillSuggestions(offline: Bool) async throws -> AutoFillPublicationStatus
     func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult)
     var capabilities: Set<VaultServiceCapability> { get }
     func changes() async -> AsyncStream<Void>
+    func events() async -> AsyncStream<VaultChange>
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview]
     func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws
     func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes
@@ -168,6 +174,19 @@ public extension VaultService {
     func invalidateDiscovery() {}
     func requestSynchronization() async throws {}
     var capabilities: Set<VaultServiceCapability> { Set(VaultServiceCapability.allCases) }
+    func events() async -> AsyncStream<VaultChange> {
+        let pair = AsyncStream<VaultChange>.makeStream()
+        let source = await changes()
+        let pump = Task {
+            for await _ in source {
+                guard !Task.isCancelled else { break }
+                pair.continuation.yield(.store)
+            }
+            pair.continuation.finish()
+        }
+        pair.continuation.onTermination = { _ in pump.cancel() }
+        return pair.stream
+    }
     func changes() async -> AsyncStream<Void> { AsyncStream { $0.finish() } }
     var sessionGeneration: Int { 0 }
     func endRecoverySession() {}

@@ -24,6 +24,7 @@ private final class FakeService: VaultService, Sendable {
         var fraction: Double?
         var capabilities = Set(VaultServiceCapability.allCases)
         var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
+        var eventObservers: [UUID: AsyncStream<VaultChange>.Continuation] = [:]
         var displayResult: VaultResult?
         var suggestionRefreshes = 0
         var syncRequests = 0
@@ -78,8 +79,21 @@ private final class FakeService: VaultService, Sendable {
             continuation.onTermination = { [weak self] _ in self?.state.withLock { $0.observers[id] = nil } }
         }
     }
-    var observerCount: Int { state.withLock { $0.observers.count } }
-    func notifyChange() { state.withLock { Array($0.observers.values) }.forEach { $0.yield(()) } }
+    func events() async -> AsyncStream<VaultChange> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            state.withLock { $0.eventObservers[id] = continuation }
+            continuation.onTermination = { [weak self] _ in self?.state.withLock { $0.eventObservers[id] = nil } }
+        }
+    }
+    var observerCount: Int { state.withLock { $0.observers.count + $0.eventObservers.count } }
+    func notifyChange() {
+        state.withLock { Array($0.observers.values) }.forEach { $0.yield(()) }
+        state.withLock { Array($0.eventObservers.values) }.forEach { $0.yield(.store) }
+    }
+    func notifyDisplay(_ vault: String) {
+        state.withLock { Array($0.eventObservers.values) }.forEach { $0.yield(.display(vault: vault)) }
+    }
     var operationProgress: String? { state.withLock { $0.progress } }
     var operationFraction: Double? { state.withLock { $0.fraction } }
     func authenticate(at time: TimeInterval = 0) { state.withLock { $0.started = time } }
@@ -106,6 +120,43 @@ private actor Barrier {
         model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)]
         return model
     }
+    @Test func displayProgressOnlyReadsAffectedCachedCatalog() async throws {
+        let id = UUID().uuidString, other = UUID().uuidString
+        let cachedReads = Mutex<[String]>([])
+        let service = FakeService(cached: { vault in
+            cachedReads.withLock { $0.append(vault) }
+            var result = VaultResult()
+            result.catalog = ItemCatalog(vault: "personal", revision: "ready", items: [])
+            return result
+        }, { operation, _, _ in
+            var result = VaultResult()
+            switch operation {
+            case .discover: result.vaults = [id, other].map { VaultDescriptor(id: $0, name: "personal", format: "mop-items-v2", enrolled: true) }
+            case .catalog: result.catalog = ItemCatalog(vault: "personal", revision: "initial", items: [])
+            default: break
+            }
+            return result
+        })
+        service.authenticate()
+        let app = model(service); app.vault = id; app.start(); try await finish(app)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while service.observerCount == 0, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(service.observerCount > 0)
+        // Let initial conflict loading finish before measuring progress-only work.
+        for _ in 0..<10 { await Task.yield() }
+        cachedReads.withLock { $0.removeAll() }
+        let before = service.state.withLock { ($0.operations.count, $0.displayCalls, $0.conflictCalls) }
+        service.notifyDisplay(id)
+        while cachedReads.withLock({ $0.isEmpty }), ContinuousClock.now < deadline { await Task.yield() }
+        try await finish(app)
+        #expect(cachedReads.withLock { $0 } == [id])
+        #expect(service.state.withLock { $0.operations.count } == before.0)
+        #expect(service.state.withLock { $0.displayCalls } == before.1)
+        #expect(service.state.withLock { $0.conflictCalls } == before.2)
+        #expect(app.catalogs[id]?.revision == "ready")
+        app.lock()
+    }
+
     @Test func refreshSuggestionsUsesServiceWithoutStartingCompetingDiscovery() async throws {
         let service = FakeService()
         service.authenticate()
@@ -2293,14 +2344,14 @@ extension AppModelTests {
 
 extension AppModelTests {
     private func selectionModel(_ catalogs: [String: ItemCatalog], defaults: UserDefaults,
-                                deleted: [String: ItemCatalog] = [:]) -> (AppModel, FakeService) {
+                                deleted: [String: ItemCatalog] = [:], localService: (any LocalVaultServing)? = nil) -> (AppModel, FakeService) {
         let service = FakeService { operation, id, _ in
             var result = VaultResult()
             if case .catalog = operation, let id { result.catalog = catalogs[id]; result.deletedCatalog = deleted[id] }
             return result
         }
         service.authenticate()
-        let app = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, usageStore: RecentUsageMemory(), now: { 0 }, automaticTimer: false)
+        let app = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, usageStore: RecentUsageMemory(), now: { 0 }, automaticTimer: false, localService: localService)
         app.vaults = catalogs.map { VaultDescriptor(id: $0.key, name: $0.value.vault, format: "mop-items-v2", enrolled: true) }
         return (app, service)
     }
@@ -2383,6 +2434,8 @@ extension AppModelTests {
         restored.vault = secondID
         restored.unlock(); try await finish(restored)
         #expect(restored.vault == firstID && restored.selectedItem == item.name)
+        #expect(restored.listSelection == ItemRow.ID(vault: firstID, name: item.name))
+        #expect(restored.displayedItems.contains { $0.id == restored.listSelection })
         let (chosen, _) = selectionModel(catalogs, defaults: defaults)
         chosen.chooseVault(secondID); try await finish(chosen)
         #expect(chosen.vault == secondID && chosen.selectedItem == nil)
@@ -2996,3 +3049,103 @@ extension AppModelTests {
         #expect(service.state.withLock { $0.operations.isEmpty })
     }
 }
+
+
+extension AppModelTests {
+    @Test func itemListUsesLocalizedNaturalTitleOrder() throws {
+        let app = model(FakeService())
+        let names = ["Zulu", "apple", "Banana", "entry 10", "entry 2", "éclair"]
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r", items:
+            names.map { VaultItem(name: $0, fields: []) }))
+        let expected = names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        #expect(app.displayedItems.map(\.item.name) == expected)
+        let ordered = app.displayedItems.map(\.item.name)
+        #expect(ordered.firstIndex(of: "apple")! < ordered.firstIndex(of: "Banana")!)
+        #expect(ordered.firstIndex(of: "entry 2")! < ordered.firstIndex(of: "entry 10")!)
+    }
+}
+
+
+@MainActor
+private final class SelectionLocalService: LocalVaultServing {
+    var identities: [LocalIdentity] = []
+    func list() throws -> [LocalIdentity] { identities }
+    func create(name: String, protocolType: LocalIdentityProtocol, authorization: LocalAuthorization) throws -> LocalIdentity {
+        throw MopError.enclaveUnavailable
+    }
+    func delete(id: UUID, authorization: LocalAuthorization) throws {}
+}
+
+extension AppModelTests {
+    @Test func allItemsRestoresLocalIdentityAndEmptyCollectionsPersistWithoutLock() async throws {
+        let suite = UUID().uuidString, defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let vault = UUID().uuidString
+        var catalog = ItemCatalog(vault: "personal", revision: "r", items: [])
+        catalog.usageScope = UUID().uuidString
+        let local = SelectionLocalService()
+        let key = P256.Signing.PrivateKey().publicKey.x963Representation
+        let identity = try LocalIdentity(name: "Local SSH", algorithm: .p256Signing, protocolType: .ssh, publicKey: key)
+        local.identities = [identity]
+        let (first, _) = selectionModel([vault: catalog], defaults: defaults, localService: local)
+        first.unlock(); try await finish(first)
+        first.chooseAllVaults()
+        first.localIdentities = [identity]
+        first.selectedRow = .init(vault: LocalVault.id, name: identity.id.uuidString)
+        let (next, _) = selectionModel([vault: catalog], defaults: defaults, localService: local)
+        next.unlock(); try await finish(next)
+        while next.localLoading { await Task.yield() }
+        #expect(next.collection == .all)
+        #expect(next.selectedLocalIdentity?.id == identity.id)
+        #expect(next.listSelection == ItemRow.ID(vault: LocalVault.id, name: identity.id.uuidString))
+        next.chooseRecent(.recentlyAdded)
+        let (empty, _) = selectionModel([vault: catalog], defaults: defaults, localService: local)
+        empty.unlock(); try await finish(empty)
+        #expect(empty.collection == .recentlyAdded && empty.selectedItem == nil)
+        // Choosing a cloud vault supersedes the most recent local-vault launch.
+        empty.chooseVault(LocalVault.id)
+        while empty.localLoading { await Task.yield() }
+        empty.selectedLocalIdentityID = identity.id
+        empty.chooseVault(vault)
+        try await finish(empty)
+        let (cloud, _) = selectionModel([vault: catalog], defaults: defaults, localService: local)
+        cloud.unlock(); try await finish(cloud)
+        #expect(!defaults.bool(forKey: "lastSelectionWasLocal"))
+        #expect(cloud.collection == .vault(vault) && cloud.selectedLocalIdentity == nil)
+    }
+}
+
+
+#if os(macOS)
+import AppKit
+import SwiftUI
+
+extension AppModelTests {
+    @Test func nativeItemListSelectionWithLargeCatalog() async throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service)
+        app.authenticated = true
+        let items = (0..<1_000).map { index in
+            VaultItem(name: "Account \(index)", fields: [ItemField(path: "username", value: "user\(index)")])
+        }
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r", items: items))
+        let host = NSHostingView(rootView: VaultItemList(model: app))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 350, height: 700),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = host
+        defer { window.contentView = nil }
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        let clock = ContinuousClock(), start = clock.now
+        for row in app.displayedItems.prefix(5) {
+            app.listSelection = row.id
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+            #expect(app.selectedTypedItem?.name == row.item.name)
+        }
+        let elapsed = start.duration(to: clock.now)
+        print("Native list: five selections with 1,000 items: \(elapsed)")
+        #expect(elapsed < .seconds(2))
+    }
+}
+#endif

@@ -196,9 +196,9 @@ import MopLocalIdentity
                 // Persist the picker metadata; app activation publishes it later.
                 // Failure here does not undo the already committed login.
                 if fillAfterSave {
-                    try? await AutoFillPublisher.shared.stage(catalog: catalog, vaultID: vault)
+                    try? await cloudPasskeyService.publishAutoFillSuggestions(catalog: catalog, vault: vault, deferred: true)
                 } else {
-                    try? await AutoFillPublisher.shared.publish(catalog: catalog, vaultID: vault)
+                    try? await cloudPasskeyService.publishAutoFillSuggestions(catalog: catalog, vault: vault)
                 }
                 guard token == generation, !Task.isCancelled else { return }
                 model.loginDraft = nil; cloudPasskeyService.lock()
@@ -400,7 +400,7 @@ import MopLocalIdentity
                     let row = try await provider.registerPasskey(vault: vault, relyingParty: rp, userName: identity.userName, userHandle: identity.userHandle, clientDataHash: request.clientDataHash, algorithms: request.supportedAlgorithms.map { Int($0.rawValue) })
                     guard token == generation, cloudPasskeyService.sessionGeneration == vaultGeneration, cloudPasskeyService.isAuthenticated, !Task.isCancelled else { return }
                     let savedCatalog = try await cloudPasskeyService.execute(.catalog, vault: vault, offline: false).requireCatalog()
-                    try await AutoFillPublisher.shared.publish(catalog: savedCatalog, vaultID: vault)
+                    try await cloudPasskeyService.publishAutoFillSuggestions(catalog: savedCatalog, vault: vault)
                     guard token == generation, cloudPasskeyService.sessionGeneration == vaultGeneration, cloudPasskeyService.isAuthenticated, !Task.isCancelled else { return }
                     extensionContext.completeRegistrationRequest(using: ASPasskeyRegistrationCredential(relyingParty: rp, clientDataHash: request.clientDataHash, credentialID: row.credential.credentialID!, attestationObject: try CloudCredentialService.attestation(row))) { _ in }
                 } else {

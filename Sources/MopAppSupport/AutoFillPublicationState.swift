@@ -3,7 +3,7 @@ import CryptoKit
 import MopCore
 
 /// Public suggestion metadata only. Never persist catalog titles, references or secrets.
-struct AutoFillPublicationState: Codable {
+struct AutoFillPublicationState: Codable, Equatable {
     /// An untrusted routing hint only. The selected item must reproduce the
     /// requested identity from its authenticated, current contents before reveal.
     static func itemID(for identifier: String, directory: URL) throws -> UUID {
@@ -20,7 +20,7 @@ struct AutoFillPublicationState: Codable {
     }
     static let currentSchema = 1
     var schema = currentSchema
-    struct Item: Codable {
+    struct Item: Codable, Equatable {
         var version: String?
         var identities: [AutoFillIdentity]
     }

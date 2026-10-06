@@ -235,13 +235,20 @@ public protocol AutoFillPublishing: Sendable {
     func status() async -> AutoFillPublicationStatus
     func publish(catalog: ItemCatalog, vaultID: String) async throws
     func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>) async throws
+    /// Validate source freshness while holding publication ownership, including across processes.
+    func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>, deferred: Bool,
+                 validating: @Sendable () async throws -> Bool) async throws -> Bool
     func refresh() async throws
     func prune(keeping vaultIDs: Set<String>) async throws
 }
 public extension AutoFillPublishing {
     func prune(keeping vaultIDs: Set<String>) async throws {}
-    func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>) async throws {
-        if complete { try await publish(catalog: catalog, vaultID: vaultID) }
+    func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>, deferred: Bool,
+                 validating: @Sendable () async throws -> Bool) async throws -> Bool {
+        guard !deferred else { throw ItemVaultServiceFailure.unavailable }
+        guard try await validating() else { return false }
+        try await publish(catalog: catalog, vaultID: vaultID, complete: complete, removing: itemIDs)
+        return true
     }
 }
 
@@ -294,6 +301,7 @@ public actor AutoFillPublisher: AutoFillPublishing {
         return health!
     }
     private func record(_ state: AutoFillPublicationStatus) {
+        guard state != health else { return }
         health = state
         // Health is advisory. A diagnostics write cannot invalidate a successful publication.
         if let directory = try? directory(), let data = try? JSONEncoder().encode(state) {
@@ -331,8 +339,10 @@ public actor AutoFillPublisher: AutoFillPublishing {
             catch CloudSyncAdapterError.engineAlreadyOwned { try await Task.sleep(for: .milliseconds(50)) }
         }
     }
+    @discardableResult
     private func update(scope: String? = nil, retainingScopes: Set<String>? = nil, force: Bool = false, deferSystemUpdate: Bool = false,
-                        _ transform: (inout AutoFillPublicationState, [AutoFillIdentity]) -> [AutoFillIdentity]) async throws {
+                        validating: @Sendable () async throws -> Bool = { true },
+                        _ transform: (inout AutoFillPublicationState, [AutoFillIdentity]) -> [AutoFillIdentity]) async throws -> Bool {
         try await gate.enter()
         var status = rememberedStatus(); status.phase = .updating; status.message = nil; health = status
         var indexed = false
@@ -342,13 +352,16 @@ public actor AutoFillPublisher: AutoFillPublishing {
             defer { withExtendedLifetime(ownership) {} }
             // Another app-group process may have published since our last operation.
             health = nil; status = rememberedStatus()
+            guard try await validating() else { await gate.leave(); return false }
             let wasDisabled = status.phase == .disabled
             status.phase = .updating; status.message = nil
             var projection = try loadProjection(directory)
+            var persistedProjection = projection
             let index = AutoFillIndex(directory: directory)
             let indexedRows: [AutoFillIdentity]
+            var repairIndex = false
             do { indexedRows = try index.load() }
-            catch MopError.invalidVault { projection.requiresReconciliation = true; indexedRows = [] }
+            catch MopError.invalidVault { projection.requiresReconciliation = true; indexedRows = []; repairIndex = true }
             let recovered = projection.items.values.flatMap { $0.values.flatMap(\.identities) }
             let previousDesired = projection.desiredCloud ?? AutoFillPublicationState.unique(indexedRows + recovered)
             let entries = transform(&projection, previousDesired)
@@ -359,40 +372,52 @@ public actor AutoFillPublisher: AutoFillPublishing {
             if let scope { status.catalogsNeedingRefresh?.remove(scope) }
             if let retainingScopes { status.catalogsNeedingRefresh = status.catalogsNeedingRefresh?.intersection(retainingScopes) }
             let incremental = deferSystemUpdate ? false : await supportsIncremental()
-            let full = force || wasDisabled || !incremental || projection.requiresReconciliation || projection.published == nil
+            let full = force || wasDisabled || (!incremental && projection.published != desired) || projection.requiresReconciliation || projection.published == nil
             let previous = projection.published ?? []
             let old = Dictionary(previous.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
             let new = Dictionary(desired.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
             let removed = previous.filter { new[$0.id] == nil || new[$0.id] != $0 }
             let saved = desired.filter { old[$0.id] != $0 }
             // Desired metadata is durable before any system call. Confirmed state stays separate.
-            try saveProjection(projection, directory: directory)
+            if projection != persistedProjection {
+                try saveProjection(projection, directory: directory)
+                persistedProjection = projection
+            }
             // The picker index is derived from the durable desired checkpoint. A
             // crash between these writes is repaired without resurrecting old rows.
-            try index.update { _ in entries }
+            if repairIndex || indexedRows != entries { try index.update { _ in entries } }
             indexed = true
             if deferSystemUpdate {
                 // An active fill must not change the host's suggestion store.
                 // App activation reconciles this durable desired checkpoint.
                 projection.requiresReconciliation = true
-                try saveProjection(projection, directory: directory)
+                if projection != persistedProjection {
+                    try saveProjection(projection, directory: directory)
+                    persistedProjection = projection
+                }
                 status.phase = .notUpdated
                 status.message = "Saved suggestions will be published when 2ndPass next becomes active."
                 record(status)
                 await gate.leave()
-                return
+                return true
             }
             if await enabled() {
                 if full || !removed.isEmpty || !saved.isEmpty {
                     projection.requiresReconciliation = true
-                    try saveProjection(projection, directory: directory)
+                    if projection != persistedProjection {
+                        try saveProjection(projection, directory: directory)
+                        persistedProjection = projection
+                    }
                     if full { try await publishIdentities(desired) }
                     else {
                         if !removed.isEmpty { try await removeIdentities(removed) }
                         if !saved.isEmpty { try await saveIdentities(saved) }
                     }
                     projection.published = desired; projection.requiresReconciliation = false
-                    try saveProjection(projection, directory: directory)
+                    if projection != persistedProjection {
+                        try saveProjection(projection, directory: directory)
+                        persistedProjection = projection
+                    }
                     status.lastSuccess = Date()
                 }
                 status.phase = .current
@@ -402,11 +427,15 @@ public actor AutoFillPublisher: AutoFillPublishing {
                 }
             } else {
                 projection.requiresReconciliation = true
-                try saveProjection(projection, directory: directory)
+                if projection != persistedProjection {
+                    try saveProjection(projection, directory: directory)
+                    persistedProjection = projection
+                }
                 status.phase = .disabled
             }
             record(status)
             await gate.leave()
+            return true
         } catch {
             if !indexed, let scope {
                 if status.catalogsNeedingRefresh == nil { status.catalogsNeedingRefresh = [] }
@@ -430,6 +459,12 @@ public actor AutoFillPublisher: AutoFillPublishing {
     }
     public func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String> = []) async throws {
         try await update(scope: vaultID) { state, old in
+            state.project(catalog, vaultID: vaultID, complete: complete, removing: itemIDs, previous: old)
+        }
+    }
+    public func publish(catalog: ItemCatalog, vaultID: String, complete: Bool, removing itemIDs: Set<String>, deferred: Bool,
+                        validating: @Sendable () async throws -> Bool) async throws -> Bool {
+        try await update(scope: vaultID, deferSystemUpdate: deferred, validating: validating) { state, old in
             state.project(catalog, vaultID: vaultID, complete: complete, removing: itemIDs, previous: old)
         }
     }

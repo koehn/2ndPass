@@ -7,6 +7,7 @@ import MopAppSupport
 /// identity detail view; local identities never enter cloud item catalogs.
 struct LocalVaultView: View {
     @Bindable var model: AppModel
+    @State private var directListSelection: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -32,24 +33,46 @@ struct LocalVaultView: View {
                     Text("Create an SSH, Git signing, or certificate identity. Create passkeys from a website’s registration flow.")
                 }
             } else {
-                List(model.displayedLocalIdentities, selection: $model.selectedLocalIdentityID) { identity in
-                    NavigationLink(value: identity.id) {
-                        let credential = CredentialPresentation(identity: identity)
-                        VaultItemRowLabel(title: credential.title,
-                            symbol: identity.protocolType == .x509 ? "key.fill" : credential.symbol,
-                            subtitle: credential.account)
-                    }
-                    .tag(identity.id)
-                    .contextMenu {
-                        Button("Copy Reference") { copyLocalPublicText(identity.reference.description) }
-                        if identity.protocolType != .webauthn {
-                            Button("Copy Public Key") { model.clipboard.copy(SecretBytes(utf8: identity.publicKeyText), concealed: false) }
+                ScrollViewReader { proxy in
+                    List(selection: Binding(get: { model.selectedLocalIdentityID }, set: { selection in
+                        model.selectedLocalIdentityID = selection
+                        directListSelection = selection
+                    })) {
+                        ForEach(model.displayedLocalIdentities) { identity in
+                            NavigationLink(value: identity.id) {
+                                let credential = CredentialPresentation(identity: identity)
+                                VaultItemRowLabel(title: credential.title,
+                                    symbol: identity.protocolType == .x509 ? "key.fill" : credential.symbol,
+                                    subtitle: credential.account)
+                            }
+                            .tag(identity.id)
+                            .contextMenu {
+                                Button("Copy Reference") { copyLocalPublicText(identity.reference.description) }
+                                if identity.protocolType != .webauthn {
+                                    Button("Copy Public Key") { model.clipboard.copy(SecretBytes(utf8: identity.publicKeyText), concealed: false) }
+                                }
+                                Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
+                            }
                         }
-                        Button("Delete…", role: .destructive) { model.requestLocalDelete(identity.id) }
                     }
-                }
-                .onChange(of: model.selectedLocalIdentityID) { _, id in
-                    if id != nil { model.cancelLocalCreate() }
+                    .safeAreaInset(edge: .trailing, spacing: 0) {
+                        AlphabetIndex(targets: model.localAlphabetTargets) { id in
+                            proxy.scrollTo(id, anchor: .top)
+                        }
+                    }
+                    .task(id: model.selectedLocalIdentityID) {
+                        if let selection = model.selectedLocalIdentityID, selection == directListSelection {
+                            directListSelection = nil
+                            return
+                        }
+                        await Task.yield()
+                        guard !Task.isCancelled, let id = model.selectedLocalIdentityID,
+                              model.displayedLocalIdentities.contains(where: { $0.id == id }) else { return }
+                        proxy.scrollTo(id)
+                    }
+                    .onChange(of: model.selectedLocalIdentityID) { _, id in
+                        if id != nil { model.cancelLocalCreate() }
+                    }
                 }
                 if model.displayedLocalIdentities.isEmpty && !model.search.isEmpty {
                     ContentUnavailableView.search(text: model.search)

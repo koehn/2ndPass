@@ -123,23 +123,34 @@ final class AppModel {
     // account, sync, or recovery and is independent of the cloud session state.
     var localIdentities: [LocalIdentity] = [] {
         didSet {
+            localListCache = nil
             invalidateItemSearch()
             if let id = selectedLocalIdentityID, !localIdentities.contains(where: { $0.id == id }) {
                 selectedLocalIdentityID = nil
             }
         }
     }
-    var selectedLocalIdentityID: UUID?
+    var selectedLocalIdentityID: UUID? { didSet { rememberSelection() } }
     var selectedLocalIdentity: LocalIdentity? {
         guard isLocalVaultSelected || collection == .all else { return nil }
         return localIdentities.first { $0.id == selectedLocalIdentityID }
     }
+    @ObservationIgnored private var localListCache: (query: String, rows: [LocalIdentity], targets: [AlphabetTarget<UUID>])?
     var displayedLocalIdentities: [LocalIdentity] {
-        localIdentities.filter {
+        _ = localIdentities // Keep observation tracking even when the cache is warm.
+        if let localListCache, localListCache.query == search { return localListCache.rows }
+        let rows = localIdentities.filter {
             let credential = CredentialPresentation(identity: $0)
             return search.isEmpty || [credential.title, credential.account ?? "", $0.name, $0.protocolType.rawValue]
                 .contains { $0.localizedCaseInsensitiveContains(search) }
         }.sorted { CredentialPresentation(identity: $0).title.localizedStandardCompare(CredentialPresentation(identity: $1).title) == .orderedAscending }
+        localListCache = (search, rows, AlphabetTarget.build(rows,
+            title: { CredentialPresentation(identity: $0).title }, id: { $0.id }))
+        return rows
+    }
+    var localAlphabetTargets: [AlphabetTarget<UUID>] {
+        _ = displayedLocalIdentities
+        return localListCache?.targets ?? []
     }
     var localReady = false
     var localLoading = false
@@ -189,6 +200,7 @@ final class AppModel {
     private var cachedVaults: Set<String> = []
     var offline = false
     private var cloudRefreshPending = false
+    private var pendingDisplayVaults: Set<String> = []
     var authenticated = false { didSet { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() }; refreshConflicts() } }
     var revealed: SecretBytes?
     @ObservationIgnored private var storeChangesTask: Task<Void, Never>?
@@ -267,7 +279,7 @@ final class AppModel {
     }
     var catalogTransferStatus: String? {
         guard isUpdatingCatalog else { return nil }
-        if catalogUpdatePaused { return "Local catalog update paused. Lock and unlock to retry." }
+        if catalogUpdatePaused { return "Local catalog update paused. Refresh to retry." }
         let values = selectedCatalogProgress
         guard !values.isEmpty else { return nil }
         if values.contains(where: { $0.downloading }) {
@@ -360,20 +372,35 @@ final class AppModel {
         let collection: ItemCollection
         let vault: String
         let item: String?
+        var localItem: UUID? = nil
     }
+    @ObservationIgnored private var pendingLocalSelection: UUID?
     // Device-local defaults contain only opaque account/vault/item IDs. Names and
     // field values remain in the encrypted vault, and are resolved after unlock.
     private func rememberSelection() {
-        guard authenticated, !unlocking, !restoringSelection else { return }
-        let id = collection == .recentlyDeleted ? selectedDeleted?.vault ?? vault : vault
+        guard !unlocking, !restoringSelection, pendingLocalSelection == nil else { return }
+        if collection == .local {
+            let selection = SavedSelection(collection: .local, vault: LocalVault.id, item: nil,
+                                           localItem: selectedLocalIdentityID)
+            if let bytes = try? JSONEncoder().encode(selection) {
+                defaults.set(bytes, forKey: "lastSelection.local")
+                defaults.set(true, forKey: "lastSelectionWasLocal")
+            }
+            return
+        }
+        guard authenticated else { return }
+        let candidate = collection == .recentlyDeleted ? selectedDeleted?.vault ?? vault : vault
+        let id = catalogs[candidate] != nil ? candidate : catalogs.keys.sorted().first ?? candidate
         guard let account = catalogs[id]?.usageScope else { return }
         if catalogLoadProgress[id] != nil, selectedItem == nil, selectedDeleted == nil { return }
         let item = collection == .recentlyDeleted
             ? deletedCatalogs[id]?.items.first(where: { $0.name == selectedDeleted?.name })
             : catalogs[id]?.items.first(where: { $0.name == selectedItem })
-        let selection = SavedSelection(collection: collection, vault: id, item: item?.storageID)
+        let selection = SavedSelection(collection: collection, vault: id, item: item?.storageID,
+                                       localItem: collection == .all ? selectedLocalIdentityID : nil)
         if let bytes = try? JSONEncoder().encode(selection) {
             defaults.set(bytes, forKey: "lastSelection." + account)
+            defaults.set(false, forKey: "lastSelectionWasLocal")
         }
     }
     private func restoreSelection() {
@@ -392,6 +419,11 @@ final class AppModel {
         collection = saved.collection == .passkeys || saved.collection == .sshKeys ? .all : saved.collection
         try? applyCatalog(source)
         selectedItem = nil; selectedDeleted = nil
+        if collection == .all, let localID = saved.localItem {
+            pendingLocalSelection = localID
+            openLocalVault()
+            return
+        }
         guard let id = saved.item else { return }
         if collection == .recentlyDeleted {
             if let item = deletedCatalogs[vault]?.items.first(where: { $0.storageID == id && $0.deletion?.isExpired(at: wallNow()) == false }) {
@@ -491,9 +523,14 @@ final class AppModel {
             passwordGeneratorOptions = options
         }
         storeChangesTask = Task { [weak self, service] in
-            for await _ in await service.changes() {
+            for await event in await service.events() {
                 guard !Task.isCancelled else { return }
-                self?.cloudChanged()
+                switch event {
+                case .store: self?.cloudChanged()
+                case .display(let vault):
+                    self?.pendingDisplayVaults.insert(vault)
+                    self?.refreshCloudIfNeeded()
+                }
             }
         }
         if automaticTimer {
@@ -532,14 +569,14 @@ final class AppModel {
             Task { [weak self] in self?.discover() }
             return
         }
-        guard launchAttempted, isActive, !authenticated, !busy, launchUnlockAvailable, !accessNeedsRepair,
+        guard launchAttempted, isActive, !isLocalVaultSelected, !authenticated, !busy, launchUnlockAvailable, !accessNeedsRepair,
               error == nil, sheet == nil, !requestedVaultIDs.isEmpty,
               automaticUnlockTask == nil else { return }
         automaticUnlockTask = Task { [weak self] in
             await Task.yield()
             guard let self else { return }
             self.automaticUnlockTask = nil
-            guard !Task.isCancelled, self.isActive, !self.authenticated, !self.busy,
+            guard !Task.isCancelled, self.isActive, !self.isLocalVaultSelected, !self.authenticated, !self.busy,
                   self.launchUnlockAvailable, !self.accessNeedsRepair, self.error == nil,
                   self.sheet == nil, !self.requestedVaultIDs.isEmpty else { return }
             self.unlock()
@@ -629,11 +666,19 @@ final class AppModel {
                 var result = row; result.recentDate = date; return result
             }.sorted {
                 if $0.recentDate != $1.recentDate { return $0.recentDate! > $1.recentDate! }
-                return ($0.item.name, $0.id.vault, $0.item.storageID ?? "") < ($1.item.name, $1.id.vault, $1.item.storageID ?? "")
+                let titleOrder = $0.item.displayTitle.localizedStandardCompare($1.item.displayTitle)
+                if titleOrder != .orderedSame { return titleOrder == .orderedAscending }
+                return ($0.id.vault, $0.item.storageID ?? "", $0.item.name) < ($1.id.vault, $1.item.storageID ?? "", $1.item.name)
             }
             rows = Array(rows.prefix(50))
         } else {
-            rows.sort { ($0.item.name, $0.vaultName, $0.id.vault) < ($1.item.name, $1.vaultName, $1.id.vault) }
+            rows.sort {
+                let titleOrder = $0.item.displayTitle.localizedStandardCompare($1.item.displayTitle)
+                if titleOrder != .orderedSame { return titleOrder == .orderedAscending }
+                let vaultOrder = $0.vaultName.localizedStandardCompare($1.vaultName)
+                if vaultOrder != .orderedSame { return vaultOrder == .orderedAscending }
+                return ($0.id.vault, $0.item.storageID ?? "", $0.item.name) < ($1.id.vault, $1.item.storageID ?? "", $1.item.name)
+            }
         }
         let index = ItemSearchIndex(rows: rows)
         itemSearchIndex = index
@@ -654,6 +699,7 @@ final class AppModel {
     }
     var unfilteredItems: [ItemRow] { activeIndex.rows }
     var displayedItems: [ItemRow] { activeIndex.search(search).rows }
+    var alphabetTargets: [AlphabetTarget<ItemRow.ID>] { activeIndex.alphabetTargets(search) }
     var listSelection: ItemRow.ID? {
         get {
             // A keyboard highlight is not a navigation selection. Feeding it
@@ -762,6 +808,8 @@ final class AppModel {
         showArchived = false; favoritesOnly = false
         allVaults = false; page = .secrets; vault = id
         if id == LocalVault.id {
+            restoreLastSelection = false
+            pendingLocalSelection = nil
             collection = .local
             clearSelection()
             openLocalVault()
@@ -881,6 +929,10 @@ final class AppModel {
             do {
                 localIdentities = try localStore().list()
                 localReady = true
+                if let id = pendingLocalSelection {
+                    pendingLocalSelection = nil
+                    selectedLocalIdentityID = localIdentities.first(where: { $0.id == id })?.id
+                }
                 reconcileLocalCredentialEvidence()
             } catch {
                 localError = (error as? MopError)?.errorDescription ?? "Could not read the device-local vault."
@@ -1159,9 +1211,12 @@ final class AppModel {
         vaultDetailsTarget = nil; deleteConfirmation = false; documentRequest = nil; error = nil
     }
     private func clearView() {
+        let wasRestoring = restoringSelection
+        restoringSelection = true
+        defer { restoringSelection = wasRestoring }
         authenticated = false
         clearSelection()
-        catalogLoadProgress = [:]; catalogUpdatePaused = false
+        catalogLoadProgress = [:]; catalogUpdatePaused = false; pendingDisplayVaults.removeAll()
         catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
@@ -1188,6 +1243,7 @@ final class AppModel {
         status = "Locked"
     }
     func changedVault() {
+        pendingLocalSelection = nil
         restoreLastSelection = false
         checkExpiration()
         clearSelection()
@@ -1269,7 +1325,7 @@ final class AppModel {
         operationTask = Task {
             defer {
                 busy = false; localOperation = false; checkExpiration()
-                if cloudRefreshPending { refreshCloudIfNeeded() }
+                if cloudRefreshPending || !pendingDisplayVaults.isEmpty { refreshCloudIfNeeded() }
                 removingDevice = false; removalProgress = nil
                 if savingTransition {
                     if itemDraft == nil && error == nil && token == generation { completePendingTransition() }
@@ -1315,7 +1371,20 @@ final class AppModel {
     func start() {
         guard !launchAttempted else { return }
         launchAttempted = true
-        discover(autoUnlock: true)
+        if defaults.bool(forKey: "lastSelectionWasLocal"),
+           let bytes = defaults.data(forKey: "lastSelection.local"),
+           let saved = try? JSONDecoder().decode(SavedSelection.self, from: bytes) {
+            restoringSelection = true
+            vault = LocalVault.id
+            collection = .local
+            pendingLocalSelection = saved.localItem
+            restoringSelection = false
+            restoreLastSelection = false
+            openLocalVault()
+            discover(autoUnlock: false)
+        } else {
+            discover(autoUnlock: true)
+        }
     }
     func discover(autoUnlock: Bool = false, selectedOnly: Bool = false) {
         guard !busy, allowTransition(.refresh) else { return }
@@ -1339,13 +1408,13 @@ final class AppModel {
                 if let id = result.defaultVault, ids.contains(id) { self.vault = id }
             } else if self.vault != LocalVault.id && !ids.contains(self.vault) {
                 self.vault = ""; self.lock(reason: .accessFailure)
-                if rows.isEmpty && result.discoveryComplete { self.sheet = .createVault }
+                if rows.isEmpty && result.discoveryComplete && !self.isLocalVaultSelected { self.sheet = .createVault }
                 else if !rows.isEmpty && !rows.contains(where: { $0.supported && $0.enrolled }) { self.status = "Connecting iCloud vaults…" }
                 return
             }
             self.status = ids.isEmpty ? (result.discoveryComplete ? "Create your first vault" : "Checking iCloud for vaults…") : self.authenticated ? "Refreshing vaults…" : "Locked"
             if self.sheet == nil {
-                if rows.isEmpty && result.discoveryComplete { self.sheet = .createVault }
+                if rows.isEmpty && result.discoveryComplete && !self.isLocalVaultSelected { self.sheet = .createVault }
                 else if !rows.isEmpty && !rows.contains(where: { $0.supported && $0.enrolled }) {
                     self.status = "Connecting iCloud vaults…"
                 }
@@ -1798,10 +1867,55 @@ final class AppModel {
         }
     }
     private func reconcileDeferredStoreChange() {
-        guard cloudRefreshPending else { return }
+        guard cloudRefreshPending || !pendingDisplayVaults.isEmpty else { return }
         Task { [weak self] in
             await Task.yield()
             self?.refreshCloudIfNeeded()
+        }
+    }
+    /// Projection progress only reads already prepared rows for the affected
+    /// vaults. It does not rediscover inventory, scan conflicts or start loaders.
+    private func refreshDisplayIfNeeded() {
+        guard authenticated, !pendingDisplayVaults.isEmpty else { pendingDisplayVaults.removeAll(); return }
+        let ids = pendingDisplayVaults.intersection(Set(requestedVaultIDs))
+        pendingDisplayVaults.removeAll()
+        guard !ids.isEmpty else { return }
+        let token = generation, revision = foregroundRevision, editing = editorGeneration
+        refreshing = true
+        refreshTask = Task {
+            defer { refreshing = false; reconcileDeferredStoreChange() }
+            do {
+                for id in ids.sorted() {
+                    guard let result = try await service.cachedCatalog(vault: id) else { continue }
+                    guard current(token), !Task.isCancelled else { return }
+                    guard isActive, !busy, itemDraft == nil, sheet == nil,
+                          revision == foregroundRevision, editing == editorGeneration else {
+                        pendingDisplayVaults.formUnion(ids); return
+                    }
+                    guard requestedVaultIDs.contains(id) else { continue }
+                    let fresh = try result.requireCatalog()
+                    recordCatalogProgress(result, vaultID: id)
+                    if selectedItemChanged(in: fresh, vaultID: id) { conceal() }
+                    try applyTargetCatalog(fresh, id: id)
+                    deletedCatalogs[id] = result.deletedCatalog
+                    if let index = vaults.firstIndex(where: { $0.id == id }) {
+                        vaults[index] = VaultDescriptor(id: id, name: fresh.vault, format: vaults[index].format, enrolled: vaults[index].enrolled)
+                    }
+                    if vault == id, catalogLoadProgress[id] == nil {
+                        if let item = selectedItem, !fresh.items.contains(where: { $0.name == item }) { selectedItem = nil }
+                        if let selected, !itemFields.contains(selected) { self.selected = nil }
+                    }
+                }
+                if selectedItem == nil && selectedDeleted == nil { restoreSelection() }
+            } catch {
+                guard current(token), !Task.isCancelled else { return }
+                if let failure = error as? MopError,
+                   [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(failure) {
+                    if failure != .authentication { accessNeedsRepair = true }
+                    lock(reason: .accessFailure)
+                } else { catalogUpdatePaused = true }
+                recordError(error, operation: "Local catalog refresh")
+            }
         }
     }
     func cloudChanged() {
@@ -1812,7 +1926,8 @@ final class AppModel {
     func refreshCloudIfNeeded() {
         guard launchAttempted, isActive, !busy, !refreshing, !loadingVaults, itemDraft == nil, sheet == nil,
               !accessNeedsRepair, pendingTransition == nil else { return }
-        guard cloudRefreshPending else { return }
+        guard cloudRefreshPending else { refreshDisplayIfNeeded(); return }
+        pendingDisplayVaults.removeAll()
         cloudRefreshPending = false
         // Store commits, foregrounding and network changes request reconciliation.
         // CKSyncEngine owns network scheduling; the UI has no sync polling timer.
