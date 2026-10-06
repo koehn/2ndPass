@@ -1,6 +1,8 @@
 import Foundation
 #if os(iOS)
 import UIKit
+#elseif os(macOS)
+import SystemConfiguration
 #endif
 import Synchronization
 import MopCore
@@ -649,7 +651,9 @@ public final class ItemVaultSession: @unchecked Sendable {
         #if os(iOS)
         return await MainActor.run { UIDevice.current.name }
         #else
-        return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        // Host.localizedName can perform blocking network name resolution.
+        // Save attribution needs only the locally configured computer name.
+        return SCDynamicStoreCopyComputerName(nil, nil) as String? ?? "Mac"
         #endif
     }
 
@@ -677,10 +681,15 @@ public final class ItemVaultSession: @unchecked Sendable {
     /// unchanged field, retained history value, or attachment.
     public func edit(itemID: UUID, expectedBase: UUID, catalog: ItemEnvelopeCatalog,
                      changedRecords: [String: SecretBytes] = [:], removedRecords: Set<String> = []) async throws -> PendingItemMutation {
+        let timing = ItemSaveTiming()
+        defer { timing.mark("session edit finished") }
         try permit.check()
+        timing.mark("edit permission checked")
         guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
         let stored = try await repository.item(binding.item(itemID))
+        timing.mark("stored version loaded")
         let deviceName = await Self.editingDeviceName()
+        timing.mark("device name loaded")
         let version = try permit.withDevice { device in
             guard let stored, stored.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
             let current = try envelope(stored)
@@ -691,6 +700,7 @@ public final class ItemVaultSession: @unchecked Sendable {
             return try EncryptedItemVersion(scope: stored.scope, versionID: changed.header.version,
                 baseVersionID: expectedBase, ciphertext: changed.encoded(), generation: changed.header.generation)
         }
+        timing.mark("envelope encrypted and signed")
         return try await repository.commitLocalMutation(version, authorization: permit)
     }
 

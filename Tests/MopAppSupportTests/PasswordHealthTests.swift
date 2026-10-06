@@ -58,6 +58,7 @@ private final class HealthService: VaultService, Sendable {
     }
 }
 private actor HealthBreach: BreachChecking {
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }
     var count = 0
     func contains(_ password: Data, force: Bool) async throws -> Bool { count += 1; return false }
     func clear() {}
@@ -95,6 +96,7 @@ private actor HealthBreach: BreachChecking {
 }
 
 private actor RefreshBreach: BreachChecking {
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }
     var count = 0
     var failing = false
     func fail() { failing = true }

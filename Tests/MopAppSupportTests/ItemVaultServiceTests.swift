@@ -167,9 +167,20 @@ private func serviceLocation() throws -> URL {
     let alphaID = try #require(alpha.storageID.flatMap(UUID.init(uuidString:)))
     let before = try #require(try await repository.item(session.binding.item(alphaID)))
     let oldEnvelope = try JSONDecoder().decode(ItemEnvelope.self, from: before.ciphertext)
+    let originalDates = try #require(alpha.metadata)
+    #expect(originalDates.createdAt != nil && originalDates.addedAt != nil && originalDates.updatedAt != nil)
+    let beforeSave = Date()
     alpha.metadata = ItemMetadata(favorite: true)
     let saved = try await service.execute(.save(ItemEdit(revision: original.revision, item: alpha, create: false)), vault: id.uuidString, offline: true)
     #expect(saved.message.contains("Saved on this device"))
+    #expect(saved.saveStatus == .local)
+    #expect(backend.waitedMutations.withLock { $0.isEmpty })
+    #expect(saved.mutationIDs.count == 1)
+    #expect(try await repository.mutationReceipt(id: saved.mutationIDs[0], account: "service")?.status == .queued)
+    let savedAlpha = try #require(try saved.requireCatalog().items.first { $0.name == "Alpha" })
+    #expect(savedAlpha.metadata?.createdAt == originalDates.createdAt)
+    #expect(savedAlpha.metadata?.addedAt == originalDates.addedAt)
+    #expect(try #require(savedAlpha.metadata?.updatedAt) >= beforeSave)
     let after = try #require(try await repository.item(session.binding.item(alphaID)))
     let newEnvelope = try JSONDecoder().decode(ItemEnvelope.self, from: after.ciphertext)
     #expect(newEnvelope.encryptedRecords == oldEnvelope.encryptedRecords)
@@ -764,6 +775,7 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     }
 }
 private struct UnusedHealthBreach: BreachChecking {
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }
     func contains(_ password: Data, force: Bool) async throws -> Bool { Issue.record("Disabled breach check called"); return false }
     func clear() async {}
 }
@@ -888,4 +900,61 @@ func idlePreparationMaterializesOnlyRequestedSnapshots(itemCount: Int) async thr
     let full = try await service.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog()
     #expect(full.items == first.items && full.revision == first.revision)
     #expect(service.catalogProjectionWork(vault: id)?.snapshots == 2)
+}
+
+@Test func itemSaveDefersAllAutoFillWorkUntilBackgroundRefresh() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
+    _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let suggestions = directory.appendingPathComponent("suggestions")
+    let systemCalls = Mutex(0)
+    let localReads = Mutex(0)
+    let publisher = AutoFillPublisher(directory: suggestions, publish: { _ in systemCalls.withLock { $0 += 1 } },
+        local: { localReads.withLock { $0 += 1 }; return [] })
+    let service = ItemVaultService(backend: backend, publisher: publisher, idleDelay: .seconds(3600))
+    let catalog = try await service.execute(.catalog, vault: vault.uuidString, offline: true).requireCatalog()
+    let callsBeforeSave = systemCalls.withLock { $0 }
+    let readsBeforeSave = localReads.withLock { $0 }
+    var item = try #require(catalog.items.first)
+    item.name = "Renamed login"
+    let result = try await service.execute(.save(ItemEdit(revision: catalog.revision, item: item, create: false)), vault: vault.uuidString, offline: false)
+    #expect(result.saveStatus == .local)
+    #expect(localReads.withLock { $0 } == readsBeforeSave)
+    #expect(systemCalls.withLock { $0 } == callsBeforeSave)
+    #expect(try result.requireCatalog().items.contains { $0.name == item.name })
+    #expect(!AutoFillEntry.entries(catalog: try result.requireCatalog(), vaultID: vault.uuidString).isEmpty)
+    #expect(try !AutoFillIndex(directory: suggestions).load().isEmpty)
+    // A later refresh reconstructs suggestions from the durable item.
+    _ = try await service.refreshAutoFillSuggestions(offline: true)
+    service.lock()
+    #expect(systemCalls.withLock { $0 } > callsBeforeSave)
+    let expected = AutoFillEntry.entries(catalog: try result.requireCatalog(), vaultID: vault.uuidString).map(\.recordIdentifier)
+    #expect(try Set(AutoFillIndex(directory: suggestions).load().map(\.id)) == Set(expected))
+}
+
+@Test(arguments: [1, 80])
+func savingOneItemDoesNotDecryptUnchangedItems(itemCount: Int) async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
+    _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let service = ItemVaultService(backend: backend, idleDelay: .seconds(3600))
+    let catalog = try await service.execute(.catalog, vault: vault.uuidString, offline: true).requireCatalog()
+    var item = try #require(catalog.items.first)
+    for index in item.fields.indices { item.fields[index].value = nil }
+    item.metadata = ItemMetadata(favorite: true)
+    let before = backend.unwrapCount
+    let result = try await service.execute(.save(ItemEdit(revision: catalog.revision, item: item, create: false)), vault: vault.uuidString, offline: true)
+    #expect(backend.unwrapCount - before <= 4)
+    #expect(result.mutationIDs.count == 1)
+    let saved = try result.requireCatalog()
+    #expect(saved.items.count == itemCount)
+    #expect(saved.items.first { $0.storageID == item.storageID }?.metadata?.favorite == true)
+    #expect(saved.items.filter { $0.storageID != item.storageID } == catalog.items.filter { $0.storageID != item.storageID })
+    service.lock()
 }

@@ -1072,6 +1072,7 @@ final class AppModel {
     }
 
     func saveItem(_ item: VaultItem, create: Bool, revision: String? = nil, draftID: UUID? = nil, originalName: String? = nil) {
+        let timing = ItemSaveTiming()
         guard !offline, let catalog else { return }
         if !create, let stored = catalog.items.first(where: { $0.name == (originalName ?? item.name) }) {
             guard stored.fields.filter({ stored.isTemplateField($0) }).allSatisfy({ required in
@@ -1092,11 +1093,15 @@ final class AppModel {
         let destination = vault
         let purpose = itemDraft?.sshPurpose ?? .ssh
         let passphrase = itemDraft.flatMap { $0.sshPassphrase.isEmpty ? nil : SecretBytes(utf8: $0.sshPassphrase) }
+        timing.mark("UI edit prepared")
         perform { token in
+            defer { timing.mark("UI save finished") }
             let edit = try await CloudCredentialService(self.service).prepareSSHSave(edit, vault: destination, purpose: purpose, passphrase: passphrase)
             guard self.current(token) else { return }
+            timing.mark("credential preparation finished")
             let result = try await self.service.execute(.save(edit), vault: destination, offline: false)
             guard self.current(token) else { return }
+            timing.mark("save service returned")
             try self.applyCatalog(result.requireCatalog())
             self.selectedItem = item.name; self.selected = nil; self.sheet = nil
             if self.itemDraft?.id == draftID { self.itemDraft = nil }
@@ -1140,6 +1145,8 @@ final class AppModel {
     }
     func cancelItemEditing() { itemDraft = nil; draftConflict = false; conceal() }
     func saveItemDraft() {
+        let timing = ItemSaveTiming()
+        defer { timing.mark("draft validation and dispatch finished") }
         guard !busy, authenticated, !offline, !draftConflict else { return }
         if let draft = itemDraft, draft.isNew {
             guard let target = catalogs[draft.vault], draft.valid(vaultName: target.vault) else { return }
@@ -1691,6 +1698,7 @@ final class AppModel {
             if copy {
                 self.clipboard.copy(value, concealed: result.valueIsConcealed)
                 self.copyFeedback = CopyFeedback(reference: selected, message: "Copied")
+                self.recordUsage(result.usageIdentity)
             } else {
                 self.revealed = value
                 self.concealTask = Task { [weak self = self] in
@@ -1698,7 +1706,6 @@ final class AppModel {
                     guard !Task.isCancelled else { return }; self?.conceal()
                 }
             }
-            self.recordUsage(result.usageIdentity)
             if self.offline { self.status = "Read only · verified cache from \(result.offlineDate.map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time")" }
         }
     }

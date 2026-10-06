@@ -499,6 +499,9 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         catch is KeychainItemVaultTrustFailure { throw ItemVaultServiceFailure.localStorageUnavailable }
     }
     private func executeCore(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult {
+        let timing: ItemSaveTiming?
+        if case .save = operation { timing = ItemSaveTiming() } else { timing = nil }
+        defer { timing?.mark("service finished") }
         try CloudVaultBoundary.requireCloud(vault)
         let token = sessionGeneration
         switch operation {
@@ -566,7 +569,9 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         default: referenceVault = nil
         }
         let selected = try await select(vault ?? referenceVault, offline: offline)
+        timing?.mark("vault selected")
         let session = try await opened(selected, token: token, offline: offline)
+        timing?.mark("session opened")
         var result = VaultResult()
         switch operation {
         case .catalog, .recentlyDeleted:
@@ -602,7 +607,9 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             if !mutations.isEmpty { return await saved(session, token: token, mutations: mutations) }
             assignCatalog(try await catalog(session), to: &result)
         case .save(let edit):
-            let mutation = try await save(edit, session: session); return await saved(session, token: token, mutations: [mutation])
+            let mutation = try await save(edit, session: session)
+            timing?.mark("local mutation committed")
+            return await saved(session, token: token, mutations: [mutation], deferPublication: true)
         case .write(let reference, let value, let replace):
             let mutation: UUID
             let entries = try await metadataEntries(session)
@@ -748,7 +755,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         return try await session.catalog(named: name)
     }
     private func metadataEntries(_ session: ItemVaultSession) async throws -> [ItemVaultCatalogEntry] {
-        _ = try await catalog(session)
+        // Editing needs current item metadata, not a full security-health refresh.
+        _ = try await prepareCatalog(session, limit: nil)
         guard session.isUnlocked,
               let cached = catalogCache.withLock({ $0[session.binding.vaultID] }),
               cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
@@ -771,7 +779,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         if limit == nil {
             let previous = catalogUpdates.withLock { $0.removeValue(forKey: session.binding.vaultID) }
             previous?.task.cancel()
-            if let previous { await previous.task.value }
+            // The catalog gate serializes projection work. Do not wait for an
+            // updater that may already be blocked in system AutoFill publication.
         }
         try await catalogGate.enter(vault: session.binding.vaultID.uuidString)
         do {
@@ -923,21 +932,26 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         deleted.items.removeAll { $0.deletion == nil }
         result.catalog = active; result.deletedCatalog = deleted
     }
-    private func saved(_ session: ItemVaultSession, token: Int, mutations: [UUID]) async -> VaultResult {
+    private func saved(_ session: ItemVaultSession, token: Int, mutations: [UUID], deferPublication: Bool = false) async -> VaultResult {
+        let timing = ItemSaveTiming()
+        defer { timing.mark("save response finished") }
         var result = VaultResult(); result.message = "Saved on this device. Cloud synchronization is queued."
         result.mutationIDs = mutations
         result.saveStatus = .local
         await delivered(&result)
+        timing.mark("delivery policy complete")
         if sessionGeneration == token, session.isUnlocked, let value = try? await catalog(session) {
+            timing.mark("saved catalog prepared")
             assignCatalog(value, to: &result)
-            // Publish committed edits before returning to the UI. Idle work can
-            // be delayed or cancelled when the user switches apps or locks.
-            // Include tombstones so partial publication removes their identities;
-            // absence alone must not delete suggestions still downloading.
-            result.autoFillStatus = await publish(value, session: session, token: token, complete: false)
+            // The encrypted item is durable. Rebuild AutoFill metadata in the
+            // background too: even deferred publication can wait on a lease or
+            // enumerate hardware identities. Deletions still publish immediately.
+            if !deferPublication {
+                result.autoFillStatus = await publish(value, session: session, token: token, complete: false)
+            }
         }
         startCatalogUpdater(session, token: token)
-        if result.autoFillStatus == nil { result.autoFillStatus = await publisher?.status() }
+        if !deferPublication, result.autoFillStatus == nil { result.autoFillStatus = await publisher?.status() }
         if sessionGeneration != token || !session.isUnlocked { result.catalog = nil; result.deletedCatalog = nil }
         return result
     }
@@ -959,12 +973,12 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
     }
 
-    private func publish(_ catalog: ItemCatalog?, session: ItemVaultSession, token: Int, complete: Bool = true, force: Bool = false) async -> AutoFillPublicationStatus? {
+    private func publish(_ catalog: ItemCatalog?, session: ItemVaultSession, token: Int, complete: Bool = true, force: Bool = false, deferred: Bool = false) async -> AutoFillPublicationStatus? {
         guard let publisher, let catalog else { return nil }
         do {
             try await publicationGate.enter(vault: session.binding.vaultID.uuidString)
             do {
-                try await publishCurrent(catalog, session: session, token: token, complete: complete, publisher: publisher, force: force)
+                try await publishCurrent(catalog, session: session, token: token, complete: complete, publisher: publisher, deferred: deferred, force: force)
                 await publicationGate.leave(vault: session.binding.vaultID.uuidString)
             } catch {
                 await publicationGate.leave(vault: session.binding.vaultID.uuidString)
@@ -1063,14 +1077,23 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         return result
     }
     private func save(_ edit: ItemEdit, session: ItemVaultSession) async throws -> UUID {
-        let entries = try await metadataEntries(session)
+        let timing = ItemSaveTiming()
+        defer { timing.mark("edit construction finished") }
         guard !edit.item.fields.isEmpty, Set(edit.item.fields.map(\.path)).count == edit.item.fields.count,
               edit.item.autoFill?.validationError(in: edit.item.fields) == nil else { throw MopError.invalidVault }
         if edit.create {
-            guard !entries.contains(where: { $0.catalog.item.name == edit.item.name }) else { throw MopError.duplicate }
+            do {
+                _ = try await entry(named: edit.item.name, session: session)
+                throw MopError.duplicate
+            } catch MopError.notFound { /* The current name index confirms availability. */ }
             let id = UUID(), metadata = try await session.vaultMetadata()
             var item = edit.item, records: [String: PortableArchiveRecord] = [:], references: [String: String] = [:]
             item.storageID = nil; item.deletion = nil
+            let date = Date()
+            if item.metadata == nil { item.metadata = ItemMetadata() }
+            item.metadata?.createdAt = date
+            item.metadata?.addedAt = date
+            item.metadata?.updatedAt = date
             for index in item.fields.indices {
                 let field = item.fields[index], recordID = UUID().uuidString
                 records[recordID] = PortableArchiveRecord(itemID: id.uuidString, bytes: SecretBytes(utf8: field.value ?? ""))
@@ -1082,11 +1105,20 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 references: references, records: records), expectedBase: nil).id
         }
         let current: ItemVaultCatalogEntry
-        if let id = edit.item.storageID.flatMap(UUID.init(uuidString:)), let entry = entries.first(where: { $0.itemID == id }) { current = entry }
-        else { current = try find(edit.originalName ?? edit.item.name, entries) }
+        if let id = edit.item.storageID.flatMap(UUID.init(uuidString:)) {
+            let index = try await session.revisionIndex()
+            if let cached = catalogCache.withLock({ $0[session.binding.vaultID] }),
+               cached.session == ObjectIdentifier(session), let entry = cached.entries[id],
+               entry.versionID == index[id] { current = entry }
+            else { current = try await session.catalog(itemID: id) }
+        } else { current = try await entry(named: edit.originalName ?? edit.item.name, session: session) }
+        timing.mark("edit metadata loaded")
         let expected = try base(edit.revision, id: current.itemID)
         guard current.versionID == expected else { throw MopError.vaultConflict }
-        guard !entries.contains(where: { $0.itemID != current.itemID && $0.catalog.item.name == edit.item.name }) else { throw MopError.duplicate }
+        do {
+            let matching = try await entry(named: edit.item.name, session: session)
+            guard matching.itemID == current.itemID else { throw MopError.duplicate }
+        } catch MopError.notFound { /* Rename to an available name. */ }
         var projection = current.catalog
         var changed: [String: SecretBytes] = [:], removed: Set<String> = []
         let wanted = Set(edit.item.fields.map(\.path)), oldName = projection.item.name
@@ -1119,6 +1151,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
         var updated = edit.item
         updated.storageID = nil; updated.deletion = current.catalog.item.deletion
+        if updated.metadata == nil { updated.metadata = ItemMetadata() }
+        updated.metadata?.createdAt = current.catalog.item.metadata?.createdAt
+        updated.metadata?.addedAt = current.catalog.item.metadata?.addedAt
+        updated.metadata?.updatedAt = Date()
         for index in updated.fields.indices {
             updated.fields[index].value = nil; updated.fields[index].recordVersion = nil
             updated.fields[index].historyID = projection.item.fields.first(where: { $0.path == updated.fields[index].path })?.historyID
@@ -1135,6 +1171,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 (SecretReference.encode(updated.name) + "/" + field.path, projection.references[SecretReference.encode(oldName) + "/" + field.path]!)
             })
         }
+        timing.mark("edit patch constructed")
         return try await session.edit(itemID: current.itemID, expectedBase: expected, catalog: projection, changedRecords: changed, removedRecords: removed).id
     }
 }

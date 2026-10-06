@@ -446,7 +446,6 @@ struct ItemDetailView: View {
                         }
                         Button(revealedEditor == field.id ? "Conceal details" : "Edit " + field.type.label.lowercased() + " details") {
                             revealedEditor = revealedEditor == field.id ? nil : field.id
-                            if revealedEditor != nil { model.recordSelectedItemUsage() }
                         }
                     }
                 }
@@ -485,7 +484,6 @@ struct ItemDetailView: View {
                     } else { SecureField(placeholder, text: valueBinding(field)) }
                     Button(revealedEditor == field.id ? "Conceal input" : "Edit multiline value") {
                         revealedEditor = revealedEditor == field.id ? nil : field.id
-                        if revealedEditor != nil { model.recordSelectedItemUsage() }
                     }
                 }
             } else if field.type.concealed {

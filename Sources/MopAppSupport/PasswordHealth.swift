@@ -4,7 +4,22 @@ import MopCore
 
 public protocol BreachChecking: Sendable {
     func contains(_ password: Data, force: Bool) async throws -> Bool
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool
     func clear() async
+}
+/// Hash material only; safe to queue without retaining the password bytes.
+public struct BreachLookup: Sendable, Equatable {
+    public let prefix: String
+    public let suffix: String
+    public init(_ password: Data) {
+        let hash = Insecure.SHA1.hash(data: password).map { String(format: "%02X", $0) }.joined()
+        prefix = String(hash.prefix(5)); suffix = String(hash.dropFirst(5))
+    }
+}
+public extension BreachChecking {
+    func contains(_ password: Data, force: Bool) async throws -> Bool {
+        try await contains(BreachLookup(password), force: force)
+    }
 }
 public protocol BreachTransport: Sendable {
     func response(for request: URLRequest) async throws -> (Data, Int)
@@ -29,23 +44,44 @@ public actor PwnedPasswordsClient: BreachChecking {
     private var cache: [String: (Date, Set<String>)] = [:]
     private var generation = UUID()
     public init(transport: any BreachTransport = URLBreachTransport()) { self.transport = transport }
-    public func clear() { generation = UUID(); cache.removeAll() }
-    public func contains(_ password: Data, force: Bool = false) async throws -> Bool {
+    private var pending: [String: Task<Set<String>, Error>] = [:]
+    public func clear() {
+        generation = UUID(); cache.removeAll()
+        for task in pending.values { task.cancel() }
+        pending.removeAll()
+    }
+    public func contains(_ lookup: BreachLookup, force: Bool = false) async throws -> Bool {
         try Task.checkCancellation()
-        let hash = Insecure.SHA1.hash(data: password).map { String(format: "%02X", $0) }.joined()
-        let prefix = String(hash.prefix(5)), suffix = String(hash.dropFirst(5))
-        if !force, let (date, suffixes) = cache[prefix], Date().timeIntervalSince(date) < 86400 { return suffixes.contains(suffix) }
+        let prefix = lookup.prefix
+        if !force, let (date, suffixes) = cache[prefix], Date().timeIntervalSince(date) < 86400 {
+            return suffixes.contains(lookup.suffix)
+        }
         let token = generation
-        var request = URLRequest(url: URL(string: "https://api.pwnedpasswords.com/range/" + prefix)!)
-        request.setValue("true", forHTTPHeaderField: "Add-Padding")
-        request.timeoutInterval = 20
-        let (data, status) = try await transport.response(for: request)
-        try Task.checkCancellation()
-        guard token == generation else { throw CancellationError() }
-        guard status == 200 else { throw BreachCheckFailure.unavailable }
-        let suffixes = try Self.parse(data)
-        cache[prefix] = (Date(), suffixes)
-        return suffixes.contains(suffix)
+        let task: Task<Set<String>, Error>
+        if let existing = pending[prefix] { task = existing }
+        else {
+            let transport = transport
+            task = Task {
+                var request = URLRequest(url: URL(string: "https://api.pwnedpasswords.com/range/" + prefix)!)
+                request.setValue("true", forHTTPHeaderField: "Add-Padding")
+                request.timeoutInterval = 20
+                let (data, status) = try await transport.response(for: request)
+                try Task.checkCancellation()
+                guard status == 200 else { throw BreachCheckFailure.unavailable }
+                return try Self.parse(data)
+            }
+            pending[prefix] = task
+        }
+        do {
+            let suffixes = try await task.value
+            try Task.checkCancellation()
+            guard token == generation else { throw CancellationError() }
+            cache[prefix] = (Date(), suffixes); pending[prefix] = nil
+            return suffixes.contains(lookup.suffix)
+        } catch {
+            if token == generation { pending[prefix] = nil }
+            throw error
+        }
     }
     public static func parse(_ data: Data) throws -> Set<String> {
         guard data.count <= 2 * 1024 * 1024, let text = String(data: data, encoding: .utf8), !text.isEmpty else { throw BreachCheckFailure.malformed }
@@ -82,7 +118,22 @@ public struct PasswordHealthFinding: Sendable, Identifiable {
 public enum PasswordHealthCheckState: String, Sendable {
     case notChecked, checked, disabled, incomplete, unavailable
 }
+public enum HealthFreshness: String, Sendable { case current, pending, stale, unavailable, disabled }
+public enum HealthExecution: String, Sendable { case idle, queued, running, paused }
+public struct HealthCheckStatus: Sendable {
+    public var freshness: HealthFreshness
+    public var execution: HealthExecution = .idle
+}
+public struct PasswordFieldHealth: Sendable {
+    public let vaultID: String
+    public let item: String
+    public let path: String
+    public var strength: HealthCheckStatus
+    public var reuse: HealthCheckStatus
+    public var breach: HealthCheckStatus
+}
 public struct PasswordHealthReport: Sendable {
+    public var fields: [PasswordFieldHealth] = []
     public var state: PasswordHealthCheckState = .notChecked
     public var breachState: PasswordHealthCheckState = .notChecked
     public var findings: [PasswordHealthFinding] = []
@@ -115,6 +166,8 @@ public enum PasswordHealthScanner {
         var reuse: CachedReuseResult?
         var retryAt: Date = .distantPast
         var failures = 0
+        var lookup: BreachLookup?
+        var readRetry: Date = .distantPast
     }
     private typealias Field = (String, ItemCatalog, VaultItem, ItemField)
     private var entries: [Key: Entry] = [:]
@@ -125,6 +178,21 @@ public enum PasswordHealthScanner {
     private var previousEnabled: Bool?
     private var nextCheck: Date = .distantPast
     private let estimate: (String, [String]) -> PasswordQuality
+    private var liveCatalogs: [String: ItemCatalog] = [:]
+    private var liveEnabled = true
+    private var liveAllowed = false
+    private var pausedItem: (String, String)?
+    private var localTask: Task<Void, Never>?
+    private var localKey: Key?
+    private var networkTasks: [Key: Task<Void, Never>] = [:]
+    private var forced: Set<Key> = []
+    private var liveGeneration = UUID()
+    private var publishTask: Task<Void, Never>?
+    private var liveUpdate: (@MainActor (PasswordHealthReport) -> Void)?
+    private var liveService: (any VaultService)?
+    private var liveBreach: (any BreachChecking)?
+    private var clock: @Sendable () -> Date = Date.init
+    public var hasRunningWork: Bool { localTask != nil || !networkTasks.isEmpty }
     public init(estimate: @escaping (String, [String]) -> PasswordQuality = { PasswordEstimator.estimate($0, userInputs: $1) }) {
         self.estimate = estimate
     }
@@ -136,6 +204,7 @@ public enum PasswordHealthScanner {
         }
     }
     public func clear() {
+        stopLive(); liveCatalogs = [:]; liveUpdate = nil
         entries.removeAll(); sessionKey = SymmetricKey(size: .bits256)
         revisions = [:]; observedCaches = [:]; producedCaches = [:]; previousEnabled = nil; nextCheck = .distantPast
     }
@@ -143,7 +212,7 @@ public enum PasswordHealthScanner {
         revisions == catalogs.mapValues(\.revision) && observedCaches == catalogs.mapValues { $0.security?.passwordChecks ?? [] } && previousEnabled == enabled && now < nextCheck
     }
     private func key(_ field: Field) -> Key {
-        Key(vault: field.0, item: field.2.storageID ?? field.2.name, path: field.3.path)
+        Key(vault: field.0, item: field.2.storageID ?? field.2.name, path: field.3.historyID?.uuidString ?? field.3.path)
     }
     private func context(_ item: VaultItem) -> [String] {
         [item.name, item.fields.first { [.username, .email].contains($0.type) }?.value ?? ""]

@@ -11,6 +11,7 @@ import MopVaultNext
 @testable import MopUI
 
 struct TestBreachClient: BreachChecking {
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }
     func contains(_ password: Data, force: Bool) async throws -> Bool { throw BreachCheckFailure.unavailable }
     func clear() async {}
 }
@@ -2273,7 +2274,7 @@ extension AppModelTests {
 }
 
 extension AppModelTests {
-    @Test func explicitAccessCountsButPreloadsOTPAndReferencesDoNot() async throws {
+    @Test func onlyFieldCopiesCountAsUsage() async throws {
         let store = RecentUsageMemory(), date = Date()
         let id = ItemUsageIdentity(account: UUID().uuidString, vault: UUID().uuidString, item: UUID().uuidString)
         let service = FakeService { operation, _, offline in
@@ -2305,11 +2306,12 @@ extension AppModelTests {
         app.read(copy: false)
         #expect(app.busy && !app.showsCloudProgress)
         try await finish(app)
-        #expect(app.lastUsed[id] == date)
+        #expect(app.lastUsed.isEmpty)
         app.read(copy: true)
         #expect(app.busy && !app.showsCloudProgress)
         try await finish(app)
         #expect(app.copyFeedback != nil)
+        #expect(app.lastUsed[id] == date)
         app.lock()
         #expect(app.lastUsed.isEmpty)
     }
@@ -2855,11 +2857,16 @@ extension AppModelTests {
 }
 
 private struct SuccessfulBatchBreachClient: BreachChecking {
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }
     func contains(_ password: Data, force: Bool) async throws -> Bool { true }
     func clear() async {}
 }
 
 private actor EditedPasswordBreachClient: BreachChecking {
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool {
+        if lookup == BreachLookup(Data("9k!Q7v#L2m@R8x$T4z%N6p".utf8)) { await gate.wait() }
+        return false
+    }
     let gate: Barrier
     init(gate: Barrier) { self.gate = gate }
     func contains(_ password: Data, force: Bool) async throws -> Bool {

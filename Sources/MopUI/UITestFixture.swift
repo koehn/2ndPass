@@ -7,6 +7,7 @@ import MopCore
 import MopAppSupport
 
 struct UITestBreachClient: BreachChecking {
+    func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }
     func contains(_ password: Data, force: Bool) async throws -> Bool { ProcessInfo.processInfo.environment["MOP_UI_SECURITY_TEST"] == "1" }
     func clear() async {}
 }
