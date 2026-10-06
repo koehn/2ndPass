@@ -12,15 +12,42 @@ longer aligned with the maintainer's values. 2ndPass should extend that same fre
 to its own users: they should be able to inspect, modify, continue using, and
 leave 2ndPass. Matching every feature of a competing password manager is not the goal.
 
-This document describes direction, not features already delivered or a release
-schedule. The [README](../README.md) describes current behavior, and
+This document tracks implementation progress and remaining release requirements;
+it is not a release schedule. The [README](../README.md) describes current behavior, and
 [validation](VALIDATION.md) defines release acceptance requirements.
+
+## Implementation status — October 6, 2026
+
+The current preview includes the following work. Implementation and recorded
+physical checks are separate from completion of the paid-release checklist.
+
+| Area | Implemented in the preview | Remaining work |
+| --- | --- | --- |
+| Item storage and synchronization (SALE-10) | Shared App Group Core Data store, CKSyncEngine transport, encrypted local saves/outbox, exact delivery receipts, automatic same-account connection, and cached display catalogs. User-reported checks cover iPhone → Mac/iPad delivery, Mac edits, and offline iPhone edits uploading after reconnect. | Physical restart/interruption, receipt supersession, account-change, and concurrent-edit acceptance; independent attachment transport and bounded cleanup. |
+| Conflict review (SALE-10) | Conflict inbox and item banners, with a review dialog identifying each version's device, update time, and deletion state. Users can keep the local or remote version; failed resolution retains both versions for retry. | Physical concurrent-edit and conflict/history preservation checks. The current dialog offers whole-version selection, not field-by-field comparison or merging. |
+| Password security health (SALE-2) | Security findings for exposed, reused, and weak passwords; encrypted per-item check results and a local security index; independent check lifetimes, incremental results, and changed-password strength updates before network checks finish. | Real CloudKit propagation, simultaneous-device behavior, signed macOS UI, and full accessibility/appearance acceptance. Credential-account redundancy management (SALE-3) remains unavailable. |
+| Native AutoFill (SALE-12) | Password, TOTP, and passkey flows; incremental suggestion publication with durable retry state; selected-item resolution without a whole-catalog read; new-login saving on iOS/iPadOS 26.2+. | Signed platform and live-site acceptance, password generation and existing-login updates, and the Firefox/Chrome lifecycle (SALE-4/SALE-5). |
+| Cloud key credentials (SALE-6/SALE-13) | Cloud passkey and SSH creation/use, supported OpenSSH imports, and portable restoration of software credential bytes. Device-local hardware credentials remain separate. | Physical SSH/Git/IDE and passkey acceptance, recovery and sharing integration, and documented device-bound passkey compatibility checks. |
+| History and portability (SALE-9/SALE-11) | Per-field retained history with restore/clear, plus portable archive export/restore using an independent archive key. Basic backup/restore has user-reported acceptance. | Complete remote inventory verification, fresh-identity/loss-of-account scenarios, physical history/conflict preservation, and SALE-1 master-recovery-key integration. General document import still needs service integration. |
+| Distribution and Pro (SALE-14/SALE-15) | Sandboxed Mac app, separate CLI packaging, and entitlement status reporting. Subscription scaffolding targets an annual Pro product. | Signed clean-machine distribution and developer workflows, Free/Pro enforcement, purchase publication, final commercial decisions, and purchase/downgrade acceptance. Purchases and enforcement remain disabled in the preview. |
+
+See [validation](VALIDATION.md) for the scope of recorded physical checks,
+[security health and history](SECURITY-HEALTH.md), [AutoFill](AUTOFILL.md),
+[cloud keys](CLOUD-KEY-CREDENTIALS.md), [backups](BACKUPS.md), and
+[subscription status](SUBSCRIPTIONS.md) for current behavior and limitations.
+
+The next durability milestone is physical validation of the implemented conflict
+review and queued-write lifecycle. In parallel, remaining feature integration
+includes recovery, cross-account sharing, device removal, permanent vault deletion,
+general document import, and credential-account management. Every implemented
+flow still needs the complete SALE-8 UI review before a paid release.
 
 ## Paid App Store release checklist
 
-Recorded September 30, 2026. These are required before putting 2ndPass up for
-sale, alongside the existing [release validation gates](VALIDATION.md). All items
-below are open; this checklist records intended behavior, not shipped support.
+Recorded September 30, 2026; status updated October 6, 2026. These are required
+before putting 2ndPass up for sale, alongside the existing
+[release validation gates](VALIDATION.md). All items below remain open for full
+release acceptance; implemented portions are summarized above.
 It supersedes earlier deferrals of passkeys and cross-account sharing for the
 paid release. Free/Pro packaging is the chosen direction (SALE-15); prices and
 subscription versus permanent-unlock purchase options remain undecided.
@@ -207,7 +234,7 @@ Complete the signed physical-device and Production CloudKit acceptance in
 account changes, and upgrades. Seek independent security review before promoting
 2ndPass for broad use as a primary credential store.
 
-Offline creation and editing commit encrypted changes locally and queue synchronization. Basic offline-edit delivery has user-reported physical acceptance. Complete concurrent-edit review, restart/interruption scenarios, receipt supersession and account-change handling without losing either version. Independent attachment transfer and bounded cleanup of staging, receipts and quarantine remain work.
+Offline creation and editing commit encrypted changes locally and queue synchronization. Basic offline-edit delivery has user-reported physical acceptance. Conflict review now supports explicit local/remote version selection. Complete physical concurrent-edit acceptance, restart/interruption scenarios, receipt supersession and account-change handling without losing either version. Independent attachment transfer and bounded cleanup of staging, receipts and quarantine remain work.
 
 ### 4. Make distribution accessible
 
