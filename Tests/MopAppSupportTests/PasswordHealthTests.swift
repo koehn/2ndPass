@@ -423,3 +423,87 @@ private actor HeldRangeTransport: BreachTransport {
     #expect(service.reads.withLock { $0 } == 2)
     session.clear()
 }
+
+@MainActor @Test func indexedHealthEvidenceStaysVaultScopedAndRefreshesWithoutRevisionChanges() {
+    let now = Date(timeIntervalSince1970: 100000)
+    var field = ItemField(path: "password", type: .password)
+    field.recordVersion = "shared-record"
+    func catalog(_ name: String, weak: Bool) -> ItemCatalog {
+        var catalog = ItemCatalog(vault: name, revision: "1", items: [VaultItem(name: "login", fields: [field])])
+        let check = CachedPasswordCheck(record: "shared-record", context: ["login", ""], weak: weak,
+            exposed: false, checkedAt: now, breachCheckedAt: nil, reuseGroup: nil, scope: "", batch: UUID())
+        var duplicate = check
+        duplicate.strengthResult?.weak = !weak
+        catalog.security = VaultSecurityMetadata()
+        // Preserve the former first-match behavior for duplicate records.
+        catalog.security?.passwordChecks = [check, duplicate]
+        return catalog
+    }
+    var catalogs = ["a": catalog("a", weak: true), "b": catalog("b", weak: false)]
+    let session = PasswordHealthSession(), service = HealthService([:]), breach = HealthBreach()
+    var report = PasswordHealthReport()
+    func reconcile() {
+        session.reconcile(catalogs: catalogs, service: service, breach: breach, enabled: false,
+            active: true, busy: true, now: { now.addingTimeInterval(10) }) { report = $0 }
+    }
+    reconcile()
+    #expect(report.checked == 2)
+    #expect(report.findings.filter { $0.kinds.contains(.weak) }.map(\.vaultID) == ["a"])
+    catalogs["a"]?.security?.passwordChecks?[0].strengthResult = CachedStrengthResult(
+        weak: false, checkedAt: now.addingTimeInterval(1), context: ["login", ""])
+    reconcile()
+    #expect(report.checked == 2)
+    #expect(!report.findings.contains { $0.kinds.contains(.weak) })
+    #expect(service.reads.withLock { $0 } == 0)
+    session.clear()
+}
+
+@MainActor @Test func healthSchedulingResumesExistingSnapshotAndPreservesCompletedChecks() async throws {
+    var field = ItemField(path: "password", type: .password); field.recordVersion = "record"
+    let catalog = ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "login", fields: [field])])
+    let service = HealthService(["v:login/password": "password"])
+    let session = PasswordHealthSession(), breach = HealthBreach()
+    let stream = AsyncStream<PasswordHealthReport>.makeStream()
+    session.reconcile(catalogs: ["v": catalog], service: service, breach: breach, enabled: false,
+        active: true, busy: true, scopeComplete: false) { stream.continuation.yield($0) }
+    // Becoming idle must still respect the item being edited.
+    session.updateScheduling(active: true, busy: false, scopeComplete: false, editingVault: "v", editingItem: "login")
+    #expect(!session.hasRunningWork)
+    #expect(service.reads.withLock { $0 } == 0)
+    // Ending editing starts work from the already reconciled snapshot.
+    session.updateScheduling(active: true, busy: false, scopeComplete: false)
+    for await report in stream.stream where report.checked == 1 {
+        #expect(report.fields[0].reuse.freshness == .pending)
+        break
+    }
+    session.updateScheduling(active: false, busy: false, scopeComplete: false)
+    session.updateScheduling(active: true, busy: false, scopeComplete: true)
+    for await report in stream.stream where report.fields.first?.reuse.freshness == .current {
+        #expect(report.checked == 1)
+        break
+    }
+    #expect(service.reads.withLock { $0 } == 1)
+    #expect(await breach.count == 0)
+    session.clear(); stream.continuation.finish()
+}
+
+@MainActor @Test func loadingHealthEvidencePreventsReadsEvenAfterSchedulingResumes() async throws {
+    var field = ItemField(path: "password", type: .password); field.recordVersion = "record"
+    var catalog = ItemCatalog(vault: "v", revision: "1", items: [VaultItem(name: "login", fields: [field])])
+    catalog.healthEvidenceLoading = true
+    let service = HealthService(["v:login/password": "password"]), breach = HealthBreach()
+    let session = PasswordHealthSession()
+    let stream = AsyncStream<PasswordHealthReport>.makeStream()
+    session.reconcile(catalogs: ["v": catalog], service: service, breach: breach, enabled: false,
+        active: true, busy: false) { stream.continuation.yield($0) }
+    session.updateScheduling(active: true, busy: false, scopeComplete: true)
+    #expect(!session.hasRunningWork)
+    #expect(service.reads.withLock { $0 } == 0)
+    #expect(!session.canRestoreCloudResults(catalogs: ["v": catalog], enabled: false))
+    catalog.healthEvidenceLoading = false
+    session.reconcile(catalogs: ["v": catalog], service: service, breach: breach, enabled: false,
+        active: true, busy: false) { stream.continuation.yield($0) }
+    for await report in stream.stream where report.checked == 1 { break }
+    #expect(service.reads.withLock { $0 } == 1)
+    session.clear(); stream.continuation.finish()
+}

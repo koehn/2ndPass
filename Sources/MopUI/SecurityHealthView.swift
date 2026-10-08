@@ -47,11 +47,13 @@ struct SecurityHealthView: View {
                         if model.healthPublishing != nil { Text("Saving password health results…").font(.caption).accessibilityIdentifier("password-health-saving") }
                         if let notice = model.healthCacheNotice { Text(notice).font(.caption).foregroundStyle(.secondary) }
                         HStack {
-                            if model.healthChecking {
+                            if model.healthEvidenceLoading {
+                                ProgressView("Loading saved password checks…")
+                            } else if model.healthChecking {
                                 ProgressView("Checking passwords…").accessibilityIdentifier("password-check-progress")
                             } else if model.healthScheduled { Text("Checks pending or paused").font(.caption) }
                             Spacer()
-                            Button("Check Now") { model.refreshHealth(force: true) }.disabled(model.healthChecking)
+                            Button("Check Now") { model.refreshHealth(force: true) }.disabled(model.healthChecking || model.healthEvidenceLoading)
                         }
                     }
                     DisclosureGroup("Breach check settings") {

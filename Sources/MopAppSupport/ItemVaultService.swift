@@ -389,11 +389,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         cached.versions.merging(cached.waiting, uniquingKeysWith: { first, _ in first }) == index
     }
     private func displayResult(_ cached: CachedCatalog, index: [UUID: UUID], session: ItemVaultSession) async throws -> VaultResult {
-        // Restore health evidence before exposing even the fast startup catalog.
-        // Otherwise an already-complete display projection looks like an unchecked
-        // vault until the background updater attaches its encrypted health rows.
-        let enriched = try await withHealth(cached.projection.catalog(), session: session)
-        var result = VaultResult(); assignCatalog(enriched, to: &result)
+        var result = VaultResult(); assignCatalog(try cached.projection.catalog(), to: &result)
         if cached.versions != index {
             result.catalogTotalCount = index.keys.filter { $0 != ItemVaultSession.metadataRecordID }.count
             result.catalogLoadedCount = cached.entries.values.filter { index[$0.itemID] == $0.versionID }.count
@@ -463,7 +459,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             let snapshot = try cached.projection.catalog()
             let enriched = try await withHealth(snapshot, session: session)
             try checked(token)
-            changed = changed || enriched.security != snapshot.security
+            changed = changed || enriched.security != snapshot.security || enriched.healthEvidenceLoading != snapshot.healthEvidenceLoading
             try state.withLock { state in
                 guard state.generation == token, session.isUnlocked else { throw MopError.authentication }
                 catalogCache.withLock { values in
@@ -970,6 +966,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             // Missing derived evidence is unknown, not a reason to hide secrets.
             result.security?.passwordChecks = []
         }
+        result.healthEvidenceLoading = false
         let checks = Dictionary((result.security?.passwordChecks ?? []).map { ($0.record, $0) }, uniquingKeysWith: { _, value in value })
         for itemIndex in result.items.indices {
             let item = result.items[itemIndex]

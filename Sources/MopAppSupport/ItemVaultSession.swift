@@ -898,18 +898,22 @@ public final class ItemVaultSession: @unchecked Sendable {
 
     public func healthChecks() async throws -> [CachedPasswordCheck] {
         try permit.check()
-        var checks: [CachedPasswordCheck] = []
-        for version in try await repository.localHealthItems(scope: nameIndexScope) {
+        let versions = try await repository.localHealthItems(scope: nameIndexScope)
+        return try await background(priority: .utility) { [self] in
+            var checks: [CachedPasswordCheck] = []
+            for version in versions {
+                try Task.checkCancellation()
+                try permit.check()
+                // Invalid disposable evidence is recomputed; authorization is rechecked below.
+                if let values = try? permit.withHealth(version, { device in
+                    let verified = try verifiedHealthEnvelope(version)
+                    _ = try readableState(verified.envelope.header.membership)
+                    return try verified.open(device: device)
+                }) { checks += values }
+            }
             try permit.check()
-            // A disposable cache entry that no longer verifies is recomputed.
-            if let values = try? permit.withHealth(version, { device in
-                let envelope = try healthEnvelope(version)
-                return try envelope.open(device: device, membership: readableState(envelope.header.membership).membership,
-                                         membershipStateDigest: envelope.header.membership)
-            }) { checks += values }
+            return checks.sorted { $0.record < $1.record }
         }
-        try permit.check()
-        return checks.sorted { $0.record < $1.record }
     }
 
     public func healthConflicts() async throws -> [EncryptedItemConflict] {
@@ -965,16 +969,21 @@ public final class ItemVaultSession: @unchecked Sendable {
     }
 
     private func healthEnvelope(_ version: EncryptedItemVersion) throws -> ItemHealthEnvelope {
+        try verifiedHealthEnvelope(version).envelope
+    }
+
+    private func verifiedHealthEnvelope(_ version: EncryptedItemVersion) throws -> ItemHealthEnvelope.Verified {
         try validateScope(version)
         guard let parent = version.healthItemID, parent != Self.metadataRecordID,
               version.scope.itemID == ItemHealthEnvelope.recordID(for: parent) else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
         let probe = try JSONDecoder().decode(ItemHealthEnvelope.self, from: version.ciphertext)
         let state = try history.state(forDigest: probe.header.membership)
-        let value = try ItemHealthEnvelope.decode(version.ciphertext, vault: binding.vaultID, item: parent,
+        let verified = try ItemHealthEnvelope.decodeVerified(version.ciphertext, vault: binding.vaultID, item: parent,
             membership: state.membership, membershipStateDigest: probe.header.membership)
+        let value = verified.envelope
         guard value.header.version == version.versionID, value.header.base == version.baseVersionID,
               value.header.generation == version.generation else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        return value
+        return verified
     }
 
     private func rewrapHealth(_ stored: EncryptedItemVersion, membership: Membership, digest: String,

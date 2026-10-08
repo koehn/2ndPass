@@ -180,11 +180,13 @@ public enum PasswordHealthScanner {
     private let estimate: @Sendable (String, [String]) -> PasswordQuality
     private var liveCatalogs: [String: ItemCatalog] = [:]
     private var liveFields: [Field] = []
+    private var liveChecks: [String: [String: CachedPasswordCheck]] = [:]
     private var liveScope = ""
     private var liveByKey: [Key: Field] = [:]
     private var liveEnabled = true
     private var didLiveWork = false
     private var liveAllowed = false
+    private var evidenceLoading = false
     private var liveScopeComplete = true
     private var pausedItem: (String, String)?
     private var localTask: Task<Void, Never>?
@@ -212,7 +214,7 @@ public enum PasswordHealthScanner {
         }
     }
     public func clear() {
-        stopLive(); liveCatalogs = [:]; liveFields = []; liveByKey = [:]; liveUpdate = nil
+        stopLive(); evidenceLoading = false; liveCatalogs = [:]; liveFields = []; liveChecks = [:]; liveByKey = [:]; liveUpdate = nil
         entries.removeAll(); sessionKey = SymmetricKey(size: .bits256)
         revisions = [:]; observedCaches = [:]; producedCaches = [:]; previousEnabled = nil; nextCheck = .distantPast
     }
@@ -239,12 +241,18 @@ public enum PasswordHealthScanner {
         let scope = SHA256.hash(data: try JSONEncoder().encode(rows)).map { String(format: "%02x", $0) }.joined()
         return (fields, scope)
     }
-    private func entry(_ field: Field, now: Date) -> Entry {
+    private func indexedChecks(_ catalogs: [String: ItemCatalog]) -> [String: [String: CachedPasswordCheck]] {
+        catalogs.mapValues { catalog in
+            Dictionary((catalog.security?.passwordChecks ?? []).map { ($0.record, $0) },
+                       uniquingKeysWith: { first, _ in first })
+        }
+    }
+    private func entry(_ field: Field, checks: [String: [String: CachedPasswordCheck]], now: Date) -> Entry {
         let (_, catalog, item, property) = field
         let version = property.recordVersion ?? catalog.revision
         var result = entries[key(field)].flatMap { $0.version == version ? $0 : nil } ?? Entry(version: version)
         if let record = property.recordVersion,
-           let saved = catalog.security?.passwordChecks?.first(where: { $0.record == record }) {
+           let saved = checks[field.0]?[record] {
             if let strength = saved.strengthResult, strength.checkedAt <= now, strength.checkedAt.timeIntervalSince1970.isFinite, strength.evaluator == 1,
                strength.context == context(item), result.strength == nil || strength.checkedAt > result.strength!.checkedAt {
                 result.strength = strength
@@ -264,8 +272,10 @@ public enum PasswordHealthScanner {
         values.allSatisfy { $0.reuse?.scope == scope } && Set(values.compactMap { $0.reuse?.batch }).count <= 1
     }
     public func canRestoreCloudResults(catalogs: [String: ItemCatalog], enabled: Bool, at now: Date = Date()) -> Bool {
-        guard let (fields, scope) = try? snapshot(catalogs) else { return false }
-        let values = fields.map { entry($0, now: now) }
+        guard !catalogs.values.contains(where: { $0.healthEvidenceLoading == true }),
+              let (fields, scope) = try? snapshot(catalogs) else { return false }
+        let checks = indexedChecks(catalogs)
+        let values = fields.map { entry($0, checks: checks, now: now) }
         return validReuse(values, scope: scope) && values.allSatisfy {
             $0.strength != nil && (!enabled || ($0.failures == 0 && $0.breach.map { now.timeIntervalSince($0.checkedAt) < 86400 } == true))
         }
@@ -357,7 +367,9 @@ extension PasswordHealthSession {
                           update: @escaping @MainActor (PasswordHealthReport) -> Void) {
         didLiveWork = false
         let wasEnabled = liveEnabled
-        liveCatalogs = catalogs; liveEnabled = enabled; liveAllowed = active && !busy; liveScopeComplete = scopeComplete
+        evidenceLoading = catalogs.values.contains { $0.healthEvidenceLoading == true }
+        liveCatalogs = catalogs; liveEnabled = enabled; liveAllowed = active && !busy && !evidenceLoading
+        liveScopeComplete = scopeComplete && !evidenceLoading
         pausedItem = editingVault.flatMap { vault in editingItem.map { (vault, $0) } }
         liveService = service; liveBreach = breach; liveUpdate = update; clock = now
         guard let (fields, scope) = try? snapshot(catalogs) else { return }
@@ -365,25 +377,43 @@ extension PasswordHealthSession {
         liveByKey = Dictionary(fields.map { (key($0), $0) }, uniquingKeysWith: { _, latest in latest })
         let live = Set(fields.map(key))
         entries = entries.filter { live.contains($0.key) }
-        for field in fields { entries[key(field)] = entry(field, now: now()) }
+        liveChecks = indexedChecks(catalogs)
+        for field in fields { entries[key(field)] = entry(field, checks: liveChecks, now: now()) }
         // Keep obsolete jobs counted until they finish; version guards discard their results.
         if (!active && hasRunningWork) || (wasEnabled && !enabled) || force {
-            for task in networkTasks.values { task.cancel() }
-            networkTasks.removeAll()
-            // Generation guards also reject transports which ignore cancellation.
-            liveGeneration = UUID()
-            localTask?.cancel(); localTask = nil; localKey = nil
-            let generation = liveGeneration
-            resetTask = Task { [weak self] in
-                await breach.clear()
-                guard let self, self.liveGeneration == generation else { return }
-                self.resetTask = nil; self.pumpLive()
-            }
+            resetWorkers(breach: breach)
         }
         if force && enabled { forced = live }
         if !enabled { forced.removeAll() }
         emitLive(immediate: true)
         pumpLive()
+    }
+
+    /// Update execution policy without rebuilding the catalog snapshot or cached evidence.
+    public func updateScheduling(active: Bool, busy: Bool, scopeComplete: Bool,
+                                 editingVault: String? = nil, editingItem: String? = nil) {
+        let completedScope = !liveScopeComplete && scopeComplete
+        liveAllowed = active && !busy && !evidenceLoading
+        liveScopeComplete = scopeComplete && !evidenceLoading
+        pausedItem = editingVault.flatMap { vault in editingItem.map { (vault, $0) } }
+        if !active, hasRunningWork, let breach = liveBreach { resetWorkers(breach: breach) }
+        // Coalesce presentation updates from a group of lifecycle/state changes.
+        pumpLive(rebuildReuse: completedScope)
+    }
+
+    private func resetWorkers(breach: any BreachChecking) {
+        for task in networkTasks.values { task.cancel() }
+        networkTasks.removeAll()
+        // Reject late results, including transports that ignore cancellation.
+        liveGeneration = UUID()
+        localTask?.cancel(); localTask = nil; localKey = nil
+        resetTask?.cancel()
+        let generation = liveGeneration
+        resetTask = Task { [weak self] in
+            await breach.clear()
+            guard let self, self.liveGeneration == generation else { return }
+            self.resetTask = nil; self.pumpLive()
+        }
     }
 
     private func stopLive() {
@@ -406,7 +436,7 @@ extension PasswordHealthSession {
         // Loading is not a credential change. Keep the completed batch until
         // the full scope can be compared; replacing it during each catalog
         // refresh can leave different vaults persisted with different batches.
-        guard liveScopeComplete else { return }
+        guard liveScopeComplete, !evidenceLoading else { return }
         let values = fields.compactMap { entries[key($0)] }
         guard !validReuse(values, scope: scope) else { return }
         for field in fields { entries[key(field)]?.reuse = nil }
@@ -420,10 +450,10 @@ extension PasswordHealthSession {
             for field in group { entries[key(field)]?.reuse = CachedReuseResult(group: id, scope: scope, batch: batch, checkedAt: now) }
         }
     }
-    private func pumpLive() {
+    private func pumpLive(rebuildReuse: Bool = true) {
         guard let service = liveService, let breach = liveBreach else { return }
         let fields = liveFields, scope = liveScope
-        rebuildLiveReuse(fields, scope: scope)
+        if rebuildReuse { rebuildLiveReuse(fields, scope: scope) }
         guard liveAllowed, resetTask == nil else { emitLive(); return }
         let now = clock(), generation = liveGeneration
         let needsReuse = !validReuse(fields.compactMap { entries[key($0)] }, scope: scope)
@@ -511,7 +541,7 @@ extension PasswordHealthSession {
         let fields = liveFields, scope = liveScope
         rebuildLiveReuse(fields, scope: scope)
         let now = clock(), values = fields.map { field in
-            var value = entries[key(field)] ?? entry(field, now: clock())
+            var value = entries[key(field)] ?? entry(field, checks: liveChecks, now: clock())
             // Hide an unconfirmed scope without destroying its saved evidence.
             if !liveScopeComplete { value.reuse = nil }
             return value

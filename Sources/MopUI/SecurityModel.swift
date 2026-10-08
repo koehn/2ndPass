@@ -13,6 +13,7 @@ struct HistorySelection: Identifiable {
 }
 
 extension AppModel {
+    var healthEvidenceLoading: Bool { catalogs.values.contains { $0.healthEvidenceLoading == true } }
     func credentialAccounts(in vault: String) -> [CredentialAccount] {
         guard let catalog = catalogs[vault] else { return [] }
         var accounts = catalog.security?.accounts ?? []
@@ -49,7 +50,20 @@ extension AppModel {
             }
         }
     }
+    func updateHealthScheduling() {
+        guard authenticated else { return }
+        guard healthSessionGeneration == service.sessionGeneration else { refreshHealth(); return }
+        healthSession.updateScheduling(active: isActive, busy: healthRefreshDeferrals > 0 || busy || isUpdatingCatalog || loadingVaults,
+            scopeComplete: !isUpdatingCatalog && !loadingVaults,
+            editingVault: itemDraft?.vault, editingItem: itemDraft?.originalName)
+        healthChecking = healthSession.hasRunningWork
+    }
+
     func refreshHealth(force: Bool = false, afterSave: Bool = false) {
+        if healthRefreshDeferrals > 0 {
+            deferredHealthRefresh = true; deferredHealthForce = deferredHealthForce || force
+            return
+        }
         guard authenticated, !catalogs.isEmpty else { clearHealth(); return }
         if healthSessionGeneration != service.sessionGeneration {
             clearHealth(); healthSessionGeneration = service.sessionGeneration
@@ -70,6 +84,7 @@ extension AppModel {
         healthChecking = healthSession.hasRunningWork
     }
     private func queueHealthCache(flush: Bool) {
+        guard !healthEvidenceLoading else { return }
         healthCacheDirty = true
         guard isActive, !busy, !isUpdatingCatalog, !loadingVaults, authenticated, healthPublishing == nil else { return }
         if healthCacheTask != nil {
@@ -118,7 +133,7 @@ extension AppModel {
                 checks = merged.values.sorted { $0.record < $1.record }
             }
             guard (source.security?.passwordChecks ?? []) != checks else { continue }
-            guard !Task.isCancelled, authenticated, isActive, !busy, !isUpdatingCatalog, !loadingVaults, healthToken == token, service.sessionGeneration == session,
+            guard !Task.isCancelled, authenticated, !healthEvidenceLoading, isActive, !busy, !isUpdatingCatalog, !loadingVaults, healthToken == token, service.sessionGeneration == session,
                   catalogs[id]?.revision == source.revision else { return }
             do {
                 healthCacheLogger.notice("Saving health evidence: fields=\(checks.count), loadedVaults=\(self.catalogs.count)")

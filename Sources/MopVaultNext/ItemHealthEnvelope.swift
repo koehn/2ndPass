@@ -74,6 +74,10 @@ public struct ItemHealthEnvelope: Codable, Equatable, Sendable {
 
     public func open(device: any DeviceOperations, membership: Membership, membershipStateDigest: String) throws -> [CachedPasswordCheck] {
         try verify(vault: header.vault, item: header.item, membership: membership, membershipStateDigest: membershipStateDigest)
+        return try openVerified(device: device, membership: membership)
+    }
+
+    private func openVerified(device: any DeviceOperations, membership: Membership) throws -> [CachedPasswordCheck] {
         guard membership.role(of: device.identity) != nil || membership.offlineRecovery == device.identity,
               let envelope = envelopes[device.identity.fingerprint] else { throw MopError.notVaultMember }
         let key = try device.unwrap(envelope,
@@ -85,6 +89,24 @@ public struct ItemHealthEnvelope: Codable, Equatable, Sendable {
         guard result.count <= 4096, Set(result.map(\.record)).count == result.count else { throw MopError.invalidVault }
         for check in result { try check.validate() }
         return result
+    }
+
+    /// Only decoding with all binding and signature checks can construct this value.
+    public struct Verified: Sendable {
+        public let envelope: ItemHealthEnvelope
+        private let membership: Membership
+        fileprivate init(envelope: ItemHealthEnvelope, membership: Membership) {
+            self.envelope = envelope; self.membership = membership
+        }
+        public func open(device: any DeviceOperations) throws -> [CachedPasswordCheck] {
+            try envelope.openVerified(device: device, membership: membership)
+        }
+    }
+
+    public static func decodeVerified(_ data: Data, vault: UUID, item: UUID, membership: Membership,
+                                      membershipStateDigest: String) throws -> Verified {
+        let envelope = try decode(data, vault: vault, item: item, membership: membership, membershipStateDigest: membershipStateDigest)
+        return Verified(envelope: envelope, membership: membership)
     }
 
     public func encoded() throws -> Data {

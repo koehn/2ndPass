@@ -1105,6 +1105,12 @@ extension AppModelTests {
                         VaultDescriptor(id: second, name: "work", format: "mop-items-v2", enrolled: true)]
         model.catalogs = [first: Self.catalog, second: ItemCatalog(vault: "work", revision: "work-r1", items: [])]
         model.authenticated = true
+        let healthChanged = Mutex(false)
+        withObservationTracking {
+            _ = model.healthReport
+        } onChange: {
+            healthChanged.withLock { $0 = true }
+        }
         model.chooseVault(second)
         #expect(model.catalog?.vault == "work" && !model.busy)
         model.chooseVault(first)
@@ -1113,6 +1119,7 @@ extension AppModelTests {
         #expect(model.allVaults && model.authenticated && !model.busy)
         model.chooseRecentlyDeleted()
         #expect(model.page == .recentlyDeleted && model.catalogs.count == 2)
+        #expect(!healthChanged.withLock { $0 })
         #expect(service.state.withLock { $0.operations.isEmpty })
         model.lock()
         #expect(model.catalogs.isEmpty && !model.authenticated)
@@ -3273,4 +3280,29 @@ extension AppModelTests {
     #expect(stored.withLock { $0.security?.passwordChecks?.first?.breachResult?.exposed } == true)
     #expect(app.healthCacheNotice == nil)
     app.lock()
+}
+
+extension AppModelTests {
+    @Test func healthSchedulingChangesDoNotSynchronouslyReconcileCatalogs() throws {
+        let service = FakeService(); service.authenticate()
+        let model = model(service)
+        try model.applyCatalog(Self.catalog)
+        model.authenticated = true
+        model.selectedItem = "github"
+        let changed = Mutex(false)
+        withObservationTracking {
+            _ = model.healthReport
+        } onChange: {
+            changed.withLock { $0 = true }
+        }
+        model.busy = true
+        model.busy = false
+        model.isActive = false
+        model.isActive = true
+        model.beginItemEditing()
+        model.itemDraft?.fields[0].value = "edited"
+        model.cancelItemEditing()
+        #expect(!changed.withLock { $0 })
+        model.lock()
+    }
 }

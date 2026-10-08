@@ -21,6 +21,9 @@ final class AppModel {
     var healthScheduled = false
     var healthToken = UUID()
     @ObservationIgnored var healthSession = PasswordHealthSession()
+    @ObservationIgnored var healthRefreshDeferrals = 0
+    @ObservationIgnored var deferredHealthRefresh = false
+    @ObservationIgnored var deferredHealthForce = false
     var healthPublishing: UUID?
     var healthCacheNotice: String?
     @ObservationIgnored var healthSessionGeneration: Int?
@@ -76,7 +79,7 @@ final class AppModel {
     let documents: any DocumentAccessing
     let clipboard: any SecretClipboardAccess
     var keyCreationPresented = false
-    var isActive = true { didSet { if oldValue != isActive { refreshConflicts(); refreshHealth() } } }
+    var isActive = true { didSet { if oldValue != isActive { refreshConflicts(); updateHealthScheduling() } } }
     var vaults: [VaultDescriptor] = []
     var hasPendingVaultDeletion = false
     var vault = "" {
@@ -195,10 +198,10 @@ final class AppModel {
     var offline = false
     private var cloudRefreshPending = false
     private var pendingDisplayVaults: Set<String> = []
-    var authenticated = false { didSet { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() }; refreshConflicts() } }
+    var authenticated = false { didSet { if oldValue != authenticated { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() }; refreshConflicts() } } }
     var revealed: SecretBytes?
     @ObservationIgnored private var storeChangesTask: Task<Void, Never>?
-    var busy = false { didSet { if oldValue != busy { refreshHealth() } } }
+    var busy = false { didSet { if oldValue != busy { updateHealthScheduling() } } }
     private(set) var localOperation = false
     // Local projection refreshes are not evidence of network activity. Keep the
     // indicator stable across the whole initial connection/download instead.
@@ -253,7 +256,7 @@ final class AppModel {
     }
     var refreshing = false
     struct CatalogLoadProgress { let loaded: Int; let total: Int; var waiting: Int = 0; var downloading = false }
-    private(set) var catalogLoadProgress: [String: CatalogLoadProgress] = [:] { didSet { refreshHealth() } }
+    private(set) var catalogLoadProgress: [String: CatalogLoadProgress] = [:] { didSet { updateHealthScheduling() } }
     private(set) var catalogUpdatePaused = false
     private var catalogIssueDetails: String?
     func showCatalogIssue() {
@@ -307,7 +310,7 @@ final class AppModel {
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var catalogLoadTask: Task<Void, Never>?
     private var catalogLoadGeneration = 0
-    private(set) var loadingVaults = false { didSet { if oldValue != loadingVaults { refreshHealth() } } }
+    private(set) var loadingVaults = false { didSet { if oldValue != loadingVaults { updateHealthScheduling() } } }
     private func cancelCatalogLoading() {
         catalogLoadGeneration += 1
         catalogLoadTask?.cancel(); catalogLoadTask = nil; loadingVaults = false
@@ -418,7 +421,7 @@ final class AppModel {
         vault = saved.vault
         // Retired type-specific sidebar selections reopen in All Items.
         collection = saved.collection == .passkeys || saved.collection == .sshKeys ? .all : saved.collection
-        try? applyCatalog(source)
+        try? applyCatalog(source, updateStoredCatalog: false)
         selectedItem = nil; selectedDeleted = nil
         if collection == .all, let localID = saved.localItem {
             pendingLocalSelection = localID
@@ -475,7 +478,9 @@ final class AppModel {
     var editorGeneration = 0
     var itemDraft: ItemDraft? {
         didSet {
-            refreshHealth()
+            if oldValue?.vault != itemDraft?.vault || oldValue?.originalName != itemDraft?.originalName {
+                updateHealthScheduling()
+            }
             if itemDraft == nil && oldValue != nil { reconcileDeferredStoreChange() }
         }
     }
@@ -827,7 +832,7 @@ final class AppModel {
             clearSelection()
             vault = id; allVaults = false; page = .secrets
             if let cached {
-                try? applyCatalog(cached)
+                try? applyCatalog(cached, updateStoredCatalog: false)
             }
             status = authenticated ? "Unlocked" : "Ready to authenticate"
         }
@@ -903,10 +908,10 @@ final class AppModel {
     func metadata(_ ref: SecretReference) -> ItemField? {
         catalog?.items.first { $0.name == ref.item }?.fields.first { ref.relativePath == SecretReference.encode(ref.item) + "/" + $0.path }
     }
-    func applyCatalog(_ catalog: ItemCatalog) throws {
+    func applyCatalog(_ catalog: ItemCatalog, updateStoredCatalog: Bool = true) throws {
         try VaultName.validate(catalog.vault)
         self.catalog = catalog
-        if !vault.isEmpty { catalogs[vault] = catalog }
+        if updateStoredCatalog, !vault.isEmpty { catalogs[vault] = catalog }
         if passwordQualitySource != passwordQualityIdentity { passwordQualities = [:]; passwordQualitySource = nil }
     }
     // MARK: - Device-local vault
@@ -1256,7 +1261,7 @@ final class AppModel {
         guard service.isAuthenticated else { authenticated = false; status = "Ready to authenticate"; return }
         let ids = requestedVaultIDs
         if !ids.isEmpty && catalogs[vault] != nil {
-            if let cached = catalogs[vault] { try? applyCatalog(cached) }
+            if let cached = catalogs[vault] { try? applyCatalog(cached, updateStoredCatalog: false) }
             authenticated = true
             status = offline ? "Read only · verified cached catalogs" : "Unlocked"
         } else {
@@ -1462,6 +1467,15 @@ final class AppModel {
         vaults = result.vaults
     }
     private func unlockContents(_ token: Int, refresh: Bool = true) async throws {
+        healthRefreshDeferrals += 1
+        defer {
+            healthRefreshDeferrals -= 1
+            if healthRefreshDeferrals == 0, deferredHealthRefresh {
+                let force = deferredHealthForce
+                deferredHealthRefresh = false; deferredHealthForce = false
+                refreshHealth(force: force)
+            }
+        }
         if requestedVaultIDs.isEmpty, vaults.contains(where: { $0.supported && !$0.enrolled }) {
             try await connectDiscoveredVaults(token)
         }
@@ -1513,7 +1527,7 @@ final class AppModel {
                 return
             }
             if vault.isEmpty { vault = ids.first(where: { loaded[$0] != nil }) ?? "" }
-            if let catalog = loaded[vault] { try applyCatalog(catalog) }
+            if let catalog = loaded[vault] { try applyCatalog(catalog, updateStoredCatalog: false) }
             else { catalog = nil }
             authenticated = true; accessNeedsRepair = false; connectionUnlockPending = false
             if openingSession { restoreSelection() }
@@ -1993,7 +2007,7 @@ final class AppModel {
                 let newlyConnected = requestedVaultIDs.filter { !requested.contains($0) }
                 loadRemainingCatalogs(newlyConnected, token: token)
                 retentionDate = wallNow(); cachedVaults = []; offline = !dates.isEmpty
-                if let next = loaded[vault] { try applyCatalog(next) }
+                if let next = loaded[vault] { try applyCatalog(next, updateStoredCatalog: false) }
                 if selectedItem == nil && selectedDeleted == nil { restoreSelection() }
                 if catalogLoadProgress[vault] == nil, let item = selectedItem, catalog?.items.contains(where: { $0.name == item }) != true { selectedItem = nil }
                 if catalogLoadProgress[vault] == nil, let selected, !itemFields.contains(selected) { self.selected = nil }

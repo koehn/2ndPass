@@ -764,10 +764,14 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     #expect(try await session.catalog().count == 1)
     #expect(try await session.revisionIndex().count == 2)
     #expect(try await session.exportPortableLocalSnapshot().items.count == 1)
-    let restarted = ItemVaultService(backend: backend)
-    // Startup uses the fast display projection, not the full .catalog operation.
-    // Its first result must already contain evidence, before the updater runs.
-    let startup = try await restarted.displayCatalog(vault: id.uuidString).requireCatalog()
+    let restarted = ItemVaultService(backend: backend, idleDelay: .milliseconds(100), idleSpacing: .zero)
+    restarted.setMaintenanceActive(false)
+    let immediate = try await restarted.displayCatalog(vault: id.uuidString).requireCatalog()
+    #expect(immediate.items.count == 1)
+    #expect(immediate.healthEvidenceLoading == true)
+    #expect(immediate.security?.passwordChecks?.isEmpty != false)
+    restarted.setMaintenanceActive(true)
+    let startup = try await waitForDisplay(restarted, vault: id) { @Sendable in $0.catalog?.healthEvidenceLoading == false }.requireCatalog()
     #expect(startup.security?.passwordChecks == checks)
     #expect(startup.items[0].fields[0].passwordQuality == saved.items[0].fields[0].passwordQuality)
     #expect(await MainActor.run {
@@ -1040,9 +1044,13 @@ private actor RestartHealthBreach: BreachChecking {
     let reopenedRepository = try EncryptedItemRepository(storeURL: url)
     let reopenedBackend = try await backend.reopened(repository: reopenedRepository)
     app.lock(); service.lock()
-    let restarted = ItemVaultService(backend: reopenedBackend)
+    let restarted = ItemVaultService(backend: reopenedBackend, idleDelay: .milliseconds(100), idleSpacing: .zero)
     var restored: [String: ItemCatalog] = [:]
-    for id in catalogs.keys { restored[id] = try await restarted.displayCatalog(vault: id).requireCatalog() }
+    for id in catalogs.keys {
+        restored[id] = try await waitForDisplay(restarted, vault: UUID(uuidString: id)!) { @Sendable in
+            $0.catalog?.healthEvidenceLoading == false
+        }.requireCatalog()
+    }
     let scanner = PasswordHealthSession { _, _ in Issue.record("Unchanged password strength was recomputed"); return .weak }
     #expect(scanner.canRestoreCloudResults(catalogs: restored, enabled: true))
     let result = try await scanner.scan(catalogs: restored, service: restarted, breach: breach, enabled: true)

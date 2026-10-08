@@ -114,6 +114,8 @@ public struct VaultItem: Codable, Equatable, Sendable {
 }
 
 public struct ItemCatalog: Codable, Sendable {
+    /// Display-only catalogs may arrive before their authenticated health evidence.
+    public var healthEvidenceLoading: Bool? = nil
     public var vault: String
     public var revision: String
     public var items: [VaultItem]

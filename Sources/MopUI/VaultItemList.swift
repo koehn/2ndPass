@@ -59,7 +59,9 @@ private struct VaultItemListRow: View {
                 subtitle: row.subtitle, vaultName: model.allVaults ? row.vaultName : nil,
                 recentDate: row.recentDate, searchDetail: row.searchDetail)
         }
-        .listRowBackground(model.searchIsFocused && !model.search.isEmpty && model.searchHighlighted == row.id
+        // Observe focus only for the highlighted result; focusing an empty search
+        // must not invalidate every row in a large vault.
+        .listRowBackground(!model.search.isEmpty && model.searchHighlighted == row.id && model.searchIsFocused
                            ? Color.accentColor.opacity(0.12) : nil)
         .contextMenu {
             if let identity = row.localIdentity {

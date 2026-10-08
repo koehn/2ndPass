@@ -70,6 +70,7 @@ final class ItemCatalogProjection: Sendable {
             ($0.itemID.uuidString, $0.versionID.uuidString)
         })).base64EncodedString()
         var result = ItemCatalog(vault: metadata.name, revision: revision, items: ids.compactMap { items[$0] })
+        result.healthEvidenceLoading = true
         result.canEdit = true; result.security = metadata.security ?? VaultSecurityMetadata()
         result.security?.histories = rows.flatMap { $0.catalog.histories }
         result.securityEnabled = true; result.canUpgradeSecurity = false
