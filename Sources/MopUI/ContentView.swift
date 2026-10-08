@@ -308,6 +308,14 @@ struct ContentView: View {
     }
     private var content: some View {
         sessionContent
+        .safeAreaInset(edge: .bottom) {
+            if model.hasPendingVaultDeletion {
+                HStack {
+                    Text("Vault deletion is pending.")
+                    Button("Retry") { model.retryVaultDeletions() }.disabled(model.busy || model.offline)
+                }.padding().frame(maxWidth: .infinity).background(.bar)
+            }
+        }
         .sheet(isPresented: $model.keyCreationPresented) { KeyCredentialCreateView(model: model) }
         .sheet(item: $model.vaultDetailsTarget) { target in
             VaultDetailsDialog(model: model, target: target)

@@ -44,6 +44,9 @@ struct Mop: AsyncParsableCommand {
         } catch let error as PortableArchiveFailure {
             IO.diagnostic("sp: \(error.errorDescription ?? "Portable archive operation failed.")\n")
             exit(withError: ExitCode(1))
+        } catch let error as VaultDeletionPending {
+            IO.diagnostic(error.message + "\n")
+            exit(withError: ExitCode(MopError.cloudUncertain.exitCode))
         } catch let error as CloudConfirmationPending {
             IO.diagnostic("sp: \(error.message)\n")
             exit(withError: ExitCode(MopError.cloudUncertain.exitCode))

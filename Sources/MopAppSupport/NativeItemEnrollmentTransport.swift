@@ -89,6 +89,36 @@ struct NativeItemEnrollmentTransport: Sendable {
             return (requestID, bytes)
         }
     }
+    /// Delete only relay records whose decoded scope names this committed vault.
+    /// No zone-wide deletion: the relay also serves unrelated vaults.
+    func purgeDeletedVault(_ vaultID: UUID) async throws {
+        try await checked()
+        var token: CKServerChangeToken?
+        var targets: Set<CKRecord.ID> = []
+        repeat {
+            let page: (modificationResultsByID: [CKRecord.ID: Result<CKDatabase.RecordZoneChange.Modification, any Error>], deletions: [CKDatabase.RecordZoneChange.Deletion], changeToken: CKServerChangeToken, moreComing: Bool)
+            do { page = try await database.recordZoneChanges(inZoneWith: zone, since: token, resultsLimit: 100) }
+            catch let error as CKError where error.code == .zoneNotFound { return }
+            try await checked()
+            for (id, result) in page.modificationResultsByID {
+                let data = try bytes(result.get().record)
+                let scope: EnrollmentScope
+                if id.recordName.hasPrefix("request-") { scope = try DeviceEnrollmentRequest.decode(data).scope }
+                else if id.recordName.hasPrefix("approval-") { scope = try DeviceEnrollmentApproval.decode(data).request.scope }
+                else { continue }
+                if scope.vault == vaultID, scope.account == account.accountNamespace,
+                   scope.container == account.containerIdentifier, scope.environment == account.environment { targets.insert(id) }
+            }
+            for deletion in page.deletions { targets.remove(deletion.recordID) }
+            token = page.changeToken
+            if !page.moreComing { break }
+        } while true
+        for id in targets {
+            try await checked()
+            do { _ = try await database.deleteRecord(withID: id) }
+            catch let error as CKError where error.code == .unknownItem || error.code == .zoneNotFound { }
+        }
+    }
     func admissionMetadata(approval: MopVaultNext.DeviceEnrollmentApproval) async throws -> (EncryptedItemVersion, Data, [MopVaultNext.MembershipEnvelope])? {
         try await checked()
         let vault = approval.request.scope.vault

@@ -6,6 +6,7 @@ import MopCore
 import MopAuth
 import MopKeychain
 import MopVaultNext
+import MopSync
 
 public struct VaultMemberRecord: Sendable, Identifiable {
     public let id: String
@@ -69,6 +70,8 @@ extension VaultOperation {
 public enum VaultSaveStatus: String, Sendable { case local, cloudConfirmed, pending }
 
 public struct VaultResult: Sendable {
+    public var pendingVaultDeletions: [String: VaultDeletionPhase] = [:]
+    public var deletionStatus: VaultDeletionPhase?
     public var saveStatus: VaultSaveStatus?
     /// Exact durable mutations, retained even when cloud confirmation is pending.
     public var mutationIDs: [UUID] = []

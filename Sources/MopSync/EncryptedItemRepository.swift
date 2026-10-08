@@ -56,6 +56,90 @@ public actor EncryptedItemRepository {
         context.stalenessInterval = 0
     }
 
+    public func deletion(_ scope: VaultScope) throws -> VaultDeletionState? {
+        try transaction { try deletionInTransaction(scope) }
+    }
+    public func deletions(account: String) throws -> [VaultDeletionState] {
+        try transaction {
+            let request = NSFetchRequest<NSManagedObject>(entityName: "StateBlob")
+            request.predicate = NSPredicate(format: "key BEGINSWITH %@", "deletion:")
+            return try context.fetch(request).map { row in
+                guard let bytes = row.value(forKey: "value") as? Data else { throw ItemRepositoryError.corruptStore }
+                return try JSONDecoder().decode(VaultDeletionState.self, from: bytes)
+            }.filter { $0.scope.account == account }
+        }
+    }
+    private func deletionInTransaction(_ scope: VaultScope) throws -> VaultDeletionState? {
+        guard let bytes = try fetchOne("StateBlob", key: "deletion:" + scope.storageKey)?.value(forKey: "value") as? Data else { return nil }
+        let value = try JSONDecoder().decode(VaultDeletionState.self, from: bytes)
+        guard value.scope == scope else { throw ItemRepositoryError.corruptStore }
+        return value
+    }
+    private func requireLiveVault(_ scope: VaultScope) throws {
+        if let deletion = try deletionInTransaction(scope), deletion.phase != .prepared { throw VaultDeletionFailure.deleted }
+    }
+    /// The authenticated domain coordinator owns authorization. Commitment and
+    /// removal of ciphertext/outbox are one optimistic-lock transaction.
+    public func saveDeletion(scope: VaultScope, notice: Data, phase: VaultDeletionPhase,
+                             authorization: any RepositoryWritePermit) throws -> VaultDeletionState {
+        try authorization.withWritePermission {
+            try transaction {
+                let old = try deletionInTransaction(scope)
+                guard !notice.isEmpty, notice.count <= 1_048_576 else { throw VaultDeletionFailure.invalidNotice }
+                if let old, old.phase == phase, old.notice == notice { return old }
+                let allowed: Bool
+                switch (old?.phase, phase) {
+                case (nil, .prepared), (nil, .committed), (.prepared?, .publishing),
+                     (.prepared?, .committed), (.publishing?, .committed),
+                     (.committed?, .cloudDeleted), (.cloudDeleted?, .complete): allowed = true
+                default: allowed = false
+                }
+                guard allowed,
+                      old == nil || old?.notice == notice || phase == .committed else { throw VaultDeletionFailure.staleState }
+                if phase == .publishing, old?.phase == .prepared { try touchVaultBoundary(scope) }
+                var assets = old?.assetVersions ?? []
+                if phase == .committed && (old == nil || old?.phase == .prepared || old?.phase == .publishing) {
+                    // Dirty the same boundary used by all local item writers.
+                    let boundary = try fetchOne("VaultBoundary", key: scope.storageKey)
+                        ?? NSEntityDescription.insertNewObject(forEntityName: "VaultBoundary", into: context)
+                    boundary.setValue(scope.storageKey, forKey: "key"); boundary.setValue(UUID(), forKey: "nonce")
+                    let predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
+                        scope.account, scope.vaultID as NSUUID, scope.database, scope.zoneOwner)
+                    for entity in ["Item", "AdmissionItem", "PendingMutation", "Conflict"] {
+                        let request = NSFetchRequest<NSManagedObject>(entityName: entity)
+                        request.predicate = predicate
+                        for row in try context.fetch(request) {
+                            if entity != "Conflict", let version = row.value(forKey: "versionID") as? UUID { assets.append(version) }
+                            context.delete(row)
+                        }
+                    }
+                    let receipts = NSFetchRequest<NSManagedObject>(entityName: "MutationReceipt")
+                    receipts.predicate = NSPredicate(format: "account == %@", scope.account)
+                    for row in try context.fetch(receipts) {
+                        guard let bytes = row.value(forKey: "scope") as? Data else { throw ItemRepositoryError.corruptStore }
+                        if VaultScope(try JSONDecoder().decode(ItemScope.self, from: bytes)) == scope {
+                            if let version = row.value(forKey: "versionID") as? UUID { assets.append(version) }
+                            context.delete(row)
+                        }
+                    }
+                    let blobs = NSFetchRequest<NSManagedObject>(entityName: "StateBlob")
+                    blobs.predicate = NSCompoundPredicate(orPredicateWithSubpredicates: [
+                        NSPredicate(format: "key ENDSWITH %@", ":" + scope.storageKey),
+                        NSPredicate(format: "key BEGINSWITH %@", "display-row:" + scope.storageKey + ":"),
+                        NSPredicate(format: "key BEGINSWITH %@", "local-health:" + scope.storageKey + ":")])
+                    for row in try context.fetch(blobs) where row.value(forKey: "key") as? String != "deletion:" + scope.storageKey { context.delete(row) }
+                    try fetchOne("VaultBoundary", key: scope.storageKey)?.setValue(nil, forKey: "initialization")
+                }
+                let state = VaultDeletionState(scope: scope, notice: phase == .complete ? Data(SHA256.hash(data: notice)) : notice, phase: phase,
+                    assetVersions: phase == .complete ? [] : Array(Set(assets)))
+                let key = "deletion:" + scope.storageKey
+                let row = try fetchOne("StateBlob", key: key) ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
+                row.setValue(key, forKey: "key"); row.setValue(try JSONEncoder().encode(state), forKey: "value")
+                return state
+            }
+        }
+    }
+
     /// Initializes only an entirely absent vault. The signed control bytes and all
     /// initial ciphertext/outbox rows become visible together at the SQLite commit.
     /// Exact retries return the creation receipt, never replacing later edits.
@@ -137,6 +221,7 @@ public actor EncryptedItemRepository {
     /// A shared uniqueness/optimistic-lock boundary serializes bootstrap against
     /// unrelated first-item creation by another process in the same vault.
     private func touchVaultBoundary(_ scope: VaultScope) throws {
+        try requireLiveVault(scope)
         let row = try fetchOne("VaultBoundary", key: scope.storageKey)
             ?? NSEntityDescription.insertNewObject(forEntityName: "VaultBoundary", into: context)
         row.setValue(scope.storageKey, forKey: "key")
@@ -209,6 +294,7 @@ public actor EncryptedItemRepository {
         return state
     }
     private func writeProvisioning(_ state: VaultProvisioningState) throws {
+        try requireLiveVault(state.binding.scope)
         let key = "provisioning:" + state.binding.scope.storageKey
         let row = try fetchOne("StateBlob", key: key) ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
         row.setValue(key, forKey: "key")
@@ -638,6 +724,80 @@ public actor EncryptedItemRepository {
         }
     }
 
+    // Device-local encrypted health observations never enter Item or PendingMutation.
+    private func localHealthPrefix(_ scope: VaultScope) -> String {
+        "local-health:" + scope.storageKey + ":"
+    }
+    public func localHealthItem(_ scope: ItemScope) throws -> EncryptedItemVersion? {
+        let key = localHealthPrefix(VaultScope(scope)) + scope.itemID.uuidString
+        guard let bytes = try readBlob(entity: "StateBlob", key: key) else { return nil }
+        return try? JSONDecoder().decode(EncryptedItemVersion.self, from: bytes)
+    }
+    public func discardLocalHealth(_ scope: ItemScope, expectedVersion: UUID,
+                                   authorization: any RepositoryWritePermit) throws {
+        try authorization.withWritePermission {
+            try transaction(publishLocalChanges: false) {
+                let key = localHealthPrefix(VaultScope(scope)) + scope.itemID.uuidString
+                guard let row = try fetchOne("StateBlob", key: key),
+                      let bytes = row.value(forKey: "value") as? Data,
+                      let current = try? JSONDecoder().decode(EncryptedItemVersion.self, from: bytes),
+                      current.versionID == expectedVersion else { throw ItemRepositoryError.staleLocalVersion }
+                context.delete(row)
+            }
+        }
+    }
+    public func localHealthItems(scope: VaultScope) throws -> [EncryptedItemVersion] {
+        try transaction {
+            let request = NSFetchRequest<NSManagedObject>(entityName: "StateBlob")
+            request.predicate = NSPredicate(format: "key BEGINSWITH %@", localHealthPrefix(scope))
+            return try context.fetch(request).compactMap { row in
+                guard let data = row.value(forKey: "value") as? Data,
+                      let version = try? JSONDecoder().decode(EncryptedItemVersion.self, from: data),
+                      VaultScope(version.scope) == scope, version.healthItemID != nil else { return nil }
+                return version
+            }
+        }
+    }
+    public func saveLocalHealth(_ version: EncryptedItemVersion, expectedParent: UUID,
+                               authorization: any RepositoryWritePermit) throws {
+        try validate(version)
+        try authorization.withWritePermission {
+            try transaction(publishLocalChanges: false) {
+                try touchVaultBoundary(VaultScope(version.scope))
+                guard let parent = version.healthItemID else { throw ItemRepositoryError.invalidScope }
+                let scope = version.scope
+                let parentScope = ItemScope(account: scope.account, vaultID: scope.vaultID, itemID: parent,
+                                            database: scope.database, zoneOwner: scope.zoneOwner)
+                guard let row = try fetchOne("Item", key: parentScope.storageKey),
+                      try decodeVersion(row).versionID == expectedParent else { throw ItemRepositoryError.staleLocalVersion }
+                let key = localHealthPrefix(VaultScope(scope)) + scope.itemID.uuidString
+                let existing = try fetchOne("StateBlob", key: key)
+                let previous = (existing?.value(forKey: "value") as? Data).flatMap { try? JSONDecoder().decode(EncryptedItemVersion.self, from: $0) }
+                guard previous?.versionID == version.baseVersionID else { throw ItemRepositoryError.staleLocalVersion }
+                let blob = existing ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
+                blob.setValue(key, forKey: "key")
+                blob.setValue(try JSONEncoder().encode(version), forKey: "value")
+            }
+        }
+    }
+    /// Caller authenticates the legacy health envelope before retiring its queue.
+    /// Discard only the matching derived head; never publish a remote deletion.
+    public func retireHealthSynchronization(_ version: EncryptedItemVersion) throws {
+        guard version.healthItemID != nil else { throw ItemRepositoryError.invalidScope }
+        try transaction {
+            if let head = try fetchOne("Item", key: version.scope.storageKey),
+               try decodeVersion(head) == version { context.delete(head) }
+            for entity in ["PendingMutation", "Conflict"] {
+                let request = NSFetchRequest<NSManagedObject>(entityName: entity)
+                request.predicate = NSPredicate(format: "key == %@", version.scope.storageKey)
+                for row in try context.fetch(request) { context.delete(row) }
+            }
+            let receipts = NSFetchRequest<NSManagedObject>(entityName: "MutationReceipt")
+            receipts.predicate = NSPredicate(format: "scopeKey == %@", version.scope.storageKey)
+            for row in try context.fetch(receipts) { context.delete(row) }
+        }
+    }
+
     public func healthItems(account: String, vaultID: UUID, database: String = "private", zoneOwner: String = "__defaultOwner__") throws -> [EncryptedItemVersion] {
         try transaction {
             let request = NSFetchRequest<NSManagedObject>(entityName: "Item")
@@ -1054,7 +1214,19 @@ public actor EncryptedItemRepository {
         // while this queue-confined closure runs, and no managed object escapes.
         for attempt in 0..<3 {
             do {
-                let (value, changed) = try performTransaction(body)
+                let (value, changed) = try performTransaction {
+                    let result = try body()
+                    for row in Array(context.insertedObjects.union(context.updatedObjects)) where !row.isDeleted {
+                        if let attributes = row.entity.attributesByName["vaultID"], attributes.name == "vaultID",
+                           let account = row.value(forKey: "account") as? String,
+                           let vault = row.value(forKey: "vaultID") as? UUID,
+                           let database = row.value(forKey: "database") as? String,
+                           let owner = row.value(forKey: "zoneOwner") as? String {
+                            try touchVaultBoundary(VaultScope(account: account, vaultID: vault, database: database, zoneOwner: owner))
+                        }
+                    }
+                    return result
+                }
                 if changed && publishLocalChanges { publishChange() }
                 return value
             } catch {

@@ -41,6 +41,8 @@ public actor ItemVaultSyncRuntime {
     private let factory: ItemVaultRuntimeDriverFactory
     private let membershipTransport: (any VaultMembershipTransport)?
     private let accountAuthorization: any RepositoryWritePermit
+    private let deletionTransport: (any VaultDeletionTransport)?
+    private let deletionCleanup: @Sendable (VaultDeletionState) async throws -> Void
     private let coordinator: VaultProvisioningCoordinator
     nonisolated private let routes: ItemVaultRuntimeRoutes
     private var activeAdmissionPermit: ConflictPublicationPermit?
@@ -62,10 +64,13 @@ public actor ItemVaultSyncRuntime {
                 accountValidator: @escaping CloudAccountValidator,
                 accountAuthorization: any RepositoryWritePermit,
                 membershipTransport: (any VaultMembershipTransport)? = nil,
+                deletionTransport: (any VaultDeletionTransport)? = nil,
+                deletionCleanup: @escaping @Sendable (VaultDeletionState) async throws -> Void = { _ in },
                 driverFactory: @escaping ItemVaultRuntimeDriverFactory) throws {
         guard !context.container.isEmpty, ["Development", "Production"].contains(context.environment),
               !context.account.isEmpty else { throw ItemVaultBootstrapFailure.invalidScope }
         self.context = context; self.repository = repository; self.trustStore = trustStore
+        self.deletionTransport = deletionTransport; self.deletionCleanup = deletionCleanup
         self.accountValidator = accountValidator; factory = driverFactory
         self.membershipTransport = membershipTransport; self.accountAuthorization = accountAuthorization
         routes = ItemVaultRuntimeRoutes(account: context.account, authorization: accountAuthorization)
@@ -80,7 +85,9 @@ public actor ItemVaultSyncRuntime {
         try self.init(context: context, repository: repository, trustStore: KeychainItemVaultTrustStore(),
             transport: NativeVaultProvisioningTransport(database: account.container.privateCloudDatabase),
             accountValidator: account.validator, accountAuthorization: account,
-            membershipTransport: NativeVaultMembershipTransport(database: account.container.privateCloudDatabase)) { addresses, items, control, eligible in
+            membershipTransport: NativeVaultMembershipTransport(database: account.container.privateCloudDatabase),
+            deletionTransport: NativeVaultDeletionTransport(database: account.container.privateCloudDatabase),
+            deletionCleanup: { state in try await ItemVaultDeletionCleanup.perform(state, account: account) }) { addresses, items, control, eligible in
                 try CloudKitSyncAdapter(repository: repository, database: account.container.privateCloudDatabase,
                     account: account.accountNamespace, stateNamespace: "MopItems1", leaseURL: lease,
                     addresses: addresses, accountValidator: account.validator, validator: items,
@@ -92,6 +99,7 @@ public actor ItemVaultSyncRuntime {
     /// A crash resumes the same signed operation rather than inventing a new head.
     public func approveEnrollment(_ request: DeviceEnrollmentRequest) async throws -> DeviceEnrollmentApproval {
         let operation = try await begin(); defer { end() }
+        try await reconcileDeletions(operation)
         return try await performAdmission(request, operation: operation)
     }
     private func performAdmission(_ request: DeviceEnrollmentRequest, operation: Int) async throws -> DeviceEnrollmentApproval {
@@ -202,6 +210,7 @@ public actor ItemVaultSyncRuntime {
     private func committedInventory() async throws -> [ItemVaultSetupRecord] {
         var complete: [ItemVaultSetupRecord] = []
         for record in try trustedRecords() {
+            if let deletion = try await repository.deletion(record.scope.repositoryScope), deletion.phase != .prepared { continue }
             if let receipt = try await repository.vaultInitialization(record.scope.repositoryScope) {
                 guard receipt.scope == record.scope.repositoryScope, receipt.setupID == (try record.setupID),
                       receipt.membershipState == record.genesis else { throw ItemVaultBootstrapFailure.invalidTrust }
@@ -218,7 +227,7 @@ public actor ItemVaultSyncRuntime {
         let operation = try await begin(); defer { end() }
         var result: [ItemVaultSetupRecord] = []
         for record in try trustedRecords() {
-            if try await repository.vaultInitialization(record.scope.repositoryScope) == nil { result.append(record) }
+            if try await repository.deletion(record.scope.repositoryScope) == nil, try await repository.vaultInitialization(record.scope.repositoryScope) == nil { result.append(record) }
             try check(operation)
         }
         return result
@@ -251,7 +260,134 @@ public actor ItemVaultSyncRuntime {
         }
     }
 
-    public func session(vaultID: UUID) throws -> ItemVaultSession { try routes.session(vaultID) }
+    public func session(vaultID: UUID) async throws -> ItemVaultSession {
+        let scope = VaultScope(account: context.account, vaultID: vaultID)
+        if let deletion = try await repository.deletion(scope), deletion.phase != .prepared {
+            routes.lock(vaultID); throw VaultDeletionFailure.deleted
+        }
+        return try routes.session(vaultID)
+    }
+
+    public func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase {
+        let operation = try await begin(); defer { end() }
+        guard let transport = deletionTransport, try await accountValidator() else { throw MopError.cloudAccount }
+        try check(operation)
+        if let driver { await driver.stop(); self.driver = nil }
+        // The permit is the sole lease owner, so invalidation releases the file
+        // lock before a waiting/retrying operation resumes on this actor.
+        let permission = ConflictPublicationPermit(lease: try SynchronizationLease(url: context.leaseURL), authorization: accountAuthorization)
+        defer { permission.invalidate() }
+        let scope = VaultScope(account: context.account, vaultID: vaultID)
+        var state = try await repository.deletion(scope)
+        if state == nil {
+            guard let record = try trustedRecords().first(where: { $0.scope.repositoryScope == scope }) else { throw MopError.vaultMissing }
+            let session = try routes.session(vaultID)
+            let notice = try await session.deletionNotice(scope: record.scope)
+            try verifyDeletion(notice, record: record)
+            try check(operation)
+            state = try await repository.saveDeletion(scope: scope, notice: notice.encoded(), phase: .prepared, authorization: permission)
+        }
+        do { return try await finishDeletion(state!, transport: transport, permission: permission, operation: operation).phase }
+        catch {
+            // Publication may have succeeded even when its response was lost.
+            // The durable journal must survive and be reconciled, never repeated
+            // as a new signed operation or reported as a normal saved edit.
+            try check(operation)
+            guard let pending = try await repository.deletion(scope) else { throw VaultDeletionFailure.staleState }
+            if pending.phase != .prepared { routes.lock(vaultID) }
+            return pending.phase
+        }
+    }
+
+    public func reconcileDeletions() async throws {
+        let operation = try await begin(); defer { end() }
+        let wasRunning = driver != nil
+        var failure: (any Error)?
+        do { try await reconcileDeletions(operation) } catch { failure = error }
+        // Discovery must not strand synchronization for the remaining vaults.
+        if wasRunning, driver == nil {
+            do {
+                _ = try await refresh(operation, checkingDeletions: false)
+                try await startDriver(operation)
+            } catch { if failure == nil { failure = error } }
+        }
+        if let failure { throw failure }
+    }
+    private func verifyDeletion(_ notice: VaultDeletionNotice, record: ItemVaultSetupRecord) throws {
+        let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trustStore)
+        let binding = VaultDeletionNotice.Binding(container: context.container, environment: context.environment,
+            account: context.account, vault: record.scope.binding.vaultID, database: "private",
+            zone: Self.address(record).zoneName, owner: record.scope.binding.zoneOwner, genesis: record.pinnedDigest)
+        try notice.verify(binding: binding, trusted: history)
+        for (previous, next) in zip(notice.chain, notice.chain.dropFirst()) {
+            try ItemVaultMembershipAuthority.validateAddition(previous: previous, next: next)
+        }
+    }
+    private func reconcileDeletions(_ operation: Int) async throws {
+        guard let transport = deletionTransport else { return }
+        guard try await accountValidator() else { throw MopError.cloudAccount }
+        try check(operation)
+        var incoming: [(ItemVaultSetupRecord, Data)] = []
+        for record in try trustedRecords() {
+            let scope = record.scope.repositoryScope
+            if try await repository.deletion(scope) != nil { continue }
+            if let bytes = try await transport.read(vaultID: scope.vaultID) {
+                try verifyDeletion(VaultDeletionNotice.decode(bytes), record: record)
+                incoming.append((record, bytes))
+            }
+            try check(operation)
+        }
+        let pending = try await repository.deletions(account: context.account)
+        guard !incoming.isEmpty || pending.contains(where: { $0.phase != .complete }) else { return }
+        if let driver { await driver.stop(); self.driver = nil }
+        // The permit is the sole lease owner, so invalidation releases the file
+        // lock before a waiting/retrying operation resumes on this actor.
+        let permission = ConflictPublicationPermit(lease: try SynchronizationLease(url: context.leaseURL), authorization: accountAuthorization)
+        defer { permission.invalidate() }
+        for (record, bytes) in incoming {
+            let scope = record.scope.repositoryScope
+            if let existing = try await repository.deletion(scope), existing.phase != .prepared && existing.phase != .publishing { continue }
+            try verifyDeletion(VaultDeletionNotice.decode(bytes), record: record)
+            try check(operation)
+            _ = try await repository.saveDeletion(scope: scope, notice: bytes, phase: .committed, authorization: permission)
+            routes.lock(scope.vaultID)
+        }
+        for state in try await repository.deletions(account: context.account) where state.phase != .complete {
+            _ = try await finishDeletion(state, transport: transport, permission: permission, operation: operation)
+        }
+    }
+    private func finishDeletion(_ original: VaultDeletionState, transport: any VaultDeletionTransport,
+                                permission: any RepositoryWritePermit, operation: Int) async throws -> VaultDeletionState {
+        var state = original
+        if state.phase == .complete { return state }
+        if state.phase == .prepared || state.phase == .publishing {
+            guard let record = try trustedRecords().first(where: { $0.scope.repositoryScope == state.scope }) else { throw MopError.vaultUntrusted }
+            try verifyDeletion(VaultDeletionNotice.decode(state.notice), record: record)
+            guard try await accountValidator() else { throw MopError.cloudAccount }
+            let bytes: Data
+            if let found = try await transport.read(vaultID: state.scope.vaultID) { bytes = found }
+            else {
+                if state.phase == .prepared {
+                    state = try await repository.saveDeletion(scope: state.scope, notice: state.notice, phase: .publishing, authorization: permission)
+                }
+                bytes = try await transport.publish(vaultID: state.scope.vaultID, notice: state.notice)
+            }
+            try verifyDeletion(VaultDeletionNotice.decode(bytes), record: record)
+            try check(operation)
+            state = try await repository.saveDeletion(scope: state.scope, notice: bytes, phase: .committed, authorization: permission)
+        }
+        routes.lock(state.scope.vaultID)
+        if state.phase == .committed {
+            guard try await accountValidator() else { throw MopError.cloudAccount }
+            try await transport.deleteZone(address: VaultCloudAddress(vaultID: state.scope.vaultID,
+                zoneName: "MopItems-" + state.scope.vaultID.uuidString, ownerName: state.scope.zoneOwner))
+            try check(operation)
+            state = try await repository.saveDeletion(scope: state.scope, notice: state.notice, phase: .cloudDeleted, authorization: permission)
+        }
+        try await deletionCleanup(state)
+        try check(operation)
+        return try await repository.saveDeletion(scope: state.scope, notice: state.notice, phase: .complete, authorization: permission)
+    }
 
     public func provision(vaultID: UUID) async throws -> VaultProvisioningState {
         let operation = try await begin(); defer { end() }
@@ -406,7 +542,8 @@ public actor ItemVaultSyncRuntime {
         }
         return records.sorted { $0.scope.binding.vaultID.uuidString < $1.scope.binding.vaultID.uuidString }
     }
-    private func refresh(_ operation: Int) async throws -> [ItemVaultSetupRecord] {
+    private func refresh(_ operation: Int, checkingDeletions: Bool = true) async throws -> [ItemVaultSetupRecord] {
+        if checkingDeletions { try await reconcileDeletions(operation) }
         while true {
             let registrationRevision = localRegistrationRevision
             let complete = try await committedInventory()
@@ -570,6 +707,18 @@ public actor ItemVaultSyncRuntime {
     }
 
     private func validateIncoming(_ version: EncryptedItemVersion, direction: CloudRecordDirection) async throws {
+        let scope = VaultScope(account: version.scope.account, vaultID: version.scope.vaultID,
+            database: version.scope.database, zoneOwner: version.scope.zoneOwner)
+        if let state = try await repository.deletion(scope), state.phase != .prepared { throw VaultDeletionFailure.deleted }
+        if direction == .sending, let transport = deletionTransport,
+           let record = try trustedRecords().first(where: { $0.scope.repositoryScope == scope }),
+           let bytes = try await transport.read(vaultID: scope.vaultID) {
+            try verifyDeletion(VaultDeletionNotice.decode(bytes), record: record)
+            // The adapter owns the synchronization lease during this callback.
+            _ = try await repository.saveDeletion(scope: scope, notice: bytes, phase: .committed, authorization: accountAuthorization)
+            routes.lock(scope.vaultID)
+            throw VaultDeletionFailure.deleted
+        }
         do { try routes.verify(version, direction: direction) }
         catch CloudSyncAdapterError.membershipUnavailable {
             guard direction != .sending,

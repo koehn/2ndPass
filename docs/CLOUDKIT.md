@@ -19,3 +19,48 @@ The private `MopEnrollment-v1` zone relays scoped enrollment packets using `MopM
 Persist commissioning intent before control publication. Verify independently pinned signed membership history/head before permitting item uploads. Once control publication may have reached the server, a missing zone is a recovery condition, not permission to silently recreate it. Discovery alone never installs a trust pin.
 
 Provision the app, AutoFill and separate CLI for the same container, environment, App Group and Keychain access group. Validate with disposable zones and signed clients. See [validation](VALIDATION.md) and [architecture](VAULT.md).
+
+## Permanent vault deletion
+
+Updated clients use a separate private zone, `MopVaultDeletions1`. Add this record
+before enabling Production deletion:
+
+| Type | Record name | Fields |
+| --- | --- | --- |
+| `MopVaultDeletionV1` | vault UUID | `notice`: Bytes, maximum 1 MiB |
+
+Use the same private-record permissions as the existing owner records. Notices
+are create-only, owner-signed terminal statements rooted in independently pinned
+membership. They include account/container/environment/zone binding and the
+shared genesis digest, not a device-local setup receipt. Never expire or delete
+these notices. They contain public authorization history but no vault name or
+secrets. No query indexes are needed; clients fetch by record ID.
+
+Deletion is available in Development. Production initiation is disabled unless
+`MopAppSupport` is built with `MOP_VAULT_DELETION` (Xcode Swift active compilation
+conditions, or SwiftPM `-Xswiftc -DMOP_VAULT_DELETION`). Keep that condition absent
+until the schema is deployed and two signed devices pass the checks below.
+Receiving authenticated notices and retrying existing operations do not depend
+on the initiation flag.
+
+1. Export the current Development schema with `cktool`, add the record type and
+   bytes field, validate, and import the complete schema without dropping existing
+   types. Review and deploy the schema in CloudKit Console before enabling the
+   Production build condition. Never reset the schema or create a real deletion
+   notice as a schema probe.
+2. On disposable vaults, confirm typed-name deletion and
+   `sp vault delete --vault UUID --confirm UUID`. Verify that history and pending
+   edits disappear, a second connected device purges its copy, and an offline
+   second device purges after reconnecting.
+3. Interrupt after notice publication and after zone deletion, relaunch, then use
+   the app's retry action or `sp vault sync`. Verify completion, keychain/cache
+   cleanup, and preservation of another vault and exported backups.
+4. Verify an older client does not recreate the missing zone. Older/offline
+   clients and exported backups cannot be remotely erased by this protocol.
+
+The local journal distinguishes prepared, publication uncertain, committed,
+cloud deleted, and complete. Uncertain publication blocks access until resolved.
+The authenticated commitment atomically removes ciphertext and the outbox; cloud
+zone deletion and scoped cache/key cleanup are idempotent retries. A missing zone
+without a verified notice never authorizes local erasure. This is logical deletion,
+not a guarantee of forensic erasure of SQLite pages, OS snapshots, or backups.

@@ -49,6 +49,16 @@ struct ItemEnrollmentRequestStore: Sendable {
             }
         }
     }
+    func purge() throws {
+        let directory = try LocalDirectory(directory: location)
+        try directory.locked {
+            for file in try FileManager.default.contentsOfDirectory(at: location, includingPropertiesForKeys: nil) where file.pathExtension == "json" {
+                let request = try DeviceEnrollmentRequest.decode(LocalFile.read(file, privateFile: true, limit: 65_536))
+                guard request.scope == scope else { throw DeviceEnrollmentFailure.invalidRequest }
+                try FileManager.default.removeItem(at: file)
+            }
+        }
+    }
     func clear() throws {
         let directory = try LocalDirectory(directory: location)
         try directory.locked {

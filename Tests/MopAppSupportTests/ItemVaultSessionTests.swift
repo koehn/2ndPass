@@ -429,7 +429,7 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     #expect(try await repository.pendingMutations(account: "session-account").count == 1)
 }
 
-@Test func healthCompanionsAuthenticateSyncAndRewrapWithoutEnteringItemCatalog() async throws {
+@Test func localHealthCacheAuthenticatesButDoesNotTransferDuringEnrollment() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-health-sync-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -449,12 +449,12 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     check.breachResult = CachedBreachResult(exposed: true, checkedAt: now)
     check.strengthResult?.quality = .veryStrong
     let saved = try #require(try await session.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID))
-    try session.validate(saved.version, direction: .receiving)
-    let wrongParent = EncryptedItemVersion(scope: saved.version.scope, versionID: saved.version.versionID,
-        baseVersionID: saved.version.baseVersionID, ciphertext: saved.version.ciphertext, generation: saved.version.generation, healthItemID: UUID())
+    try session.validate(saved, direction: .receiving)
+    let wrongParent = EncryptedItemVersion(scope: saved.scope, versionID: saved.versionID,
+        baseVersionID: saved.baseVersionID, ciphertext: saved.ciphertext, generation: saved.generation, healthItemID: UUID())
     #expect(throws: (any Error).self) { try session.validate(wrongParent, direction: .receiving) }
-    let wrongKind = EncryptedItemVersion(scope: saved.version.scope, versionID: saved.version.versionID, baseVersionID: nil,
-        ciphertext: saved.version.ciphertext, generation: saved.version.generation)
+    let wrongKind = EncryptedItemVersion(scope: saved.scope, versionID: saved.versionID, baseVersionID: nil,
+        ciphertext: saved.ciphertext, generation: saved.generation)
     #expect(throws: (any Error).self) { try session.validate(wrongKind, direction: .receiving) }
     await #expect(throws: ItemRepositoryError.staleLocalVersion) {
         try await session.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: UUID())
@@ -469,13 +469,13 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     #expect(unwraps.value.withLock { $0 } == 1)
     reopened.lock()
     let address = VaultCloudAddress(vaultID: root.id, zoneName: "health", ownerName: binding.zoneOwner)
-    let cloud = try CloudKitSyncAdapter.makeRecord(saved.version, address: address)
-    #expect(try CloudKitSyncAdapter.unverifiedVersion(from: cloud, account: binding.account, database: binding.database, address: address) == saved.version)
+    let cloud = try CloudKitSyncAdapter.makeRecord(saved, address: address)
+    #expect(try CloudKitSyncAdapter.unverifiedVersion(from: cloud, account: binding.account, database: binding.database, address: address) == saved)
     let request = try DeviceEnrollmentRequest.create(scope: EnrollmentScope(container: "iCloud.test", environment: "Development",
         account: binding.account, vault: root.id, member: owner.identity.member), device: joining)
     let prepared = try await session.prepareAdmission(request: request)
     #expect(prepared.approval.expectedItemCount == 1)
-    #expect(prepared.versions.count == 3)
+    #expect(prepared.versions.count == 2)
     let joinedHistory = try prepared.approval.verifiedHistory()
     let target = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("joining.sqlite"))
     let joined = try ItemVaultSession(repository: target, binding: binding, history: joinedHistory, device: joining)
@@ -485,11 +485,21 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     }
     #expect(try await joined.catalog().count == 1)
     #expect(try await joined.revisionIndex().count == 2)
-    #expect(try await joined.healthChecks() == [check])
+    #expect(try await joined.healthChecks().isEmpty)
     let receiver = ItemVaultService(backend: SyncedHealthBackend(session: joined))
     let received = try await receiver.execute(.catalog, vault: root.id.uuidString, offline: true).requireCatalog()
-    #expect(received.items.first?.fields.first?.passwordQuality == .veryStrong)
+    #expect(received.items.first?.fields.first?.passwordQuality == nil)
     #expect(try await joined.exportPortableLocalSnapshot().items.count == 1)
+    // A damaged derived cache is unknown and replaceable, never a secret failure.
+    let damaged = EncryptedItemVersion(scope: saved.scope, baseVersionID: saved.versionID,
+        ciphertext: Data([0]), generation: saved.generation + 1, healthItemID: saved.healthItemID)
+    try await repository.saveLocalHealth(damaged, expectedParent: item.version.versionID,
+                                        authorization: DomainAccountAuthorization())
+    #expect(try await session.healthChecks().isEmpty)
+    _ = try await session.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID)
+    #expect(try await session.healthChecks() == [check])
+    #expect(try await repository.pendingMutations(account: binding.account).allSatisfy { $0.version.healthItemID == nil })
+    #expect(try await repository.item(item.version.scope) == item.version)
     joined.lock()
     await #expect(throws: MopError.authentication) { try await joined.healthChecks() }
 }

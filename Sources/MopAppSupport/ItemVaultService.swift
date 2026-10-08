@@ -7,6 +7,10 @@ import MopSync
 import MopVaultNext
 
 public protocol ItemVaultServiceBackend: Sendable {
+    var vaultDeletionAvailable: Bool { get }
+    func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase
+    func deletionStates() async throws -> [UUID: VaultDeletionPhase]
+    func resumeDeletions() async throws -> [UUID: VaultDeletionPhase]
     func inventory() async throws -> [VaultDescriptor]
     func discover() async throws -> ItemVaultDiscovery
     func invalidateDiscovery()
@@ -25,6 +29,10 @@ public protocol ItemVaultServiceBackend: Sendable {
     func resolveVault(named name: String, offline: Bool) async throws -> UUID?
 }
 public extension ItemVaultServiceBackend {
+    var vaultDeletionAvailable: Bool { false }
+    func deletionStates() async throws -> [UUID: VaultDeletionPhase] { [:] }
+    func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase { throw ItemVaultServiceFailure.unavailable }
+    func resumeDeletions() async throws -> [UUID: VaultDeletionPhase] { [:] }
     func conflictAdapter() async throws -> CloudKitSyncAdapter { throw ItemVaultServiceFailure.unavailable }
     func discover() async throws -> ItemVaultDiscovery { try await ItemVaultDiscovery(vaults: inventory(), complete: true) }
     func invalidateDiscovery() {}
@@ -70,6 +78,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private let publisher: (any AutoFillPublishing)?
     private let autoFillDirectory: URL?
     private let idleWork: IdleWorkQueue
+    private let localHealthSessions = Mutex<[UUID: ObjectIdentifier]>([:])
     private let catalogGate = OperationGate()
     private let publicationGate = OperationGate()
     private struct PublishedCatalog: Sendable {
@@ -148,7 +157,11 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         return status
     }
 
-    public var capabilities: Set<VaultServiceCapability> { [.portableBackup, .enrollment, .passwordCheckCache] }
+    public var capabilities: Set<VaultServiceCapability> {
+        var result: Set<VaultServiceCapability> = [.portableBackup, .enrollment, .passwordCheckCache]
+        if backend.vaultDeletionAvailable { result.insert(.vaultDeletion) }
+        return result
+    }
     public func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult) {
         guard kind != .passkey, let vault = AutoFillEntry.vaultID(recordIdentifier), let id = UUID(uuidString: vault) else { throw MopError.notFound }
         let item = try AutoFillPublicationState.itemID(for: recordIdentifier, directory: autoFillDirectory ?? AutoFillStorage.directory())
@@ -255,6 +268,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private func opened(_ id: UUID, token: Int, offline: Bool) async throws -> ItemVaultSession {
         let opening = authenticatedAt == nil
         let session = try await backend.open(id, offline: offline)
+        if localHealthSessions.withLock({ $0[id] }) != ObjectIdentifier(session) {
+            try await session.retireLegacyHealthSynchronization()
+            localHealthSessions.withLock { $0[id] = ObjectIdentifier(session) }
+        }
         if opening { idleWork.activity() }
         try checked(token)
         state.withLock { value in if value.generation == token, value.authenticated == nil { value.authenticated = ProcessInfo.processInfo.systemUptime } }
@@ -475,7 +492,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
         switch operation {
         case .manage(.automaticEnrollment), .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.checkEnrollment), .manage(.enrollmentInbox), .manage(.approveEnrollment), .manage(.confirmEnrollment), .manage(.cancelEnrollment), .manage(.rejectEnrollment), .manage(.devices): break
-        case .discover, .catalog, .recentlyDeleted, .read, .save, .write, .delete, .create, .restorePortable,
+        case .discover, .catalog, .recentlyDeleted, .read, .save, .write, .delete, .deleteVault, .create, .restorePortable,
              .trashItem, .restoreItem, .rename, .exportPortable, .sync, .readHistory, .restoreHistory, .clearHistory, .passwordQuality, .savePasswordChecks: break
         default: throw ItemVaultServiceFailure.unavailable
         }
@@ -509,11 +526,47 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         try CloudVaultBoundary.requireCloud(vault)
         let token = sessionGeneration
         switch operation {
+        case .deleteVault:
+            guard backend.vaultDeletionAvailable else { throw ItemVaultServiceFailure.unavailable }
+            guard !offline else { throw MopError.offlineWrite }
+            guard let vault, let id = UUID(uuidString: vault) else { throw MopError.vaultMissing }
+            let phase = try await backend.deleteVault(id)
+            var result = VaultResult(); result.deletionStatus = phase
+            result.message = phase == .complete ? "Vault deleted. Updated devices erase their copies when they reconnect. Backups remain."
+                : "Vault deletion is pending. Run sync to resume; do not start another deletion."
+            if phase != .prepared {
+                catalogUpdates.withLock { $0.removeValue(forKey: id) }?.task.cancel()
+                catalogCache.withLock { $0[id] = nil }; publishedCatalogs.withLock { $0[id] = nil }
+                backend.invalidateDiscovery(); displayChanged(id)
+            }
+            return result
+        case .sync:
+            guard !offline else { throw MopError.offlineWrite }
+            let deletions = try await backend.resumeDeletions()
+            var result = VaultResult()
+            if let pending = deletions.values.first(where: { $0 != .complete }) {
+                result.deletionStatus = pending; result.message = "Vault deletion is pending. Run sync again to retry."
+                return result
+            }
+            let selectedDeletion = vault.flatMap(UUID.init(uuidString:)).flatMap { deletions[$0] }
+            if (vault != nil && selectedDeletion == nil) || deletions.isEmpty {
+                let selected = try await select(vault, offline: false)
+                _ = try await opened(selected, token: token, offline: false)
+            }
+            try await backend.requestSync()
+            result.message = deletions.isEmpty ? "Synchronization requested." : "Vault deletion completed. Synchronization requested."
+            return result
         case .discover:
             var result = VaultResult()
             if offline { result.vaults = try await backend.inventory(offline: true); result.discoveryComplete = false }
             else { let discovery = try await backend.discover(); result.vaults = discovery.vaults; result.discoveryComplete = discovery.complete }
             try checked(token)
+            let deletions = try await backend.deletionStates()
+            result.pendingVaultDeletions = Dictionary(uniqueKeysWithValues: deletions.filter { $0.value != .complete }.map { ($0.key.uuidString, $0.value) })
+            result.vaults.removeAll { descriptor in
+                guard let id = UUID(uuidString: descriptor.id), let phase = deletions[id] else { return false }
+                return phase != .prepared
+            }
             result.defaultVault = result.vaults.count == 1 ? result.vaults.first?.id : nil
             // Offline inventory is a complete local enrollment snapshot. Online
             // discovery may be partial; absence then is not evidence of removal.
@@ -598,7 +651,6 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             })
             guard Set(checks.map(\.record)).count == checks.count, checks.allSatisfy({ live.contains($0.record) }) else { throw MopError.vaultConflict }
             for check in checks { try check.validate() }
-            var mutations: [UUID] = []
             let storedChecks = Dictionary(uniqueKeysWithValues: try await session.healthChecks().map { ($0.record, $0) })
             // Health publications are incremental evidence, not replacement lists.
             // A partial/stale client snapshot must never clear unvisited passwords.
@@ -610,11 +662,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 let ids = Set(entry.catalog.references.values)
                 let subset = merged.values.filter { ids.contains($0.record) }.sorted { $0.record < $1.record }
                 if !subset.isEmpty && subset.allSatisfy({ storedChecks[$0.record] == $0 }) { continue }
-                if let mutation = try await session.saveHealthChecks(subset, itemID: entry.itemID, expectedItemVersion: entry.versionID) {
-                    mutations.append(mutation.id)
-                }
+                _ = try await session.saveHealthChecks(subset, itemID: entry.itemID, expectedItemVersion: entry.versionID)
             }
-            if !mutations.isEmpty { return await saved(session, token: token, mutations: mutations, deferPublication: true) }
             assignCatalog(try await catalog(session), to: &result)
             // Health evidence changes no AutoFill identities. Even status() can
             // wait on the OS identity store, so bypass the shared publication tail.
@@ -687,9 +736,6 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 _ = try PortableArchive.open(LocalFile.read(target, limit: PortableArchive.maximumSize), recoveryKey: archive.recoveryKey)
             }
             result.value = archive.recoveryKey; result.message = "Encrypted local snapshot exported and verified. It includes saved local changes; cloud inventory completeness is not certified. Save the backup key separately."
-        case .sync:
-            guard !offline else { throw MopError.offlineWrite }
-            try await backend.requestSync(); result.message = "Synchronization requested. Saved changes remain durable until iCloud confirms them."
         case .readHistory(let id, let revision):
             let entries = try await metadataEntries(session)
             guard let entry = entries.first(where: { $0.catalog.histories.contains { $0.entries.contains { $0.id == id } } }) else { throw MopError.notFound }
@@ -915,22 +961,15 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         return prepared
     }
     private func withHealth(_ catalog: ItemCatalog, session: ItemVaultSession) async throws -> ItemCatalog {
-        // Preserve the latest successful timestamp for each independent check.
-        let conflicts = try await session.healthConflicts()
-        if !conflicts.isEmpty {
-            do {
-                let adapter = try await backend.conflictAdapter()
-                for conflict in conflicts { try await session.resolveHealthConflict(conflict, coordinator: adapter) }
-            } catch CloudSyncAdapterError.engineNotStarted {
-                // Reading verified local items must not require a live sync engine.
-                // Keep both health heads intact and retry their merge on a later
-                // catalog load when the publication coordinator is available.
-            }
-        }
         var result = catalog
         if result.security == nil { result.security = VaultSecurityMetadata() }
         let live = Set(catalog.items.filter { !$0.isArchived && $0.deletion == nil }.flatMap { $0.fields.compactMap(\.recordVersion) })
-        result.security?.passwordChecks = try await session.healthChecks().filter { live.contains($0.record) }
+        do { result.security?.passwordChecks = try await session.healthChecks().filter { live.contains($0.record) } }
+        catch let failure as MopError { throw failure }
+        catch {
+            // Missing derived evidence is unknown, not a reason to hide secrets.
+            result.security?.passwordChecks = []
+        }
         let checks = Dictionary((result.security?.passwordChecks ?? []).map { ($0.record, $0) }, uniquingKeysWith: { _, value in value })
         for itemIndex in result.items.indices {
             let item = result.items[itemIndex]

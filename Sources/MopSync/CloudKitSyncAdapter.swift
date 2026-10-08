@@ -41,6 +41,22 @@ private struct CloudItemWireEnvelope: Codable {
     let generation: UInt64
 }
 
+// Cancellation is transport interruption, not evidence of invalid ciphertext or
+// a failed disk write. Keep both Swift and CloudKit cancellation paths equivalent.
+func cloudSyncFailure(_ error: any Error, fallback: CloudSyncAdapterError) -> CloudSyncAdapterError {
+    if error is CancellationError || (error as? CKError)?.code == .operationCancelled {
+        return .operationInterrupted
+    }
+    return error as? CloudSyncAdapterError ?? fallback
+}
+
+/// A delivered event must finish its local processing before its delegate returns,
+/// even when cancelOperations cancels the transport task that delivered it.
+/// Lifecycle/account validation remains the event processor's responsibility.
+func completeCloudSyncEvent(_ process: @escaping @Sendable () async -> Void) async {
+    await Task { await process() }.value
+}
+
 /// CKSyncEngine owns transfer scheduling and retries; this adapter owns no retry timer.
 /// Construct one adapter per account/container/environment/database binding with a
 /// distinct lease URL. Initialization performs no cloud calls; start is explicit.
@@ -171,7 +187,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         if !uploadsAllowed, let engine { await engine.cancelOperations() }
         if uploadsAllowed {
             do { try await registerPendingChanges() }
-            catch { lastFailure = .untrustedRecord }
+            catch { lastFailure = suspension.failure ?? cloudSyncFailure(error, fallback: .storageFailure) }
         }
     }
 
@@ -250,7 +266,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         } catch {
             // The choice is already durable. Do not turn a scheduling error into
             // a false report that the local transaction failed.
-            lastFailure = error as? CloudSyncAdapterError ?? .storageFailure
+            lastFailure = cloudSyncFailure(error, fallback: .storageFailure)
         }
     }
 
@@ -359,7 +375,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             // cause. The enclosing send can then throw a generic partialFailure;
             // do not replace that diagnosis or mutate a retired engine's state.
             if expectedGeneration == identityGeneration, !suspended {
-                lastFailure = error as? CloudSyncAdapterError ?? .storageFailure
+                lastFailure = cloudSyncFailure(error, fallback: .storageFailure)
             }
             // CKSyncEngine owns network retry. A new explicit request or restart
             // retries this wake-up; unrelated store events must not create a loop.
@@ -367,6 +383,12 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     }
 
     public func handleEvent(_ event: CKSyncEngine.Event, syncEngine: CKSyncEngine) async {
+        await completeCloudSyncEvent { [self] in
+            await processEvent(event, syncEngine: syncEngine)
+        }
+    }
+
+    private func processEvent(_ event: CKSyncEngine.Event, syncEngine: CKSyncEngine) async {
         guard !suspended, engine === syncEngine else { return }
         let expectedGeneration = identityGeneration
         let dataEvent: Bool
@@ -398,7 +420,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                     do { try await receive(change.record) }
                     catch let error as CloudSyncAdapterError { lastFailure = error }
                     catch {
-                        suspend(.storageFailure)
+                        suspend(cloudSyncFailure(error, fallback: .storageFailure))
                         throw error
                     }
                 }
@@ -453,7 +475,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 if let underlying = native.userInfo[NSUnderlyingErrorKey] as? NSError {
                     Self.logger.error("Underlying sync failure: domain=\(underlying.domain, privacy: .public) code=\(underlying.code)")
                 }
-                suspend(error as? CloudSyncAdapterError ?? .storageFailure)
+                suspend(cloudSyncFailure(error, fallback: .storageFailure))
             }
         }
         if dataEvent, expectedGeneration == identityGeneration { activeDataEvents -= 1 }
@@ -523,7 +545,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             guard expectedGeneration == generation, uploadsAllowed, !suspended, !resolutionInProgress, engine === syncEngine, !records.isEmpty else { return nil }
             return CKSyncEngine.RecordZoneChangeBatch(recordsToSave: records, atomicByZone: false)
         } catch {
-            lastFailure = error as? CloudSyncAdapterError ?? .untrustedRecord
+            lastFailure = cloudSyncFailure(error, fallback: .untrustedRecord)
             return nil
         }
     }
@@ -561,6 +583,11 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         } catch CloudSyncAdapterError.storageFailure {
             suspend(.storageFailure)
             throw CloudSyncAdapterError.storageFailure
+        } catch where cloudSyncFailure(error, fallback: .untrustedRecord) == .operationInterrupted {
+            // An interrupted validator has not established whether this record
+            // is trustworthy. Do not quarantine it or advance the durable token.
+            suspend(.operationInterrupted)
+            throw CloudSyncAdapterError.operationInterrupted
         } catch {
             // Persist opaque invalid input for recovery rather than applying it or dropping
             // it while CKSyncEngine advances its change token.
@@ -569,6 +596,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             throw CloudSyncAdapterError.untrustedRecord
         }
         try await validateAccount(generation: expectedGeneration)
+        // Legacy devices may still publish signed health envelopes. They are
+        // optional derived data: authenticate above, retire old local uploads,
+        // and consume the cloud event without importing or merging the result.
+        if version.healthItemID != nil {
+            try await repository.retireHealthSynchronization(version)
+            return
+        }
         if let accepted = try await repository.acceptedVersion(version.scope) {
             // Authenticate the stored watermark too; an editable database column
             // alone must not decide whether a signed remote version is fresh.
@@ -705,7 +739,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             if !provenMismatch {
                 // Protected storage, account retirement, and unavailable local
                 // trust are not evidence that a remote authority is invalid.
-                suspend((error as? CloudSyncAdapterError) ?? .storageFailure)
+                suspend(cloudSyncFailure(error, fallback: .storageFailure))
                 throw suspension.failure ?? .storageFailure
             }
             do {
@@ -715,7 +749,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 }
                 try await repository.blockProvisioning(scope)
             } catch {
-                suspend((error as? CloudSyncAdapterError) ?? .storageFailure)
+                suspend(cloudSyncFailure(error, fallback: .storageFailure))
                 throw error
             }
             throw CloudSyncAdapterError.untrustedRecord
@@ -750,6 +784,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             record["envelopeAssets"] = nil
         } else {
             guard var assetDirectory else { throw CloudSyncAdapterError.assetDirectoryRequired }
+            let accountDirectory = SHA256.hash(data: Data(version.scope.account.utf8)).map { String(format: "%02x", $0) }.joined()
+            assetDirectory = assetDirectory.appendingPathComponent(accountDirectory, isDirectory: true)
+                .appendingPathComponent(version.scope.vaultID.uuidString, isDirectory: true)
             try LocalFile.privateDirectory(assetDirectory)
             var protection = URLResourceValues()
             protection.isExcludedFromBackup = true

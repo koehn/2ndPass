@@ -110,6 +110,22 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
         }
     }
 
+    /// Remove only this vault's pin and bounded membership checkpoints. A durable
+    /// repository deletion marker must already prohibit bootstrap/enrollment.
+    func removeDeletedVault(scope: ItemVaultSetupScope) throws {
+        var query = try baseQuery(scope)
+        let prefix = try setupHash(setupEncode(scope))
+        for generation in 2...128 {
+            query[kSecAttrService as String] = "mop.item-vault-membership.v1"
+            query[kSecAttrAccount as String] = prefix + ":" + String(generation)
+            let status = SecItemDelete(query as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainItemVaultTrustFailure.status(status) }
+        }
+        query = try baseQuery(scope)
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainItemVaultTrustFailure.status(status) }
+    }
+
     private func baseQuery(_ scope: ItemVaultSetupScope) throws -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecUseDataProtectionKeychain as String: true,

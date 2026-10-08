@@ -29,7 +29,11 @@ struct CloudConfirmationPending: Error {
         + (mutationIDs.isEmpty ? "" : " Mutation receipts: " + mutationIDs.map(\.uuidString).joined(separator: ", "))
     }
 }
+struct VaultDeletionPending: Error {
+    let message = "Vault deletion is pending. Run sp vault sync to resume; do not start another deletion."
+}
 private func requireCloudConfirmation(_ result: VaultResult) throws -> VaultResult {
+    if let phase = result.deletionStatus, phase != .complete { throw VaultDeletionPending() }
     if result.saveStatus == .pending { throw CloudConfirmationPending(mutationIDs: result.mutationIDs) }
     return result
 }
@@ -370,10 +374,12 @@ struct Vault: AsyncParsableCommand {
         func run() async throws { throw ItemVaultServiceFailure.unavailable }
     }
     struct DeleteVault: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(commandName: "delete", abstract: "Delete the selected cloud vault. Backups and local ciphertext remain.")
+        static let configuration = CommandConfiguration(commandName: "delete", abstract: "Permanently delete the selected cloud vault. Updated devices erase cached copies when they reconnect; backups remain.")
         @OptionGroup var storage: VaultOptions
         @Option(help: "Repeat the exact vault UUID to confirm deletion.") var confirm: String
         func run() async throws {
+            try storage.requireOnline()
+            guard !storage.localSave else { throw ValidationError("Vault deletion does not support --local-save.") }
             guard let selected = storage.vault, UUID(uuidString: selected) != nil, confirm == selected else { throw MopError.confirmationRequired }
             try emit(await storage.execute(.deleteVault))
         }

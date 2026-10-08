@@ -78,6 +78,7 @@ final class AppModel {
     var keyCreationPresented = false
     var isActive = true { didSet { if oldValue != isActive { refreshConflicts(); refreshHealth() } } }
     var vaults: [VaultDescriptor] = []
+    var hasPendingVaultDeletion = false
     var vault = "" {
         didSet {
             switch collection {
@@ -1404,6 +1405,7 @@ final class AppModel {
             let connectedAutomatically = rows.contains { row in
                 row.enrolled && self.vaults.contains { $0.id == row.id && !$0.enrolled }
             }
+            self.hasPendingVaultDeletion = !result.pendingVaultDeletions.isEmpty
             self.vaults = rows
             self.catalogLoadProgress = self.catalogLoadProgress.filter { ids.contains($0.key) }
             self.catalogs = self.catalogs.filter { ids.contains($0.key) }
@@ -1456,6 +1458,7 @@ final class AppModel {
         }
         let result = try await service.execute(.discover, vault: nil, offline: false)
         guard current(token) else { return }
+        hasPendingVaultDeletion = !result.pendingVaultDeletions.isEmpty
         vaults = result.vaults
     }
     private func unlockContents(_ token: Int, refresh: Bool = true) async throws {
@@ -1485,6 +1488,7 @@ final class AppModel {
                     let discovery = try await service.execute(.discover, vault: nil, offline: false)
                     guard current(token) else { return }
                     guard !discovery.vaults.contains(where: { $0.id == id }) else { throw MopError.vaultMissing }
+                    hasPendingVaultDeletion = !discovery.pendingVaultDeletions.isEmpty
                     vaults = discovery.vaults
                     loaded.removeValue(forKey: id); deleted.removeValue(forKey: id)
                     if vault == id { vault = "" }
@@ -1801,6 +1805,7 @@ final class AppModel {
             let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
             guard self.current(token) else { return }
             self.offline = discovery.usingCache
+            self.hasPendingVaultDeletion = !discovery.pendingVaultDeletions.isEmpty
             self.vaults = discovery.vaults
             self.sheet = .enrollDevice
         }
@@ -1955,6 +1960,7 @@ final class AppModel {
                 guard current(token), !Task.isCancelled else { return }
                 let available = Set(discovery.vaults.map(\.id))
                 guard requested.allSatisfy({ available.contains($0) }) else {
+                    hasPendingVaultDeletion = !discovery.pendingVaultDeletions.isEmpty
                     vaults = discovery.vaults
                     if vault != LocalVault.id && !available.contains(vault) { vault = "" }
                     lock()
@@ -1980,6 +1986,7 @@ final class AppModel {
                 }
                 for (id, result) in progressResults { recordCatalogProgress(result, vaultID: id) }
                 if selectedItemChanged(in: loaded[vault], vaultID: vault) { conceal() }
+                hasPendingVaultDeletion = !discovery.pendingVaultDeletions.isEmpty
                 vaults = discovery.vaults; catalogs = loaded; deletedCatalogs = deleted
                 // Newly connected vaults join the existing authenticated view;
                 // do not return to the lock screen or discard already open rows.
@@ -2072,16 +2079,40 @@ final class AppModel {
     func deleteVault(target: VaultDescriptor, confirmation: String) {
         guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.deleteVault) ?? ""; return }
         guard !offline, !busy, confirmation == (target.name ?? target.id) else { return }
-        conceal(); clearClipboard(); catalog = nil; selected = nil; selectedItem = nil; authenticated = false
+        conceal(); clearClipboard()
         perform { token in
-            _ = try await self.service.execute(.deleteVault, vault: target.id, offline: false)
+            let result = try await self.service.execute(.deleteVault, vault: target.id, offline: false)
+            guard self.current(token) else { return }
+            guard let phase = result.deletionStatus else { throw ItemVaultServiceFailure.unavailable }
+            let pending = phase != .complete
+            if phase != .prepared {
+                self.lock()
+                self.vaults.removeAll { $0.id == target.id }
+                self.catalogs[target.id] = nil; self.deletedCatalogs[target.id] = nil
+                self.vault = self.cloudVaults.first?.id ?? ""
+                self.openVaultDetails(nil)
+            }
+            self.sheetRequest = nil
+            self.hasPendingVaultDeletion = pending
+            self.notice = result.message
+            self.status = pending ? "Vault deletion pending" : "Vault deleted"
+        }
+    }
+
+    func retryVaultDeletions() {
+        guard !busy, !offline else { return }
+        perform { token in
+            let result = try await self.service.execute(.sync, vault: nil, offline: false)
+            guard self.current(token) else { return }
+            let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
             guard self.current(token) else { return }
             self.lock()
-            self.vaults.removeAll { $0.id == target.id }
-            self.catalogs[target.id] = nil
-            self.vault = ""
-            self.notice = "Vault deleted. Backups and caches on other devices remain."
-            self.status = "Vault deleted"
+            self.hasPendingVaultDeletion = !discovery.pendingVaultDeletions.isEmpty
+            self.vaults = discovery.vaults
+            self.vault = self.cloudVaults.first?.id ?? ""
+            self.openVaultDetails(nil)
+            self.notice = result.message
+            self.status = self.hasPendingVaultDeletion ? "Vault deletion pending" : "Vault deleted"
         }
     }
 

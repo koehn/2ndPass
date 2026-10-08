@@ -3,6 +3,42 @@ import Foundation
 import Testing
 @testable import MopSync
 
+@Test func transportCancellationDoesNotInterruptDeliveredEventPersistence() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let entered = AsyncStream<Void>.makeStream()
+    let resume = AsyncStream<Void>.makeStream()
+    let delivered = Data([1, 2, 3])
+    let callback = Task {
+        await completeCloudSyncEvent {
+            entered.continuation.yield(())
+            for await _ in resume.stream { break }
+            do {
+                try Task.checkCancellation()
+                try await repository.saveEngineState(delivered, account: "account", database: "event-test")
+            } catch { Issue.record("Delivered event was interrupted: \(error)") }
+        }
+    }
+    for await _ in entered.stream { break }
+    // Reproduce cancelOperations cancelling the delegate while it awaits work.
+    callback.cancel()
+    resume.continuation.yield(())
+    await callback.value
+    #expect(try await repository.engineState(account: "account", database: "event-test") == delivered)
+    entered.continuation.finish(); resume.continuation.finish()
+}
+
+@Test func cancelledSyncWorkIsNeitherStorageFailureNorUntrustedData() {
+    for error: any Error in [CancellationError(), CKError(.operationCancelled)] {
+        #expect(cloudSyncFailure(error, fallback: .storageFailure) == .operationInterrupted)
+        #expect(cloudSyncFailure(error, fallback: .untrustedRecord) == .operationInterrupted)
+    }
+    #expect(cloudSyncFailure(CloudSyncAdapterError.untrustedRecord, fallback: .storageFailure) == .untrustedRecord)
+    #expect(cloudSyncFailure(CloudSyncAdapterError.accountChanged, fallback: .storageFailure) == .accountChanged)
+    #expect(cloudSyncFailure(CocoaError(.fileReadCorruptFile), fallback: .storageFailure) == .storageFailure)
+}
+
 @Test(arguments: [CloudSyncAdapterError.membershipUnavailable, .storageFailure, .unreadableRemoteRecord])
 func syncSuspensionRetainsCauseAcrossInterruptedCallbacks(_ cause: CloudSyncAdapterError) throws {
     var suspension = CloudSyncSuspension()

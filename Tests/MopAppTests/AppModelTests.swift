@@ -608,7 +608,7 @@ private actor Barrier {
     @Test func deletionRequiresExactConfirmationAndFixedUUID() async throws {
         let service = FakeService { op, id, offline in
             guard case .deleteVault = op else { Issue.record("Wrong operation"); return VaultResult() }
-            #expect(id != nil && !offline); return VaultResult()
+            #expect(id != nil && !offline); var result = VaultResult(); result.deletionStatus = .complete; return result
         }
         let model = model(service)
         let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)
@@ -617,6 +617,29 @@ private actor Barrier {
         #expect(!model.busy)
         model.deleteVault(target: target, confirmation: "personal"); try await finish(model)
         #expect(model.vault.isEmpty && model.vaults.isEmpty)
+    }
+    @Test func deletionBeforeCommitFailurePreservesUsableVault() async throws {
+        let service = FakeService { _, _, _ in throw MopError.cloudUnavailable }
+        service.authenticate()
+        let model = model(service); model.authenticated = true
+        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)
+        model.vaults = [target]
+        model.deleteVault(target: target, confirmation: "personal"); try await finish(model)
+        #expect(model.error != nil && model.authenticated)
+        #expect(model.vaults == [target] && model.vault == target.id)
+        #expect(!model.hasPendingVaultDeletion)
+    }
+    @Test func deletionPendingStateRemainsVisibleAndClosesDeletedDetails() async throws {
+        let service = FakeService { _, _, _ in
+            var result = VaultResult(); result.deletionStatus = .committed; result.message = "Pending deletion"; return result
+        }
+        service.authenticate()
+        let model = model(service); model.authenticated = true
+        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)
+        model.vaults = [target]; model.vaultDetailsTarget = target
+        model.deleteVault(target: target, confirmation: "personal"); try await finish(model)
+        #expect(model.hasPendingVaultDeletion && model.notice == "Pending deletion")
+        #expect(model.vaultDetailsTarget == nil && model.vaults.isEmpty && !model.authenticated)
     }
     @Test func renameRetainsAuthenticationAndReplacesOldReferences() async throws {
         let service = FakeService { _, _, _ in var r = VaultResult(); r.catalog = Self.catalog; r.catalog?.vault = "private"; return r }

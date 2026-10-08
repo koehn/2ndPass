@@ -153,6 +153,19 @@ public final class ItemVaultSession: @unchecked Sendable {
         }
     }
 
+    func deletionNotice(scope: ItemVaultSetupScope) async throws -> VaultDeletionNotice {
+        let vaultScope = scope.repositoryScope
+        guard scope.binding == binding, try await repository.deletion(vaultScope) == nil else { throw VaultDeletionFailure.deleted }
+        return try permit.withDevice { device in
+            try validateMembershipAuthority(digest: currentDigest)
+            let binding = VaultDeletionNotice.Binding(container: scope.container, environment: scope.environment,
+                account: self.binding.account, vault: self.binding.vaultID, database: self.binding.database,
+                zone: "MopItems-" + self.binding.vaultID.uuidString, owner: self.binding.zoneOwner,
+                genesis: try history.orderedStates[0].digest())
+            return try VaultDeletionNotice.create(binding: binding, history: history, owner: device)
+        }
+    }
+
     public var ciphertextValidator: CloudItemValidator {
         { [self] version, direction in try validate(version, direction: direction) }
     }
@@ -871,55 +884,32 @@ public final class ItemVaultSession: @unchecked Sendable {
     }
 
     /// Derived evidence has its own encrypted heads and never changes item revisions.
+    public func retireLegacyHealthSynchronization() async throws {
+        try permit.check()
+        // Retire only authenticated legacy health records. Secret heads and their
+        // pending changes are unaffected; old cloud health data is not imported.
+        for legacy in try await repository.healthItems(account: binding.account, vaultID: binding.vaultID,
+                database: binding.database, zoneOwner: binding.zoneOwner) {
+            if (try? healthEnvelope(legacy)) != nil {
+                try await repository.retireHealthSynchronization(legacy)
+            }
+        }
+    }
+
     public func healthChecks() async throws -> [CachedPasswordCheck] {
         try permit.check()
-        let index = try await repository.healthRevisionIndex(scope: nameIndexScope)
-        if let cached = try permit.cachedHealthProjection(index) { return cached }
-        let versions = try await repository.healthItems(account: binding.account, vaultID: binding.vaultID,
-            database: binding.database, zoneOwner: binding.zoneOwner)
-        guard !versions.isEmpty else { return [] }
-        let keyEnvelope = try await displayCacheEnvelope(), context = try displayCacheContext()
-        let rows = try await repository.displayCatalogRows(scope: nameIndexScope)
-        let cached = Dictionary(uniqueKeysWithValues: rows.map { ($0.itemID, $0) })
-        var checks: [CachedPasswordCheck] = [], replacements: [EncryptedDisplayCatalogRow] = []
-        for version in versions.sorted(by: { $0.scope.itemID.uuidString < $1.scope.itemID.uuidString }) {
-            await Task.yield()
-            try Task.checkCancellation()
-            do {
+        var checks: [CachedPasswordCheck] = []
+        for version in try await repository.localHealthItems(scope: nameIndexScope) {
+            try permit.check()
+            // A disposable cache entry that no longer verifies is recomputed.
+            if let values = try? permit.withHealth(version, { device in
                 let envelope = try healthEnvelope(version)
-                let membership = try readableState(envelope.header.membership)
-                let existing: [CachedPasswordCheck]? = try permit.withDisplayKey(envelope: keyEnvelope, context: context) { key in
-                    guard let row = cached[version.scope.itemID], row.versionID == version.versionID, row.keyID == key.id,
-                          var bytes = try? key.open(row.ciphertext, item: row.itemID, version: row.versionID) else { return nil }
-                    defer { SecretBytes.wipe(&bytes) }
-                    return try? JSONDecoder().decode([CachedPasswordCheck].self, from: bytes)
-                }
-                if let existing { checks += existing; continue }
-                let values = try permit.withHealth(version) { device in
-                    try envelope.open(device: device, membership: membership.membership, membershipStateDigest: envelope.header.membership)
-                }
-                checks += values
-                var bytes = try setupEncode(values)
-                defer { SecretBytes.wipe(&bytes) }
-                replacements.append(try permit.withDisplayKey(envelope: keyEnvelope, context: context) { key in
-                    EncryptedDisplayCatalogRow(itemID: version.scope.itemID, versionID: version.versionID, keyID: key.id,
-                        ciphertext: try key.seal(bytes, item: version.scope.itemID, version: version.versionID))
-                })
-                await Task.yield()
-            } catch ItemVaultSessionFailure.pendingAdmission { continue }
-        }
-        if !replacements.isEmpty {
-            do {
-                try await repository.saveDisplayCatalogRows(scope: nameIndexScope, rows: replacements, keyEnvelope: keyEnvelope, authorization: permit)
-            } catch ItemRepositoryError.staleLocalVersion { /* A newer source will rebuild its derived row. */ }
-        }
-        let result = checks.sorted { $0.record < $1.record }
-        let projected = Dictionary(uniqueKeysWithValues: versions.map { ($0.scope.itemID, $0.versionID) })
-        if try await repository.healthRevisionIndex(scope: nameIndexScope) == projected {
-            try permit.cacheHealthProjection(projected, checks: result)
+                return try envelope.open(device: device, membership: readableState(envelope.header.membership).membership,
+                                         membershipStateDigest: envelope.header.membership)
+            }) { checks += values }
         }
         try permit.check()
-        return result
+        return checks.sorted { $0.record < $1.record }
     }
 
     public func healthConflicts() async throws -> [EncryptedItemConflict] {
@@ -929,13 +919,17 @@ public final class ItemVaultSession: @unchecked Sendable {
         }
     }
 
-    public func saveHealthChecks(_ checks: [CachedPasswordCheck], itemID: UUID, expectedItemVersion: UUID) async throws -> PendingItemMutation? {
+    public func saveHealthChecks(_ checks: [CachedPasswordCheck], itemID: UUID, expectedItemVersion: UUID) async throws -> EncryptedItemVersion? {
         try permit.check()
         guard let parent = try await repository.item(binding.item(itemID)), parent.versionID == expectedItemVersion else {
             throw ItemRepositoryError.staleLocalVersion
         }
         let scope = binding.item(ItemHealthEnvelope.recordID(for: itemID))
-        let previous = try await repository.item(scope)
+        var previous = try await repository.localHealthItem(scope)
+        if let invalid = previous, (try? healthEnvelope(invalid)) == nil {
+            try await repository.discardLocalHealth(scope, expectedVersion: invalid.versionID, authorization: permit)
+            previous = nil
+        }
         let version: EncryptedItemVersion? = try permit.withDevice { device in
             let item = try envelope(parent)
             let state = try readableState(item.header.membership)
@@ -966,31 +960,8 @@ public final class ItemVaultSession: @unchecked Sendable {
                 ciphertext: sealed.encoded(), generation: sealed.header.generation, healthItemID: itemID)
         }
         guard let version else { return nil }
-        return try await repository.commitLocalMutation(version, authorization: permit, expectedHealthParentVersion: expectedItemVersion)
-    }
-
-    public func resolveHealthConflict(_ conflict: EncryptedItemConflict, coordinator: CloudKitSyncAdapter) async throws {
-        let version = try permit.withDevice { device in
-            guard conflict.local.scope == conflict.remote.scope, conflict.local.healthItemID == conflict.remote.healthItemID else {
-                throw ItemVaultSessionFailure.invalidEnvelopeBinding
-            }
-            let local = try healthEnvelope(conflict.local), remote = try healthEnvelope(conflict.remote)
-            var merged: [String: CachedPasswordCheck] = [:]
-            for envelope in [remote, local] {
-                let state = try readableState(envelope.header.membership)
-                for check in try envelope.open(device: device, membership: state.membership, membershipStateDigest: envelope.header.membership) {
-                    merged[check.record] = merged[check.record].map { check.retainingNewerResults(from: $0) } ?? check
-                }
-            }
-            let generation = max(local.header.generation, remote.header.generation)
-            guard generation < UInt64(Int64.max) else { throw MopError.invalidVault }
-            let next = try ItemHealthEnvelope.seal(merged.values.sorted { $0.record < $1.record }, vault: binding.vaultID,
-                item: local.header.item, generation: generation + 1, base: remote.header.version,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
-            return try EncryptedItemVersion(scope: conflict.local.scope, versionID: next.header.version, baseVersionID: next.header.base,
-                ciphertext: next.encoded(), generation: next.header.generation, healthItemID: conflict.local.healthItemID)
-        }
-        _ = try await coordinator.resolveConflict(conflict, with: version, authorization: permit)
+        try await repository.saveLocalHealth(version, expectedParent: expectedItemVersion, authorization: permit)
+        return version
     }
 
     private func healthEnvelope(_ version: EncryptedItemVersion) throws -> ItemHealthEnvelope {

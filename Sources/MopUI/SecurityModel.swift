@@ -88,7 +88,6 @@ extension AppModel {
     private func persistHealthCache(_ report: PasswordHealthReport, snapshots: [String: ItemCatalog], token: UUID, session: Int, partial: Bool = false) async {
         guard supports(.passwordCheckCache) else { healthCacheNotice = "Results are available during this unlocked session."; return }
         guard healthPublishing == nil else { return }
-        guard !offline else { healthCacheNotice = "Results are local until iCloud is available."; return }
         healthCacheNotice = snapshots.values.contains { $0.canEdit != true || $0.securityEnabled != true } ? "Some vault results are local to this unlocked session." : nil
         healthPublishing = token
         defer {
@@ -141,7 +140,7 @@ extension AppModel {
                         catalogs[id] = updated
                     }
                 }
-                healthCacheNotice = "Results are available on this device, but the iCloud cache could not be updated."
+                healthCacheNotice = "Results are available during this session, but the encrypted local cache could not be updated."
             }
         }
     }

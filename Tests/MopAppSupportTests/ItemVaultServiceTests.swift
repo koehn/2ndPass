@@ -759,7 +759,7 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     #expect(saved.items[0].fields[0].passwordQuality == checks.first?.strengthResult?.quality)
     #expect(saved.items[0].fields[0].passwordQuality != nil)
     #expect(try await session.vaultMetadata().versionID == metadataBefore)
-    let health = try await repository.healthItems(account: session.binding.account, vaultID: id)
+    let health = try await repository.localHealthItems(scope: VaultScope(account: session.binding.account, vaultID: id, database: session.binding.database, zoneOwner: session.binding.zoneOwner))
     #expect(health.count == 1 && health.first?.healthItemID == itemID)
     #expect(try await session.catalog().count == 1)
     #expect(try await session.revisionIndex().count == 2)
@@ -786,26 +786,20 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     await #expect(throws: MopError.vaultConflict) {
         try await service.execute(.savePasswordChecks(checks, revision: "stale"), vault: id.uuidString, offline: true)
     }
-    // A health conflict on just one vault must not make its local catalog
-    // depend on the CloudKit engine having started (including after restart).
-    let remote = try #require(health.first)
-    let conflict = try await repository.recordConflict(remote: remote, serverSystemFields: Data([1]))
-    #expect(conflict.local.versionID != conflict.remote.versionID)
-    let conflictedService = ItemVaultService(backend: backend)
-    let visible = try await conflictedService.displayCatalog(vault: id.uuidString).requireCatalog()
-    #expect(visible.items == saved.items)
-    #expect(visible.security?.passwordChecks?.first?.breachResult == newer.breachResult)
-    #expect(try await conflictedService.cachedCatalog(vault: id.uuidString)?.requireCatalog().items == saved.items)
-    #expect(try await conflictedService.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().items == saved.items)
-    #expect(try await session.healthConflicts() == [conflict])
+    // Simulate an old build's queued/conflicted health record. Opening with the
+    // new service retires only that work, without editing secret ciphertext.
+    let legacy = try #require(health.first)
+    _ = try await repository.commitLocalMutation(legacy)
+    _ = try await repository.recordConflict(remote: legacy, serverSystemFields: Data([1]))
+    let migrated = ItemVaultService(backend: backend)
+    _ = try await migrated.displayCatalog(vault: id.uuidString)
+    #expect(try await session.healthConflicts().isEmpty)
+    #expect(try await repository.healthItems(account: session.binding.account, vaultID: id).isEmpty)
     #expect(try await repository.item(session.binding.item(itemID))?.ciphertext == original.ciphertext)
-    // Only missing engine availability is deferred; trust/account failures still fail.
-    for failure in [CloudSyncAdapterError.untrustedRecord, .accountChanged] {
-        backend.conflictAdapterFailure.withLock { $0 = failure }
-        await #expect(throws: failure) {
-            try await conflictedService.displayCatalog(vault: id.uuidString)
-        }
-    }
+    #expect(try await migrated.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().security?.passwordChecks?.first?.breachResult == newer.breachResult)
+
+    #expect(try await repository.pendingMutations(account: session.binding.account).allSatisfy { $0.version.healthItemID == nil })
+
 }
 private struct UnusedHealthBreach: BreachChecking {
     func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }

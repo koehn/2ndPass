@@ -5,6 +5,7 @@ import LocalAuthentication
 import Synchronization
 import MopAuth
 import MopCore
+import MopKeychain
 import MopSync
 import MopVaultNext
 
@@ -134,7 +135,39 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     public func invalidateDiscovery() {
         state.withLock { $0.remoteVaults = nil; $0.discoveryAttempted = false; $0.enrollmentAttempted = false }
     }
+    public var vaultDeletionAvailable: Bool {
+        guard let configuration = try? SigningIdentity.cloudConfiguration() else { return false }
+        if configuration.environment == "Development" { return true }
+        #if MOP_VAULT_DELETION
+        return true
+        #else
+        return false
+        #endif
+    }
+    public func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase {
+        guard vaultDeletionAvailable else { throw ItemVaultServiceFailure.unavailable }
+        let context = try await serialized { try await self.connected() }
+        let scope = try context.account.setupScope(vaultID: vaultID)
+        if try await context.repository.deletion(scope.repositoryScope) == nil { _ = try await open(vaultID) }
+        let phase = try await context.runtime.deleteVault(vaultID)
+        invalidateDiscovery()
+        return phase
+    }
+    public func deletionStates() async throws -> [UUID: VaultDeletionPhase] {
+        guard let context = state.withLock({ $0.context }) else { return [:] }
+        return Dictionary(uniqueKeysWithValues: try await context.repository.deletions(account: context.account.accountNamespace).map { ($0.scope.vaultID, $0.phase) })
+    }
+    public func resumeDeletions() async throws -> [UUID: VaultDeletionPhase] {
+        let context = try await serialized { try await self.connected() }
+        do { try await context.runtime.reconcileDeletions() }
+        catch {
+            let states = try await context.repository.deletions(account: context.account.accountNamespace)
+            guard states.contains(where: { $0.phase != .complete }) else { throw error }
+        }
+        return Dictionary(uniqueKeysWithValues: try await context.repository.deletions(account: context.account.accountNamespace).map { ($0.scope.vaultID, $0.phase) })
+    }
     public func discover() async throws -> ItemVaultDiscovery {
+        _ = try await resumeDeletions()
         let local = try await inventory(offline: false)
         let context = try await serialized { try await self.connected() }
         scheduleAutomaticEnrollment(context)
@@ -323,6 +356,13 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         let context = try await serialized { try await self.connected() }
         let generation = state.withLock { $0.generation }
         try checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
+        if try await context.repository.deletion((try context.account.setupScope(vaultID: vaultID)).repositoryScope) != nil {
+            throw VaultDeletionFailure.deleted
+        }
+        // Presence alone can block new admission, but cannot authorize erasure.
+        if try await NativeVaultDeletionTransport(database: context.account.container.privateCloudDatabase).read(vaultID: vaultID) != nil {
+            throw VaultDeletionFailure.deleted
+        }
         let scope = enrollmentScope(context.account, vaultID: vaultID)
         let store = ItemEnrollmentRequestStore(directory: context.account.directory, scope: scope)
         let transport = NativeItemEnrollmentTransport(account: context.account)
@@ -490,11 +530,13 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             if offline { await context.runtime.pauseNetwork() }
             if let session = try? await context.runtime.session(vaultID: vaultID), session.isUnlocked { return session }
             let scope = try context.account.setupScope(vaultID: vaultID)
+            if let deletion = try await context.repository.deletion(scope.repositoryScope), deletion.phase != .prepared { throw VaultDeletionFailure.deleted }
             let trust = try KeychainItemVaultTrustStore()
             guard try trust.load(scope: scope) != nil else { throw MopError.vaultMissing }
             let device = try await device(context, vaultID: vaultID, create: false)
             let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: trust, scope: scope, device: device)
             let session = try await bootstrap.open()
+            try await session.retireLegacyHealthSynchronization()
             try await context.runtime.register(session: session, synchronize: !offline)
             if !offline {
                 state.withLock { $0.enrollmentAttempted = false }
@@ -506,6 +548,8 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     public func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession {
         try await serialized { [self] in
             let context = try await connected(), scope = try context.account.setupScope(vaultID: id)
+            guard try await context.repository.deletion(scope.repositoryScope) == nil,
+                  try await NativeVaultDeletionTransport(database: context.account.container.privateCloudDatabase).read(vaultID: id) == nil else { throw VaultDeletionFailure.deleted }
             let device = try await device(context, vaultID: id, create: true)
             let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: scope, device: device)
             let session: ItemVaultSession
@@ -574,6 +618,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         let device = try openDevice(account, vaultID: record.scope.binding.vaultID, context: snapshot.1.context, create: false)
         let bootstrap = try ItemVaultBootstrap(repository: repository, trustStore: KeychainItemVaultTrustStore(), scope: record.scope, device: device)
         let session = try await bootstrap.open()
+        try await session.retireLegacyHealthSynchronization()
         guard state.withLock({ $0.generation == snapshot.0 }) else { session.lock(); return nil }
         return session
     }

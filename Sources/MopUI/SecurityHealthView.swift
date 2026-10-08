@@ -56,7 +56,7 @@ struct SecurityHealthView: View {
                     }
                     DisclosureGroup("Breach check settings") {
                         Toggle("Check exposed passwords with HIBP", isOn: $model.breachChecksEnabled)
-                        Text(model.supports(.passwordCheckCache) ? "Results sync encrypted with each vault. Breach checks refresh daily; strength and reuse update when credentials change. Vault members can see them." : "Results remain available during this unlocked session. Synchronizing cached results is not yet available.").font(.caption)
+                        Text(model.supports(.passwordCheckCache) ? "Results are cached encrypted on this device. Breach checks refresh daily; strength and reuse update when credentials change." : "Results remain available during this unlocked session. Persistent local caching is not available.").font(.caption)
                         Text("HIBP receives a five-character password hash prefix and your network address. Your password and account details are not sent.").font(.caption)
                     }
                 }

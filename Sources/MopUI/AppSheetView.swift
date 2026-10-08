@@ -55,9 +55,10 @@ struct AppSheetView: View {
                 if (try? VaultName.validate(name)) == nil { Text("Use lowercase letters, numbers, and hyphens.").font(.caption).foregroundStyle(.secondary) }
             case .deleteVault:
                 Text("Delete cloud vault").font(.title2)
-                Text("Permanently delete cloud contents and history. Existing backups and local encrypted checkpoints remain.")
+                Text("Permanently delete cloud contents, history, and unsynced changes. Updated devices erase cached copies when they reconnect. Backups and older or offline clients may retain copies.")
                 Text(request.target?.name ?? "Unnamed vault").font(.headline)
                 Button("Export Backup First…") { model.chooseExportBackup(target: request.target) }.disabled(model.busy)
+                Text(request.target?.id ?? "").font(.caption).textSelection(.enabled)
                 TextField("Type the vault name to confirm", text: $confirmation)
 
             }
