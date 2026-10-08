@@ -918,8 +918,14 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         // Preserve the latest successful timestamp for each independent check.
         let conflicts = try await session.healthConflicts()
         if !conflicts.isEmpty {
-            let adapter = try await backend.conflictAdapter()
-            for conflict in conflicts { try await session.resolveHealthConflict(conflict, coordinator: adapter) }
+            do {
+                let adapter = try await backend.conflictAdapter()
+                for conflict in conflicts { try await session.resolveHealthConflict(conflict, coordinator: adapter) }
+            } catch CloudSyncAdapterError.engineNotStarted {
+                // Reading verified local items must not require a live sync engine.
+                // Keep both health heads intact and retry their merge on a later
+                // catalog load when the publication coordinator is available.
+            }
         }
         var result = catalog
         if result.security == nil { result.security = VaultSecurityMetadata() }

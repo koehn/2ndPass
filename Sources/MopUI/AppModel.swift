@@ -254,6 +254,12 @@ final class AppModel {
     struct CatalogLoadProgress { let loaded: Int; let total: Int; var waiting: Int = 0; var downloading = false }
     private(set) var catalogLoadProgress: [String: CatalogLoadProgress] = [:] { didSet { refreshHealth() } }
     private(set) var catalogUpdatePaused = false
+    private var catalogIssueDetails: String?
+    func showCatalogIssue() {
+        guard catalogUpdatePaused else { return }
+        error = "Local catalog update paused. Refresh to retry."
+        errorDetails = catalogIssueDetails
+    }
     var isUpdatingCatalog: Bool { !catalogLoadProgress.isEmpty }
     var hasCatalogDownloads: Bool { catalogLoadProgress.values.contains { $0.downloading || $0.waiting > 0 } }
     private var selectedCatalogProgress: [CatalogLoadProgress] {
@@ -283,6 +289,7 @@ final class AppModel {
     }
     private func recordCatalogProgress(_ result: VaultResult, vaultID: String) {
         catalogUpdatePaused = false
+        catalogIssueDetails = nil
         if let loaded = result.catalogLoadedCount, let total = result.catalogTotalCount, loaded < total {
             catalogLoadProgress[vaultID] = CatalogLoadProgress(loaded: loaded, total: total, waiting: result.catalogWaitingCount ?? 0, downloading: result.catalogDownloading)
         } else { catalogLoadProgress[vaultID] = nil }
@@ -1214,7 +1221,7 @@ final class AppModel {
         defer { restoringSelection = wasRestoring }
         authenticated = false
         clearSelection()
-        catalogLoadProgress = [:]; catalogUpdatePaused = false; pendingDisplayVaults.removeAll()
+        catalogLoadProgress = [:]; catalogUpdatePaused = false; catalogIssueDetails = nil; pendingDisplayVaults.removeAll()
         catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
@@ -1515,7 +1522,7 @@ final class AppModel {
             if catalogLoadProgress[vault] == nil, let selected, !itemFields.contains(selected) { self.selected = nil }
             let date = dates.values.min().map { ISO8601DateFormatter().string(from: $0) } ?? "unknown time"
             status = offline ? "Read only · oldest verified cache from \(date)" : "Unlocked · \(loaded.count) vault\(loaded.count == 1 ? "" : "s")"
-            loadRemainingCatalogs(ids.filter { (loaded[$0] == nil || cachedVaults.contains($0)) && requestedVaultIDs.contains($0) }, token: token)
+            loadRemainingCatalogs(ids.filter { (loaded[$0] == nil || cachedVaults.contains($0) || catalogLoadProgress[$0] != nil || catalogUpdatePaused) && requestedVaultIDs.contains($0) }, token: token)
             if openingSession { requestBackgroundSynchronization() }
         } catch {
             // The selected vault must verify before opening the session.
@@ -1608,6 +1615,11 @@ final class AppModel {
                         // A slow/unavailable secondary vault must not close the
                         // verified selected vault. Periodic refresh retries it.
                         self.notice = "Some vaults could not be loaded. Refresh to retry."
+                        self.recordError(error, operation: "Load remaining catalog")
+                        if self.catalogLoadProgress[id] != nil {
+                            self.catalogUpdatePaused = true
+                            self.catalogIssueDetails = self.errorDetails
+                        }
                         self.cloudRefreshPending = true
                     }
                 }
@@ -1913,6 +1925,7 @@ final class AppModel {
                     lock(reason: .accessFailure)
                 } else { catalogUpdatePaused = true }
                 recordError(error, operation: "Local catalog refresh")
+                if catalogUpdatePaused { catalogIssueDetails = errorDetails }
             }
         }
     }
@@ -1995,6 +2008,7 @@ final class AppModel {
                     cloudRefreshPending = true
                 }
                 recordError(error, operation: "Background cloud refresh")
+                if catalogUpdatePaused { catalogIssueDetails = errorDetails }
             }
         }
     }

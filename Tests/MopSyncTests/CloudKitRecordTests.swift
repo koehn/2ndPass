@@ -3,6 +3,20 @@ import Foundation
 import Testing
 @testable import MopSync
 
+@Test(arguments: [CloudSyncAdapterError.membershipUnavailable, .storageFailure, .unreadableRemoteRecord])
+func syncSuspensionRetainsCauseAcrossInterruptedCallbacks(_ cause: CloudSyncAdapterError) throws {
+    var suspension = CloudSyncSuspension()
+    try suspension.check()
+    suspension.record(cause)
+    // Another callback can fail after sync stops while account validation waits.
+    suspension.record(.operationInterrupted)
+    #expect(throws: cause) { try suspension.check() }
+    // A genuinely changed account takes priority and cannot be masked later.
+    suspension.record(.accountChanged)
+    suspension.record(.storageFailure)
+    #expect(throws: CloudSyncAdapterError.accountChanged) { try suspension.check() }
+}
+
 @Test func cloudRecordContainsNoLocalAccountIdentityAndBindsDestination() throws {
     let scope = ItemScope(account: "private-local-account-binding", vaultID: UUID(), itemID: UUID())
     let version = EncryptedItemVersion(scope: scope, baseVersionID: nil, ciphertext: Data([1, 2, 3]))

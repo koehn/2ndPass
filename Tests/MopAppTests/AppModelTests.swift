@@ -1331,6 +1331,42 @@ extension AppModelTests {
         #expect(app.sheet == nil && app.error != nil)
         #expect(service.state.withLock { $0.operations.isEmpty })
     }
+    @Test func refreshRetriesPausedCatalogWithoutAnotherStoreNotification() async throws {
+        let id = UUID().uuidString
+        let phase = Mutex(0)
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [.init(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+            } else if case .catalog = operation {
+                let current = phase.withLock { $0 }
+                if current == 1 { throw MopError.inputOutput }
+                result.catalog = ItemCatalog(vault: "personal", revision: current == 0 ? "partial" : "complete", items: [])
+                if current == 0 { result.catalogLoadedCount = 0; result.catalogTotalCount = 2 }
+            }
+            return result
+        }
+        service.authenticate()
+        let app = model(service); app.vault = id; app.start()
+        try await finish(app)
+        #expect(app.authenticated && app.isUpdatingCatalog)
+        phase.withLock { $0 = 1 }
+        app.cloudChanged()
+        try await finish(app)
+        #expect(app.catalogUpdatePaused)
+        app.showCatalogIssue()
+        #expect(app.error == "Local catalog update paused. Refresh to retry.")
+        app.error = nil
+        phase.withLock { $0 = 2 }
+        // The fake sync request deliberately emits no store change notification.
+        app.refresh()
+        try await finish(app)
+        #expect(app.catalog?.revision == "complete")
+        #expect(!app.catalogUpdatePaused && !app.isUpdatingCatalog)
+        #expect(app.catalogTransferStatus == nil)
+        app.shutdown()
+    }
+
     @Test func newlyConnectedVaultShowsDownloadingUntilItemsArrive() async throws {
         let id = UUID().uuidString
         let service = FakeService { operation, _, _ in

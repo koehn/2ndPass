@@ -19,6 +19,10 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
     let confirmsDelivery = Mutex(false)
     let locksAfterCreate = Mutex(false)
     let discoveryComplete = Mutex(true)
+    let conflictAdapterFailure = Mutex<CloudSyncAdapterError>(.engineNotStarted)
+    func conflictAdapter() async throws -> CloudKitSyncAdapter {
+        throw conflictAdapterFailure.withLock { $0 }
+    }
     func discover() async throws -> ItemVaultDiscovery {
         try await ItemVaultDiscovery(vaults: inventory(), complete: discoveryComplete.withLock { $0 })
     }
@@ -781,6 +785,26 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     #expect(try await repository.item(session.binding.item(itemID))?.ciphertext == original.ciphertext)
     await #expect(throws: MopError.vaultConflict) {
         try await service.execute(.savePasswordChecks(checks, revision: "stale"), vault: id.uuidString, offline: true)
+    }
+    // A health conflict on just one vault must not make its local catalog
+    // depend on the CloudKit engine having started (including after restart).
+    let remote = try #require(health.first)
+    let conflict = try await repository.recordConflict(remote: remote, serverSystemFields: Data([1]))
+    #expect(conflict.local.versionID != conflict.remote.versionID)
+    let conflictedService = ItemVaultService(backend: backend)
+    let visible = try await conflictedService.displayCatalog(vault: id.uuidString).requireCatalog()
+    #expect(visible.items == saved.items)
+    #expect(visible.security?.passwordChecks?.first?.breachResult == newer.breachResult)
+    #expect(try await conflictedService.cachedCatalog(vault: id.uuidString)?.requireCatalog().items == saved.items)
+    #expect(try await conflictedService.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().items == saved.items)
+    #expect(try await session.healthConflicts() == [conflict])
+    #expect(try await repository.item(session.binding.item(itemID))?.ciphertext == original.ciphertext)
+    // Only missing engine availability is deferred; trust/account failures still fail.
+    for failure in [CloudSyncAdapterError.untrustedRecord, .accountChanged] {
+        backend.conflictAdapterFailure.withLock { $0 = failure }
+        await #expect(throws: failure) {
+            try await conflictedService.displayCatalog(vault: id.uuidString)
+        }
     }
 }
 private struct UnusedHealthBreach: BreachChecking {

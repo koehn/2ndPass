@@ -18,6 +18,19 @@ public enum CloudSyncAdapterError: Error, Equatable, Sendable {
     case operationInterrupted
 }
 
+/// Keep the reason sync stopped separate from subsequent callback diagnostics.
+struct CloudSyncSuspension {
+    private(set) var failure: CloudSyncAdapterError?
+
+    mutating func record(_ reason: CloudSyncAdapterError) {
+        if failure == nil || reason == .accountChanged { failure = reason }
+    }
+
+    func check() throws {
+        if let failure { throw failure }
+    }
+}
+
 /// One engine owns a database's serialized state at a time across app-group processes.
 /// The descriptor is immutable and its advisory lock lasts exactly as long as this object.
 public final class SynchronizationLease: @unchecked Sendable {

@@ -226,6 +226,9 @@ struct ContentView: View {
                                 .accessibilityLabel("Items ready")
                         } else { ProgressView().controlSize(.small) }
                         Text(progress).font(.caption).foregroundStyle(.secondary)
+                        if model.catalogUpdatePaused {
+                            Button("Details…") { model.showCatalogIssue() }.font(.caption)
+                        }
                         Spacer()
                     }.padding(.horizontal, 12).padding(.bottom, 8)
                     .accessibilityIdentifier("catalog-transfer-progress")

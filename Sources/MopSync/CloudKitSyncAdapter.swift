@@ -63,7 +63,8 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     private var engine: CKSyncEngine?
     private var lease: SynchronizationLease?
     private var uploadsAllowed = false
-    private var suspended = false
+    private var suspension = CloudSyncSuspension()
+    private var suspended: Bool { suspension.failure != nil }
     private var stopping = false
     private var resolutionInProgress = false
     private var resolutionPermit: ConflictPublicationPermit?
@@ -111,7 +112,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     public func start(automaticallySync: Bool = true) async throws {
         try Task.checkCancellation()
         guard !stopping else { throw CloudSyncAdapterError.operationInterrupted }
-        guard !suspended else { throw CloudSyncAdapterError.accountChanged }
+        try checkSuspension()
         guard engine == nil else { return }
         let expectedGeneration = identityGeneration
         let acquired = try SynchronizationLease(url: leaseURL)
@@ -255,7 +256,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     public func requestSync() async throws {
         try Task.checkCancellation()
-        guard !suspended else { throw CloudSyncAdapterError.accountChanged }
+        try checkSuspension()
         guard let engine else { throw CloudSyncAdapterError.engineNotStarted }
         let expectedGeneration = identityGeneration
         try await validateAccount(generation: expectedGeneration)
@@ -283,7 +284,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     /// Call after a durable local transaction; restart reconstructs this list from Core Data.
     public func registerPendingChanges() async throws {
-        guard !suspended else { throw CloudSyncAdapterError.accountChanged }
+        try checkSuspension()
         guard let engine else { throw CloudSyncAdapterError.engineNotStarted }
         let expectedGeneration = identityGeneration
         let pending = try await repository.pendingScopes(account: account, excludingConflicts: true)
@@ -326,7 +327,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             // storage or an unreadable asset. Never resume under a different account.
             guard try await accountValidator() else { throw CloudSyncAdapterError.accountChanged }
             await stop()
-            suspended = false
+            suspension = CloudSyncSuspension()
             lastFailure = nil
         }
         if engine == nil {
@@ -383,9 +384,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 guard expectedGeneration == identityGeneration, engine === syncEngine else {
                     throw CloudSyncAdapterError.operationInterrupted
                 }
-                suspended = true
-                resolutionPermit?.invalidate()
-                uploadsAllowed = false
+                suspend(.accountChanged)
                 generation += 1
                 identityGeneration += 1
                 lastFailure = .accountChanged
@@ -399,9 +398,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                     do { try await receive(change.record) }
                     catch let error as CloudSyncAdapterError { lastFailure = error }
                     catch {
-                        suspended = true
-                        uploadsAllowed = false
-                        lastFailure = .storageFailure
+                        suspend(.storageFailure)
                         throw error
                     }
                 }
@@ -456,9 +453,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 if let underlying = native.userInfo[NSUnderlyingErrorKey] as? NSError {
                     Self.logger.error("Underlying sync failure: domain=\(underlying.domain, privacy: .public) code=\(underlying.code)")
                 }
-                lastFailure = error as? CloudSyncAdapterError ?? .storageFailure
-                suspended = true
-                uploadsAllowed = false
+                suspend(error as? CloudSyncAdapterError ?? .storageFailure)
             }
         }
         if dataEvent, expectedGeneration == identityGeneration { activeDataEvents -= 1 }
@@ -468,9 +463,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         do { try await repository.saveEngineState(state, account: account, database: stateNamespace) }
         catch {
             if expectedGeneration == identityGeneration, engine === syncEngine {
-                suspended = true
-                uploadsAllowed = false
-                lastFailure = .storageFailure
+                suspend(.storageFailure)
             }
         }
     }
@@ -537,7 +530,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     /// Public for deterministic transport tests without CloudKit network execution.
     public func receive(_ record: CKRecord) async throws {
-        guard !suspended else { throw CloudSyncAdapterError.accountChanged }
+        try checkSuspension()
         let expectedGeneration = identityGeneration
         try await validateAccount(generation: expectedGeneration)
         // Enrollment relay zones are outside this engine's trusted item inventory.
@@ -551,9 +544,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         let wireBytes: Data
         do { wireBytes = try Self.wireBytes(record) }
         catch {
-            suspended = true
-            uploadsAllowed = false
-            lastFailure = .unreadableRemoteRecord
+            suspend(.unreadableRemoteRecord)
             throw CloudSyncAdapterError.unreadableRemoteRecord
         }
         let version: EncryptedItemVersion
@@ -562,13 +553,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             try await validator(version, .receiving)
         }
         catch CloudSyncAdapterError.membershipUnavailable {
-            suspended = true; uploadsAllowed = false; lastFailure = .membershipUnavailable
+            suspend(.membershipUnavailable)
             throw CloudSyncAdapterError.membershipUnavailable
         } catch CloudSyncAdapterError.operationInterrupted {
-            suspended = true; uploadsAllowed = false; lastFailure = .operationInterrupted
+            suspend(.operationInterrupted)
             throw CloudSyncAdapterError.operationInterrupted
         } catch CloudSyncAdapterError.storageFailure {
-            suspended = true; uploadsAllowed = false; lastFailure = .storageFailure
+            suspend(.storageFailure)
             throw CloudSyncAdapterError.storageFailure
         } catch {
             // Persist opaque invalid input for recovery rather than applying it or dropping
@@ -629,17 +620,30 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         }
     }
 
+    private func checkSuspension() throws {
+        try suspension.check()
+    }
+
+    private func suspend(_ failure: CloudSyncAdapterError) {
+        // Preserve the first cause even if subsequent callbacks fail because the
+        // engine is suspended. A confirmed account change always takes priority.
+        suspension.record(failure)
+        resolutionPermit?.invalidate()
+        uploadsAllowed = false
+        lastFailure = suspension.failure
+    }
+
     private func validateAccount(generation expected: Int) async throws {
         guard expected == identityGeneration else { throw CloudSyncAdapterError.operationInterrupted }
         let authorized = try await accountValidator()
         guard expected == identityGeneration else { throw CloudSyncAdapterError.operationInterrupted }
-        guard !suspended, authorized else {
-            suspended = true
-            resolutionPermit?.invalidate()
-            uploadsAllowed = false
-            lastFailure = .accountChanged
+        guard authorized else {
+            suspend(.accountChanged)
             throw CloudSyncAdapterError.accountChanged
         }
+        // A callback can suspend the engine while account validation awaits.
+        // A valid account must not turn that failure into an account mismatch.
+        try checkSuspension()
     }
 
     private func decode(_ record: CKRecord, bytes: Data? = nil) throws -> EncryptedItemVersion {
@@ -701,9 +705,8 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             if !provenMismatch {
                 // Protected storage, account retirement, and unavailable local
                 // trust are not evidence that a remote authority is invalid.
-                suspended = true; uploadsAllowed = false
-                lastFailure = (error as? CloudSyncAdapterError) ?? .storageFailure
-                throw lastFailure!
+                suspend((error as? CloudSyncAdapterError) ?? .storageFailure)
+                throw suspension.failure ?? .storageFailure
             }
             do {
                 try await validateAccount(generation: expected)
@@ -712,7 +715,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 }
                 try await repository.blockProvisioning(scope)
             } catch {
-                suspended = true; uploadsAllowed = false
+                suspend((error as? CloudSyncAdapterError) ?? .storageFailure)
                 throw error
             }
             throw CloudSyncAdapterError.untrustedRecord
