@@ -393,3 +393,83 @@ private actor SuspendedRuntimeDriver: ItemVaultRuntimeDriver {
     #expect(await driver.starts == 1)
     await runtime.stop()
 }
+
+@Test func recoveryPauseWaitsForInterruptedCloudStartup() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-runtime-recovery-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let inventory = MemoryItemInventory(), owner = try SessionDevice()
+    let context = ItemVaultRuntimeContext(container: "iCloud.test", environment: "Development", account: "runtime", memberID: owner.identity.member, leaseURL: directory.appendingPathComponent("lease.lock"))
+    let gate = RuntimeBarrier(), drivers = Mutex<[RuntimeDriver]>([])
+    let runtime = try ItemVaultSyncRuntime(context: context, repository: repository, trustStore: inventory, transport: DomainProvisionServer(),
+        accountValidator: { true }, accountAuthorization: DomainAccountAuthorization()) { addresses, items, controls, eligible in
+            drivers.withLock { values in
+                let driver = RuntimeDriver(addresses, items, controls, eligible, startGate: values.isEmpty ? gate : nil)
+                values.append(driver); return driver
+            }
+        }
+    let scope = ItemVaultSetupScope(container: context.container, environment: context.environment,
+        binding: ItemVaultBinding(account: context.account, database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
+    let session = try await ItemVaultBootstrap(repository: repository, trustStore: inventory, scope: scope, device: SessionDevice(copying: owner)).create(name: "local")
+    try await runtime.register(session: session)
+    let startup = Task { try await runtime.start() }
+    await gate.entered()
+    let paused = Mutex(false)
+    let pause = Task {
+        try await runtime.pauseForRecovery()
+        paused.withLock { $0 = true }
+    }
+    let driver = try #require(drivers.withLock { $0.first })
+    let stopped = try await DeliveryConfirmationWaiter.wait(timeout: .seconds(2), request: {}, observe: {
+        await driver.stops > 0
+    })
+    #expect(stopped)
+    #expect(!paused.withLock { $0 })
+    await gate.release()
+    await #expect(throws: CloudSyncAdapterError.operationInterrupted) { try await startup.value }
+    try await pause.value
+    #expect(paused.withLock { $0 })
+    await runtime.stop()
+}
+
+@Test(arguments: [false, true]) func envelopeRepairWaitsForStartupWithoutInterruptingForegroundSync(failRepair: Bool) async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-runtime-repair-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let inventory = MemoryItemInventory(), owner = try SessionDevice()
+    let context = ItemVaultRuntimeContext(container: "iCloud.test", environment: "Development", account: "runtime", memberID: owner.identity.member, leaseURL: directory.appendingPathComponent("lease.lock"))
+    let gate = RuntimeBarrier(), drivers = Mutex<[RuntimeDriver]>([])
+    let runtime = try ItemVaultSyncRuntime(context: context, repository: repository, trustStore: inventory, transport: DomainProvisionServer(),
+        accountValidator: { true }, accountAuthorization: DomainAccountAuthorization()) { addresses, items, controls, eligible in
+            drivers.withLock { values in
+                let driver = RuntimeDriver(addresses, items, controls, eligible, startGate: values.isEmpty ? gate : nil)
+                values.append(driver); return driver
+            }
+        }
+    let scope = ItemVaultSetupScope(container: context.container, environment: context.environment,
+        binding: ItemVaultBinding(account: context.account, database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
+    let session = try await ItemVaultBootstrap(repository: repository, trustStore: inventory, scope: scope, device: SessionDevice(copying: owner)).create(name: "local")
+    try await runtime.register(session: session)
+    let startup = Task { try await runtime.start() }
+    await gate.entered()
+    let entered = Mutex(false)
+    let repair = Task {
+        try await runtime.performEnvelopeRepair {
+            entered.withLock { $0 = true }
+            // The callback exclusively owns publication while the engine is stopped.
+            #expect(throws: CloudSyncAdapterError.engineAlreadyOwned) { try SynchronizationLease(url: context.leaseURL) }
+            if failRepair { throw MopError.cloudUnavailable }
+        }
+    }
+    #expect(!entered.withLock { $0 })
+    await gate.release()
+    try await startup.value
+    if failRepair {
+        await #expect(throws: MopError.cloudUnavailable) { try await repair.value }
+    } else { try await repair.value }
+    #expect(entered.withLock { $0 })
+    _ = try await runtime.requestSync()
+    await runtime.stop()
+}

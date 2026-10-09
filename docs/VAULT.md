@@ -40,6 +40,8 @@ Lock clears plaintext views and the session catalog key. Exact reads, edits, Aut
 
 Portable archives preserve locally available transferable items, fields, retained history, trash, attachments and software credential bytes. Each archive has an independent generated key. Restore creates a new owned vault; it does not restore device-local private keys or membership. The current exporter cannot certify complete remote inventory.
 
-Same-account vaults, local editing, history, trash/restore, password checks, password/TOTP AutoFill and portable backup/restore are connected. Cross-account sharing, device removal, account recovery, permanent vault deletion, general document import and credential-account management are unavailable. Independent attachment transfer remains planned; ciphertext travels with its item envelope.
+Same-account vaults, local editing, history, trash/restore, password checks, password/TOTP AutoFill and portable backup/restore are connected. Cross-account sharing, device removal, permanent vault deletion, general document import and credential-account management are unavailable. Independent attachment transfer remains planned; ciphertext travels with its item envelope.
 
 See [security](SECURITY.md), [CloudKit schema](CLOUDKIT.md), [backup and restore](BACKUPS.md), [validation](VALIDATION.md) and [roadmap](ROADMAP.md).
+
+Offline code setup, account recovery, key replacement/revocation, and shared missing-envelope repair are implemented. Physical iCloud acceptance remains pending; see [recovery](OFFLINE-RECOVERY.md).

@@ -52,15 +52,17 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
     private let trustStore: any ItemVaultTrustStore
     private let scope: ItemVaultSetupScope
     private let permit: ItemVaultPermit
+    private let recovery: DevicePublicKey?
     private let running = Mutex(false)
     private let completed = Mutex<ItemVaultSession?>(nil)
 
     public init(repository: EncryptedItemRepository, trustStore: any ItemVaultTrustStore,
-                scope: ItemVaultSetupScope, device: any DeviceOperations) throws {
+                scope: ItemVaultSetupScope, device: any DeviceOperations, recovery: DevicePublicKey? = nil) throws {
         guard !scope.container.isEmpty, ["Development", "Production"].contains(scope.environment),
               !scope.binding.account.isEmpty, scope.binding.database == "private",
               scope.binding.zoneOwner == "__defaultOwner__" else { throw ItemVaultBootstrapFailure.invalidScope }
         self.repository = repository; self.trustStore = trustStore; self.scope = scope
+        self.recovery = recovery
         permit = ItemVaultPermit(device: device)
     }
     public func lock() { permit.invalidate() }
@@ -174,8 +176,7 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
             guard genesis.membership.accounts.count == 1,
                   genesis.membership.accounts[0].role == .owner,
                   genesis.membership.accounts[0].id == device.identity.member,
-                  history.current.membership.role(of: device.identity) == .owner,
-                  genesis.membership.offlineRecovery == nil else {
+                  history.current.membership.role(of: device.identity) == .owner else {
                 throw ItemVaultBootstrapFailure.invalidTrust
             }
         }
@@ -192,7 +193,7 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
         if let existing = try trustStore.load(scope: scope) { record = existing }
         else {
             record = try permit.withDevice { device in
-                let membership = try Membership(accounts: [AccountMember(id: device.identity.member, role: .owner, devices: [device.identity])])
+                let membership = try Membership(accounts: [AccountMember(id: device.identity.member, role: .owner, devices: [device.identity])], offlineRecovery: recovery)
                 let genesis = try MembershipEnvelope.genesis(vault: scope.binding.vaultID, membership: membership, owner: device)
                 return try trustStore.reserve(ItemVaultSetupRecord(scope: scope, sourceDigest: sourceDigest, name: archive.name,
                     genesis: genesis.encoded(), pinnedDigest: genesis.digest()))

@@ -41,7 +41,7 @@ non-extractability of a Secure Enclave key. Typed public metadata stays in the
 encrypted catalog. Public AutoFill suggestions contain RP, username, credential ID,
 user handle, and an opaque vault-scoped locator, never a private key.
 
-Cloud credentials use encrypted item storage and same-account synchronization. Portable archives preserve transferable software key bytes. Account recovery, cross-account sharing and device removal are unavailable. Credential-account registration evidence is separate from key creation/use and remains unconnected. See [backups](BACKUPS.md).
+Cloud credentials use encrypted item storage and same-account synchronization. Portable archives preserve transferable software key bytes. Account recovery is implemented with physical acceptance pending; cross-account sharing and device removal are unavailable. Credential-account registration evidence is separate from key creation/use and remains unconnected. See [backups](BACKUPS.md).
 
 Archived/deleted items are excluded from selection and suggestions on refresh. Deleting an item does not revoke the credential at its website or server.
 

@@ -11,9 +11,15 @@ struct ItemConflictInbox: View {
                     .foregroundStyle(.orange)
             }.padding(8)
         }
+        if model.checkingConflicts {
+            ProgressView("Checking sync differences…")
+        } else if model.pendingConflictChecks > 0 {
+            Text("Automatic sync reconciliation has not finished. Retry when synchronization is available.").font(.caption)
+            Button("Retry sync check") { model.requestBackgroundSynchronization(); model.refreshConflicts() }
+        }
         if let failure = model.conflictFailure {
             Text(failure).font(.caption).foregroundStyle(.orange)
-            Button("Retry conflict check") { model.refreshConflicts() }
+            Button("Retry sync check") { model.requestBackgroundSynchronization(); model.refreshConflicts() }
         }
     }
 }
@@ -34,7 +40,7 @@ struct ItemConflictBanner: View {
             .accessibilityIdentifier("item-sync-conflict")
         } else if let failure = model.conflictFailure {
             Text(failure).font(.caption).foregroundStyle(.orange)
-            Button("Retry conflict check") { model.refreshConflicts() }
+            Button("Retry sync check") { model.requestBackgroundSynchronization(); model.refreshConflicts() }
         }
     }
 }
@@ -50,7 +56,7 @@ struct ItemConflictReview: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
+                LazyVStack(alignment: .leading, spacing: 20) {
                     Text("The version you choose will sync to your other devices.").font(.subheadline).foregroundStyle(.secondary)
                     ForEach(previews, id: \.conflict.id) { preview in
                         ItemConflictEditor(service: model.service, preview: preview,
@@ -123,7 +129,7 @@ private struct ItemConflictEditor: View {
         // service returns. Let the completion close the dialog in that case.
         Task {
             do { try await service.resolve(preview, choice: choice); resolved() }
-            catch { failure = "Could not save your choice. Both versions are still preserved. Please try again."; await refresh() }
+            catch { failure = "Could not save your choice. Both versions are still preserved.\n\(error.localizedDescription)"; await refresh() }
             busy = false
         }
     }

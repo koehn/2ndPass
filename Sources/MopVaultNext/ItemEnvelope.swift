@@ -162,6 +162,33 @@ public struct ItemEnvelope: Codable, Equatable, Sendable {
             membership: membership, membershipStateDigest: membershipStateDigest, signer: signer)
     }
 
+    /// Conflicts can straddle a recovery-recipient change. Authenticate each
+    /// branch against its own pinned state, but publish only current recipients.
+    public func resolvingConflict(with remote: Self, catalog: ItemEnvelopeCatalog,
+                                  changedRecords: [String: SecretBytes] = [:], removedRecords: Set<String> = [],
+                                  history: TrustedMembershipHistory, signer: any DeviceOperations,
+                                  localGeneration: UInt64? = nil) throws -> Self {
+        let previous = try history.state(forDigest: header.membership)
+        let remoteState = try history.state(forDigest: remote.header.membership)
+        try verify(vault: history.vault, item: header.item, membership: previous.membership, membershipStateDigest: header.membership)
+        try remote.verify(vault: history.vault, item: header.item, membership: remoteState.membership, membershipStateDigest: remote.header.membership)
+        try history.verifyAccountPath(from: header.membership)
+        try history.verifyAccountPath(from: remote.header.membership)
+        let digest = try history.current.digest()
+        let current: Self
+        if header.membership == digest { current = self }
+        else {
+            current = try rekey(name: "conflict", previousMembership: previous.membership,
+                previousMembershipStateDigest: header.membership, membership: history.current.membership,
+                membershipStateDigest: digest, signer: signer)
+        }
+        let generation = max(localGeneration ?? header.generation, remote.header.generation)
+        guard generation < UInt64(Int64.max) else { throw MopError.invalidVault }
+        return try current.editing(catalog: catalog, changedRecords: changedRecords, removedRecords: removedRecords,
+            generation: generation + 1, base: remote.header.version,
+            membership: history.current.membership, membershipStateDigest: digest, signer: signer)
+    }
+
     /// Membership changes never silently reuse prior field keys. This explicit
     /// operation decrypts all retained records, generates a new key generation,
     /// and encrypts a complete successor for the new authenticated membership.
@@ -191,11 +218,20 @@ public struct ItemEnvelope: Codable, Equatable, Sendable {
         return try rewrapMembership(previous: previous, successor: history.current, signer: signer)
     }
 
+    /// The recovery provider only decrypts. The admitted device signs the result.
+    public func repairingMembership(history: TrustedMembershipHistory, decryptor: any DeviceOperations,
+                                    signer: any DeviceOperations) throws -> Self {
+        let previous = try history.state(forDigest: header.membership)
+        try history.verifyAdditivePath(from: header.membership)
+        guard history.current.header.generation > previous.header.generation else { throw MopError.invalidVault }
+        return try rewrapMembership(previous: previous, successor: history.current, signer: signer, decryptor: decryptor)
+    }
+
     private func rewrapMembership(previous: MembershipEnvelope, successor: MembershipEnvelope,
-                                  signer: any DeviceOperations) throws -> Self {
-        guard previous.header.vault == header.vault, previous.membership.role(of: signer.identity) == .owner,
+                                  signer: any DeviceOperations, decryptor: (any DeviceOperations)? = nil) throws -> Self {
+        guard previous.header.vault == header.vault, successor.membership.role(of: signer.identity) == .owner,
               header.generation < UInt64(Int64.max) else { throw MopError.cloudPermission }
-        let key = try key(device: signer, membership: previous.membership, membershipStateDigest: previous.digest())
+        let key = try key(device: decryptor ?? signer, membership: previous.membership, membershipStateDigest: previous.digest())
         let catalog = try catalog(using: key)
         let next = try Header(format: header.format, vault: header.vault, item: header.item,
             version: UUID(), generation: header.generation + 1, keyGeneration: header.keyGeneration,

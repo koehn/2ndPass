@@ -23,7 +23,7 @@ Formerly Mop. See [branding and upgrade compatibility](docs/BRANDING.md) for ret
 
 2ndPass is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. These clients now use independently encrypted item records in a shared device-local Core Data store. CKSyncEngine transfers committed changes through one synchronization owner per account/database. Saves are durable locally before cloud delivery.
 
-**Development preview.** Same-account private vaults connect automatically through iCloud while an existing device is unlocked. Shared vaults, account recovery, device removal, permanent vault deletion and general document import are unavailable. See the [vault architecture](docs/VAULT.md), [backup guide](docs/BACKUPS.md) and [validation gates](docs/VALIDATION.md).
+**Development preview.** Same-account private vaults connect automatically through iCloud while an existing device is unlocked. Shared vaults, device removal, permanent vault deletion and general document import are unavailable. See the [vault architecture](docs/VAULT.md), [backup guide](docs/BACKUPS.md) and [validation gates](docs/VALIDATION.md).
 
 ## Recent items
 
@@ -56,7 +56,7 @@ The GUI retains an authenticated session context until lock/expiry, while releas
 `read` releases plaintext to stdout or a selected file; `inject` produces plaintext configuration on stdout or disk. `run` supplies plaintext environment variables to a child: that program, its dependencies and inheriting descendants become trusted with the secret. Environments can leak through diagnostics or privileged host access. Default masking only filters exact secret bytes in stdout/stderr; it does not constrain transformed output, files or network traffic. 2ndPass cannot control a child's use of plaintext. See [CLI boundaries](docs/SECURITY.md#cli-and-extension-disclosure-boundaries).
 ## Recovery
 
-Use portable backups and retain their separate archive keys. Account recovery is unavailable. Same-account device connection is automatic; no access request, approval screen or comparison code is needed.
+Use portable backups and retain their separate archive keys. An optional offline code can recover account vault access; physical iCloud acceptance remains pending. Same-account device connection is automatic; no access request, approval screen or comparison code is needed.
 
 ## Backups and deletion
 Portable backups contain transferable vault contents and use a newly generated
@@ -111,7 +111,7 @@ Register a separate `com.koehn.mop.CLI` App ID with access to the existing host 
 `sp-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VALIDATION.md) for automated and physical-device acceptance requirements. Do not treat software fixtures or simulator builds as hardware evidence.
 ## Current limitations
 
-Cross-account sharing, recovery and document imports require further integration. Cloud software credential bytes can survive portable restore, but account registration management is not yet connected. The separate `local` vault and its hardware-backed operations remain available.
+Cross-account sharing and document imports require further integration. Account recovery is implemented, with physical iCloud acceptance pending. Cloud software credential bytes can survive portable restore, but account registration management is not yet connected. The separate `local` vault and its hardware-backed operations remain available.
 
 ## Public website and build shortcuts
 
@@ -148,3 +148,5 @@ limitations, and acceptance requirements](docs/LOCAL-VAULT.md).
 Subscription status reporting and release configuration are documented in
 [Subscription evidence](docs/SUBSCRIPTIONS.md). This preview does not enforce
 Free/Pro limits; purchase UI and production publication default to disabled.
+
+Offline code setup, account recovery, key replacement/revocation, and shared missing-envelope repair are implemented. Physical iCloud acceptance remains pending; see [recovery](docs/OFFLINE-RECOVERY.md).

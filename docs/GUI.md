@@ -16,6 +16,8 @@ Recent lists show the newest 50 active, unarchived items per category. Search fi
 
 ## Available workflows
 
-Create/rename vaults, edit/read items, inspect history, trash/restore, check password health, use password/TOTP AutoFill and export/restore portable archives. General document import, account recovery, device removal, sharing, permanent vault deletion and credential-account management are unavailable.
+Create/rename vaults, edit/read items, inspect history, trash/restore, check password health, use password/TOTP AutoFill and export/restore portable archives. General document import, device removal, sharing, permanent vault deletion and credential-account management are unavailable.
 
 See [backups](BACKUPS.md), [AutoFill](AUTOFILL.md), [architecture](VAULT.md) and [validation](VALIDATION.md).
+
+Offline code setup, account recovery, key replacement/revocation, and shared missing-envelope repair are implemented. Physical iCloud acceptance remains pending; see [recovery](OFFLINE-RECOVERY.md).

@@ -34,6 +34,8 @@ private final class FakeService: VaultService, Sendable {
         var exactReadIDs: [String?] = []
         var conflicts: [ItemVaultConflictPreview] = []
         var conflictCalls = 0
+        var pendingConflictChecks = 0
+        var nextConflictWait: (@Sendable () async -> Void)?
     }
     let state = Mutex(State())
     let handler: @Sendable (VaultOperation, String?, Bool) async throws -> VaultResult
@@ -64,10 +66,20 @@ private final class FakeService: VaultService, Sendable {
         if fail { throw MopError.cloudUnavailable }
     }
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] {
-        state.withLock { state in
+        let wait = state.withLock { value in
+            let wait = value.nextConflictWait; value.nextConflictWait = nil
+            return wait
+        }
+        let result = state.withLock { state in
             state.conflictCalls += 1
             return state.conflicts.filter { $0.conflict.local.scope.vaultID.uuidString == vault }
         }
+        await wait?()
+        return result
+    }
+    func checkConflicts(vault: String) async throws -> ItemVaultConflictCheck {
+        let choices = try await conflicts(vault: vault)
+        return ItemVaultConflictCheck(choices: choices, pending: state.withLock { $0.pendingConflictChecks })
     }
     func cachedCatalog(vault: String) async throws -> VaultResult? { try await cachedHandler(vault) }
 
@@ -120,6 +132,73 @@ private actor Barrier {
         model.vault = UUID().uuidString
         model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)]
         return model
+    }
+    @Test func repeatedConflictUpdatesCoalesceWhileScanIsBlocked() async throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service), gate = Barrier()
+        app.catalogs[app.vault] = Self.catalog
+        app.authenticated = true
+        service.state.withLock { $0.nextConflictWait = { await gate.wait() } }
+        app.refreshConflicts()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !(await gate.entered) {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        for _ in 0..<20 { app.refreshConflicts(); await Task.yield() }
+        #expect(service.state.withLock { $0.conflictCalls } == 1)
+        await gate.release()
+        while service.state.withLock({ $0.conflictCalls }) < 2 {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(service.state.withLock { $0.conflictCalls } == 2)
+        app.lock(clearClipboard: false)
+    }
+    @Test func automaticConflictWorkShowsStatusWithoutVersionChoices() async throws {
+        let service = FakeService(); service.authenticate()
+        service.state.withLock { $0.pendingConflictChecks = 3 }
+        let app = model(service), gate = Barrier()
+        service.state.withLock { $0.nextConflictWait = { await gate.wait() } }
+        app.catalogs[app.vault] = Self.catalog
+        app.authenticated = true
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !(await gate.entered) {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        #expect(app.checkingConflicts && app.conflictPreviews.isEmpty)
+        app.conflictReviewPresented = true
+        await gate.release()
+        while app.checkingConflicts {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        #expect(app.pendingConflictChecks == 3)
+        #expect(!app.conflictReviewPresented)
+        #expect(app.conflictPreviews.isEmpty && app.conflictItems.isEmpty)
+        app.lock(clearClipboard: false)
+        #expect(app.pendingConflictChecks == 0 && !app.checkingConflicts)
+    }
+    @Test func successfulSyncRetriesConflictCleanupWithoutStoreChanges() async throws {
+        let service = FakeService(); service.authenticate()
+        let app = model(service)
+        app.catalogs[app.vault] = Self.catalog
+        app.authenticated = true
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while service.state.withLock({ $0.conflictCalls }) == 0 {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        let before = service.state.withLock { $0.conflictCalls }
+        app.requestBackgroundSynchronization()
+        while service.state.withLock({ $0.conflictCalls }) == before {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        #expect(service.state.withLock { $0.syncRequests } == 1)
+        app.lock(clearClipboard: false)
     }
     @Test func displayProgressOnlyReadsAffectedCachedCatalog() async throws {
         let id = UUID().uuidString, other = UUID().uuidString
@@ -508,6 +587,30 @@ private actor Barrier {
         clock.time = 599; model.checkExpiration()
         #expect(!service.isAuthenticated && model.status == "Locked")
         model.activate(); #expect(!model.authenticated)
+    }
+    @Test func recoveryWorkDefersIdleLockAndRestartsTimerOnCompletion() {
+        let clock = Clock(), service = FakeService(); service.authenticate()
+        let model = model(service, clock: clock)
+        model.checkExpiration()
+        let hold = model.beginRecoveryWork()
+        clock.time = 900; model.checkExpiration()
+        #expect(service.isAuthenticated)
+        model.endRecoveryWork(hold)
+        clock.time = 1199; model.checkExpiration()
+        #expect(service.isAuthenticated)
+        clock.time = 1200; model.checkExpiration()
+        #expect(!service.isAuthenticated)
+    }
+    @Test func explicitLockInvalidatesRecoveryHoldAndLateCompletion() {
+        let clock = Clock(), service = FakeService(); service.authenticate()
+        let model = model(service, clock: clock)
+        let hold = model.beginRecoveryWork()
+        model.lock(reason: .system)
+        #expect(!service.isAuthenticated)
+        clock.time = 100; service.authenticate(at: 100); model.checkExpiration()
+        clock.time = 350; model.endRecoveryWork(hold)
+        clock.time = 400; model.checkExpiration()
+        #expect(!service.isAuthenticated)
     }
     @Test func settingsApplyImmediatelyAndClampToWholeMinuteRange() {
         let clock = Clock(), service = FakeService(); service.authenticate()

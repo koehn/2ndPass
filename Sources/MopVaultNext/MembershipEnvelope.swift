@@ -14,14 +14,16 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
     }
     public let header: Header
     public let membership: Membership
+    public let recoveryRequest: DeviceEnrollmentRequest?
     public let signature: Data
 
     private struct Statement: Encodable {
         let domain = "2ndpass-membership-signature-1"
         let header: Header
         let membership: Membership
+        let recoveryRequest: DeviceEnrollmentRequest?
     }
-    private var statement: Statement { Statement(header: header, membership: membership) }
+    private var statement: Statement { Statement(header: header, membership: membership, recoveryRequest: recoveryRequest) }
 
     public static func genesis(vault: UUID = UUID(), membership: Membership,
                                owner: any DeviceOperations) throws -> Self {
@@ -35,13 +37,13 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
     /// The caller supplies a previously authenticated/pinned parent and publishes
     /// this with a conditional head update. This pure operation performs no I/O.
     public static func successor(of parent: Self, membership: Membership,
-                                 owner: any DeviceOperations) throws -> Self {
+                                 owner: any DeviceOperations, recoveryRequest: DeviceEnrollmentRequest? = nil) throws -> Self {
         try parent.validateStructure()
-        guard parent.membership.role(of: owner.identity) == .owner,
+        guard (parent.membership.role(of: owner.identity) == .owner || parent.membership.offlineRecovery == owner.identity),
               parent.header.generation < UInt64.max else { throw MopError.cloudPermission }
         let value = try signed(Header(format: "2ndpass-membership-1", vault: parent.header.vault,
             generation: parent.header.generation + 1, parent: parent.digest(), author: owner.identity.fingerprint),
-            membership: membership, signer: owner)
+            membership: membership, signer: owner, recoveryRequest: recoveryRequest)
         try value.verifySuccessor(of: parent)
         return value
     }
@@ -50,7 +52,7 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
         try validateStructure()
         guard Codec.hash(pinnedDigest), try digest() == pinnedDigest,
               header.vault == vault, header.generation == 1, header.parent == nil,
-              membership.removedDevices?.isEmpty ?? true,
+              membership.removedDevices?.isEmpty ?? true, recoveryRequest == nil,
               let author = membership.key(header.author), membership.role(of: author) == .owner,
               author.verifies(signature, message: try Codec.encode(statement)) else { throw MopError.vaultUntrusted }
     }
@@ -64,8 +66,17 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
         guard parent.header.generation < UInt64.max,
               header.vault == parent.header.vault, header.generation == parent.header.generation + 1,
               header.parent == (try parent.digest()), membership.owner == parent.membership.owner,
-              let author = parent.membership.key(header.author), parent.membership.role(of: author) == .owner,
+              let author = parent.membership.key(header.author),
               author.verifies(signature, message: try Codec.encode(statement)) else { throw MopError.vaultUntrusted }
+        if parent.membership.role(of: author) != .owner {
+            guard parent.membership.offlineRecovery == author else { throw MopError.vaultUntrusted }
+            let added = membership.devices.filter { !parent.membership.devices.contains($0) }
+            guard added.count == 1, let device = added.first else { throw MopError.vaultUntrusted }
+            try verifyDeviceAdditionShape(of: parent, device: device)
+            guard let request = recoveryRequest, request.identity == device,
+                  request.scope.vault == header.vault, request.scope.member == membership.owner else { throw MopError.vaultUntrusted }
+            try request.verifyStructure()
+        } else if recoveryRequest != nil { throw MopError.vaultUntrusted }
         let previouslyRemoved = Set(parent.membership.removedDevices ?? [])
         let nowRemoved = Set(membership.removedDevices ?? [])
         let previousDevices = Dictionary(uniqueKeysWithValues: parent.membership.devices.map { ($0.device, $0) })
@@ -80,6 +91,10 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
     /// Removals, role changes, and recovery changes require separate rekeying.
     public func verifyDeviceAddition(of parent: Self, device: DevicePublicKey) throws {
         try verifySuccessor(of: parent)
+        try verifyDeviceAdditionShape(of: parent, device: device)
+    }
+
+    private func verifyDeviceAdditionShape(of parent: Self, device: DevicePublicKey) throws {
         let before = parent.membership, after = membership
         guard before.accounts.count == 1, before.accounts[0].role == .owner,
               before.accounts[0].id == device.member,
@@ -94,6 +109,20 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
                 throw MopError.vaultUntrusted
             }
         }
+    }
+
+    /// Supported account-private transitions: one device admission or an owner-signed
+    /// recovery recipient change. Recovery signers cannot change recovery authority.
+    public func verifyAccountTransition(of parent: Self) throws {
+        try verifySuccessor(of: parent)
+        if membership.accounts == parent.membership.accounts,
+           membership.removedDevices == parent.membership.removedDevices,
+           membership.offlineRecovery != parent.membership.offlineRecovery,
+           let author = parent.membership.key(header.author),
+           parent.membership.role(of: author) == .owner { return }
+        let added = membership.devices.filter { !parent.membership.devices.contains($0) }
+        guard added.count == 1, let device = added.first else { throw MopError.vaultUntrusted }
+        try verifyDeviceAddition(of: parent, device: device)
     }
 
     public func encoded() throws -> Data {
@@ -113,10 +142,10 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
         return value
     }
     private static func signed(_ header: Header, membership: Membership,
-                               signer: any DeviceOperations) throws -> Self {
+                               signer: any DeviceOperations, recoveryRequest: DeviceEnrollmentRequest? = nil) throws -> Self {
         try membership.validate()
-        let value = Self(header: header, membership: membership,
-            signature: try signer.sign(Codec.encode(Statement(header: header, membership: membership))))
+        let value = Self(header: header, membership: membership, recoveryRequest: recoveryRequest,
+            signature: try signer.sign(Codec.encode(Statement(header: header, membership: membership, recoveryRequest: recoveryRequest))))
         try value.validateStructure()
         return value
     }

@@ -20,6 +20,9 @@ struct ItemEnrollmentView: View {
                         ForEach(choices) { vault in Text(vault.name ?? "Vault \(vault.id.prefix(8))").tag(vault.id) }
                     }
                 }
+                if model.supports(.recovery) {
+                    Button("Recover with an Offline Code…") { model.presentSheet(.recover) }
+                }
                 Button("Retry Connection") { refresh() }.disabled(vaultID.isEmpty || model.busy)
             }
         }

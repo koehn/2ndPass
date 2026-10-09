@@ -428,7 +428,7 @@ public final class ItemVaultSession: @unchecked Sendable {
     private func readableState(_ digest: String) throws -> MembershipEnvelope {
         let state = try history.state(forDigest: digest)
         guard state.membership.role(of: identity) != nil else {
-            try history.verifyAdditivePath(from: digest)
+            try history.verifyAccountPath(from: digest)
             throw ItemVaultSessionFailure.pendingAdmission
         }
         return state
@@ -469,7 +469,7 @@ public final class ItemVaultSession: @unchecked Sendable {
                 let value = try envelope(version)
                 let state = try history.state(forDigest: value.header.membership)
                 if state.membership.role(of: identity) == nil {
-                    try history.verifyAdditivePath(from: value.header.membership)
+                    try history.verifyAccountPath(from: value.header.membership)
                     waiting[id] = version.versionID
                     continue
                 }
@@ -592,7 +592,7 @@ public final class ItemVaultSession: @unchecked Sendable {
         else if version.scope.itemID == Self.metadataRecordID { digest = try metadata(version).header.membership }
         else { digest = try envelope(version).header.membership }
         let state = try history.state(forDigest: digest)
-        try history.verifyAdditivePath(from: digest)
+        try history.verifyAccountPath(from: digest)
         return state.membership.role(of: identity) != nil
     }
 
@@ -613,45 +613,42 @@ public final class ItemVaultSession: @unchecked Sendable {
 
     public func prepareMembershipCatchUp() async throws -> [EncryptedItemVersion] {
         try permit.check()
+        let conflicted = try await repository.conflictedScopes(account: binding.account)
         let snapshot = try await repository.items(account: binding.account, vaultID: binding.vaultID,
             database: binding.database, zoneOwner: binding.zoneOwner)
         return try await background { [self] in
             var result: [EncryptedItemVersion] = []
             for stored in snapshot {
                 try Task.checkCancellation()
-                guard try requiresMembershipCatchUp(stored) else { continue }
-                let next = try permit.withDevice { device -> EncryptedItemVersion? in
-                    if stored.healthItemID != nil {
-                        return try rewrapHealth(stored, membership: history.current.membership, digest: currentDigest, device: device)
-                    }
-                    if stored.scope.itemID == Self.metadataRecordID {
-                        let previous = try metadata(stored)
-                        guard previous.header.membership != currentDigest else { return nil }
-                        let state = try history.state(forDigest: previous.header.membership)
-                        try history.verifyAdditivePath(from: previous.header.membership)
-                        guard state.membership.role(of: identity) != nil else { return nil }
-                        guard stored.generation < UInt64(Int64.max) else { throw MopError.invalidVault }
-                        let value = try previous.open(device: device, membership: state.membership, membershipStateDigest: previous.header.membership)
-                        let next = try VaultMetadataEnvelope.seal(value, vault: binding.vaultID, generation: stored.generation + 1,
-                            base: stored.versionID, membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
-                        return try EncryptedItemVersion(scope: stored.scope, versionID: next.header.version,
-                            baseVersionID: stored.versionID, ciphertext: next.encoded(), generation: next.header.generation)
-                    }
-                    let previous = try envelope(stored)
-                    guard previous.header.membership != currentDigest else { return nil }
-                    let state = try history.state(forDigest: previous.header.membership)
-                    try history.verifyAdditivePath(from: previous.header.membership)
-                    guard state.membership.role(of: identity) != nil else { return nil }
-                    let next = try previous.adoptingMembership(history: history, signer: device)
-                    return try EncryptedItemVersion(scope: stored.scope, versionID: next.header.version,
-                        baseVersionID: stored.versionID, ciphertext: next.encoded(), generation: next.header.generation)
-                }
-                if let next { result.append(next) }
-                await Task.yield()
+                guard !conflicted.contains(stored.scope), try requiresMembershipCatchUp(stored) else { continue }
+                result.append(try permit.withDevice {
+                    try ItemEnvelopeTransition.rewrite(stored, history: history, decryptor: $0, signer: $0)
+                })
             }
             return result
         }
     }
+
+    public func missingEnvelopeRequests(scope: EnrollmentScope) async throws -> [EnvelopeRepairRequest] {
+        try permit.check()
+        let records = try await repository.items(account: binding.account, vaultID: binding.vaultID,
+            database: binding.database, zoneOwner: binding.zoneOwner)
+        return try records.compactMap { record in
+            let digest = try ItemEnvelopeTransition.membershipDigest(record)
+            let previous = try history.state(forDigest: digest)
+            try history.verifyAccountPath(from: digest)
+            guard previous.membership.role(of: identity) == nil else { return nil }
+            // Verify the signature and record identity before requesting repair.
+            if record.healthItemID != nil { _ = try healthEnvelope(record) }
+            else if record.scope.itemID == Self.metadataRecordID { _ = try metadata(record) }
+            else { _ = try envelope(record) }
+            return try permit.withDevice {
+                try EnvelopeRepairRequest.create(scope: scope, record: record.scope.itemID, version: record.versionID,
+                    history: history, device: $0)
+            }
+        }
+    }
+
 
     func withAdmissionPermission<T>(_ body: () throws -> T) throws -> T {
         try authorityValid.withLock { valid in
@@ -759,13 +756,39 @@ public final class ItemVaultSession: @unchecked Sendable {
     }
 
     public func conflictPreviews() async throws -> [ItemVaultConflictPreview] {
+        try Task.checkCancellation()
         try permit.check()
         let conflicts = try await repository.conflicts(account: binding.account)
         var result: [ItemVaultConflictPreview] = []
         for conflict in conflicts where binding.contains(conflict.local.scope) && conflict.local.scope.itemID != Self.metadataRecordID && conflict.local.healthItemID == nil {
+            try Task.checkCancellation()
             result.append(try await conflictPreview(conflict))
         }
         return result
+    }
+
+    /// Re-encryption changes ciphertext and version IDs, not retained contents.
+    /// Compare all records, history, metadata and edit attribution before treating
+    /// a conflict as a duplicate; matching visible fields alone is insufficient.
+    public func isDuplicateConflict(_ expected: EncryptedItemConflict) async throws -> Bool {
+        try validateConflictScope(expected)
+        let live = try await repository.reviewedConflict(expected)
+        return try await background(priority: .utility) { [self] in
+            try Task.checkCancellation()
+            return try permit.withDevice { device in
+                try Task.checkCancellation()
+                guard live == expected else { throw ItemRepositoryError.staleConflict }
+                let local = try envelope(expected.local), remote = try envelope(expected.remote)
+                let left = try history.state(forDigest: local.header.membership)
+                let right = try history.state(forDigest: remote.header.membership)
+                let a = try local.catalog(device: device, membership: left.membership, membershipStateDigest: local.header.membership)
+                let b = try remote.catalog(device: device, membership: right.membership, membershipStateDigest: remote.header.membership)
+                guard a == b else { return false }
+                return try local.portableArchive(name: "conflict", device: device, membership: left.membership,
+                    membershipStateDigest: local.header.membership) == remote.portableArchive(name: "conflict", device: device,
+                    membership: right.membership, membershipStateDigest: remote.header.membership)
+            }
+        }
     }
 
     /// Field choices include absence on either side, allowing explicit deletion.
@@ -815,16 +838,20 @@ public final class ItemVaultSession: @unchecked Sendable {
         try validateConflictScope(expected)
         let live = try await repository.reviewedConflict(expected)
         let deviceName = await Self.editingDeviceName()
-        return try permit.withDevice { device in
-            guard live == expected else { throw ItemRepositoryError.staleConflict }
-            let local = try envelope(expected.local), remote = try envelope(expected.remote)
-            let localState = try history.state(forDigest: local.header.membership)
-            let remoteState = try history.state(forDigest: remote.header.membership)
-            return try ItemVaultConflictPreview(conflict: expected,
-                local: local.catalog(device: device, membership: localState.membership, membershipStateDigest: local.header.membership),
-                remote: remote.catalog(device: device, membership: remoteState.membership, membershipStateDigest: remote.header.membership),
-                localAuthorName: local.header.author == device.identity.fingerprint ? deviceName : nil,
-                remoteAuthorName: remote.header.author == device.identity.fingerprint ? deviceName : nil)
+        return try await background(priority: .utility) { [self] in
+            try Task.checkCancellation()
+            return try permit.withDevice { device in
+                try Task.checkCancellation()
+                guard live == expected else { throw ItemRepositoryError.staleConflict }
+                let local = try envelope(expected.local), remote = try envelope(expected.remote)
+                let localState = try history.state(forDigest: local.header.membership)
+                let remoteState = try history.state(forDigest: remote.header.membership)
+                return try ItemVaultConflictPreview(conflict: expected,
+                    local: local.catalog(device: device, membership: localState.membership, membershipStateDigest: local.header.membership),
+                    remote: remote.catalog(device: device, membership: remoteState.membership, membershipStateDigest: remote.header.membership),
+                    localAuthorName: local.header.author == device.identity.fingerprint ? deviceName : nil,
+                    remoteAuthorName: remote.header.author == device.identity.fingerprint ? deviceName : nil)
+            }
         }
     }
 
@@ -857,15 +884,45 @@ public final class ItemVaultSession: @unchecked Sendable {
     /// CKSyncEngine lease, so older queued uploads are quiesced before the CAS.
     public func resolveConflictUsingRemote(_ expected: EncryptedItemConflict,
                                            coordinator: CloudKitSyncAdapter) async throws -> EncryptedItemVersion {
-        try permit.withWritePermission {
-            guard expected.local.scope == expected.remote.scope else { throw ItemVaultSessionFailure.invalidBinding }
-            try validateScope(expected.local)
-            if expected.local.healthItemID != nil { _ = try healthEnvelope(expected.local) }
-            else if expected.local.scope.itemID == Self.metadataRecordID { _ = try metadata(expected.local) }
-            else { _ = try envelope(expected.local) }
-            try validateCurrentState(expected.remote)
+        if expected.local.scope.itemID == Self.metadataRecordID || expected.local.healthItemID != nil {
+            try permit.withWritePermission {
+                guard expected.local.scope == expected.remote.scope else { throw ItemVaultSessionFailure.invalidBinding }
+                try validateScope(expected.local)
+                if expected.local.healthItemID != nil { _ = try healthEnvelope(expected.local) }
+                else { _ = try metadata(expected.local) }
+                try validateCurrentState(expected.remote)
+            }
+            return try await coordinator.resolveConflictUsingRemote(expected, authorization: permit)
+        }
+        if let replacement = try remoteConflictReplacement(expected) {
+            return try await coordinator.resolveConflict(expected, with: replacement, authorization: permit).version
         }
         return try await coordinator.resolveConflictUsingRemote(expected, authorization: permit)
+    }
+
+    public func resolveDuplicateConflictBatch(_ conflicts: [EncryptedItemConflict], coordinator: CloudKitSyncAdapter) async throws -> [UUID: Result<EncryptedItemVersion, any Error>] {
+        guard conflicts.count <= 25 else { throw ItemVaultSessionFailure.invalidBinding }
+        var entries: [(conflict: EncryptedItemConflict, replacement: EncryptedItemVersion?)] = []
+        for conflict in conflicts {
+            try Task.checkCancellation()
+            let replacement = try await background(priority: .utility) { [self] in try remoteConflictReplacement(conflict) }
+            entries.append((conflict, replacement))
+        }
+        return try await coordinator.resolveConflictBatch(entries, authorization: permit)
+    }
+
+    private func remoteConflictReplacement(_ expected: EncryptedItemConflict) throws -> EncryptedItemVersion? {
+        try permit.withDevice { device in
+            try validateConflictScope(expected)
+            let local = try envelope(expected.local), remote = try envelope(expected.remote)
+            guard remote.header.membership != currentDigest else { return nil }
+            let state = try history.state(forDigest: remote.header.membership)
+            let catalog = try remote.catalog(device: device, membership: state.membership, membershipStateDigest: remote.header.membership)
+            let resolved = try remote.resolvingConflict(with: remote, catalog: catalog, history: history,
+                signer: device, localGeneration: local.header.generation)
+            return try EncryptedItemVersion(scope: expected.local.scope, versionID: resolved.header.version,
+                baseVersionID: resolved.header.base, ciphertext: resolved.encoded(), generation: resolved.header.generation)
+        }
     }
 
     public func resolveConflict(_ expected: EncryptedItemConflict, catalog: ItemEnvelopeCatalog,
@@ -876,7 +933,7 @@ public final class ItemVaultSession: @unchecked Sendable {
             let local = try envelope(expected.local), remote = try envelope(expected.remote)
             let resolved = try local.resolvingConflict(with: remote, catalog: catalog,
                 changedRecords: changedRecords, removedRecords: removedRecords,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
+                history: history, signer: device)
             return try EncryptedItemVersion(scope: expected.local.scope, versionID: resolved.header.version,
                 baseVersionID: resolved.header.base, ciphertext: resolved.encoded(), generation: resolved.header.generation)
         }

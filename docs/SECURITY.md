@@ -96,8 +96,8 @@ flowchart TB
 Each item has an encrypted catalog and encrypted record map, protected by its item
 key. Attachment ciphertext is inside the item envelope, not an independent lazy
 blob service. The derived display catalog has a separate device-wrapped key and is
-not uploaded. Portable archives use an independent generated archive key; there is
-no active account-recovery recipient workflow in this service.
+not uploaded. Portable archives use an independent generated archive key. An optional
+account recovery recipient protects cloud contents; see [recovery](OFFLINE-RECOVERY.md).
 
 ## Hardware keys, Keychain and authentication
 
@@ -302,7 +302,7 @@ existing pin only for this reconnect case with no initialization receipt.
 
 ### Cross-account sharing and removal
 
-Cross-account sharing, device removal, account recovery and permanent vault deletion
+Cross-account sharing, device removal and permanent vault deletion
 are unavailable through the current service. Protocol types, primitive operations
 and test fixtures do not establish a user-facing implementation. Sharing requires
 both transport permissions and cryptographic authorization, with separate physical
@@ -422,15 +422,25 @@ solely on an installed application.
 
 ### Losing devices or the Apple Account
 
-Account-wide recovery of a live cloud vault is unavailable. If an enrolled device
-survives, keep it unlocked while a new device connects on the same Apple Account.
-Otherwise an independently retained portable archive and key provide a restore path
-for their contents. Neither mechanism recovers the Apple Account itself.
+**Without a valid, activated recovery code or access to at least one enrolled
+device, cloud vaults are completely inaccessible.** No administrative bypass can
+recover their encryption keys. **Access to the Apple Account is also required to
+access or recover vaults stored in its iCloud, even with a recovery code.**
 
-Device-local Secure Enclave credential keys cannot be backed up, moved or recovered.
+A configured offline recovery code opens read-only cloud access and authorizes exact
+additive enrollment into the same Apple Account. Existing devices and the recovery
+recipient remain unchanged. Ordinary content updates are signed by the enrolled
+device, not the recovery identity. Progress persists without the code, and normal
+access remains blocked until verification completes. See [recovery](OFFLINE-RECOVERY.md)
+for setup, missing-envelope repair, replacement/revocation, and validation limits.
+An independent portable archive and key remain a separate restore path. Neither
+mechanism recovers the Apple Account itself.
+
+**Items in device-local vaults can never be backed up from their device or restored
+on another device.** Their Secure Enclave credential keys cannot be backed up,
+moved or recovered, including through device backups or account recovery codes.
 Register independent credentials or service recovery methods before device loss.
-No UI or protocol primitive should be presented as a working live-vault recovery
-workflow until integration and physical acceptance are complete.
+Software recovery tests do not establish physical iCloud or Secure Enclave acceptance.
 
 ## Metadata and intentional disclosure
 
@@ -549,7 +559,7 @@ screen capture, or receiving application has already copied.
 | Malware reading process memory | Concealed fields opened on demand; owned buffers cleared where practical | Temporary keys, visible metadata and requested secrets enter memory; not all framework copies can be wiped. |
 | Clipboard reader or screen capture | Concealment, reveal timeout and expiring device-local secret copies | Already captured plaintext cannot be retracted. |
 | Recipient retains data | No claim of retrospective secrecy | Device removal is unavailable; even future rotation cannot invalidate copied external credentials. |
-| All enrolled devices lost | Portable archive plus its separate key | No active live-account recovery; hardware credential keys cannot be recovered. |
+| All enrolled devices unavailable | Configured account recovery code, or portable archive plus its separate key | Same iCloud account required for live recovery; hardware credential keys cannot be recovered. Physical acceptance remains pending. |
 
 ## The device-local `local` vault
 
@@ -611,7 +621,7 @@ lock/sleep during an outstanding prompt, and late Secure Enclave results.
 Typed cloud SSH/Git credentials and passkeys store normalized software private keys
 as concealed encrypted item payloads, with public protocol metadata inside the
 encrypted catalog. Authorized members can obtain software key material; these
-credentials do not inherit Secure Enclave non-extractability. Key creation/use routes through authenticated item catalog/read/save operations. Cross-account sharing, device removal and account recovery are unavailable. Portable archives preserve software key bytes, not proof of external service registration. Hardware keys remain
+credentials do not inherit Secure Enclave non-extractability. Key creation/use routes through authenticated item catalog/read/save operations. Cross-account sharing and device removal are unavailable. Configured account recovery also covers these software credentials. Portable archives preserve software key bytes, not proof of external service registration. Hardware keys remain
 non-exportable and never enter this format. See [supported cloud keys and
 validation limits](CLOUD-KEY-CREDENTIALS.md).
 
@@ -671,6 +681,6 @@ and [portable archive specification](formats/PORTABLE-BACKUP-v1.md) complement t
 Release acceptance must include concurrent edits and explicit conflict resolution,
 restart/interruption, lock during operations, account changes, large-vault catalog
 repair, backup completeness and restore independence, and signed app/CLI/AutoFill
-behavior on supported physical platforms. Sharing, removal and account recovery
-need implementation and separate physical acceptance before being claimed supported.
+behavior on supported physical platforms. Sharing and removal need further implementation;
+account recovery needs separate physical acceptance before release.
 Production provisioning and independent security review remain distinct gates.

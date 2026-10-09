@@ -17,6 +17,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         let account: NativeItemCloudAccount
         let repository: EncryptedItemRepository
         let runtime: ItemVaultSyncRuntime
+        let recovery: ItemRecoveryCoordinator
     }
     private struct State: @unchecked Sendable {
         var generation = 0
@@ -48,6 +49,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             return (value.context, bootstraps)
         }
         resources.1.forEach { $0.lock() }
+        resources.0?.recovery.lock()
         resources.0?.runtime.lock()
     }
     deinit {
@@ -84,6 +86,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                 if let retired {
                     retired.0?.invalidate(); retired.1?.invalidate(); retired.2?.cancel()
                     retired.3.forEach { $0.lock() }
+                    existing.recovery.lock()
                     existing.runtime.invalidate()
                 }
             }
@@ -98,7 +101,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         let root = account.directory
         let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("Items.sqlite"))
         let runtime = try ItemVaultSyncRuntime(account: account, repository: repository)
-        let context = Context(account: account, repository: repository, runtime: runtime)
+        let context = Context(account: account, repository: repository, runtime: runtime, recovery: try ItemRecoveryCoordinator(account: account, repository: repository))
         let accepted = state.withLock { value in
             guard value.generation == generation else { return false }
             value.context = context; return true
@@ -129,6 +132,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         return pair.stream
     }
     public func existing(_ vaultID: UUID) async -> ItemVaultSession? {
+        if let context = state.withLock({ $0.context }), (try? requireNoRecovery(context)) == nil { return nil }
         guard let context = state.withLock({ $0.context }) else { return nil }
         return try? await context.runtime.session(vaultID: vaultID)
     }
@@ -232,8 +236,19 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             }
             do {
                 try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
+                try self.requireNoRecovery(context)
                 let transport = NativeItemEnrollmentTransport(account: context.account)
                 let inventory = try await context.runtime.inventory()
+                // Repair is a shared enrollment service, retried by cloud hints and foreground sync.
+                try await context.runtime.performEnvelopeRepair {
+                    for record in inventory {
+                        let provider = try await self.device(context, vaultID: record.scope.binding.vaultID, create: false, allowPrompt: false)
+                        defer { provider.close() }
+                        try await NativeEnvelopeRepair(account: context.account).reconcile(vault: record.scope.binding.vaultID, device: provider) {
+                            try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
+                        }
+                    }
+                }
                 let requests = try await transport.requests()
                 Self.logger.notice("Enrollment trace: owner scan; requests=\(requests.count) localVaults=\(inventory.count)")
                 for (id, bytes) in requests {
@@ -321,6 +336,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     public func resolveVault(named name: String, offline: Bool) async throws -> UUID? {
         try await serialized { [self] in
             let context = try await connected(offline: offline)
+            try requireNoRecovery(context)
             if offline { await context.runtime.pauseNetwork() }
             var matches: [UUID] = []
             for record in try await context.runtime.inventory() {
@@ -483,6 +499,15 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             let approval = try DeviceEnrollmentApproval.decode(bytes)
             _ = try approval.acceptFromAuthenticatedPrivateCloudKit(request: request, scope: scope)
             guard let (metadata, systemFields, successors) = try await transport.admissionMetadata(approval: approval) else {
+                try await serialized { [self] in
+                    try await context.runtime.performEnvelopeRepair { [self] in
+                        let provider = try await device(context, vaultID: vaultID, create: false, allowPrompt: allowPrompt)
+                        defer { provider.close() }
+                        try await NativeEnvelopeRepair(account: context.account).reconcile(vault: vaultID, device: provider) {
+                            try self.checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
+                        }
+                    }
+                }
                 view.request = projection(request); view.approvalAvailable = true
                 result.enrollment = view; result.message = "Waiting for an existing device to upload encrypted vault access. This device will connect automatically."; return result
             }
@@ -513,12 +538,84 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         result.enrollment = view
         return result
     }
+    public func endRecoverySession() {
+        guard let context = state.withLock({ $0.context }) else { return }
+        context.recovery.lock()
+        if var progress = try? context.recovery.store.load(), progress.phase == .preview {
+            progress.phase = .complete
+            try? context.recovery.store.save(progress)
+        }
+    }
+    private let recoveryActivity = Mutex<String?>(nil)
+    public var operationProgress: String? { state.withLock { $0.context }?.recovery.operationProgress ?? recoveryActivity.withLock { $0 } }
+    public var operationFraction: Double? { state.withLock { $0.context }?.recovery.operationFraction }
+    public var recoveryAvailable: Bool { true }
+    public func recoveryState() async throws -> ItemRecoveryState? {
+        do {
+            let context = try await connected(offline: true)
+            return try context.recovery.store.load()
+        } catch MopError.cloudAccount { return nil }
+    }
+    public func recovery(_ action: VaultManagement) async throws -> VaultResult {
+        try await serialized { [self] in
+            let context = try await connected()
+            let generation = state.withLock { $0.generation }
+            let check: ItemRecoveryCoordinator.Check = { [self] in
+                try context.account.withWritePermission {}
+                guard state.withLock({ $0.generation == generation }) else { throw MopError.authentication }
+            }
+            if case .recoveryGenerate = action {
+                return try await context.recovery.execute(action, device: { _, _ in throw MopError.invalidRecovery }, check: check)
+            }
+            state.withLock { $0.enrollmentTask?.cancel(); $0.enrollmentTask = nil; $0.enrollmentTaskID = nil }
+            recoveryActivity.withLock { $0 = "Waiting for background synchronization to finish…" }
+            defer { recoveryActivity.withLock { $0 = nil } }
+            try await context.runtime.pauseForRecovery()
+            let result: VaultResult
+            do {
+                let lease = try SynchronizationLease(url: context.account.leaseURL(database: "private"))
+                defer { withExtendedLifetime(lease) {} }
+                recoveryActivity.withLock { $0 = "Updating recovery protection…" }
+                result = try await context.recovery.execute(action, device: { [self] id, create in
+                    try check()
+                    return try await device(context, vaultID: id, create: create)
+                }, check: check)
+            } catch {
+                context.runtime.lock()
+                if Authentication.requiresRenewal(error) {
+                    // A completed LAContext forbids additional prompts. Once its
+                    // authorization expires, do not reuse it on every resume.
+                    let stale = state.withLock { value -> (ContextInvalidator?, ContextInvalidator?) in
+                        guard value.generation == generation else { return (nil, nil) }
+                        let stale = (value.authorization, value.pendingAuthorization)
+                        value.authorization = nil; value.pendingAuthorization = nil
+                        return stale
+                    }
+                    stale.0?.invalidate(); stale.1?.invalidate()
+                }
+                throw error
+            }
+            context.runtime.lock()
+            if try context.recovery.store.load()?.blocksRegularAccess != true {
+                // A background-sync startup failure does not undo the acknowledged recovery operation.
+                recoveryActivity.withLock { $0 = "Recovery finished. Restarting synchronization…" }
+                do { try await context.runtime.start() }
+                catch { Self.logger.error("Recovery completed; background sync restart failed: \(String(describing: error), privacy: .public)") }
+            }
+            return result
+        }
+    }
+    private func requireNoRecovery(_ context: Context) throws {
+        guard try context.recovery.store.load()?.blocksRegularAccess != true else { throw ItemRecoveryFailure.recoveryInProgress }
+    }
+
     public func open(_ vaultID: UUID) async throws -> ItemVaultSession { try await open(vaultID, offline: false) }
     public func open(_ vaultID: UUID, offline: Bool) async throws -> ItemVaultSession {
         // Revealing an already open vault never waits for commissioning, another
         // vault's authentication, or the cloud delivery queue.
         let snapshot = state.withLock { ($0.generation, $0.context) }
         if let context = snapshot.1, (try? context.account.withWritePermission {}) != nil {
+            try requireNoRecovery(context)
             if let session = try? await context.runtime.session(vaultID: vaultID), session.isUnlocked {
                 guard state.withLock({ $0.generation == snapshot.0 }) else { throw MopError.authentication }
                 if offline { await context.runtime.pauseNetwork() }
@@ -548,10 +645,13 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     public func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession {
         try await serialized { [self] in
             let context = try await connected(), scope = try context.account.setupScope(vaultID: id)
+            try requireNoRecovery(context)
+            let (recoveryConfiguration, _) = try await NativeItemRecoveryTransport(account: context.account).configuration()
+            guard !recoveryConfiguration.incomplete else { throw ItemRecoveryFailure.configurationBusy }
             guard try await context.repository.deletion(scope.repositoryScope) == nil,
                   try await NativeVaultDeletionTransport(database: context.account.container.privateCloudDatabase).read(vaultID: id) == nil else { throw VaultDeletionFailure.deleted }
             let device = try await device(context, vaultID: id, create: true)
-            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: scope, device: device)
+            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: scope, device: device, recovery: recoveryConfiguration.active)
             let session: ItemVaultSession
             if let archiveData, let recoveryKey { session = try await bootstrap.restore(archiveData: archiveData, recoveryKey: recoveryKey, name: name) }
             else if archiveData == nil, recoveryKey == nil { session = try await bootstrap.create(name: name) }
@@ -568,9 +668,20 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             return session
         }
     }
+    public func activeConflictAdapter() async -> CloudKitSyncAdapter? {
+        guard let context = state.withLock({ $0.context }) else { return nil }
+        return try? await context.runtime.cloudAdapter()
+    }
     public func conflictAdapter() async throws -> CloudKitSyncAdapter {
         guard let context = state.withLock({ $0.context }) else { throw MopError.authentication }
-        return try await context.runtime.cloudAdapter()
+        let adapter: CloudKitSyncAdapter
+        do { adapter = try await context.runtime.cloudAdapter() }
+        catch CloudSyncAdapterError.engineNotStarted {
+            _ = try await context.runtime.requestSync()
+            adapter = try await context.runtime.cloudAdapter()
+        }
+        _ = try await adapter.requestForegroundSync()
+        return adapter
     }
     public func requestSync() async throws {
         try Task.checkCancellation()
@@ -611,6 +722,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     /// Called by the shared lease owner only with a locally pinned setup. It must
     /// never initiate authentication while responding to a background save.
     private func loadWithoutPrompt(_ record: ItemVaultSetupRecord, account: NativeItemCloudAccount, repository: EncryptedItemRepository) async throws -> ItemVaultSession? {
+        guard try ItemRecoveryStateStore(directory: account.directory, account: account.accountNamespace).load()?.blocksRegularAccess != true else { return nil }
         guard let snapshot = state.withLock({ value -> (Int, ContextInvalidator)? in
             value.authorization.map { (value.generation, $0) }
         }) else { return nil }

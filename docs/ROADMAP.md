@@ -60,7 +60,7 @@ subscription versus permanent-unlock purchase options remain undecided.
   on supported platforms, including when all previously enrolled devices are
   unavailable. Define account binding, key replacement/revocation, and coverage
   of existing and newly written data. Review the changed threat model and update
-  the recovery documentation when implemented. Account recovery is currently unavailable; see [recovery status](OFFLINE-RECOVERY.md).
+  the recovery documentation when implemented. Recovery integration and automated restart/rotation tests are implemented; physical device-loss acceptance remains pending. See [recovery status](OFFLINE-RECOVERY.md).
 - [ ] **SALE-2 — Password security health.** Provide a screen showing passwords
   found in Have I Been Pwned (HIBP), reused passwords, weak/simple passwords, and
   actionable guidance for resolving findings. Acceptance: findings identify
@@ -254,6 +254,6 @@ paid, maintained distribution can coexist.
 
 ## Current implementation boundaries
 
-Cross-account sharing, account recovery, device removal, permanent vault deletion, general document import and credential-account management are unavailable. Cloud-key creation/use routes through item reads and saves, and software credential bytes survive portable restore; full physical acceptance remains pending. Device-local hardware credentials remain separate and cannot be synchronized or restored.
+Cross-account sharing, device removal, permanent vault deletion, general document import and credential-account management are unavailable. Cloud-key creation/use routes through item reads and saves, and software credential bytes survive portable restore; full physical acceptance remains pending. Device-local hardware credentials remain separate and cannot be synchronized or restored.
 
 The checklist boxes represent full release acceptance, not source implementation. All remain open until the described gates are evidenced. Implemented portions include password checks, basic history, portable archives, offline saves, distribution scaffolding and entitlement reporting. Free/Pro enforcement and purchase publication remain disabled in the preview. Complete the remaining integration and physical checks before treating any of these as release-ready.

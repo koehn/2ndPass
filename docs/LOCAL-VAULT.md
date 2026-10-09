@@ -6,6 +6,11 @@ cannot hold passwords, imported private keys, TOTP seeds, notes, or bearer token
 It has no CloudKit account, sharing, normal vault export, backup, or recovery.
 Public keys, certificate requests, and certificates can be exported.
 
+**Items in this device-local vault can never be backed up from their device or
+restored on another device.** Recovery codes, portable archives, and device backups
+cannot recover their Secure Enclave private keys. Exported public keys and
+certificates are not backups of these identities.
+
 **Device loss, erasure, or replacement permanently loses these identities.**
 Register an independent credential on another device before relying on one.
 This is the redundancy model used with hardware security keys: two devices have

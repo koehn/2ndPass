@@ -80,7 +80,7 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
             guard bytes.count <= 262_144 else { throw ItemVaultBootstrapFailure.invalidTrust }
             return try JSONDecoder().decode(MembershipCheckpoint.self, from: bytes)
         }.filter { $0.scope == scope }.sorted { $0.generation < $1.generation }
-        guard slots.count <= 127, slots.enumerated().allSatisfy({ $0.element.generation == UInt64($0.offset + 2) }),
+        guard slots.count <= 4095, slots.enumerated().allSatisfy({ $0.element.generation == UInt64($0.offset + 2) }),
               let record = try load(scope: scope) else { throw ItemVaultBootstrapFailure.invalidTrust }
         let bytes = slots.map(\.bytes)
         _ = try ItemVaultMembershipAuthority.history(record: record, successors: bytes)

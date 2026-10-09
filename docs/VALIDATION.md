@@ -42,3 +42,9 @@ The full suite needs Unix sockets, process inspection, child processes and test 
 - Accessibility and every UI flow, purchase/distribution acceptance, and independent cryptographic/security review.
 
 The roadmap tracks these requirements. No automated result substitutes for an unperformed physical or release check.
+
+## Account recovery implementation checks (2026-10-08)
+
+Automated recovery tests cover recovery-signed additive enrollment with embedded proof of possession, preservation of existing devices, rejection of recovery-authority changes, fresh-device bootstrap without the old device, recipient replacement/revocation across item/metadata/health envelopes, account-scoped progress, and interruption after committed cloud writes. Injected transports exercise restart without a retained recovery code and re-entry when a late record was not staged.
+
+These tests do not validate live CloudKit or Secure Enclave recovery. Physical acceptance remains: activate and verify coverage; make every original device unavailable; recover on a fresh same-account device; then reconnect an original device and verify reading, editing, and synchronization. Exercise interruption and missing-envelope repair on both platforms before release. Do not use a destructive local reset as a substitute.

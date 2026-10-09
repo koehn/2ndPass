@@ -32,13 +32,15 @@ struct OfflineRecoveryView: View {
     @State private var recoveryAllowed = false
     private enum ProgressLocation: Equatable {
         case generate, activate, coverage, resume, reset, revoke, eligibility, open
-        case catalog(UUID), complete(UUID), read(UUID, String)
+        case catalog(UUID), complete(UUID), completeAll, read(UUID, String)
     }
     @State private var progressLocation: ProgressLocation?
     @State private var working = false
+    @State private var idleLockHold: UUID?
     @State private var progressMessage = ""
     @State private var progressFraction: Double?
     @State private var message = ""
+    @State private var showingError = false
     @State private var rows: [VaultDescriptor] = []
     @State private var statuses: [String] = []
     @State private var fields: [(UUID, String)] = []
@@ -71,6 +73,9 @@ struct OfflineRecoveryView: View {
                         .disabled(model.removalCleanupPending)
                         .help("Check whether this device can open your iCloud vaults using its existing device key.")
                 }
+                if rows.count > 1 {
+                    actionButton("Complete Recovery for All Vaults", operation: .recoveryCompleteAll(rows.compactMap { UUID(uuidString: $0.id) }), location: .completeAll)
+                }
                 ForEach(rows) { row in
                     if let id = UUID(uuidString: row.id) {
                         GroupBox(row.name ?? "Unnamed vault") {
@@ -80,7 +85,7 @@ struct OfflineRecoveryView: View {
                                         .fixedSize(horizontal: false, vertical: true)
                                 } else if recoveredVaultIDs.contains(id) {
                                     Label("This device already has access", systemImage: "checkmark.circle.fill")
-                                    Text("You can use this vault normally. Recovery is not needed.").foregroundStyle(.secondary)
+                                    Text("This vault is verified. Finish recovery for the remaining selected vaults before opening normal vault access.").foregroundStyle(.secondary)
                                 } else {
                                     Text("Browse to confirm your data. Complete recovery to enable normal use on this device while keeping existing devices and accounts connected.").foregroundStyle(.secondary)
                                     HStack {
@@ -106,7 +111,7 @@ struct OfflineRecoveryView: View {
                 GroupBox("1. Create and save an offline copy") {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Prepare for losing your devices. Generate a recovery key, then keep a file or paper copy somewhere safe and separate from your devices and iCloud.").foregroundStyle(.secondary)
-                        actionButton("Generate a New Recovery Copy", operation: .recoveryGenerate, location: .generate)
+                        actionButton("Generate Recovery Code", operation: .recoveryGenerate, location: .generate)
                         Text("Generating a copy does not change your current recovery key. If replacing a key, keep both copies until every vault finishes updating.").font(.caption).foregroundStyle(.secondary)
                         if !code.isEmpty {
                             Text(code).font(.system(.body, design: .monospaced)).textSelection(.enabled).privacySensitive()
@@ -118,12 +123,12 @@ struct OfflineRecoveryView: View {
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                 }
-                if !code.isEmpty {
+                Group {
                     GroupBox("2. Verify your saved copy and activate") {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("Import the file you just saved or re-enter the code from your paper copy. Verification confirms you can use that copy before enabling it for your vaults.").foregroundStyle(.secondary)
+                            Text("Import a previously saved file or enter your recovery code. Verification confirms you can use that copy before enabling it for your vaults.").foregroundStyle(.secondary)
                             copyInput
-                            actionButton("Verify Copy and Activate", operation: .recoveryActivate(copy: copy, fingerprint: fingerprint), location: .activate)
+                            actionButton("Verify and Enable Recovery", operation: .recoveryActivate(copy: copy, fingerprint: fingerprint), location: .activate)
                                 .buttonStyle(.borderedProminent).disabled(input.isEmpty && imported == nil)
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                     }
@@ -133,20 +138,8 @@ struct OfflineRecoveryView: View {
                         Text("Check coverage to see which vaults are protected by your configured recovery key. This does not change your key or test your saved copy.").foregroundStyle(.secondary)
                         actionButton("Check Coverage", operation: .recoveryStatus, location: .coverage)
                         Text("If setup, replacement, or removal was interrupted, resume to finish applying the changes to your remaining vaults.").foregroundStyle(.secondary)
-                        actionButton("Resume Incomplete Changes", operation: .recoveryResume, location: .resume)
+                        actionButton("Resume Recovery Setup", operation: .recoveryResume, location: .resume)
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
-                }
-                DisclosureGroup("Test recovery on this device") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Simulate losing this device without deleting your iCloud vaults. Import your saved offline copy or enter its code. We verify that it can recover every owned vault before clearing this device’s iCloud vault keys and cached iCloud data. Local-only vaults are not changed.").foregroundStyle(.secondary)
-                        Text("Quit or lock 2ndPass on your other devices first. You will need your offline copy again after the reset. This cannot be undone.").font(.callout)
-                        copyInput
-                        if working && progressLocation == .reset { operationProgress }
-                        else {
-                            Button("Reset This Device for Recovery Testing…", role: .destructive) { resetForTesting = true }
-                                .disabled(input.isEmpty && imported == nil)
-                        }
-                    }.padding(.top, 8)
                 }
                 DisclosureGroup("Remove offline recovery") {
                     VStack(alignment: .leading, spacing: 10) {
@@ -156,7 +149,7 @@ struct OfflineRecoveryView: View {
                     }.padding(.top, 8)
                 }
             }
-            Text(message).fixedSize(horizontal: false, vertical: true)
+            if progressLocation == nil { Text(message).fixedSize(horizontal: false, vertical: true) }
             ForEach(Array(statuses.enumerated()), id: \.offset) { _, status in Text(status).font(.caption).textSelection(.enabled) }
         }
         .onAppear {
@@ -175,6 +168,9 @@ struct OfflineRecoveryView: View {
                 do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
             }
         }
+        .alert("Recovery could not finish", isPresented: $showingError) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(message) }
         .disabled(working || model.offline)
         .confirmationDialog("Reset this device for recovery testing?", isPresented: $resetForTesting, titleVisibility: .visible) {
             Button("Verify Copy and Reset This Device", role: .destructive) { run(.recoveryTestReset(copy: copy)) }
@@ -201,7 +197,10 @@ struct OfflineRecoveryView: View {
         }
         .onChange(of: input) { _, value in if !value.isEmpty { imported = nil } }
         .onChange(of: model.securityGeneration) { _, _ in clear() }
-        .onChange(of: scenePhase) { _, phase in if phase == .background { clear(); model.service.lock() } }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { clear(); model.service.lock() }
+            else if phase == .active, recovering, rows.isEmpty { run(.recoveryEligibility) }
+        }
         .onDisappear { clear(); model.service.endRecoverySession(); if completedVault { model.refresh() } }
     }
     private var operationProgress: some View {
@@ -215,7 +214,14 @@ struct OfflineRecoveryView: View {
     @ViewBuilder private func actionButton(_ title: String, operation: VaultManagement,
                                           location: ProgressLocation, vaultID: UUID? = nil) -> some View {
         if working && progressLocation == location { operationProgress }
-        else { Button(title) { run(operation, vaultID: vaultID) } }
+        else {
+            VStack(alignment: .leading, spacing: 6) {
+                Button(title) { run(operation, vaultID: vaultID) }
+                if progressLocation == location, !message.isEmpty {
+                    Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
     }
     private var copyInput: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -239,6 +245,7 @@ struct OfflineRecoveryView: View {
     }
     private var copy: SecretBytes { imported ?? SecretBytes(utf8: input) }
     private func clear() {
+        if let hold = idleLockHold { model.endRecoveryWork(hold); idleLockHold = nil }
         task?.cancel(); task = nil; code = ""; input = ""; fingerprint = ""; file = nil; imported = nil
         revealed = ""; attachment = nil; fields = []; rows = []; working = false
         recoveredVaultIDs = []; recoveryConfirmations = [:]
@@ -258,23 +265,36 @@ struct OfflineRecoveryView: View {
         case .recoveryOpen: progressLocation = .open
         case .recoveryCatalog(let id): progressLocation = .catalog(id)
         case .recoveryComplete(let id): progressLocation = .complete(id)
+        case .recoveryCompleteAll: progressLocation = .completeAll
         case .recoveryRead(let id, let path): progressLocation = .read(id, path)
         default: progressLocation = nil
         }
         switch operation {
         case .recoveryTestReset: progressMessage = "Verifying your offline copy before resetting this device…"
         case .recoveryEligibility: progressMessage = "Checking this device’s vault access…"
-        case .recoveryActivate: progressMessage = "Verifying your recovery copy…"
+        case .recoveryGenerate: progressMessage = "Generating your recovery code…"
+        case .recoveryResume: progressMessage = "Resuming recovery setup… Keep this app open."
+        case .recoveryActivate: progressMessage = "Verifying your recovery code and updating vault protection…"
         case .recoveryStatus: progressMessage = "Checking recovery coverage with iCloud…"
         default: progressMessage = "Working with iCloud…"
         }
+        switch operation {
+        case .recoveryComplete, .recoveryCompleteAll: model.recoveryInProgress = true
+        default: break
+        }
         working = true; message = ""; statuses = []; revealed = ""; attachment = nil
         let generation = model.securityGeneration
+        let hold = model.beginRecoveryWork()
+        idleLockHold = hold
         task = Task { @MainActor in
-            defer { working = false }
+            defer {
+                model.endRecoveryWork(hold)
+                if idleLockHold == hold { idleLockHold = nil; working = false }
+            }
             do {
                 let result = try await model.service.execute(.manage(operation), vault: nil, offline: false)
                 guard !Task.isCancelled, generation == model.securityGeneration else { return }
+                model.recoveryInProgress = result.recoveryInProgress
                 if let value = result.recoveryCode { code = String(decoding: value, as: UTF8.self) }
                 if let value = result.recoveryFile { file = value }
                 if let value = result.recoveryFingerprint { fingerprint = value }
@@ -306,7 +326,8 @@ struct OfflineRecoveryView: View {
                     rows = result.vaults
                     recoveredVaultIDs = Set(result.vaults.filter(\.enrolled).compactMap { UUID(uuidString: $0.id) })
                     recoveryAllowed = result.recoveryNeeded
-                case .recoveryComplete:
+                    if !result.recoveryInProgress, result.vaults.contains(where: \.enrolled) { completedVault = true }
+                case .recoveryComplete, .recoveryCompleteAll:
                     recoveredVaultIDs.formUnion(result.recoveryVaults.filter(\.complete).map(\.id))
                     if result.recoveryVaults.contains(where: \.complete) {
                         completedVault = true
@@ -328,7 +349,8 @@ struct OfflineRecoveryView: View {
                     return
                 }
                 guard !Task.isCancelled, generation == model.securityGeneration else { return }
-                message = (error as? MopError)?.errorDescription ?? "Recovery could not finish. Retry when iCloud and the required data are available."
+                message = ItemRecoveryFailure.message(for: error)
+                showingError = true
             }
         }
     }

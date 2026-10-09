@@ -73,7 +73,7 @@ struct NativeItemEnrollmentTransport: Sendable {
             do { page = try await database.recordZoneChanges(inZoneWith: zone, since: token, resultsLimit: 100) }
             catch let error as CKError where error.code == .zoneNotFound { return [] }
             try await checked()
-            for (id, result) in page.modificationResultsByID {
+            for (id, result) in page.modificationResultsByID where id.recordName.hasPrefix("request-") || id.recordName.hasPrefix("approval-") {
                 let record = try result.get().record
                 records[id] = try bytes(record)
             }
@@ -105,6 +105,7 @@ struct NativeItemEnrollmentTransport: Sendable {
                 let scope: EnrollmentScope
                 if id.recordName.hasPrefix("request-") { scope = try DeviceEnrollmentRequest.decode(data).scope }
                 else if id.recordName.hasPrefix("approval-") { scope = try DeviceEnrollmentApproval.decode(data).request.scope }
+                else if id.recordName.hasPrefix("repair-") { scope = try EnvelopeRepairRequest.decode(data).scope }
                 else { continue }
                 if scope.vault == vaultID, scope.account == account.accountNamespace,
                    scope.container == account.containerIdentifier, scope.environment == account.environment { targets.insert(id) }

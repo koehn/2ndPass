@@ -3,10 +3,17 @@ import Foundation
 import OSLog
 import Synchronization
 import MopCore
+import MopAuth
 import MopSync
 import MopVaultNext
 
 public protocol ItemVaultServiceBackend: Sendable {
+    var operationProgress: String? { get }
+    var operationFraction: Double? { get }
+    var recoveryAvailable: Bool { get }
+    func recovery(_ action: VaultManagement) async throws -> VaultResult
+    func endRecoverySession()
+    func recoveryState() async throws -> ItemRecoveryState?
     var vaultDeletionAvailable: Bool { get }
     func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase
     func deletionStates() async throws -> [UUID: VaultDeletionPhase]
@@ -21,6 +28,7 @@ public protocol ItemVaultServiceBackend: Sendable {
     func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession
     func requestSync() async throws
     func conflictAdapter() async throws -> CloudKitSyncAdapter
+    func activeConflictAdapter() async -> CloudKitSyncAdapter?
     func waitForDelivery(_ mutationIDs: [UUID], timeout: Duration) async throws -> Bool
     func creationMutations(_ vaultID: UUID) async throws -> [UUID]
     func lock()
@@ -29,11 +37,18 @@ public protocol ItemVaultServiceBackend: Sendable {
     func resolveVault(named name: String, offline: Bool) async throws -> UUID?
 }
 public extension ItemVaultServiceBackend {
+    var operationProgress: String? { nil }
+    var operationFraction: Double? { nil }
+    var recoveryAvailable: Bool { false }
+    func recovery(_ action: VaultManagement) async throws -> VaultResult { throw ItemVaultServiceFailure.unavailable }
+    func endRecoverySession() {}
+    func recoveryState() async throws -> ItemRecoveryState? { nil }
     var vaultDeletionAvailable: Bool { false }
     func deletionStates() async throws -> [UUID: VaultDeletionPhase] { [:] }
     func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase { throw ItemVaultServiceFailure.unavailable }
     func resumeDeletions() async throws -> [UUID: VaultDeletionPhase] { [:] }
     func conflictAdapter() async throws -> CloudKitSyncAdapter { throw ItemVaultServiceFailure.unavailable }
+    func activeConflictAdapter() async -> CloudKitSyncAdapter? { nil }
     func discover() async throws -> ItemVaultDiscovery { try await ItemVaultDiscovery(vaults: inventory(), complete: true) }
     func invalidateDiscovery() {}
     func enrollment(_ action: VaultManagement, vaultID: UUID) async throws -> VaultResult { throw ItemVaultServiceFailure.unavailable }
@@ -72,6 +87,7 @@ public enum ItemVaultServiceFailure: Error, LocalizedError, Equatable {
 public enum ItemVaultDelivery: Sendable { case local, cloudConfirmed(timeout: Duration) }
 
 public final class ItemVaultService: VaultService, @unchecked Sendable {
+    private static let conflictLogger = Logger(subsystem: "com.koehn.mop", category: "Conflicts")
     private let backend: any ItemVaultServiceBackend
     private let delivery: ItemVaultDelivery
     private let allowsAttachments: Bool
@@ -110,6 +126,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     func catalogProjectionWork(vault: UUID) -> (snapshots: Int, sortedRows: Int)? {
         catalogCache.withLock { $0[vault]?.projection.work.value }
     }
+    public var operationProgress: String? { backend.operationProgress }
+    public var operationFraction: Double? { backend.operationFraction }
     private let catalogCache = Mutex<[UUID: CachedCatalog]>([:])
     private var accountObserver: NSObjectProtocol?
 
@@ -157,8 +175,11 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         return status
     }
 
+    public func endRecoverySession() { backend.endRecoverySession() }
+
     public var capabilities: Set<VaultServiceCapability> {
         var result: Set<VaultServiceCapability> = [.portableBackup, .enrollment, .passwordCheckCache]
+        if backend.recoveryAvailable { result.insert(.recovery) }
         if backend.vaultDeletionAvailable { result.insert(.vaultDeletion) }
         return result
     }
@@ -266,6 +287,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         try Task.checkCancellation()
     }
     private func opened(_ id: UUID, token: Int, offline: Bool) async throws -> ItemVaultSession {
+        guard try await backend.recoveryState()?.blocksRegularAccess != true else { throw ItemRecoveryFailure.recoveryInProgress }
         let opening = authenticatedAt == nil
         let session = try await backend.open(id, offline: offline)
         if localHealthSessions.withLock({ $0[id] }) != ObjectIdentifier(session) {
@@ -278,11 +300,67 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         return session
     }
     public func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] {
+        try await checkConflicts(vault: vault).choices
+    }
+
+    public func checkConflicts(vault: String) async throws -> ItemVaultConflictCheck {
         let token = sessionGeneration
-        guard let id = UUID(uuidString: vault), let session = await backend.existing(id), session.isUnlocked else { return [] }
+        guard let id = UUID(uuidString: vault), let session = await backend.existing(id), session.isUnlocked else { return ItemVaultConflictCheck(choices: [], pending: 0) }
         let previews = try await session.conflictPreviews()
+        var remaining: [ItemVaultConflictPreview] = []
+        var duplicates = 0, resolved = 0, deferred = 0, failed = 0
+        if !previews.isEmpty { Self.conflictLogger.notice("Conflict cleanup starting; records=\(previews.count)") }
+        defer {
+            if !previews.isEmpty {
+                Self.conflictLogger.notice("Conflict cleanup finished; checked=\(resolved + remaining.count + deferred + failed) duplicates=\(duplicates) resolved=\(resolved) deferred=\(deferred) failed=\(failed)")
+            }
+        }
+        for start in stride(from: 0, to: previews.count, by: 25) {
+            try Task.checkCancellation()
+            try checked(token)
+            let batch = Array(previews[start..<min(start + 25, previews.count)])
+            var matching: [ItemVaultConflictPreview] = []
+            for preview in batch {
+                try Task.checkCancellation()
+                do {
+                    if try await session.isDuplicateConflict(preview.conflict) { matching.append(preview) }
+                    else { remaining.append(preview) }
+                } catch {
+                    try Task.checkCancellation()
+                    failed += 1
+                    if failed == 1 {
+                        let native = error as NSError
+                        Self.conflictLogger.error("Conflict comparison deferred: domain=\(native.domain, privacy: .public) code=\(native.code)")
+                    }
+                }
+            }
+            duplicates += matching.count
+            guard !matching.isEmpty else { continue }
+            guard let adapter = await backend.activeConflictAdapter() else {
+                deferred += matching.count; continue
+            }
+            do {
+                let results = try await session.resolveDuplicateConflictBatch(matching.map(\.conflict), coordinator: adapter)
+                for preview in matching {
+                    if case .success = results[preview.conflict.id] { resolved += 1 }
+                    else {
+                        failed += 1
+                        if failed == 1, case .failure(let error) = results[preview.conflict.id] {
+                            let native = error as NSError
+                            Self.conflictLogger.error("Duplicate conflict cleanup failed: domain=\(native.domain, privacy: .public) code=\(native.code)")
+                        }
+                    }
+                }
+            } catch {
+                try Task.checkCancellation()
+                failed += matching.count
+                let native = error as NSError
+                Self.conflictLogger.error("Duplicate conflict batch interrupted: domain=\(native.domain, privacy: .public) code=\(native.code)")
+            }
+            Self.conflictLogger.notice("Conflict cleanup progress; checked=\(resolved + remaining.count + deferred + failed)/\(previews.count) duplicates=\(duplicates) resolved=\(resolved) failed=\(failed)")
+        }
         try checked(token)
-        return previews
+        return ItemVaultConflictCheck(choices: remaining, pending: deferred + failed)
     }
 
     public func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes {
@@ -300,15 +378,20 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         guard let session = await backend.existing(preview.conflict.local.scope.vaultID), session.isUnlocked else { throw MopError.authentication }
         let adapter = try await backend.conflictAdapter()
         try checked(token)
-        switch choice {
-        case .remote:
-            _ = try await session.resolveConflictUsingRemote(preview.conflict, coordinator: adapter)
-        case .local:
-            _ = try await session.resolveConflict(preview.conflict, catalog: preview.local, coordinator: adapter)
-        case .combine(let metadata, let fields):
-            let patch = try await session.combinedConflict(preview.conflict, metadata: metadata, fields: fields)
-            _ = try await session.resolveConflict(preview.conflict, catalog: patch.catalog,
-                changedRecords: patch.changedRecords, removedRecords: patch.removedRecords, coordinator: adapter)
+        do {
+            switch choice {
+            case .remote:
+                _ = try await session.resolveConflictUsingRemote(preview.conflict, coordinator: adapter)
+            case .local:
+                _ = try await session.resolveConflict(preview.conflict, catalog: preview.local, coordinator: adapter)
+            case .combine(let metadata, let fields):
+                let patch = try await session.combinedConflict(preview.conflict, metadata: metadata, fields: fields)
+                _ = try await session.resolveConflict(preview.conflict, catalog: patch.catalog,
+                    changedRecords: patch.changedRecords, removedRecords: patch.removedRecords, coordinator: adapter)
+            }
+        } catch {
+            if Authentication.requiresRenewal(error) { lock(); throw MopError.authentication }
+            throw error
         }
         try checked(token)
     }
@@ -486,6 +569,15 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             try CloudVaultBoundary.requireCloud(name)
         default: break
         }
+        if case .manage(let action) = operation, action.isItemRecovery {
+            guard !offline else { throw MopError.offlineWrite }
+            let result = try await backend.recovery(action)
+            if try await backend.recoveryState()?.blocksRegularAccess == true { try await publisher?.prune(keeping: []) }
+            return result
+        }
+        if case .discover = operation {} else {
+            guard try await backend.recoveryState()?.blocksRegularAccess != true else { throw ItemRecoveryFailure.recoveryInProgress }
+        }
         switch operation {
         case .manage(.automaticEnrollment), .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.checkEnrollment), .manage(.enrollmentInbox), .manage(.approveEnrollment), .manage(.confirmEnrollment), .manage(.cancelEnrollment), .manage(.rejectEnrollment), .manage(.devices): break
         case .discover, .catalog, .recentlyDeleted, .read, .save, .write, .delete, .deleteVault, .create, .restorePortable,
@@ -554,6 +646,12 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             return result
         case .discover:
             var result = VaultResult()
+            if let recovery = try await backend.recoveryState(), recovery.blocksRegularAccess {
+                result.recoveryNeeded = true
+                result.vaults = recovery.vaults.map { VaultDescriptor(id: $0.uuidString, name: nil, format: "mop-items-v2", enrolled: false) }
+                try await publisher?.prune(keeping: [])
+                return result
+            }
             if offline { result.vaults = try await backend.inventory(offline: true); result.discoveryComplete = false }
             else { let discovery = try await backend.discover(); result.vaults = discovery.vaults; result.discoveryComplete = discovery.complete }
             try checked(token)
@@ -623,7 +721,16 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
         let selected = try await select(vault ?? referenceVault, offline: offline)
         timing?.mark("vault selected")
-        let session = try await opened(selected, token: token, offline: offline)
+        let session: ItemVaultSession
+        if case .passwordQuality = operation, let unlocked = await backend.existing(selected), unlocked.isUnlocked {
+            // This is a local inspection of the already unlocked item, not an
+            // instruction to put the account's synchronization runtime offline.
+            guard try await backend.recoveryState()?.blocksRegularAccess != true else { throw ItemRecoveryFailure.recoveryInProgress }
+            try checked(token)
+            session = unlocked
+        } else {
+            session = try await opened(selected, token: token, offline: offline)
+        }
         timing?.mark("session opened")
         var result = VaultResult()
         switch operation {

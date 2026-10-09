@@ -39,6 +39,56 @@ private func conflictedRepository() async throws -> (URL, EncryptedItemRepositor
     #expect(try await reopened.item(remote.scope) == remote)
 }
 
+@Test func conflictBatchPausesOnceAndContinuesPastStaleChoice() async throws {
+    let (directory, repository, _, conflict) = try await conflictedRepository()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let remote = EncryptedItemVersion(scope: conflict.remote.scope, baseVersionID: conflict.remote.versionID,
+        ciphertext: Data([4]), generation: 3)
+    let current = try await repository.recordConflict(remote: remote, serverSystemFields: Data([3]))
+    // Stale and current reviews refer to the same conflict ID, so use a second
+    // repository for the independent successful entry.
+    let (otherDirectory, otherRepository, _, other) = try await conflictedRepository()
+    defer { try? FileManager.default.removeItem(at: otherDirectory) }
+    var pauses = 0, resumes = 0
+    let results = try await performConflictResolutionBatch([(conflict, nil), (other, nil)], quiesce: {
+        pauses += 1
+    }, resolve: { entry in
+        let store = entry.conflict.id == conflict.id ? repository : otherRepository
+        return try await store.resolveConflictUsingRemote(entry.conflict, authorization: ResolutionPermit())
+    }, finish: { resumes += 1 })
+    #expect(pauses == 1 && resumes == 1)
+    if case .failure(let error) = results[conflict.id] { #expect(error as? ItemRepositoryError == .staleConflict) }
+    else { Issue.record("Stale choice must fail") }
+    #expect(try results[other.id]?.get() == other.remote)
+    #expect(try await repository.conflict(conflict.local.scope) == current)
+    #expect(try await otherRepository.conflicts(account: other.local.scope.account).isEmpty)
+}
+
+@Test func conflictBatchCancellationResumesAndPreservesCommittedChoice() async throws {
+    let (directory, repository, _, conflict) = try await conflictedRepository()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let entered = AsyncStream<Void>.makeStream(), release = AsyncStream<Void>.makeStream()
+    let task = Task {
+        var resumed = false
+        do {
+            _ = try await performConflictResolutionBatch([(conflict, nil)], quiesce: {}, resolve: { entry in
+                let saved = try await repository.resolveConflictUsingRemote(entry.conflict, authorization: ResolutionPermit())
+                entered.continuation.yield(())
+                for await _ in release.stream { break }
+                return saved
+            }, finish: { resumed = true })
+            Issue.record("Expected cancellation")
+        } catch { #expect(error is CancellationError) }
+        return resumed
+    }
+    for await _ in entered.stream { break }
+    task.cancel(); release.continuation.finish()
+    #expect(await task.value)
+    #expect(try await repository.item(conflict.local.scope) == conflict.remote)
+    #expect(try await repository.conflicts(account: conflict.local.scope.account).isEmpty)
+    entered.continuation.finish()
+}
+
 @Test func staleConflictChoiceCannotDiscardNewLocalEdit() async throws {
     let (directory, repository, pending, conflict) = try await conflictedRepository()
     defer { try? FileManager.default.removeItem(at: directory) }

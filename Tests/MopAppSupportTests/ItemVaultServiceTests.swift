@@ -19,6 +19,11 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
     let confirmsDelivery = Mutex(false)
     let locksAfterCreate = Mutex(false)
     let discoveryComplete = Mutex(true)
+    let offlineOpens = Mutex(0)
+    func open(_ vaultID: UUID, offline: Bool) async throws -> ItemVaultSession {
+        if offline { offlineOpens.withLock { $0 += 1 } }
+        return try await open(vaultID)
+    }
     let conflictAdapterFailure = Mutex<CloudSyncAdapterError>(.engineNotStarted)
     func conflictAdapter() async throws -> CloudKitSyncAdapter {
         throw conflictAdapterFailure.withLock { $0 }
@@ -144,6 +149,29 @@ func loginDestinationsUseCurrentMetadataWithoutReadingLoginItems(itemCount: Int)
     metadata.name = "renamed-again"
     _ = try await session.saveMetadata(metadata, expectedBase: latest.versionID)
     #expect(try await service.loginDestinations().first?.name == "renamed-again")
+}
+
+@Test(arguments: [false, true])
+func conflictChoicesExcludeDuplicatesEvenWithoutSyncAdapter(different: Bool) async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    var contents = try sessionArchive()
+    let archive = try PortableArchive.seal(contents)
+    let session = try await backend.create(name: "review", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let original = try #require(try await repository.items(account: "service", vaultID: id).first { $0.scope.itemID != ItemVaultSession.metadataRecordID })
+    if different {
+        let key = try #require(contents.records.keys.first)
+        contents.records[key] = PortableArchiveRecord(itemID: contents.records[key]!.itemID, bytes: SecretBytes(copying: Data("changed".utf8)))
+        _ = try await session.save(contents, expectedBase: original.versionID)
+    }
+    _ = try await repository.recordConflict(remote: original, serverSystemFields: Data([1]))
+    let service = ItemVaultService(backend: backend)
+    let report = try await service.checkConflicts(vault: id.uuidString)
+    #expect(report.choices.count == (different ? 1 : 0))
+    #expect(report.pending == (different ? 0 : 1))
+    #expect(try await repository.conflicts(account: "service").count == 1)
 }
 
 private func serviceLocation() throws -> URL {
@@ -381,7 +409,7 @@ func autoFillDirectReadUnwrapsOnlySelectedItemAndRejectsStaleHints(itemCount: In
 
     let session = try await fresh.open(vault)
     let current = try await session.catalog(itemID: itemID)
-    _ = try await session.replaceField(itemID: itemID, expectedBase: current.versionID, path: "username", value: SecretBytes(utf8: "changed"))
+    _ = try await session.replaceField(itemID: itemID, expectedBase: current.versionID, path: "username", value: SecretBytes(copying: Data("changed".utf8)))
     let beforeStale = fresh.unwrapCount
     await #expect(throws: MopError.notFound) {
         try await AutoFillAccess.resolve(recordIdentifier: identity.recordIdentifier, kind: kind, service: service)
@@ -1082,4 +1110,18 @@ private actor RestartHealthBreach: BreachChecking {
         #expect(localReads.withLock { $0 } == reads)
         #expect(statusReads.withLock { $0 } == statuses)
     }
+}
+
+@Test func localPasswordStrengthCheckDoesNotPauseAnUnlockedVault() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository)
+    let archive = try PortableArchive.seal(sessionArchive())
+    let id = UUID()
+    _ = try await backend.create(name: "test", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let service = ItemVaultService(backend: backend)
+    let result = try await service.execute(.passwordQuality(item: "Login"), vault: id.uuidString, offline: true)
+    #expect(!result.passwordQuality.isEmpty)
+    #expect(backend.offlineOpens.withLock { $0 } == 0)
 }

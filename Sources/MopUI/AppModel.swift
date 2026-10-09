@@ -38,10 +38,13 @@ final class AppModel {
     var pendingSecurityUpgrade: (String, String)?
     private(set) var conflictPreviews: [ItemVaultConflictPreview] = []
     private(set) var conflictFailure: String?
+    private(set) var checkingConflicts = false
+    private(set) var pendingConflictChecks = 0
     var conflictReviewPresented = false
     var conflictReviewItem: ItemRow.ID?
     @ObservationIgnored private var conflictRefreshTask: Task<Void, Never>?
     private var conflictRefreshGeneration = 0
+    private var conflictRefreshAgain = false
     var conflictItems: Set<ItemRow.ID> {
         Set(conflictPreviews.map { .init(vault: $0.conflict.local.scope.vaultID.uuidString, name: $0.local.item.name) })
     }
@@ -51,28 +54,48 @@ final class AppModel {
         refreshConflicts()
     }
     func refreshConflicts() {
-        conflictRefreshGeneration += 1
-        let token = conflictRefreshGeneration
-        conflictRefreshTask?.cancel(); conflictRefreshTask = nil
         guard authenticated, isActive else {
+            conflictRefreshGeneration += 1
+            conflictRefreshTask?.cancel(); conflictRefreshTask = nil
+            conflictRefreshAgain = false
             conflictPreviews = []; conflictFailure = nil
+            checkingConflicts = false; pendingConflictChecks = 0
             conflictReviewPresented = false; conflictReviewItem = nil
             return
         }
-        let vaultIDs = catalogs.keys.sorted()
+        conflictRefreshAgain = true
+        guard conflictRefreshTask == nil else { return }
+        conflictRefreshGeneration += 1
+        let token = conflictRefreshGeneration
+        checkingConflicts = true
         conflictRefreshTask = Task { [weak self, service] in
-            do {
-                var loaded: [ItemVaultConflictPreview] = []
-                for id in vaultIDs {
-                    loaded += try await service.conflicts(vault: id)
+            guard let self else { return }
+            defer { if self.conflictRefreshGeneration == token { self.conflictRefreshTask = nil; self.checkingConflicts = false } }
+            repeat {
+                self.conflictRefreshAgain = false
+                let vaultIDs = self.catalogs.keys.sorted()
+                do {
+                    var loaded: [ItemVaultConflictPreview] = []
+                    var pending = 0
+                    for id in vaultIDs {
+                        try Task.checkCancellation()
+                        let report = try await service.checkConflicts(vault: id)
+                        loaded += report.choices; pending += report.pending
+                    }
                     try Task.checkCancellation()
+                    guard self.conflictRefreshGeneration == token, self.authenticated, self.isActive else { return }
+                    self.conflictPreviews = loaded; self.conflictFailure = nil
+                    self.pendingConflictChecks = pending
+                    if loaded.isEmpty {
+                        self.conflictReviewPresented = false; self.conflictReviewItem = nil
+                    }
+                } catch {
+                    guard !Task.isCancelled, self.conflictRefreshGeneration == token else { return }
+                    self.conflictPreviews = []
+                    self.conflictFailure = "Sync differences could not be checked. Retry when synchronization is available."
+                    return
                 }
-                guard let self, self.conflictRefreshGeneration == token, self.authenticated, self.isActive else { return }
-                self.conflictPreviews = loaded; self.conflictFailure = nil
-            } catch {
-                guard !Task.isCancelled, let self, self.conflictRefreshGeneration == token else { return }
-                self.conflictFailure = "Conflict status could not be refreshed. Try again."
-            }
+            } while self.conflictRefreshAgain && self.authenticated && self.isActive && !Task.isCancelled
         }
     }
     let service: any VaultService
@@ -192,6 +215,7 @@ final class AppModel {
     var members: [VaultMemberRecord] = []
     var settingsVisible = false
     var devices: [VaultDeviceRecord] = []
+    var recoveryInProgress = false
     var deviceRemoved = false
     var removalCleanupPending = false
     private var cachedVaults: Set<String> = []
@@ -245,6 +269,10 @@ final class AppModel {
                     try await self.service.requestSynchronization()
                     guard self.generation == token, !Task.isCancelled else { return }
                     self.syncIssue = nil; self.syncIssueDetails = nil
+                    // The initial conflict scan may precede the lease-owning
+                    // adapter. Retry cleanup once synchronization is available,
+                    // even when fetching produces no repository changes.
+                    self.refreshConflicts()
                 } catch {
                     guard self.generation == token, !Task.isCancelled else { return }
                     self.syncIssue = "iCloud sync could not resume. Local changes are saved. Tap Refresh to retry."
@@ -441,6 +469,16 @@ final class AppModel {
     @ObservationIgnored private var inactivityTask: Task<Void, Never>?
     @ObservationIgnored private var operationTask: Task<Void, Never>?
     private var lastActivity: TimeInterval?
+    private var recoveryIdleLockHolds: Set<UUID> = []
+    func beginRecoveryWork() -> UUID {
+        let token = UUID()
+        recoveryIdleLockHolds.insert(token)
+        return token
+    }
+    func endRecoveryWork(_ token: UUID) {
+        guard recoveryIdleLockHolds.remove(token) != nil else { return }
+        if recoveryIdleLockHolds.isEmpty, service.isAuthenticated { lastActivity = now() }
+    }
     private var launchUnlockAvailable = true
     private var accessNeedsRepair = false
     private var connectionRepairMessage: String {
@@ -555,7 +593,7 @@ final class AppModel {
     func checkExpiration() {
         if let started = service.authenticatedAt {
             if lastActivity == nil { lastActivity = started }
-            if now() - (lastActivity ?? started) >= Double(autoLockMinutes * 60) {
+            if recoveryIdleLockHolds.isEmpty, now() - (lastActivity ?? started) >= Double(autoLockMinutes * 60) {
                 lock(reason: .timeout)
             }
         } else if lastActivity != nil {
@@ -1231,6 +1269,7 @@ final class AppModel {
         catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
+        recoveryIdleLockHolds.removeAll()
         #if os(macOS)
         DistributedNotificationCenter.default().postNotificationName(LocalAuthorization.appLockNotification, object: nil, userInfo: nil, deliverImmediately: true)
         #endif
@@ -1402,6 +1441,14 @@ final class AppModel {
         let refreshContents = authenticated
         perform { token in
             let result = try await self.service.execute(.discover, vault: nil, offline: false)
+            if result.recoveryNeeded {
+                self.recoveryInProgress = true
+                self.lock(reason: .accessFailure)
+                self.vaults = result.vaults
+                self.sheet = .recover
+                self.status = "Recovery is incomplete. Continue recovery to open your vaults."
+                return
+            }
             if result.deviceRemoved { self.showDeviceRemoved(); return }
             self.offline = result.usingCache
             let rows = result.vaults

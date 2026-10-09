@@ -37,7 +37,7 @@ public enum VaultManagement: Sendable {
     case recoveryTestReset(copy: SecretBytes)
     case recoveryActivate(copy: SecretBytes, fingerprint: String)
     case recoveryOpen(copy: SecretBytes)
-    case recoveryCatalog(UUID), recoveryRead(UUID, String), recoveryComplete(UUID)
+    case recoveryCatalog(UUID), recoveryRead(UUID, String), recoveryComplete(UUID), recoveryCompleteAll([UUID])
     case reconcileShare
     case importCheckpoint(document: Data, fingerprint: String, sharedOwner: String?)
 }
@@ -81,6 +81,7 @@ public struct VaultResult: Sendable {
     public var recoveryCode: SecretBytes?
     public var recoveryFile: SecretBytes?
     public var recoveryVaults: [RecoveryVaultStatus] = []
+    public var recoveryInProgress = false
     public var recoveryNeeded = false
     public var recoveryReadOnly = false
     public var recoveredAttachment: Attachment?
@@ -137,6 +138,7 @@ public protocol VaultService: Sendable {
     var capabilities: Set<VaultServiceCapability> { get }
     func changes() async -> AsyncStream<Void>
     func events() async -> AsyncStream<VaultChange>
+    func checkConflicts(vault: String) async throws -> ItemVaultConflictCheck
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview]
     func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws
     func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes
@@ -167,6 +169,9 @@ public extension VaultService {
     func userActivity() {}
     func setMaintenanceActive(_ active: Bool) {}
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] { [] }
+    func checkConflicts(vault: String) async throws -> ItemVaultConflictCheck {
+        try await ItemVaultConflictCheck(choices: conflicts(vault: vault), pending: 0)
+    }
     func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws { throw ItemVaultServiceFailure.unavailable }
     func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes { throw ItemVaultServiceFailure.unavailable }
 
@@ -246,5 +251,25 @@ actor OperationGate {
         while let first = waiters.first, available(first.1) {
             waiters.removeFirst(); occupy(first.1); first.2.resume()
         }
+    }
+}
+
+public extension VaultManagement {
+    var isItemRecovery: Bool {
+        switch self {
+        case .recoveryEligibility, .recoveryGenerate, .recoveryStatus, .recoveryRevoke, .recoveryResume,
+             .recoveryActivate, .recoveryOpen, .recoveryCatalog, .recoveryRead, .recoveryComplete, .recoveryCompleteAll: true
+        default: false
+        }
+    }
+}
+
+/// Only verified content differences belong in choices. Pending records need
+/// automatic reconciliation or another successful comparison, never a choice.
+public struct ItemVaultConflictCheck: Sendable {
+    public var choices: [ItemVaultConflictPreview]
+    public var pending: Int
+    public init(choices: [ItemVaultConflictPreview], pending: Int) {
+        self.choices = choices; self.pending = pending
     }
 }

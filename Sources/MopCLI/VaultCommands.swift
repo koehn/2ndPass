@@ -300,7 +300,7 @@ struct Vault: AsyncParsableCommand {
         struct Activate: AsyncParsableCommand {
             @OptionGroup var storage: VaultOptions
             @Option(completion: .file()) var file: String
-            @Option(help: "Public fingerprint displayed when the copy was generated.") var fingerprint: String
+            @Option(help: "Optional public fingerprint displayed when the copy was generated.") var fingerprint: String = ""
             func run() async throws {
                 try storage.requireOnline()
                 try emit(await storage.execute(.manage(.recoveryActivate(copy: Recovery.read(file), fingerprint: fingerprint))))
@@ -327,7 +327,7 @@ struct Vault: AsyncParsableCommand {
             @Option(help: "Offline recovery file or paper-code file.", completion: .file()) var file: String
             @Option(help: "Read a relative field path without completing recovery.") var read: String?
             @Option(help: "Write a recovered field or attachment to a new file.", completion: .file()) var output: String?
-            @Flag(help: "Complete recovery and rotate access for selected or all matching vaults.") var complete = false
+            @Flag(help: "Enroll this device for selected or all matching vaults, preserving existing devices.") var complete = false
             func validate() throws { guard !(complete && read != nil), output == nil || read != nil else { throw MopError.invalidProcess } }
             func run() async throws {
                 try storage.requireOnline()
@@ -335,6 +335,10 @@ struct Vault: AsyncParsableCommand {
                 let opened = try await service.execute(.manage(.recoveryOpen(copy: Recovery.read(file))), vault: nil)
                 let selected = opened.vaults.filter { storage.vault == nil || $0.id == storage.vault || $0.name == storage.vault }
                 guard !selected.isEmpty, read == nil || selected.count == 1 else { throw MopError.ambiguousVault }
+                if complete {
+                    try emit(await service.execute(.manage(.recoveryCompleteAll(selected.compactMap { UUID(uuidString: $0.id) })), vault: nil))
+                    return
+                }
                 for vault in selected {
                     guard let id = UUID(uuidString: vault.id) else { throw MopError.invalidVault }
                     if let read {

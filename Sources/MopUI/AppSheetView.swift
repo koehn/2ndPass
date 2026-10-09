@@ -32,7 +32,7 @@ struct AppSheetView: View {
                     Text("Use letters, numbers, and hyphens for the vault name.").font(.caption).foregroundStyle(.secondary)
                 }
                 Text("2ndPass will create this device’s protected keys automatically.")
-                Text("Export a portable backup and save its separate key. Other devices on your Apple Account connect automatically when an existing device is unlocked. Offline account recovery is not yet available for item vaults.").font(.caption)
+                Text("Export a portable backup and save its separate key. Other devices on your Apple Account connect automatically when an existing device is unlocked. Set up an offline recovery code to regain access if your other devices are unavailable.").font(.caption)
                 Divider()
                 DisclosureGroup("More Options") {
                 if model.canPresent(.enrollDevice) { Button("Connect to an existing vault…") { dismissOrConfirm(next: .enrollDevice) } }
@@ -79,6 +79,7 @@ struct AppSheetView: View {
                 Spacer()
                 Button(submitted || [.enrollDevice, .addDevice, .setupRecovery, .recover, .shareAccount].contains(kind) ? "Close" : "Cancel") { dismissOrConfirm() }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(kind == .recover && model.recoveryInProgress)
                 if kind == .createVault {
                     Button("Create Vault") { submitted = true; model.createVault(name: creationName) }
                         .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
@@ -97,7 +98,7 @@ struct AppSheetView: View {
                 }
             }.padding()
         }.mopSheetWidth(640)
-        .interactiveDismissDisabled(dirty && !submitted)
+        .interactiveDismissDisabled((dirty && !submitted) || (kind == .recover && model.recoveryInProgress))
         .documentTransfers(model: model, inSheet: true)
         .onAppear {
             if kind == .renameVault { name = request.target?.name ?? "" }

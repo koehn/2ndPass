@@ -420,19 +420,24 @@ public actor ItemVaultSyncRuntime {
         let operation = try await begin(); defer { end() }
         let wake = try await repository.requestSync(account: context.account, database: "private", reason: .manual)
         try check(operation)
+        var stage = "refreshing local inventory"
         do {
             let inventory = try await refresh(operation)
+            stage = "commissioning pending vault changes"
             try await commissionPending(inventory, operation: operation)
             _ = try await refresh(operation)
+            stage = "updating local membership envelopes"
             try await catchUpMembership(inventory, operation: operation)
             // An existing adapter may be suspended after protected storage or
             // membership was unavailable. Its foreground entry point can recover
             // from the durable token; start() deliberately rejects suspension.
+            stage = "starting the sync engine"
             if driver == nil { try await startDriver(operation) }
             await ensureRequestPump()
             try check(operation)
             guard let driver else { throw CloudSyncAdapterError.engineNotStarted }
             Self.logger.notice("Sync trace: runtime setup complete; handing wake to driver")
+            stage = "resuming the sync engine"
             let request = try await driver.requestForegroundSync()
             try check(operation)
             await driver.setUploadsAllowed(routes.hasUnlockedSessions)
@@ -444,6 +449,10 @@ public actor ItemVaultSyncRuntime {
             // Returning this receipt never claims CloudKit accepted the items.
             Self.logger.notice("Sync trace: runtime lease owned by another process")
             return wake
+        } catch {
+            let native = error as NSError
+            Self.logger.error("Sync resume failed during \(stage, privacy: .public): domain=\(native.domain, privacy: .public) code=\(native.code)")
+            throw error
         }
     }
 
@@ -465,13 +474,49 @@ public actor ItemVaultSyncRuntime {
         Task { await self.stop() }
     }
 
+    /// Background envelope repair shares the runtime gate with foreground sync.
+    /// Unlike an explicit pause, it must not invalidate queued foreground wakes.
+    public func performEnvelopeRepair(_ repair: @Sendable () async throws -> Void) async throws {
+        let operation = try await begin(); defer { end() }
+        let resume = backgroundSyncEnabled
+        if let active = driver { driver = nil; await active.stop() }
+        try check(operation)
+        do {
+            do {
+                let lease = try SynchronizationLease(url: context.leaseURL)
+                defer { withExtendedLifetime(lease) {} }
+                try await repair()
+                try check(operation)
+            }
+        } catch {
+            if resume {
+                do { try await startDriver(operation) }
+                catch {
+                    let native = error as NSError
+                    Self.logger.error("Sync restart after envelope repair failed: domain=\(native.domain, privacy: .public) code=\(native.code)")
+                }
+            }
+            throw error
+        }
+        if resume { try await startDriver(operation) }
+    }
+
     /// Explicit offline mode pauses transfer without retiring local sessions.
     public func pauseNetwork() async {
+        Self.logger.notice("Sync trace: network pause requested; runtimeBusy=\(self.busy)")
         backgroundSyncEnabled = false; lastSetupAttempt = nil; generation += 1
         activeAdmissionPermit?.invalidate()
         await coordinator.stop()
         let old = driver; driver = nil
         await old?.stop()
+    }
+
+    /// Recovery takes the database lease only after in-flight runtime work has
+    /// observed the generation change and released its own admission lease.
+    public func pauseForRecovery() async throws {
+        await pauseNetwork()
+        _ = try await begin()
+        end()
     }
 
     public func stop() async {
@@ -638,6 +683,7 @@ public actor ItemVaultSyncRuntime {
         }
     }
     private func catchUpMembership(_ inventory: [ItemVaultSetupRecord], operation: Int) async throws {
+        let conflicted = try await repository.conflictedScopes(account: context.account)
         var candidates: [ItemVaultSetupRecord] = []
         for record in inventory {
             guard try !membershipSuccessors(record).isEmpty,
@@ -646,7 +692,10 @@ public actor ItemVaultSyncRuntime {
             let items = try await repository.items(account: scope.account, vaultID: scope.vaultID,
                 database: scope.database, zoneOwner: scope.zoneOwner)
             try check(operation)
-            if try items.contains(where: { try session.requiresMembershipCatchUp($0) }) {
+            if try items.contains(where: { version in
+                guard !conflicted.contains(version.scope) else { return false }
+                return try session.requiresMembershipCatchUp(version)
+            }) {
                 candidates.append(record)
             } else {
                 pendingMembershipCatchUp.remove(record.scope.binding.vaultID)
@@ -719,6 +768,12 @@ public actor ItemVaultSyncRuntime {
             routes.lock(scope.vaultID)
             throw VaultDeletionFailure.deleted
         }
+        if direction == .sending, membershipTransport != nil,
+           let record = try trustedRecords().first(where: { $0.scope.repositoryScope == scope }),
+           let provisioning = try await repository.provisioning(scope) {
+            // Never publish an offline edit under an obsolete recovery recipient.
+            try await synchronizeMembership(record: record, binding: provisioning.binding)
+        }
         do { try routes.verify(version, direction: direction) }
         catch CloudSyncAdapterError.membershipUnavailable {
             guard direction != .sending,
@@ -781,7 +836,7 @@ public actor ItemVaultSyncRuntime {
         var next = try MembershipEnvelope.decode(head.bytes)
         var reversed: [MembershipEnvelope] = []
         while try next.digest() != currentDigest {
-            guard next.header.generation > history.current.header.generation, reversed.count < 127,
+            guard next.header.generation > history.current.header.generation, reversed.count < 4095,
                   let parent = next.header.parent else { throw CloudSyncAdapterError.operationInterrupted }
             reversed.append(next)
             if parent == currentDigest { break }

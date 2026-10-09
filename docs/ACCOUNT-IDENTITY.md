@@ -8,4 +8,4 @@ Same-account private vaults are discovered and connected automatically. Keep an 
 
 An attacker with write access through the trusted account/container channel may gain admission when an existing unlocked device processes the request. Signing-key possession is not hardware attestation. Observed account changes invalidate local bindings; offline clients cannot observe remote changes.
 
-Cross-account sharing, device removal and account recovery are unavailable. Portable restore creates a new vault from an archive and its separate key. See [security](SECURITY.md), [architecture](VAULT.md) and [backups](BACKUPS.md).
+Cross-account sharing, device removal are unavailable. Account recovery is implemented; physical acceptance remains pending. See [recovery](OFFLINE-RECOVERY.md). Portable restore creates a new vault from an archive and its separate key. See [security](SECURITY.md), [architecture](VAULT.md) and [backups](BACKUPS.md).

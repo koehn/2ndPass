@@ -45,7 +45,7 @@ Eligible password and concealed-field edits retain previous values in the encryp
 
 History is associated with stable field identities and excluded from ordinary secret references, search and AutoFill. Explicit history reads require authentication. Restore is an ordinary edit that retains its predecessor. Portable archives preserve retained history and trash/restore preserves the item contents.
 
-Clearing history affects the current stored item; it cannot erase values from exported archives, remote copies or a recipient's memory. Live account recovery and permanent vault deletion are unavailable. Physical conflict/history preservation and deletion semantics remain release acceptance work.
+Clearing history affects the current stored item; it cannot erase values from exported archives, remote copies or a recipient's memory. Account recovery includes retained history; see [recovery](OFFLINE-RECOVERY.md). Physical acceptance remains pending. Physical conflict/history preservation and deletion semantics remain release acceptance work.
 
 ## Validation evidence — October 2, 2026
 

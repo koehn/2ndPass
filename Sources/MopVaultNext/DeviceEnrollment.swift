@@ -40,7 +40,7 @@ public struct DeviceEnrollmentRequest: Codable, Equatable, Sendable {
         try verifyStructure()
         guard expiresAt > now, expiresAt.timeIntervalSince(now) <= 900 else { throw DeviceEnrollmentFailure.expired }
     }
-    fileprivate func verifyStructure() throws {
+    func verifyStructure() throws {
         try scope.validate(); try identity.validate()
         guard identity.member == scope.member, expiresAt.timeIntervalSince1970.isFinite,
               identity.verifies(signature, message: try Codec.encode(statement)) else { throw DeviceEnrollmentFailure.invalidRequest }
@@ -80,14 +80,15 @@ public struct DeviceEnrollmentApproval: Codable, Equatable, Sendable {
         guard expectedItemCount.map({ $0 >= 0 }) ?? true else { throw DeviceEnrollmentFailure.invalidApproval }
         let previous = history.current.membership
         guard previous.accounts.count == 1, history.vault == request.scope.vault, owner.identity.member == request.scope.member,
-              previous.role(of: owner.identity) == .owner,
+              (previous.role(of: owner.identity) == .owner || previous.offlineRecovery == owner.identity),
               previous.accounts.contains(where: { $0.id == request.identity.member }),
               !previous.devices.contains(where: { $0.device == request.identity.device }) else { throw DeviceEnrollmentFailure.invalidApproval }
         let accounts = previous.accounts.map { account in
             AccountMember(id: account.id, role: account.role, devices: account.devices + (account.id == request.identity.member ? [request.identity] : []))
         }
         let membership = try Membership(accounts: accounts, offlineRecovery: previous.offlineRecovery, removedDevices: previous.removedDevices)
-        let successor = try MembershipEnvelope.successor(of: history.current, membership: membership, owner: owner)
+        let successor = try MembershipEnvelope.successor(of: history.current, membership: membership, owner: owner,
+            recoveryRequest: previous.offlineRecovery == owner.identity ? request : nil)
         let statement = Statement(request: request, history: history.orderedStates, expectedItemCount: expectedItemCount, successor: successor,
             approvedAt: now, author: owner.identity)
         return Self(request: request, history: statement.history, successor: successor, expectedItemCount: expectedItemCount, approvedAt: statement.approvedAt,
@@ -127,7 +128,7 @@ public struct DeviceEnrollmentApproval: Codable, Equatable, Sendable {
         guard expectedItemCount.map({ $0 >= 0 }) ?? true, let genesis = history.first, history.count <= 4096 else { throw DeviceEnrollmentFailure.invalidApproval }
         var result = try TrustedMembershipHistory(genesis: genesis, vault: request.scope.vault, pinnedDigest: genesis.digest())
         for state in history.dropFirst() { try result.append(state) }
-        guard result.current.membership.role(of: author) == .owner, author.member == request.scope.member,
+        guard (result.current.membership.role(of: author) == .owner || (!isReconnect && result.current.membership.offlineRecovery == author)), author.member == request.scope.member,
               author.verifies(signature, message: try Codec.encode(statement)) else { throw DeviceEnrollmentFailure.invalidApproval }
         if isReconnect {
             guard result.current.membership.accounts.count == 1,
@@ -135,6 +136,9 @@ public struct DeviceEnrollmentApproval: Codable, Equatable, Sendable {
                 throw DeviceEnrollmentFailure.invalidApproval
             }
         } else {
+            if result.current.membership.offlineRecovery == author {
+                guard successor.recoveryRequest == request else { throw DeviceEnrollmentFailure.invalidApproval }
+            }
             try successor.verifyDeviceAddition(of: result.current, device: request.identity)
             try result.append(successor)
         }

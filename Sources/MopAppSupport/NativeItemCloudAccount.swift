@@ -89,6 +89,11 @@ public final class NativeItemCloudAccount: RepositoryWritePermit, @unchecked Sen
         return try AppStorageLocation.itemSyncLease(directory: directory, account: accountNamespace, database: database)
     }
 
+    public var recoveryScope: RecoveryScope {
+        // Constructed from the authenticated, validated native account identity.
+        try! RecoveryScope(container: containerIdentifier, environment: environment, account: userRecordName)
+    }
+
     public var validator: CloudAccountValidator { { [self] in try await validate() } }
     public func invalidate() { lifetime.invalidate() }
     public func withWritePermission<T>(_ body: () throws -> T) throws -> T {

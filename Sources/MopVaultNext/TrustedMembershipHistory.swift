@@ -43,6 +43,15 @@ public struct TrustedMembershipHistory: Sendable {
         guard try parent.digest() == current.digest() else { throw MopError.vaultUntrusted }
     }
 
+    public func verifyAccountPath(from digest: String) throws {
+        var parent = try state(forDigest: digest)
+        for next in orderedStates where next.header.generation > parent.header.generation {
+            try next.verifyAccountTransition(of: parent)
+            parent = next
+        }
+        guard try parent.digest() == current.digest() else { throw MopError.vaultUntrusted }
+    }
+
     public var orderedStates: [MembershipEnvelope] { states.values.sorted { $0.header.generation < $1.header.generation } }
     public var count: Int { states.count }
 }

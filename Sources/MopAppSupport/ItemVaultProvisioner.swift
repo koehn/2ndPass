@@ -50,7 +50,7 @@ public struct ItemVaultProvisioner: Sendable {
                 let genesis = try MembershipEnvelope.decode(bytes)
                 try genesis.verifyGenesis(vault: scope.binding.vaultID, pinnedDigest: record.pinnedDigest)
                 guard genesis.membership.accounts.count == 1, genesis.membership.accounts[0].role == .owner,
-                      genesis.membership.devices.count == 1, genesis.membership.offlineRecovery == nil else {
+                      genesis.membership.devices.count == 1 else {
                     throw CloudSyncAdapterError.untrustedRecord
                 }
             } catch { throw CloudSyncAdapterError.untrustedRecord }
@@ -80,7 +80,7 @@ public struct ItemVaultProvisioner: Sendable {
         let genesis = try MembershipEnvelope.decode(record.genesis)
         try genesis.verifyGenesis(vault: scope.binding.vaultID, pinnedDigest: record.pinnedDigest)
         guard genesis.membership.accounts.count == 1, genesis.membership.accounts[0].role == .owner,
-              genesis.membership.devices.count == 1, genesis.membership.offlineRecovery == nil else {
+              genesis.membership.devices.count == 1 else {
             throw ItemVaultBootstrapFailure.invalidTrust
         }
         let authorization = ItemVaultProvisioningPermit(session: session, digest: record.pinnedDigest)

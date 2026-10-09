@@ -16,8 +16,7 @@ struct ItemVaultPinnedAuthority: Sendable {
         let genesis = try MembershipEnvelope.decode(record.genesis)
         history = try ItemVaultMembershipAuthority.history(record: record, successors: successors)
         guard genesis.membership.accounts.count == 1, genesis.membership.accounts[0].id == memberID,
-              genesis.membership.accounts[0].role == .owner, genesis.membership.devices.count == 1,
-              genesis.membership.offlineRecovery == nil else { throw ItemVaultBootstrapFailure.invalidTrust }
+              genesis.membership.accounts[0].role == .owner, genesis.membership.devices.count == 1 else { throw ItemVaultBootstrapFailure.invalidTrust }
         self.record = record
     }
     func verify(_ version: EncryptedItemVersion) throws {

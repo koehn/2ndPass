@@ -176,15 +176,25 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         activeDataEvents = 0
         let oldEngine = engine
         engine = nil
-        if let oldEngine { await oldEngine.cancelOperations() }
+        if let oldEngine {
+            Self.logger.notice("Sync trace: cancelling operations; reason=engine stop")
+            await oldEngine.cancelOperations()
+        }
         lease = nil
         stopping = false
     }
 
     public func setUploadsAllowed(_ allowed: Bool) async {
-        uploadsAllowed = allowed && !suspended
+        let next = allowed && !suspended
+        // Reapplying the read-only startup policy must not cancel downloads.
+        // Only a transition from allowed to disallowed revokes active sends.
+        guard next != uploadsAllowed else { return }
+        uploadsAllowed = next
         generation += 1
-        if !uploadsAllowed, let engine { await engine.cancelOperations() }
+        if !uploadsAllowed, let engine {
+            Self.logger.notice("Sync trace: cancelling operations; reason=uploads disabled")
+            await engine.cancelOperations()
+        }
         if uploadsAllowed {
             do { try await registerPendingChanges() }
             catch { lastFailure = suspension.failure ?? cloudSyncFailure(error, fallback: .storageFailure) }
@@ -232,13 +242,55 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         return result
     }
 
-    private func claimResolution(_ expected: EncryptedItemConflict) throws -> CKSyncEngine {
-        guard let engine, lease != nil else { throw CloudSyncAdapterError.engineNotStarted }
-        guard !suspended, !stopping, !resolutionInProgress else { throw CloudSyncAdapterError.operationInterrupted }
+    /// Each entry still commits through the repository's reviewed-version CAS.
+    /// One lease and transport pause cover the bounded batch, including failures.
+    public func resolveConflictBatch(_ entries: [(conflict: EncryptedItemConflict, replacement: EncryptedItemVersion?)],
+                                     authorization: any RepositoryWritePermit) async throws -> [UUID: Result<EncryptedItemVersion, any Error>] {
+        guard !entries.isEmpty else { return [:] }
+        guard entries.count <= 25, Set(entries.map { $0.conflict.id }).count == entries.count else {
+            throw CloudSyncAdapterError.invalidBinding
+        }
+        let owner = try claimResolution(entries[0].conflict)
+        guard let lease else { throw CloudSyncAdapterError.engineNotStarted }
+        let permit = ConflictPublicationPermit(lease: lease, authorization: authorization)
+        resolutionPermit = permit
+        defer {
+            permit.invalidate()
+            if resolutionPermit === permit { resolutionPermit = nil; resolutionInProgress = false }
+        }
+        let expectedGeneration = identityGeneration
+        return try await performConflictResolutionBatch(entries, quiesce: {
+            Self.logger.notice("Sync trace: cancelling operations; reason=conflict batch records=\(entries.count)")
+            await owner.cancelOperations()
+        }, resolve: { entry in
+            try await self.validateAccount(generation: expectedGeneration)
+            guard self.engine === owner, self.resolutionInProgress, !self.stopping else { throw CloudSyncAdapterError.operationInterrupted }
+            try self.validateResolutionBinding(entry.conflict)
+            try await self.validator(entry.conflict.local, .cached)
+            try await self.validator(entry.conflict.remote, .receiving)
+            if let replacement = entry.replacement { try await self.validator(replacement, .sending) }
+            try await self.validateAccount(generation: expectedGeneration)
+            guard self.engine === owner, self.resolutionInProgress, !self.stopping else { throw CloudSyncAdapterError.operationInterrupted }
+            if let replacement = entry.replacement {
+                return try await self.repository.resolveConflict(entry.conflict, with: replacement, authorization: permit).version
+            }
+            return try await self.repository.resolveConflictUsingRemote(entry.conflict, authorization: permit)
+        }, finish: {
+            await self.finishResolution(engine: owner, generation: expectedGeneration)
+        })
+    }
+
+    private func validateResolutionBinding(_ expected: EncryptedItemConflict) throws {
         guard expected.local.scope == expected.remote.scope, expected.local.scope.account == account,
               expected.local.scope.database == databaseName, address(for: expected.local.scope) != nil else {
             throw CloudSyncAdapterError.invalidBinding
         }
+    }
+
+    private func claimResolution(_ expected: EncryptedItemConflict) throws -> CKSyncEngine {
+        guard let engine, lease != nil else { throw CloudSyncAdapterError.engineNotStarted }
+        guard !suspended, !stopping, !resolutionInProgress else { throw CloudSyncAdapterError.operationInterrupted }
+        try validateResolutionBinding(expected)
         resolutionInProgress = true
         generation += 1
         return engine
@@ -246,6 +298,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     private func quiesceResolution(_ expected: EncryptedItemConflict, engine owner: CKSyncEngine,
                                    generation expectedGeneration: Int) async throws {
+        Self.logger.notice("Sync trace: cancelling operations; reason=conflict resolution")
         await owner.cancelOperations()
         try await validateAccount(generation: expectedGeneration)
         guard engine === owner, resolutionInProgress, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
@@ -258,8 +311,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     }
 
     private func finishResolution(engine owner: CKSyncEngine, generation expectedGeneration: Int) async {
+        guard identityGeneration == expectedGeneration, engine === owner else { return }
         resolutionInProgress = false
-        guard identityGeneration == expectedGeneration, engine === owner, !suspended, !stopping else { return }
+        guard !suspended, !stopping else { return }
         do {
             try await registerPendingChanges()
             _ = try await repository.requestSync(account: account, database: databaseName, reason: .manual)
