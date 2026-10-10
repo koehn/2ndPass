@@ -336,7 +336,12 @@ extension EncryptedItemRepository {
         }
     }
 
+    private struct InboxUsage { var count: Int; var bytes: Int }
     func stageIncomingInTransaction(_ record: IncomingRecord, budget: Int) throws -> IncomingRecord {
+        var usage: InboxUsage?
+        return try stageIncomingInTransaction(record, budget: budget, usage: &usage)
+    }
+    private func stageIncomingInTransaction(_ record: IncomingRecord, budget: Int, usage: inout InboxUsage?) throws -> IncomingRecord {
         guard budget > 0, !record.account.isEmpty, ["private", "shared"].contains(record.database),
               !record.id.isEmpty, !record.bytes.isEmpty,
               record.bytes.count <= Self.maximumCiphertextBytes * 4 / 3 + 16_384,
@@ -350,16 +355,17 @@ extension EncryptedItemRepository {
             }
             return old
         }
-        // Concurrent insertions must contend even when record IDs differ.
-        let boundaryKey = journalKey(record.account, "inbox-boundary", "")
-        try writeJournal(UUID(), entity: "StateBlob", key: boundaryKey)
-        // Refresh after touching the boundary: commits before it must be in
-        // the budget, and commits after it must conflict at save.
-        try journalReadCache.begin(in: context, persistent: context.persistentStoreCoordinator?.persistentStores.first?.type == NSSQLiteStoreType)
-        let all: [IncomingBudgetFields] = try journalValues("IncomingRecord", account: record.account)
-        let size = all.reduce(0) { $0 + $1.size }
+        if usage == nil {
+            // Establish the cross-process boundary before reading capacity.
+            let boundaryKey = journalKey(record.account, "inbox-boundary", "")
+            try writeJournal(UUID(), entity: "StateBlob", key: boundaryKey)
+            try journalReadCache.begin(in: context, persistent: context.persistentStoreCoordinator?.persistentStores.first?.type == NSSQLiteStoreType)
+            let all: [IncomingBudgetFields] = try journalValues("IncomingRecord", account: record.account)
+            usage = InboxUsage(count: all.count, bytes: all.reduce(0) { $0 + $1.size })
+        }
         let added = record.bytes.count + record.systemFields.count
-        guard all.isEmpty || (added <= budget && size <= budget - added) else { throw SyncJournalError.inboxFull }
+        guard usage!.count == 0 || (added <= budget && usage!.bytes <= budget - added) else { throw SyncJournalError.inboxFull }
+        usage!.count += 1; usage!.bytes += added
         try writeJournal(record, entity: "IncomingRecord", key: key, account: record.account, database: record.database)
         _ = try enqueueInTransaction(SyncOperation(id: record.operationID, account: record.account, database: record.database,
             vaultID: record.vaultID, zoneOwner: record.zoneOwner, kind: .applyIncoming, payload: Data(record.id.utf8), now: record.receivedAt))
@@ -375,6 +381,20 @@ extension EncryptedItemRepository {
         return record
     }
 
+    /// Durable reception without advancing the engine token. The adapter only
+    /// persists its deferred checkpoint after every received chunk has committed.
+    public func stageIncomingRecords(_ records: [IncomingRecord], permit: any RepositoryWritePermit,
+                                     budget: Int = maximumInboxBytes) throws {
+        guard let first = records.first else { return }
+        guard records.allSatisfy({ $0.account == first.account && $0.database == first.database }) else { throw SyncJournalError.invalidOperation }
+        try permit.withWritePermission {
+            try transaction {
+                var usage: InboxUsage?
+                for record in records { _ = try stageIncomingInTransaction(record, budget: budget, usage: &usage) }
+            }
+        }
+    }
+
     /// A transport checkpoint cannot escape ahead of its materialized records.
     /// One budget failure rolls back the entire batch and its engine state.
     public func stageIncomingBatch(_ records: [IncomingRecord], checkpoint: Data, account: String, database: String,
@@ -383,7 +403,8 @@ extension EncryptedItemRepository {
               records.allSatisfy({ $0.account == account && $0.database == database }) else { throw SyncJournalError.invalidOperation }
         try permit.withWritePermission {
             try transaction {
-                for record in records { _ = try stageIncomingInTransaction(record, budget: budget) }
+                var usage: InboxUsage?
+                for record in records { _ = try stageIncomingInTransaction(record, budget: budget, usage: &usage) }
                 let key = blobKey(account, database)
                 let row = try fetchOne("StateBlob", key: key) ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
                 row.setValue(key, forKey: "key"); row.setValue(checkpoint, forKey: "value")

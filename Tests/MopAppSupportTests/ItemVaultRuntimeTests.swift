@@ -90,6 +90,33 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
     #expect(policy.recipients.contains(newcomer.identity.fingerprint))
     #expect(try await repository.missingContentGrants(scope: scope.repositoryScope).count == 1)
     #expect(committed.withLock { $0 } == 1)
+    #if DEBUG
+    let admitted = try ItemVaultMembershipAuthority.history(record: pin, trustStore: trust)
+    let authorized = try GrantBackedContentSession(repository: repository, binding: scope.binding,
+        history: admitted, device: SessionDevice(copying: owner))
+    let removal = try await authorized.prepareMembership(
+        DebugEnrollmentResetFailure.removing(owner.identity.device, from: admitted.current.membership),
+        owner: DomainAccountAuthorization())
+    _ = try await repository.enqueue(removal)
+    authorized.lock()
+    guard case .completed = await publisher.handle(removal, permit: DomainAccountAuthorization()) else {
+        Issue.record("Self-removal failed"); return
+    }
+    #expect(await server.headWrites == 2)
+    #expect(try await repository.operationIsDelivered(removal.id, account: scope.binding.account))
+    let revoked = try ItemVaultMembershipAuthority.history(record: pin, trustStore: trust, allowingDeviceRemoval: true)
+    #expect(revoked.current.membership.devices == [newcomer.identity])
+    #expect(throws: MopError.notVaultMember) {
+        try GrantBackedContentSession(repository: repository, binding: scope.binding,
+            history: revoked, device: SessionDevice(copying: owner))
+    }
+    // Lost responses/replayed signed removals never apply a second authority change.
+    let replay = try #require(await repository.operations(account: scope.binding.account, database: "private").first { $0.id == removal.id })
+    guard case .completed = await publisher.handle(replay, permit: DomainAccountAuthorization()) else {
+        Issue.record("Removal replay failed"); return
+    }
+    #expect(await server.headWrites == 2)
+    #endif
 }
 
 @Test func contentMembershipInboxPinsOnlyACommittedHeadAndReplaysOutOfOrder() async throws {
@@ -133,3 +160,17 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
     #expect(try trust.membershipHistory(scope: scope).count == 2)
     #expect(owner.unwrapCount == 0)
 }
+
+#if DEBUG
+@Test func debugResetRemovesOnlyCurrentDeviceAndRefusesLastOwner() throws {
+    let owner = try SessionDevice(), other = try SessionDevice(member: owner.identity.member)
+    let old = UUID()
+    let membership = try Membership(accounts: [.init(id: owner.identity.member, role: .owner,
+        devices: [owner.identity, other.identity])], removedDevices: [old])
+    let result = try DebugEnrollmentResetFailure.removing(owner.identity.device, from: membership)
+    #expect(result.devices == [other.identity])
+    #expect(Set(result.removedDevices ?? []) == Set([old, owner.identity.device]))
+    #expect(throws: (any Error).self) { try DebugEnrollmentResetFailure.removing(other.identity.device, from: result) }
+    #expect(throws: (any Error).self) { try DebugEnrollmentResetFailure.removing(UUID(), from: membership) }
+}
+#endif

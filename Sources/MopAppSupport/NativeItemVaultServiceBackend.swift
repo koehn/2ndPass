@@ -21,6 +21,9 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     }
     private struct State: @unchecked Sendable {
         var generation = 0
+        #if DEBUG
+        var resettingEnrollment = false
+        #endif
         var context: Context?
         var authorization: ContextInvalidator?
         var pendingAuthorization: ContextInvalidator?
@@ -60,6 +63,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         if let existing = state.withLock({ $0.context }) {
             do {
                 try existing.account.withWritePermission {}
+                if !offline { try await existing.runtime.start() }
                 return existing
             } catch MopError.cloudAccount {
                 // A retired account is never rebound in place. Drop only live
@@ -97,8 +101,9 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             value.context = context; return true
         }
         guard accepted else { runtime.invalidate(); throw MopError.authentication }
+        // Subscribe before startup can commit discovery/inventory records.
+        let stream = await repository.changes()
         let pump = Task { [weak self] in
-            let stream = await repository.changes()
             for await _ in stream {
                 guard !Task.isCancelled, let self else { break }
                 _ = try? await context.recovery.progress()
@@ -263,7 +268,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             guard let member = current.accounts.first, current.accounts.count == 1,
                   member.devices.count > 1, member.devices.contains(where: { $0.device == id }) else { throw MopError.cloudPermission }
             let updated = try Membership(accounts: [AccountMember(id: member.id, role: member.role, devices: member.devices.filter { $0.device != id })],
-                offlineRecovery: current.offlineRecovery, removedDevices: Array(Set((current.removedDevices ?? []) + [id])))
+                offlineRecovery: current.offlineRecovery, removedDevices: Array(Set((current.removedDevices ?? []) + [id])).sorted { $0.uuidString < $1.uuidString })
             let operation = try await content.prepareMembership(updated, owner: context.account)
             _ = try await context.repository.enqueue(operation)
             try await context.runtime.wake(reason: .unlocked)
@@ -501,6 +506,109 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         guard state.withLock({ $0.generation == snapshot.0 }) else { session.lock(); return nil }
         return session
     }
+    #if DEBUG
+    private struct DebugReset: Codable {
+        let account: String
+        let scopes: [ItemVaultSetupScope]
+        let removals: [SyncOperation]
+        var revoked = false
+    }
+    public func debugResetEnrollment() async throws {
+        guard state.withLock({ value in
+            if value.resettingEnrollment { return false }
+            value.resettingEnrollment = true; return true
+        }) else { throw DebugEnrollmentResetFailure.waiting }
+        defer { state.withLock { $0.resettingEnrollment = false } }
+        let context = try await serialized {
+            if let context = self.state.withLock({ $0.context }) { return context }
+            return try await self.connected()
+        }
+        let resetLease: SynchronizationLease
+        do { resetLease = try SynchronizationLease(url: context.account.directory.appendingPathComponent("ContentPreview3/debug-enrollment-reset.lock")) }
+        catch CloudSyncAdapterError.engineAlreadyOwned { throw DebugEnrollmentResetFailure.waiting }
+        defer { withExtendedLifetime(resetLease) {} }
+        let location = context.account.directory.appendingPathComponent("ContentPreview3/debug-enrollment-reset.json")
+        var reset: DebugReset
+        if FileManager.default.fileExists(atPath: location.path) {
+            reset = try JSONDecoder().decode(DebugReset.self, from: LocalFile.read(location, privateFile: true, limit: 16 * 1024 * 1024))
+            guard reset.account == context.account.accountNamespace else { throw MopError.cloudAccount }
+        } else {
+            guard try await context.repository.pendingMutations(account: context.account.accountNamespace).isEmpty,
+                  try await context.repository.contentConflicts(account: context.account.accountNamespace, includePendingDecisions: true).isEmpty,
+                  try await context.recovery.progress()?.blocksRegularAccess != true else {
+                throw DebugEnrollmentResetFailure.pendingWork
+            }
+            let records = try await context.runtime.inventory()
+            guard !records.isEmpty else { throw DebugEnrollmentResetFailure.noVaults }
+            var removals: [SyncOperation] = []
+            for record in records {
+                let session = try await open(record.scope.binding.vaultID)
+                guard let content = session.contentSession else { throw MopError.vaultUntrusted }
+                let current = content.history.current.membership, id = try session.currentDeviceID
+                let membership = try DebugEnrollmentResetFailure.removing(id, from: current)
+                removals.append(try await content.prepareMembership(membership, owner: context.account))
+            }
+            reset = DebugReset(account: context.account.accountNamespace, scopes: records.map(\.scope), removals: removals)
+            // Persist randomized signed proposals before any cloud publication.
+            try LocalFile.write(JSONEncoder().encode(reset), to: location, replace: false)
+        }
+        if !reset.revoked {
+            let existing = try await context.repository.operations(account: reset.account, database: "private")
+            for operation in reset.removals where !existing.contains(where: { $0.id == operation.id }) {
+                _ = try await context.repository.enqueue(operation)
+            }
+            try await context.runtime.wake(reason: .unlocked)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+            while true {
+                var delivered = true
+                for operation in reset.removals {
+                    if try await !context.repository.operationIsDelivered(operation.id, account: reset.account) { delivered = false; break }
+                }
+                if delivered { break }
+                guard ContinuousClock.now < deadline else { throw DebugEnrollmentResetFailure.waiting }
+                try await Task.sleep(for: .milliseconds(250))
+            }
+            // Completed journal operations are not sufficient evidence by themselves.
+            for scope in reset.scopes {
+                let operation = reset.removals.first { $0.vaultID == scope.binding.vaultID }!
+                let proposal = try JSONDecoder().decode(ContentMembershipCommit.self, from: operation.payload)
+                let head = try await NativeVaultMembershipTransport(database: context.account.container.privateCloudDatabase).readHead(binding: NativeContentHistoryReader(account: context.account).binding(scope.binding.vaultID))
+                guard try await context.runtime.debugVerifyRemoval(vault: scope.binding.vaultID, head: head.bytes,
+                    removed: Set(proposal.successor.membership.removedDevices ?? [])) else {
+                    throw DebugEnrollmentResetFailure.waiting
+                }
+            }
+            reset.revoked = true
+            try LocalFile.write(JSONEncoder().encode(reset), to: location, replace: true)
+        }
+        await context.runtime.stop()
+        let lease = try SynchronizationLease(url: context.account.leaseURL(database: "private"))
+        defer { withExtendedLifetime(lease) {} }
+        guard try await context.repository.pendingMutations(account: reset.account).isEmpty,
+              try await context.repository.contentConflicts(account: reset.account, includePendingDecisions: true).isEmpty else {
+            throw DebugEnrollmentResetFailure.pendingWork
+        }
+        lock()
+        // Recheck pending work inside the clearing transaction before deleting keys.
+        // The durable manifest makes a crash during subsequent Keychain cleanup resumable.
+        try await context.repository.debugClearEnrollmentStore(authorization: context.account)
+        let trust = try KeychainItemVaultTrustStore(namespace: .contentPreview3)
+        for scope in reset.scopes {
+            let vault = scope.binding.vaultID
+            let keyScope = context.account.containerIdentifier + "/" + context.account.environment + "/content3/" + reset.account + "/" + vault.uuidString
+            try DeviceKeychain.remove(scope: keyScope, member: context.account.memberID)
+            try trust.removeDeletedVault(scope: scope)
+            try ItemEnrollmentRequestStore(directory: context.account.directory.appendingPathComponent("ContentPreview3"),
+                scope: enrollmentScope(context.account, vaultID: vault)).purge()
+        }
+        state.withLock { value in
+            value.changePump?.cancel(); value.changePump = nil; value.context = nil
+            value.provisionalBootstraps.removeAll()
+        }
+        try FileManager.default.removeItem(at: location)
+    }
+    #endif
+
     private func openDevice(_ account: NativeItemCloudAccount, vaultID: UUID, context: LAContext, create: Bool) throws -> any DeviceOperations {
         let keyScope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vaultID.uuidString
         return SharedAuthorizationDevice(try DeviceKeychain.open(scope: keyScope, member: account.memberID, context: context, create: create))
@@ -546,3 +654,25 @@ private final class SharedAuthorizationDevice: DeviceOperations {
     func close() { device.releaseHandles() }
     deinit { close() }
 }
+
+#if DEBUG
+public enum DebugEnrollmentResetFailure: Error, LocalizedError {
+    case pendingWork, noVaults, lastOwner, waiting
+    static func removing(_ device: UUID, from current: Membership) throws -> Membership {
+        guard current.accounts.count == 1, let member = current.accounts.first,
+              member.role == .owner, member.devices.contains(where: { $0.device == device }),
+              member.devices.count > 1 else { throw DebugEnrollmentResetFailure.lastOwner }
+        return try Membership(accounts: [AccountMember(id: member.id, role: member.role,
+            devices: member.devices.filter { $0.device != device })], offlineRecovery: current.offlineRecovery,
+            removedDevices: Array(Set((current.removedDevices ?? []) + [device])).sorted { $0.uuidString < $1.uuidString })
+    }
+    public var errorDescription: String? {
+        switch self {
+        case .pendingWork: return "Finish syncing local edits, resolve conflicts, and finish recovery before resetting enrollment."
+        case .noVaults: return "This device has no enrolled cloud vaults to reset."
+        case .lastOwner: return "Every vault must have another owner device before this device can be removed."
+        case .waiting: return "Removal is still pending. Keep another owner device unlocked, then run Reset Enrollment again to resume. Local enrollment has not been cleared."
+        }
+    }
+}
+#endif

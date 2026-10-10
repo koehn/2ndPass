@@ -11,6 +11,18 @@ These observations cover the previous protocol preview and those scenarios only.
 
 ## Automated checks
 
+October 10 debug enrollment reset: added coverage for V3-only store clearing,
+write-permit rejection, durable inbox/checkpoint removal, legacy-store preservation,
+last-owner refusal, revoked-device tombstone preservation, fresh-enrollment UI
+transitions, and refusal preserving the existing UI session. The injected
+membership transport also exercises signed self-removal, exact readback after a
+lost acknowledgment, old-identity rejection, and replay without another authority
+change. The full Swift suite passed 668 tests; iOS Debug app/AutoFill and macOS
+Release app/AutoFill builds passed. The Release executable contains neither the
+reset action text nor the reset method name. No physical device was reset; live
+CloudKit removal, key rotation on the remaining owner, fresh Secure Enclave
+identity creation, and complete re-download still require physical acceptance.
+
 October 9, 2026 sync consolidation checks: the full Swift suite passed, macOS app/AutoFill and iOS app/AutoFill simulator builds passed, and the repaired Xcode `MopTests` target ran 350 tests successfully on the iPhone 18 Pro simulator. The final independently selectable journal and content/grant suites ran 16 tests successfully on that simulator. The first full Swift run, concurrent with a fresh Xcode build, failed timing-sensitive idle-queue and password-health tests; both passed in isolation and the full suite passed without concurrent compilation. The Xcode project now references current tests instead of five deleted source files.
 
 October 9 protocol follow-up: the full Swift suite passed again after the key-reuse, tombstone, ancestry, and publication-check changes. All 12 `ContentEnvelopeTests` passed on the iPhone 18 Pro simulator, including the final original-editor-grant regression test. The iOS app/AutoFill simulator build and macOS app/AutoFill build passed. Coverage now includes edits during additive enrollment, grants surviving author changes, identical-content supersession, true competing edits, missing versus sufficient ancestry, deletion versus editing, revoked-key publication rejection, recovery-authorized rotation, and offline edits racing access-only rotation. The first new revocation test exposed a missing historical device-removal authority path; the narrowly scoped v3 fix passed the subsequent runs. Legacy membership verification retains its prior default policy.
@@ -37,6 +49,12 @@ No real vault or cloud schema was changed by these checks. Production connection
 
 
 ### Enrolling-device status queries — October 10, 2026
+
+Durable ingestion batching: fetched record modifications are materialized into application-owned bytes and staged in groups of at most 200 records or 8 MiB (an individually valid larger record uses its own group). Each group commits inbox records and their operation entries atomically, reads account capacity once behind the cross-process boundary, and accounts for new rows incrementally. Duplicate replay consumes no additional capacity or commit. The adapter's existing active-data-event barrier still withholds deferred CloudKit state until reception finishes; any failed group suspends checkpoint persistence, while earlier committed groups remain replayable. Record application remains independently durable; SQLite checkpoint/vacuum settings were not weakened.
+
+`largeVaultIngestionBatchesDurableCommits` stages 1,000 records containing 32 KiB each in separate SQLite stores: individual commits took 1.958 seconds versus 1.572 seconds batched (about 20% lower elapsed staging time), with persistent-history commits reduced from 1,000 to five. Reopening retains all 1,000 inbox records and operations without advancing a checkpoint; duplicate replay adds no commits. The full 663-test suite passed (`/tmp/mop-ingest-full.log`). The subsequently added interruption test and two existing capacity/checkpoint tests passed (`/tmp/mop-ingest-replay.log`): a later failed group rolls back completely, preserves the first committed group and prior checkpoint across reopening, and supports duplicate replay. This measures repository ingestion, not end-to-end iCloud enrollment.
+
+First-launch discovery follow-up: an account context constructed by an offline recovery/status read is now started when reused by online discovery. Runtime startup is idempotent, retries after a failed startup request, and resets after an explicit network pause; repeated read-only discovery does not enqueue repeated reconciliation. Repository-change subscription is installed before startup can commit its first inventory. A sanitized startup log identifies this path. The Swift suite passed 662 tests (`/tmp/mop-startup-final.log`); physical first-enrollment confirmation remains necessary.
 
 AutoFill publication batching: the background catalog projector still prepares and announces 16-item UI batches, but publishes accumulated AutoFill changes every eight batches. Settling (including waiting for grants) flushes the remaining usable catalog; completion retains the full-inventory reconciliation. Publication no longer splits the accumulated delta back into 16-item writes. Session/version validation after acquiring the publication lease, immediate deletion behavior, explicit refresh, and extension publication remain intact. Tests cover 17, 257, and 1,025 items and require exactly zero, two, and eight 128-item partial publications respectively, followed by a complete inventory.
 

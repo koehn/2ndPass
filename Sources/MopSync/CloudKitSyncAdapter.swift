@@ -430,19 +430,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 // Do not delete/rebind the outbox or reuse this engine under another account.
             case .fetchedRecordZoneChanges(let changes):
                 Self.logger.notice("Sync trace: fetched records=\(changes.modifications.count) deletions=\(changes.deletions.count)")
-                for change in changes.modifications {
-                    guard expectedGeneration == identityGeneration, engine === syncEngine, !suspended else {
-                        throw CloudSyncAdapterError.operationInterrupted
-                    }
-                    do { try await receive(change.record) }
-                    catch let error as CloudSyncAdapterError {
-                        suspend(error); throw error
-                    }
-                    catch {
-                        suspend(cloudSyncFailure(error, fallback: .storageFailure))
-                        throw error
-                    }
-                }
+                do { try await receiveBatch(changes.modifications.map(\.record)) }
+                catch let error as CloudSyncAdapterError { suspend(error); throw error }
+                catch { suspend(cloudSyncFailure(error, fallback: .storageFailure)); throw error }
                 for deletion in changes.deletions where deletion.recordType == NativeVaultProvisioningTransport.recordType {
                     try await validateAccount(generation: expectedGeneration)
                     try await blockZone(deletion.recordID.zoneID)
@@ -688,17 +678,33 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     /// Public for deterministic transport tests without CloudKit network execution.
     public func receive(_ record: CKRecord) async throws {
+        try await receiveBatch([record])
+    }
+
+    private func receiveBatch(_ records: [CKRecord]) async throws {
         try checkSuspension()
-        try await validateAccount(generation: identityGeneration)
-        guard receiveZoneIDs.contains(record.recordID.zoneID) else { return }
-            guard let contentPermit, engine != nil else { throw CloudSyncAdapterError.engineNotStarted }
+        let token = identityGeneration, owner = engine
+        try await validateAccount(generation: token)
+        guard let contentPermit, owner != nil else { throw CloudSyncAdapterError.engineNotStarted }
+        var chunk: [IncomingRecord] = [], bytes = 0
+        for record in records where receiveZoneIDs.contains(record.recordID.zoneID) {
             let incoming = try record.recordID.zoneID == coordinationZoneID
                 ? PreparedCoordinationRecord.materialize(record, account: account)
                 : record.recordType == NativeVaultProvisioningTransport.recordType
                     ? ContentMembershipTransport.materialize(record, account: account)
                     : ContentRecordTransport.materialize(record, account: account, database: databaseName)
-            try await repository.stageIncoming(incoming, permit: contentPermit)
+            let size = incoming.bytes.count + incoming.systemFields.count
+            if !chunk.isEmpty && (chunk.count >= 200 || bytes + size > 8 * 1024 * 1024) {
+                try await commitIncomingChunk(chunk, token: token, owner: owner, permit: contentPermit); chunk.removeAll(keepingCapacity: true); bytes = 0
+            }
+            chunk.append(incoming); bytes += size
+        }
+        if !chunk.isEmpty { try await commitIncomingChunk(chunk, token: token, owner: owner, permit: contentPermit) }
+    }
 
+    private func commitIncomingChunk(_ chunk: [IncomingRecord], token: Int, owner: CKSyncEngine?, permit: ConflictPublicationPermit) async throws {
+        guard token == identityGeneration, engine === owner, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
+        try await repository.stageIncomingRecords(chunk, permit: permit)
     }
 
     public func processIncomingOperation(_ operation: SyncOperation) async -> SyncOperationOutcome {

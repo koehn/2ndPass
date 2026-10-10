@@ -142,6 +142,9 @@ public enum VaultChange: Sendable {
 }
 
 public protocol VaultService: Sendable {
+    #if DEBUG
+    func debugResetEnrollment() async throws
+    #endif
     func refreshAutoFillSuggestions(offline: Bool) async throws -> AutoFillPublicationStatus
     func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult)
     var capabilities: Set<VaultServiceCapability> { get }
@@ -172,6 +175,9 @@ public protocol VaultService: Sendable {
 }
 
 public extension VaultService {
+    #if DEBUG
+    func debugResetEnrollment() async throws { throw ItemVaultServiceFailure.unavailable }
+    #endif
     func refreshAutoFillSuggestions(offline: Bool) async throws -> AutoFillPublicationStatus { throw ItemVaultServiceFailure.unavailable }
     func resolveAutoFill(recordIdentifier: String, kind: AutoFillKind) async throws -> (AutoFillEntry, VaultResult) {
         throw ItemVaultServiceFailure.unavailable

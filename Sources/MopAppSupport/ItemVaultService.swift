@@ -8,6 +8,9 @@ import MopSync
 import MopVaultNext
 
 public protocol ItemVaultServiceBackend: Sendable {
+    #if DEBUG
+    func debugResetEnrollment() async throws
+    #endif
     var operationProgress: String? { get }
     var operationFraction: Double? { get }
     var recoveryAvailable: Bool { get }
@@ -39,6 +42,9 @@ public protocol ItemVaultServiceBackend: Sendable {
     func resolveVault(named name: String, offline: Bool) async throws -> UUID?
 }
 public extension ItemVaultServiceBackend {
+    #if DEBUG
+    func debugResetEnrollment() async throws { throw ItemVaultServiceFailure.unavailable }
+    #endif
     var operationProgress: String? { nil }
     var operationFraction: Double? { nil }
     var recoveryAvailable: Bool { false }
@@ -1159,6 +1165,16 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             }
         }
     }
+    #if DEBUG
+    public func debugResetEnrollment() async throws {
+        try await backend.debugResetEnrollment()
+        lock()
+        // System suggestion publication can be unavailable. Discovery retries
+        // pruning; it must not make a completed identity reset appear to fail.
+        try? await publisher?.prune(keeping: [])
+    }
+    #endif
+
     private func delivered(_ result: inout VaultResult) async {
         guard case .cloudConfirmed(let timeout) = delivery else { return }
         result.saveStatus = .pending

@@ -1,5 +1,6 @@
 @preconcurrency import CloudKit
 import Foundation
+import OSLog
 import Synchronization
 import MopCore
 import MopAuth
@@ -9,6 +10,7 @@ import MopVaultNext
 /// The native account's sole scheduler. All app-owned work, including lease
 /// acquisition, runs through the durable journal; CKSyncEngine owns transport.
 actor ItemVaultSyncRuntime {
+    private static let logger = Logger(subsystem: "com.koehn.mop", category: "CloudSync")
     typealias Enrollment = @Sendable (UUID, PreparedCoordinationRecord?, any RepositoryWritePermit) async throws -> Void
     private let account: NativeItemCloudAccount
     private let repository: EncryptedItemRepository
@@ -22,6 +24,7 @@ actor ItemVaultSyncRuntime {
     private var recoveryWork: (@Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome)?
     private var recoveryGrant: (@Sendable (SyncOperation, GrantBackedContentSession, any RepositoryWritePermit) async -> SyncOperationOutcome?)?
     private var observers: ContentRuntimeObservers?
+    private var startupRequested = false
     private var enabled = true
     private var retired = false
     nonisolated private let sessions = Mutex<[UUID: ItemVaultSession]>([:])
@@ -86,6 +89,7 @@ actor ItemVaultSyncRuntime {
     }
     nonisolated func invalidate() { lock(); Task { await self.stop() } }
     func pauseNetwork() async {
+        startupRequested = false
         enabled = false; adapterStartup?.cancel(); adapterStartup = nil; adapterStartupID = nil
         await adapter?.stop(); adapter = nil
     }
@@ -115,7 +119,16 @@ actor ItemVaultSyncRuntime {
         // Start asynchronously: a handler can reenter runtime during callbacks.
         Task { await value.start() }
     }
-    func start() async throws { try await wake(reason: .startup) }
+    /// Online discovery may reuse a context created by an offline status read.
+    /// Ensure one durable startup request without making every discovery a wake.
+    func start() async throws {
+        guard !retired else { throw CloudSyncAdapterError.accountChanged }
+        guard !startupRequested else { return }
+        startupRequested = true
+        Self.logger.notice("Sync trace: starting account coordinator for online discovery")
+        do { try await wake(reason: .startup) }
+        catch { startupRequested = false; throw error }
+    }
     /// A bounded OS-granted execution opportunity can move public, prepared work
     /// without constructing an authenticated device or opening any secret keys.
     func runAvailableWork() async throws {
@@ -263,15 +276,29 @@ actor ItemVaultSyncRuntime {
     private func discovered(_ addresses: [VaultCloudAddress]) async throws {
         try await repository.retainContentDiscovery(account: account.accountNamespace, addresses: addresses, authorization: account)
     }
+    #if DEBUG
+    func debugVerifyRemoval(vault: UUID, head: Data, removed: Set<UUID>) throws -> Bool {
+        guard let trusted = try history(vault) else { return false }
+        let envelope = try MembershipEnvelope.decode(head)
+        guard try trusted.state(forDigest: envelope.digest()) == envelope else { return false }
+        return removed.isSubset(of: Set(envelope.membership.removedDevices ?? []))
+    }
+    #endif
+
     private func changedMembership(_ history: TrustedMembershipHistory) async throws {
         let coordinator = coordinator
         Task { await coordinator?.wake(reason: .dependenciesChanged) }
         if let existing = sessions.withLock({ $0[history.vault] }),
            (try? existing.validateMembershipAuthority(digest: history.current.digest())) != nil { return }
         lock(vaultID: history.vault)
-        if let pin = try pin(history.vault), let loader, let loaded = try await loader(pin) {
-            try await register(session: loaded)
-            let coordinator = coordinator; Task { await coordinator?.wake(reason: .unlocked) }
+        do {
+            if let pin = try pin(history.vault), let loader, let loaded = try await loader(pin) {
+                try await register(session: loaded)
+                let coordinator = coordinator; Task { await coordinator?.wake(reason: .unlocked) }
+            }
+        } catch MopError.notVaultMember {
+            // Revocation is successfully applied even though this device can no
+            // longer open a session under the newly pinned membership.
         }
     }
     private func apply(_ operation: SyncOperation, permit: any RepositoryWritePermit) async -> SyncOperationOutcome {

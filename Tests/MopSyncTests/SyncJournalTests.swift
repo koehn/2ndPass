@@ -4,6 +4,34 @@ import Synchronization
 @testable import MopSync
 
 @Suite struct SyncJournalTests: Sendable {
+    #if DEBUG
+    @Test func debugEnrollmentResetClearsOnlyPreviewStoreAndRequiresPermit() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = SyncStoreLayout.contentPreviewURL(in: root)
+        let preview = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let legacy = try EncryptedItemRepository(storeURL: root.appendingPathComponent("legacy.sqlite"))
+        let work = SyncOperation(account: "a", kind: .enrollment, payload: Data([1]))
+        _ = try await preview.enqueue(work)
+        _ = try await legacy.enqueue(work)
+        struct Denied: RepositoryWritePermit {
+            func withWritePermission<T>(_ body: () throws -> T) throws -> T { throw ItemRepositoryError.invalidScope }
+        }
+        await #expect(throws: ItemRepositoryError.invalidScope) { try await preview.debugClearEnrollmentStore(authorization: Denied()) }
+        #expect(try await preview.operations(account: "a", database: "private") == [work])
+        await #expect(throws: ItemRepositoryError.invalidScope) { try await legacy.debugClearEnrollmentStore(authorization: JournalWritePermit()) }
+        try await preview.saveEngineState(Data([9]), account: "a", database: "private")
+        _ = try await preview.stageIncoming(incoming("reset-inbox"))
+        try await preview.debugClearEnrollmentStore(authorization: JournalWritePermit())
+        #expect(try await preview.operations(account: "a", database: "private").isEmpty)
+        let reopened = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        #expect(try await reopened.operations(account: "a", database: "private").isEmpty)
+        #expect(try await reopened.engineState(account: "a", database: "private") == nil)
+        #expect(try await reopened.incomingRecords(account: "a", database: "private").isEmpty)
+        #expect(try await legacy.operations(account: "a", database: "private") == [work])
+    }
+    #endif
+
     private func journalStore() throws -> (URL, EncryptedItemRepository) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-journal-" + UUID().uuidString)
         return (root, try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite")))
@@ -468,6 +496,23 @@ extension SyncJournalTests {
 }
 
 extension SyncJournalTests {
+    @Test func interruptedChunksReplayWithoutAdvancingCheckpoint() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        try await repository.saveEngineState(Data([9]), account: "a", database: "private")
+        let first = incoming("first", bytes: 40)
+        try await repository.stageIncomingRecords([first], permit: JournalWritePermit(), budget: 100)
+        await #expect(throws: SyncJournalError.inboxFull) {
+            try await repository.stageIncomingRecords([incoming("second", bytes: 40), incoming("third", bytes: 40)], permit: JournalWritePermit(), budget: 100)
+        }
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(try await reopened.incomingRecords(account: "a", database: "private") == [first])
+        #expect(try await reopened.engineState(account: "a", database: "private") == Data([9]))
+        #expect(try await reopened.activeOperations(account: "a", database: "private").count == 1)
+        try await reopened.stageIncomingRecords([first, first], permit: JournalWritePermit(), budget: 100)
+        #expect(try await reopened.incomingRecords(account: "a", database: "private") == [first])
+        #expect(try await reopened.engineState(account: "a", database: "private") == Data([9]))
+    }
+
     @Test func inboxBatchAndCheckpointRollbackTogetherAtCapacity() async throws {
         let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
         try await repository.saveEngineState(Data([1]), account: "a", database: "private")

@@ -734,6 +734,26 @@ public actor EncryptedItemRepository {
         }
     }
 
+    #if DEBUG
+    /// Caller holds the account's sync lease and has confirmed revocation.
+    /// This deliberately resets only the isolated V3 database, never legacy stores.
+    public func debugClearEnrollmentStore(authorization: any RepositoryWritePermit) throws {
+        guard layout == .contentPreview3 else { throw ItemRepositoryError.invalidScope }
+        try authorization.withWritePermission {
+            try transaction {
+                guard try context.count(for: NSFetchRequest<NSFetchRequestResult>(entityName: "PendingMutation")) == 0,
+                      try context.count(for: NSFetchRequest<NSFetchRequestResult>(entityName: "ContentBranch")) == 0 else {
+                    throw ItemRepositoryError.pendingLocalChanges
+                }
+                for entity in container.managedObjectModel.entities {
+                    guard let name = entity.name else { continue }
+                    for row in try context.fetch(NSFetchRequest<NSManagedObject>(entityName: name)) { context.delete(row) }
+                }
+            }
+        }
+    }
+    #endif
+
     public func pendingMutations(account: String) throws -> [PendingItemMutation] {
         try transaction {
             let request = NSFetchRequest<NSManagedObject>(entityName: "PendingMutation")

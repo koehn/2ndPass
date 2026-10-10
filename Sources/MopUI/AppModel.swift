@@ -1896,6 +1896,31 @@ final class AppModel {
         deviceRemoved = true; vaults = []; vault = ""; devices = []
         error = nil; sheet = .enrollDevice
     }
+    #if DEBUG
+    func debugResetEnrollment() {
+        guard !busy else { return }
+        perform { _ in
+            do { try await self.service.debugResetEnrollment() }
+            catch { self.error = (error as? LocalizedError)?.errorDescription ?? "Enrollment reset failed."; return }
+            self.operationTask = nil // Lock must not cancel the fresh discovery below.
+            self.lock()
+            self.deviceRemoved = false; self.removalCleanupPending = false
+            self.vaults = []; self.vault = ""; self.devices = []
+            self.accessNeedsRepair = false
+            self.notice = "Enrollment reset. Unlock an existing owner device to approve this device again."
+            do {
+                let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
+                self.offline = discovery.usingCache
+                self.vaults = discovery.vaults
+                self.sheet = .enrollDevice
+            } catch {
+                self.error = "Enrollment was reset. Cloud discovery could not finish; reopen the app to continue."
+                self.recordError(error, operation: "debugResetEnrollment discovery")
+            }
+        }
+    }
+    #endif
+
     func reconnectDevice() {
         perform { token in
             _ = try await self.service.execute(.manage(.reconnect), vault: nil, offline: false)

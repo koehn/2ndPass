@@ -151,3 +151,21 @@ Subscription status reporting and release configuration are documented in
 Free/Pro limits; purchase UI and production publication default to disabled.
 
 Offline code setup, account recovery, key replacement/revocation, and shared missing-envelope repair are implemented. Physical iCloud acceptance remains pending; see [recovery](docs/OFFLINE-RECOVERY.md).
+
+### Repeat cloud enrollment in a Debug build
+
+On the device being tested, use **Settings → Advanced → Developer → Reset Cloud
+Enrollment…** and confirm. Finish syncing local edits and resolve conflicts first;
+every enrolled vault must have another owner device. Keep that other device
+unlocked to approve the new enrollment.
+
+The reset publishes signed device removals and verifies their cloud commitment
+before clearing this device’s V3 database/checkpoints, trust pins, enrollment
+requests, and per-vault device keys. It returns to enrollment, where **Unlock to
+Connect** creates a fresh device identity and downloads the vault again. Cloud
+vault contents, legacy stores, and device-local vaults are retained. This is real
+revocation and exercises the normal key-rotation and admission paths.
+
+If removal is still pending, use the same reset action again to resume; do not
+manually erase the database or Keychain entries. The action is absent from Release
+builds. Use disposable test vaults for repeated revocation/enrollment testing.

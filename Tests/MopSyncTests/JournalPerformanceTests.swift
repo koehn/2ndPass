@@ -220,6 +220,38 @@ extension EncryptedItemRepository {
         print("Incoming health benchmark: 100 commits + 1000 reads, 11200 retained operations=\(start.duration(to: .now)); builds=100, decoded rows=200")
     }
 
+    @Test func largeVaultIngestionBatchesDurableCommits() async throws {
+        struct Permit: RepositoryWritePermit { func withWritePermission<T>(_ body: () throws -> T) throws -> T { try body() } }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let records = (0..<1000).map { IncomingRecord(id: "ingest-\($0)", account: "a", database: "private", zoneName: "zone", zoneOwner: "owner",
+            recordName: "record-\($0)", recordType: "content", bytes: Data(repeating: 7, count: 32768), systemFields: Data([1])) }
+        var elapsed: [Duration] = []
+        for batched in [false, true] {
+            let url = root.appendingPathComponent(batched ? "batch/store.sqlite" : "single/store.sqlite")
+            let repository = try EncryptedItemRepository(storeURL: url)
+            let start = ContinuousClock.now
+            if batched {
+                for offset in stride(from: 0, to: records.count, by: 200) {
+                    try await repository.stageIncomingRecords(Array(records[offset..<offset + 200]), permit: Permit())
+                }
+            } else {
+                for record in records { try await repository.stageIncoming(record, permit: Permit()) }
+            }
+            elapsed.append(start.duration(to: .now))
+            #expect(try await repository.historyTransactionCount() == (batched ? 5 : 1000))
+            let reopened = try EncryptedItemRepository(storeURL: url)
+            #expect(try await reopened.incomingRecords(account: "a", database: "private").count == 1000)
+            #expect(try await reopened.activeOperations(account: "a", database: "private").count == 1000)
+            #expect(try await reopened.engineState(account: "a", database: "private") == nil)
+            if batched {
+                try await reopened.stageIncomingRecords(records, permit: Permit())
+                #expect(try await reopened.historyTransactionCount() == 5)
+            }
+        }
+        print("Ingestion benchmark: 1000 x 32 KiB; individual=\(elapsed[0]), batched=\(elapsed[1]); durable commits 1000 -> 5")
+    }
+
     @Test func enrollingStatusReadsDoNotScanJournalOrProduceWakeups() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

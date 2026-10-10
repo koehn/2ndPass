@@ -92,6 +92,9 @@ struct SessionSettings: View {
     @AppStorage("developerToolsEnabled") private var developerTools = false
     @State private var vaultID = ""
     @State private var removal: VaultDeviceRecord?
+    #if DEBUG
+    @State private var resetEnrollment = false
+    #endif
     @State private var customTimeout = false
     @State private var categoryPath: [SettingsCategory] = []
     private let durations = [1, 5, 10, 15, 30, 60]
@@ -131,6 +134,13 @@ struct SessionSettings: View {
         .onDisappear { model.settingsVisible = false }
         .sheet(item: Binding<SheetRequest?>(get: { model.sheetRequest?.inSettings == true ? model.sheetRequest : nil }, set: { if model.sheetRequest?.inSettings == true { model.sheetRequest = $0 } })) { request in AppSheetView(model: model, request: request) }
         .documentTransfers(model: model, inSettings: true)
+        #if DEBUG
+        .confirmationDialog("Reset this device’s cloud enrollment?", isPresented: $resetEnrollment, titleVisibility: .visible) {
+            Button("Remove Device and Reset Enrollment", role: .destructive) { model.debugResetEnrollment() }
+        } message: {
+            Text("Testing only. Removes this device from every enrolled cloud vault, then clears its V3 local cache and device keys. Cloud vaults and device-local vaults remain. Every vault needs another owner device. Keep that device unlocked to enroll again. Interrupted resets can be resumed with this button.")
+        }
+        #endif
         .confirmationDialog("Remove this device?", isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), titleVisibility: .visible) {
             if let device = removal {
                 Button("Remove " + device.name, role: .destructive) { model.removeDevice(device.id); removal = nil }
@@ -229,6 +239,10 @@ struct SessionSettings: View {
             case .advanced:
                 SubscriptionSettingsView()
             Section("Developer") {
+                #if DEBUG
+                Button("Reset Cloud Enrollment…", role: .destructive) { resetEnrollment = true }
+                    .disabled(model.busy || model.offline)
+                #endif
                 Toggle("Show developer tools", isOn: Binding(get: { developerTools }, set: { DeveloperPreferences.shared.set($0) }))
                 Text("Show additional diagnostic details. Syncs across devices using your Apple Account.")
                     .font(.caption).foregroundStyle(.secondary)

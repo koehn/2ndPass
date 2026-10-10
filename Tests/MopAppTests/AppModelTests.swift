@@ -30,6 +30,8 @@ private final class FakeService: VaultService, Sendable {
         var suggestionRefreshes = 0
         var syncRequests = 0
         var syncFails = false
+        var enrollmentResets = 0
+        var resetFails = false
         var displayCalls = 0
         var exactReadIDs: [String?] = []
         var conflicts: [ItemVaultConflictPreview] = []
@@ -61,6 +63,12 @@ private final class FakeService: VaultService, Sendable {
         var status = AutoFillPublicationStatus(); status.phase = .current
         return status
     }
+    #if DEBUG
+    func debugResetEnrollment() async throws {
+        let fails = state.withLock { $0.enrollmentResets += 1; return $0.resetFails }
+        if fails { throw DebugEnrollmentResetFailure.lastOwner }
+    }
+    #endif
     func requestSynchronization() async throws {
         let fail = state.withLock { $0.syncRequests += 1; return $0.syncFails }
         if fail { throw MopError.cloudUnavailable }
@@ -132,6 +140,34 @@ private actor Barrier {
         model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)]
         return model
     }
+    #if DEBUG
+    @Test func debugResetReturnsToFreshEnrollmentWithoutCancellingDiscovery() async throws {
+        let service = FakeService { operation, _, _ in
+            try Task.checkCancellation()
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [.init(id: "new", name: "personal", format: "mop-content-v3", enrolled: false)]
+            }
+            return result
+        }
+        service.authenticate()
+        let app = model(service); app.authenticated = true
+        app.debugResetEnrollment(); try await finish(app)
+        #expect(service.state.withLock { $0.enrollmentResets } == 1)
+        #expect(!app.authenticated)
+        #expect(app.vaults.map(\.id) == ["new"])
+        #expect(app.sheet == .enrollDevice)
+    }
+    @Test func debugResetRefusalKeepsLocalEnrollmentAndExplainsWhy() async throws {
+        let service = FakeService(); service.authenticate()
+        service.state.withLock { $0.resetFails = true }
+        let app = model(service); app.authenticated = true
+        let original = app.vault
+        app.debugResetEnrollment(); try await finish(app)
+        #expect(app.authenticated && app.vault == original)
+        #expect(app.error == DebugEnrollmentResetFailure.lastOwner.errorDescription)
+    }
+    #endif
     @Test func repeatedConflictUpdatesCoalesceWhileScanIsBlocked() async throws {
         let service = FakeService(); service.authenticate()
         let app = model(service), gate = Barrier()
