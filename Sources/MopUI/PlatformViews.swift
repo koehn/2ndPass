@@ -41,9 +41,6 @@ struct SessionToolbar: ToolbarContent {
                 Button("Import…") { model.beginImport() }.disabled(model.busy || model.offline || !model.authenticated)
                 Button("New Vault…") { model.presentSheet(.createVault) }.disabled(model.busy || model.offline)
             } label: { Label("New", systemImage: "plus") }.help("New item or vault")
-            Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
-                .help("Refresh").accessibilityLabel("Refresh").keyboardShortcut("r")
-                .disabled(model.busy)
             if model.authenticated {
                 Button("Lock", systemImage: "lock") { model.lock() }
                     .help("Lock 2ndPass").accessibilityLabel("Lock").keyboardShortcut("l", modifiers: [.command, .shift])

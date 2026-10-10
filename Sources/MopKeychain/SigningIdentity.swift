@@ -5,6 +5,28 @@ import LocalAuthentication
 import MopCore
 
 public enum SigningIdentity {
+    /// Foundation locates Bundle.main from the launch path, which may be a CLI
+    /// symlink. Frameworks such as PushKit require the real enclosing bundle.
+    public static func bundledExecutableForRelaunch() throws -> URL? {
+        guard Bundle.main.bundleIdentifier == nil else { return nil }
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        var information: CFDictionary?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any],
+              let executable = info[kSecCodeInfoMainExecutable as String] as? URL,
+              let bundle = applicationBundle(for: executable), bundle.bundleIdentifier != nil else {
+            // Unbundled development tools can still run non-cloud commands.
+            return nil
+        }
+        guard Bundle.main.bundleURL.standardizedFileURL != bundle.bundleURL.standardizedFileURL else {
+            throw MopError.signing // Do not loop if the enclosing bundle is malformed.
+        }
+        return executable.resolvingSymlinksInPath()
+    }
+
     /// Resolve the shared container from the signed enclosing app, including when
     /// the CLI is launched through a symlink outside the app bundle.
     public static var appGroupIdentifier: String? {

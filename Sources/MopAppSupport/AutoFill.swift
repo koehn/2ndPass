@@ -423,7 +423,7 @@ public actor AutoFillPublisher: AutoFillPublishing {
                 status.phase = .current
                 if status.catalogsNeedingRefresh?.isEmpty == false {
                     status.phase = .failed
-                    status.message = "Some vault suggestions still need an update. Choose Refresh Suggestions to retry."
+                    status.message = "Some vault suggestions still need an update. They will update automatically when the vault is available."
                 }
             } else {
                 projection.requiresReconciliation = true
@@ -442,7 +442,7 @@ public actor AutoFillPublisher: AutoFillPublishing {
                 status.catalogsNeedingRefresh?.insert(scope)
             }
             status.phase = .failed
-            status.message = "Suggestions could not be updated. Your saved vault changes are safe. Try Refresh Suggestions."
+            status.message = "Suggestions could not be updated. Your saved vault changes are safe; suggestions will update automatically."
             record(status)
             await gate.leave(); throw error
         }

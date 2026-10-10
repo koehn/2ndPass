@@ -90,7 +90,7 @@ public enum SyncRequestReason: String, Codable, Sendable {
     case localSave, manual, foreground, networkRestored
 }
 
-public struct DurableSyncRequest: Equatable, Sendable {
+public struct DurableSyncRequest: Equatable, Codable, Sendable {
     public let account: String
     public let database: String
     public let generation: Int64

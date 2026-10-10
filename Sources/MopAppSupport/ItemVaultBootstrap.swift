@@ -101,61 +101,42 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
         try validate(receipt, record: record)
         return try completedSession(receipt: receipt, history: history)
     }
-    /// Call only after native account validation and retrieval from this same
-    /// account's private CloudKit database. This channel supplies the initial
-    /// bootstrap authority; an existing local pin is never replaced.
-    public func acceptFromAuthenticatedPrivateCloudKit(approval: DeviceEnrollmentApproval,
-            request: DeviceEnrollmentRequest, metadata: EncryptedItemVersion,
-            metadataSystemFields: Data? = nil, successors: [MembershipEnvelope] = []) async throws -> ItemVaultSession {
+    /// Admission is independent of download. The exact locally saved request
+    /// and authenticated private-account approval establish the first pin; content
+    /// and grant records subsequently arrive through the durable inbox.
+    public func acceptContentEnrollment(approval: DeviceEnrollmentApproval, request: DeviceEnrollmentRequest) async throws -> ItemVaultSession {
         try begin(); defer { end() }
-        guard let membershipStore = trustStore as? any ItemVaultMembershipTrustStore else { throw ItemVaultBootstrapFailure.invalidTrust }
-        let expectedScope = try permit.withDevice { device in
+        guard repository.layout == .contentPreview3, let membershipStore = trustStore as? any ItemVaultMembershipTrustStore else { throw ItemVaultBootstrapFailure.invalidTrust }
+        let expected = try permit.withDevice { device in
             guard device.identity == request.identity else { throw ItemVaultBootstrapFailure.invalidTrust }
-            return EnrollmentScope(container: scope.container, environment: scope.environment,
-                account: scope.binding.account, vault: scope.binding.vaultID, member: device.identity.member)
+            return EnrollmentScope(container: scope.container, environment: scope.environment, account: scope.binding.account,
+                vault: scope.binding.vaultID, member: device.identity.member)
         }
-        var history = try approval.acceptFromAuthenticatedPrivateCloudKit(request: request, scope: expectedScope)
-        for successor in successors {
-            try ItemVaultMembershipAuthority.validateAddition(previous: history.current, next: successor)
-            try history.append(successor)
-        }
-        let digest = try history.current.digest()
-        guard metadata.scope == scope.binding.item(ItemVaultSession.metadataRecordID), !metadata.isTombstone else {
-            throw ItemVaultBootstrapFailure.invalidTrust
-        }
-        let envelope = try VaultMetadataEnvelope.decode(metadata.ciphertext, vault: scope.binding.vaultID,
-            membership: history.current.membership, membershipStateDigest: digest)
-        guard envelope.header.version == metadata.versionID, envelope.header.base == metadata.baseVersionID,
-              envelope.header.generation == metadata.generation else { throw ItemVaultBootstrapFailure.invalidTrust }
-        let name = try permit.withDevice { device in
-            try envelope.open(device: device, membership: history.current.membership, membershipStateDigest: digest).name
-        }
-        guard let genesis = history.orderedStates.first else { throw ItemVaultBootstrapFailure.invalidTrust }
-        let existingReceipt = try await repository.vaultInitialization(scope.repositoryScope)
-        let restoringMissingStore = approval.isReconnect && existingReceipt == nil
-        let sourceDigest = try setupHash(approval.encoded())
+        let proposed = try approval.acceptFromAuthenticatedPrivateCloudKit(request: request, scope: expected)
+        guard let genesis = proposed.orderedStates.first else { throw ItemVaultBootstrapFailure.invalidTrust }
         let record = try permit.withWritePermission { () throws -> ItemVaultSetupRecord in
             let record: ItemVaultSetupRecord
             if let existing = try trustStore.load(scope: scope) {
-                guard existing.scope == scope, (existing.sourceDigest == sourceDigest || restoringMissingStore),
-                      existing.genesis == (try genesis.encoded()), existing.pinnedDigest == (try genesis.digest()) else {
-                    throw ItemVaultBootstrapFailure.invalidTrust
-                }
+                guard existing.genesis == (try genesis.encoded()), existing.pinnedDigest == (try genesis.digest()) else { throw MopError.vaultUntrusted }
+                let local = try ItemVaultMembershipAuthority.history(record: existing, trustStore: trustStore, allowingDeviceRemoval: true)
+                let count = min(local.count, proposed.count)
+                guard Array(local.orderedStates.prefix(count)) == Array(proposed.orderedStates.prefix(count)) else { throw MopError.vaultUntrusted }
                 record = existing
             } else {
-                record = try trustStore.reserve(ItemVaultSetupRecord(scope: scope, sourceDigest: sourceDigest, name: name,
-                    genesis: genesis.encoded(), pinnedDigest: genesis.digest()))
-                guard record.scope == scope, record.sourceDigest == sourceDigest,
-                      record.genesis == (try genesis.encoded()), record.pinnedDigest == (try genesis.digest()) else {
-                    throw ItemVaultBootstrapFailure.invalidTrust
-                }
+                record = try trustStore.reserve(ItemVaultSetupRecord(scope: scope, sourceDigest: setupHash(approval.encoded()),
+                    name: "vault", genesis: genesis.encoded(), pinnedDigest: genesis.digest()))
+                guard record.genesis == (try genesis.encoded()), record.pinnedDigest == (try genesis.digest()) else { throw MopError.vaultUntrusted }
             }
-            try membershipStore.reserveMembership(scope: scope, successors: history.orderedStates.dropFirst().map { try $0.encoded() })
+            let existing = try membershipStore.membershipHistory(scope: scope)
+            if existing.count < proposed.count - 1 {
+                try membershipStore.reserveMembership(scope: scope, successors: proposed.orderedStates.dropFirst().map { try $0.encoded() })
+            }
             return record
         }
-        let receipt = try await repository.initializeEnrolledVault(scope: scope.repositoryScope, metadata: metadata,
-            metadataSystemFields: metadataSystemFields, expectedItemCount: approval.expectedItemCount, membershipState: record.genesis,
-            currentControl: history.current.encoded(), setupID: record.setupID, authorization: permit)
+        let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trustStore, allowingDeviceRemoval: true)
+        let receipt = try await repository.initializeEnrolledContentVault(scope: scope.repositoryScope,
+            policy: GrantBackedContentStorage.recipientPolicy(history: history), expectedItemCount: approval.expectedItemCount, enrollmentRecipient: approval.request.identity.fingerprint,
+            membershipState: record.genesis, currentControl: history.current.encoded(), setupID: record.setupID, authorization: permit)
         return try completedSession(receipt: receipt, history: history)
     }
 
@@ -171,7 +152,7 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
         guard record.scope == scope else { throw ItemVaultBootstrapFailure.invalidTrust }
         try VaultName.validate(record.name)
         let genesis = try MembershipEnvelope.decode(record.genesis)
-        let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trustStore)
+        let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trustStore, allowingDeviceRemoval: repository.layout == .contentPreview3)
         try permit.withDevice { device in
             guard genesis.membership.accounts.count == 1,
                   genesis.membership.accounts[0].role == .owner,
@@ -206,10 +187,19 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
             try validate(receipt, record: record)
             committed = receipt
         } else {
-            let versions = try encrypt(archive, history: history)
             do {
-                committed = try await repository.initializeVault(scope: scope.repositoryScope, versions: versions,
-                    membershipState: record.genesis, setupID: record.setupID, authorization: permit)
+                if repository.layout == .contentPreview3 {
+                    let publications = try encryptContent(archive, history: history)
+                    let provision = SyncOperation(account: scope.binding.account, vaultID: scope.binding.vaultID,
+                        zoneOwner: scope.binding.zoneOwner, kind: .provision, payload: try setupEncode(record))
+                    committed = try await repository.initializeContentVault(scope: scope.repositoryScope, publications: publications,
+                        policy: GrantBackedContentStorage.recipientPolicy(history: history), membershipState: record.genesis,
+                        setupID: record.setupID, provision: provision, authorization: permit)
+                } else {
+                    let versions = try encrypt(archive, history: history)
+                    committed = try await repository.initializeVault(scope: scope.repositoryScope, versions: versions,
+                        membershipState: record.genesis, setupID: record.setupID, authorization: permit)
+                }
             } catch {
                 // A competing process can commit this same pinned logical import
                 // using different random ciphertext. Authenticate its operation identity.
@@ -234,6 +224,36 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
             throw error
         }
     }
+    private func encryptContent(_ document: PortableVaultArchive, history: TrustedMembershipHistory) throws -> [PreparedContentPublication] {
+        var records: [String: [String: PortableArchiveRecord]] = [:]
+        for (id, record) in document.records { records[record.itemID, default: [:]][id] = record }
+        var references: [String: [String: String]] = [:]
+        for (path, id) in document.references {
+            guard let record = document.records[id] else { throw PortableArchiveFailure.invalid }
+            references[record.itemID, default: [:]][path] = id
+        }
+        let histories = Dictionary(grouping: document.security?.histories ?? [], by: \.itemID)
+        var publications: [PreparedContentPublication] = []
+        for item in document.items {
+            try Task.checkCancellation(); try permit.check()
+            guard let id = document.itemIDs[item.name], let uuid = UUID(uuidString: id) else { throw PortableArchiveFailure.invalid }
+            var security = VaultSecurityMetadata(); security.histories = histories[id] ?? []
+            let archive = PortableVaultArchive(name: document.name, items: [item], itemIDs: [item.name: id],
+                references: references[id] ?? [:], records: records[id] ?? [:], security: security)
+            let components = try ContentItemArchive.components(archive)
+            let publication = try permit.withDevice { try ContentEnvelope.seal(components.values, vault: scope.binding.vaultID,
+                item: uuid, history: history, signer: $0) }
+            publications.append(try GrantBackedContentStorage.prepare(publication, scope: scope.binding.item(uuid), history: history))
+        }
+        var security = document.security; security?.histories = []
+        let metadata = VaultEnvelopeMetadata(name: document.name, security: security, exclusions: document.exclusions)
+        try metadata.validate()
+        let publication = try permit.withDevice { try ContentEnvelope.seal([ContentItemArchive.metadataComponent: ContentItemArchive.encode(metadata)],
+            vault: scope.binding.vaultID, item: ItemVaultSession.metadataRecordID, history: history, signer: $0) }
+        publications.append(try GrantBackedContentStorage.prepare(publication, scope: scope.binding.item(ItemVaultSession.metadataRecordID), history: history))
+        return publications
+    }
+
     private func encrypt(_ document: PortableVaultArchive, history: TrustedMembershipHistory) throws -> [EncryptedItemVersion] {
         let membership = history.current.membership, digest = try history.current.digest()
         var records: [String: [String: PortableArchiveRecord]] = [:]

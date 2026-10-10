@@ -157,6 +157,7 @@ public enum PasswordHealthScanner {
 /// Each check has its own validity: strength follows value/context, reuse follows
 /// the active credential set, and only breach results expire with elapsed time.
 @MainActor public final class PasswordHealthSession {
+    private(set) var reconciliationCount = 0
     private struct Key: Hashable { let vault: String; let item: String; let path: String }
     private struct Entry {
         var version: String
@@ -365,6 +366,7 @@ extension PasswordHealthSession {
                           editingVault: String? = nil, editingItem: String? = nil, force: Bool = false,
                           now: @escaping @Sendable () -> Date = Date.init,
                           update: @escaping @MainActor (PasswordHealthReport) -> Void) {
+        reconciliationCount += 1
         didLiveWork = false
         let wasEnabled = liveEnabled
         evidenceLoading = catalogs.values.contains { $0.healthEvidenceLoading == true }

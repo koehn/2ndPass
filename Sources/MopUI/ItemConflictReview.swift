@@ -11,15 +11,14 @@ struct ItemConflictInbox: View {
                     .foregroundStyle(.orange)
             }.padding(8)
         }
-        if model.checkingConflicts {
-            ProgressView("Checking sync differences…")
-        } else if model.pendingConflictChecks > 0 {
-            Text("Automatic sync reconciliation has not finished. Retry when synchronization is available.").font(.caption)
-            Button("Retry sync check") { model.requestBackgroundSynchronization(); model.refreshConflicts() }
+        // Routine repository checks run after sync events. Keep them silent so
+        // background delivery doesn't repeatedly insert/remove a list header.
+        // Preserve the last known pending state while a new check is running.
+        if model.pendingConflictChecks > 0 {
+            Text("Encrypted changes are pending. Synchronization continues automatically.").font(.caption)
         }
         if let failure = model.conflictFailure {
             Text(failure).font(.caption).foregroundStyle(.orange)
-            Button("Retry sync check") { model.requestBackgroundSynchronization(); model.refreshConflicts() }
         }
     }
 }
@@ -40,7 +39,6 @@ struct ItemConflictBanner: View {
             .accessibilityIdentifier("item-sync-conflict")
         } else if let failure = model.conflictFailure {
             Text(failure).font(.caption).foregroundStyle(.orange)
-            Button("Retry sync check") { model.requestBackgroundSynchronization(); model.refreshConflicts() }
         }
     }
 }
@@ -96,9 +94,9 @@ private struct ItemConflictEditor: View {
             Text(preview.local.item.name).font(.title2.bold())
             Text("Which version do you want to keep?")
             version(name: preview.localDeviceName, date: preview.localUpdatedAt,
-                    deleted: preview.local.item.deletion != nil, choice: .local)
+                    deleted: preview.conflict.local.isTombstone || preview.local.item.deletion != nil, choice: .local)
             version(name: preview.remoteDeviceName, date: preview.remoteUpdatedAt,
-                    deleted: preview.remote.item.deletion != nil, choice: .remote)
+                    deleted: preview.conflict.remote.isTombstone || preview.remote.item.deletion != nil, choice: .remote)
             if let failure { Text(failure).foregroundStyle(.red) }
             if busy { ProgressView("Saving your choice…") }
         }

@@ -8,7 +8,6 @@ import UIKit
 /// Replaces the navigation hierarchy so locked content cannot be read by accessibility.
 struct LockedView: View {
     @Bindable var model: AppModel
-    @State private var confirmRepair = false
     // This is a loose SwiftPM resource, not an asset-catalog image. SwiftUI's
     // named lookup can render it blank in a packaged app's resource bundle.
     private static let icon: Image = {
@@ -22,18 +21,40 @@ struct LockedView: View {
         return Image(systemName: "lock.shield")
     }()
 
+    private func connectionThermometer(title: String) -> some View {
+        VStack(spacing: 8) {
+            Text(title)
+            ProgressView(value: model.connectionProgress?.fraction, total: 1)
+                .progressViewStyle(.linear)
+                .accessibilityLabel("Vault connection progress")
+                .accessibilityValue(model.connectionProgress.map { "\($0.ready) of \($0.total) vault records ready" } ?? "Waiting for approval")
+            if let progress = model.connectionProgress {
+                Text("\(progress.ready) of \(progress.total) vault records ready")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: 320)
+        .accessibilityIdentifier("Enrollment progress")
+    }
+
     var body: some View {
         VStack(spacing: 24) {
             Self.icon
                 .resizable().scaledToFit().frame(width: 128, height: 128)
                 .accessibilityLabel("2ndPass")
-            if model.isConnectingVaults {
-                ProgressView("Connecting securely…")
+            if model.waitingForVaultMetadata {
+                connectionThermometer(title: "Downloading vault…")
+                Text("This device is connected. Waiting for vault details and secure access to finish downloading. Your vault will open automatically.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 420)
+            } else if model.isConnectingVaults {
+                connectionThermometer(title: "Connecting securely…")
+                if !model.authenticated {
+                    Button("Unlock to Connect") { model.authorizeVaultConnection() }.disabled(model.busy)
+                }
                 Text("Open and unlock 2ndPass on another device to finish connecting.")
                     .font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Retry Connection") { model.retryVaultConnection() }
-                    .disabled(model.busy)
             } else {
                 Button(model.unlocking ? "Unlocking…" : "Unlock 2ndPass") {
                     if model.vaults.contains(where: { $0.supported }) { model.unlock() }
@@ -42,7 +63,7 @@ struct LockedView: View {
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                 .disabled(model.hasConnectedVaults ? !model.canUnlock : model.busy || model.deviceRemoved)
             }
-            if model.vaults.contains(where: { $0.supported && !$0.enrolled }) {
+            if !model.waitingForVaultMetadata, model.vaults.contains(where: { $0.supported && !$0.enrolled }) {
                 Text("Connecting your iCloud vaults").font(.headline)
                 Text("Open and unlock 2ndPass on an existing device. Key access syncs automatically.")
                     .multilineTextAlignment(.center).frame(maxWidth: 420)
@@ -50,23 +71,14 @@ struct LockedView: View {
                     Label(vault.name ?? "Vault \(vault.id.prefix(8))", systemImage: "icloud")
                 }
             }
-            if model.supports(.enrollment) && model.cloudConnectionRepairEnabled && model.sessionState == .needsRepair && !model.deviceRemoved {
-                Text("This device could not open its saved vault connection. If you can open your vaults on another device, reset this device’s iCloud connection and connect again.")
+            if model.supports(.recovery) && model.sessionState == .needsRepair && !model.deviceRemoved {
+                Text("Use your offline recovery copy to verify access. Your saved local data remains intact.")
                     .multilineTextAlignment(.center).frame(maxWidth: 420)
-                Button("Repair iCloud Connection…") { confirmRepair = true }
-                    .disabled(model.busy)
-                Button("Recover with Offline Copy…") { model.presentSheet(.recover) }
-                    .disabled(model.busy)
+                Button("Recover with Offline Copy…") { model.presentSheet(.recover) }.disabled(model.busy)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
         .accessibilityIdentifier("Locked screen")
-        .alert("Reset this device’s iCloud connection?", isPresented: $confirmRepair) {
-            Button("Reset Connection", role: .destructive) { model.resetCloudAccess() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("First make sure you can open your vaults on another device. This removes this device’s iCloud vault keys and cached data, including any changes that have not reached iCloud. You will need to reconnect every iCloud vault. Vaults in iCloud, other devices, local-only vaults, and exported backups stay intact.")
-        }
     }
 }

@@ -16,10 +16,14 @@ public struct Membership: Codable, Equatable, Sendable {
     public let accounts: [AccountMember]
     public let offlineRecovery: DevicePublicKey?
     public let removedDevices: [UUID]?
+    private let orderedRecipients: [DevicePublicKey]
+    private let recipientIndex: [String: DevicePublicKey]
 
     public init(accounts: [AccountMember], offlineRecovery: DevicePublicKey? = nil, removedDevices: [UUID]? = nil) throws {
         self.accounts = accounts.sorted { $0.id.uuidString < $1.id.uuidString }; self.offlineRecovery = offlineRecovery
         self.removedDevices = removedDevices
+        orderedRecipients = (accounts.flatMap(\.devices) + [offlineRecovery].compactMap { $0 }).sorted { $0.fingerprint < $1.fingerprint }
+        recipientIndex = orderedRecipients.reduce(into: [:]) { $0[$1.fingerprint] = $1 }
         try validate()
     }
     private enum CodingKeys: String, CodingKey { case accounts, offlineRecovery, removedDevices, recovery }
@@ -29,6 +33,8 @@ public struct Membership: Codable, Equatable, Sendable {
         accounts = try c.decode([AccountMember].self, forKey: .accounts)
         offlineRecovery = try c.decodeIfPresent(DevicePublicKey.self, forKey: .offlineRecovery)
         removedDevices = try c.decodeIfPresent([UUID].self, forKey: .removedDevices)
+        orderedRecipients = (accounts.flatMap(\.devices) + [offlineRecovery].compactMap { $0 }).sorted { $0.fingerprint < $1.fingerprint }
+        recipientIndex = orderedRecipients.reduce(into: [:]) { $0[$1.fingerprint] = $1 }
         try validate()
     }
     public func encode(to encoder: Encoder) throws {
@@ -38,13 +44,13 @@ public struct Membership: Codable, Equatable, Sendable {
         try c.encodeIfPresent(removedDevices, forKey: .removedDevices)
     }
     public var devices: [DevicePublicKey] { accounts.flatMap(\.devices) }
-    var recipients: [DevicePublicKey] { (devices + [offlineRecovery].compactMap { $0 }).sorted { $0.fingerprint < $1.fingerprint } }
+    var recipients: [DevicePublicKey] { orderedRecipients }
     var owner: UUID { accounts.first { $0.role == .owner }!.id }
     public func role(of key: DevicePublicKey) -> MemberRole? {
         accounts.first { $0.id == key.member && $0.devices.contains(key) }?.role
     }
     func key(_ fingerprint: String) -> DevicePublicKey? {
-        recipients.first { $0.fingerprint == fingerprint }
+        recipientIndex[fingerprint]
     }
     func validate() throws {
         let removed = removedDevices ?? []

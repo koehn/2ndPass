@@ -53,6 +53,9 @@ extension AppModel {
     func updateHealthScheduling() {
         guard authenticated else { return }
         guard healthSessionGeneration == service.sessionGeneration else { refreshHealth(); return }
+        if deferredHealthRefresh, !isUpdatingCatalog, !loadingVaults, healthRefreshDeferrals == 0 {
+            refreshHealth(force: deferredHealthForce); return
+        }
         healthSession.updateScheduling(active: isActive, busy: healthRefreshDeferrals > 0 || busy || isUpdatingCatalog || loadingVaults,
             scopeComplete: !isUpdatingCatalog && !loadingVaults,
             editingVault: itemDraft?.vault, editingItem: itemDraft?.originalName)
@@ -68,10 +71,21 @@ extension AppModel {
         if healthSessionGeneration != service.sessionGeneration {
             clearHealth(); healthSessionGeneration = service.sessionGeneration
         }
+        // Enrollment publishes partial catalogs repeatedly. Keep workers paused
+        // until the scope settles instead of rehashing the growing catalog.
+        if isUpdatingCatalog || loadingVaults {
+            deferredHealthRefresh = true; deferredHealthForce = deferredHealthForce || force
+            healthSession.updateScheduling(active: isActive, busy: true, scopeComplete: false,
+                editingVault: itemDraft?.vault, editingItem: itemDraft?.originalName)
+            healthChecking = healthSession.hasRunningWork
+            return
+        }
+        let requestedForce = force || deferredHealthForce
+        deferredHealthRefresh = false; deferredHealthForce = false
         let token = healthToken
         healthSession.reconcile(catalogs: catalogs, service: service, breach: breachClient,
             enabled: breachChecksEnabled, active: isActive, busy: busy || isUpdatingCatalog || loadingVaults, scopeComplete: !isUpdatingCatalog && !loadingVaults,
-            editingVault: itemDraft?.vault, editingItem: itemDraft?.originalName, force: force) { [weak self] report in
+            editingVault: itemDraft?.vault, editingItem: itemDraft?.originalName, force: requestedForce) { [weak self] report in
                 guard let self, self.authenticated, self.healthToken == token else { return }
                 self.healthReport = report
                 self.healthChecking = self.healthSession.hasRunningWork

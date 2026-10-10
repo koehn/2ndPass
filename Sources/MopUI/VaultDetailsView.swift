@@ -31,7 +31,6 @@ struct VaultDetailsView: View {
             } else if target.enrolled {
                 Button("Unlock to Manage Vault") { model.unlock() }.disabled(!model.canUnlock)
             } else {
-                if model.canPresent(.enrollDevice) { Button("Retry Connection") { model.enrollmentAction(.automaticEnrollment, vaultID: target.id) } }
             }
             if model.lastBackupVaultID == target.id, let url = model.lastBackupURL {
                 Text("Backup saved: " + url.lastPathComponent).textSelection(.enabled)

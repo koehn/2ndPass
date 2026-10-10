@@ -48,9 +48,10 @@ References have the form `sp://vault/item/[section/]field`. Values are encrypted
 `--vault NAME-OR-UUID` constrains selection. With multiple vaults, management commands require a selection. Names are not aliases; renaming changes references:
 ```sh
 sp vault rename --vault VAULT_UUID new-name
-sp vault sync --vault VAULT_UUID
+sp vault sync --vault VAULT_UUID             # optional diagnostic wake / receipt wait
 sp read --offline sp://personal/service/token
 ```
+Normal synchronization resumes automatically; `sp vault sync` is not required for delivery. The new protocol uses a separate store and cloud namespace; existing preview data requires [explicit portable export/import](docs/ITEM-SYNC-MIGRATION.md).
 Local operations use the encrypted Core Data store and a device-only account binding. They cannot detect unobserved remote revocation or prove freshness. Observed account changes invalidate that binding. GUI, CLI and AutoFill share the device-local App Group store; cloud clients no longer accept an isolated `--state-directory`. CLI writes normally wait up to 20 seconds for their exact cloud delivery receipts. Use `--local-save` to return after the durable local commit; `--offline` prevents network use. A delivery timeout leaves the local save queued and exits nonzero with receipt IDs and a pending message; do not repeat the write. GUI saves report local durability, not an unconfirmed cloud upload.
 The GUI retains an authenticated session context until lock/expiry, while releasing hardware key handles and individual secret keys after operations. CLI commands own their session. AutoFill always starts fresh authentication and locks after filling. Plaintext necessarily reaches 2ndPass, clipboard destinations, and commands receiving secrets.
 `read` releases plaintext to stdout or a selected file; `inject` produces plaintext configuration on stdout or disk. `run` supplies plaintext environment variables to a child: that program, its dependencies and inheriting descendants become trusted with the secret. Environments can leak through diagnostics or privileged host access. Default masking only filters exact secret bytes in stdout/stderr; it does not constrain transformed output, files or network traffic. 2ndPass cannot control a child's use of plaintext. See [CLI boundaries](docs/SECURITY.md#cli-and-extension-disclosure-boundaries).

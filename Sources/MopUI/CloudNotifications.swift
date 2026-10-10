@@ -1,6 +1,7 @@
 @preconcurrency import CloudKit
 import Foundation
 import MopAppSupport
+import MopSync
 #if os(macOS)
 import AppKit
 #else
@@ -15,9 +16,7 @@ extension Notification.Name {
 /// before publishing contents, rather than trusting notification payloads.
 @MainActor public final class MopApplicationDelegate: NSObject {
     static weak var editingModel: AppModel?
-    private var subscriptionTask: Task<Void, Never>?
     private var accountObserver: NSObjectProtocol?
-    private var networkObserver: NSObjectProtocol?
 
     private func start() {
         #if DEBUG && (os(macOS) || targetEnvironment(simulator))
@@ -28,40 +27,14 @@ extension Notification.Name {
         #else
         UIApplication.shared.registerForRemoteNotifications()
         #endif
-        accountObserver = NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in await AutoFillStorage.invalidate(); self?.subscribe() }
+        accountObserver = NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: .main) { _ in
+            Task { @MainActor in await AutoFillStorage.invalidate() }
         }
-        networkObserver = NotificationCenter.default.addObserver(forName: NetworkAvailability.changed, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.subscribe() }
-        }
-        subscribe()
-    }
-    private func subscribe() {
-        subscriptionTask?.cancel()
-        subscriptionTask = Task {
-            guard NetworkAvailability.shared.isOnline,
-                  let config = try? DefaultVaultPlatformConfiguration().cloudConfiguration() else { return }
-            let container = CKContainer(identifier: config.container)
-            let databases = [(container.privateCloudDatabase, "mop-private-database-v7"), (container.sharedCloudDatabase, "mop-shared-database-v7")]
-            for (database, subscriptionID) in databases {
-            let subscription = CKDatabaseSubscription(subscriptionID: subscriptionID)
-            let info = CKSubscription.NotificationInfo()
-            info.shouldSendContentAvailable = true
-            subscription.notificationInfo = info
-            // Retry transient subscription failures without prompting for secret access.
-            while !Task.isCancelled {
-                do { _ = try await database.save(subscription); break }
-                catch {
-                    do { try await Task.sleep(for: .seconds(60)) }
-                    catch { return }
-                }
-            }
-        }
-        }
+        // CKSyncEngine owns subscription creation and its transport retries.
     }
     private func received(_ userInfo: [AnyHashable: Any]) -> Bool {
         guard let notification = CKNotification(fromRemoteNotificationDictionary: userInfo),
-              ["mop-private-database-v7", "mop-shared-database-v7", "mop-enrollment-v1"].contains(notification.subscriptionID ?? "") else { return false }
+              notification.subscriptionID == SyncStoreLayout.contentSubscriptionID else { return false }
         NotificationCenter.default.post(name: .mopCloudChanged, object: nil)
         return true
     }

@@ -69,6 +69,14 @@ extension VaultOperation {
 }
 public enum VaultSaveStatus: String, Sendable { case local, cloudConfirmed, pending }
 
+/// Counts include the metadata record. Before approval the total is unknown.
+public struct VaultEnrollmentProgress: Sendable, Equatable {
+    public let ready: Int
+    public let total: Int
+    public init(ready: Int, total: Int) { self.total = max(0, total); self.ready = min(max(0, ready), max(0, total)) }
+    public var fraction: Double? { total > 0 ? Double(ready) / Double(total) : nil }
+}
+
 public struct VaultResult: Sendable {
     public var pendingVaultDeletions: [String: VaultDeletionPhase] = [:]
     public var deletionStatus: VaultDeletionPhase?
@@ -93,6 +101,7 @@ public struct VaultResult: Sendable {
     public var importReport: ImportReport?
     public var vaults: [VaultDescriptor] = []
     public var discoveryComplete = true
+    public var enrollmentProgress: [String: VaultEnrollmentProgress] = [:]
     public var enrollment: ItemEnrollmentView?
     public var defaultVault: String?
     public var autoFillStatus: AutoFillPublicationStatus?
@@ -145,6 +154,7 @@ public protocol VaultService: Sendable {
     func invalidateDiscovery()
     /// Foreground/push wake, independent of local catalog reads and authentication.
     func requestSynchronization() async throws
+    func synchronizationHealth() async throws -> SyncHealthSnapshot?
     var sessionGeneration: Int { get }
     var authenticatedAt: TimeInterval? { get }
     var operationProgress: String? { get }
@@ -181,6 +191,7 @@ public extension VaultService {
     }
     func invalidateDiscovery() {}
     func requestSynchronization() async throws {}
+    func synchronizationHealth() async throws -> SyncHealthSnapshot? { nil }
     var capabilities: Set<VaultServiceCapability> { Set(VaultServiceCapability.allCases) }
     func events() async -> AsyncStream<VaultChange> {
         let pair = AsyncStream<VaultChange>.makeStream()

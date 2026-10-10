@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import MopCore
 import MopVaultNext
 
@@ -26,6 +27,14 @@ struct ItemRecoveryStateStore: Sendable {
     let account: String
     private var location: URL { directory.appendingPathComponent("Recovery").appendingPathComponent(setupHash(Data(account.utf8))) }
     func load() throws -> ItemRecoveryState? {
+        // Most accounts have never started recovery. Read absence without
+        // creating directories/locks or changing protection on every UI wake.
+        // Do not cache absence: a different process may start recovery next.
+        var info = stat()
+        if lstat(location.appendingPathComponent("state.json").path, &info) != 0 {
+            if errno == ENOENT { return nil }
+            throw MopError.filePermissions
+        }
         let dir = try LocalDirectory(directory: location)
         return try dir.locked {
             let file = location.appendingPathComponent("state.json")

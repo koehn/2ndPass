@@ -14,15 +14,9 @@ public enum VaultDeletionFailure: Error, LocalizedError, Sendable {
     case deleted, staleState, invalidNotice
     public var errorDescription: String? {
         switch self {
-        case .deleted: "This vault is being deleted or has been deleted. Sync to finish any pending cleanup."
-        case .staleState: "Vault deletion state changed. Sync to resume the operation."
+        case .deleted: "This vault is being deleted or has been deleted. Pending cleanup continues automatically."
+        case .staleState: "Vault deletion state changed. The operation continues automatically."
         case .invalidNotice: "The vault deletion notice could not be verified. No local data was erased."
         }
     }
-}
-public protocol VaultDeletionTransport: Sendable {
-    func read(vaultID: UUID) async throws -> Data?
-    /// Create-only. A racing publication returns the existing bytes for validation.
-    func publish(vaultID: UUID, notice: Data) async throws -> Data
-    func deleteZone(address: VaultCloudAddress) async throws
 }

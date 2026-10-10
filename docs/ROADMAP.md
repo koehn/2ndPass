@@ -1,6 +1,6 @@
 # Project direction and roadmap
 
-Current clients use independently encrypted item records, a shared device-local store and CKSyncEngine. Local saves, portable backup/restore and automatic same-account connection are implemented. User-reported enrollment and basic synchronization/offline-edit acceptance are recorded in [validation](VALIDATION.md). This remains a development preview.
+Current clients use the isolated V3 content/grant protocol, a shared device-local store and CKSyncEngine. Local saves, portable backup/restore and automatic same-account connection are implemented. Earlier-preview physical acceptance is recorded in [validation](VALIDATION.md); the V3 protocol requires fresh physical acceptance. This remains a development preview.
 
 2ndPass is an Apple-native password and secrets manager built for the
 command line. It began with a practical need: keep passwords and other secrets
@@ -18,12 +18,26 @@ it is not a release schedule. The [README](../README.md) describes current behav
 
 ## Implementation status — October 6, 2026
 
+### Sync consolidation and clean preview cutover — October 9, 2026
+
+Native GUI, CLI, AutoFill and background callbacks now select `ContentPreview3/Content3.sqlite`, the separate V3 Keychain services, `MopContent3-UUID` vault zones and the `MopCoordination3` account zone. Existing databases, keys and cloud zones are preserved. Transfer existing data with a portable export from the previous preview and an explicit import into a new vault; see [cutover instructions](ITEM-SYNC-MIGRATION.md).
+
+`ItemVaultSyncRuntime` is the account coordinator. It owns one lease and CKSyncEngine, durable application operations, the inbox, dependency reconciliation and health. Connectivity, unlock, foreground, incoming changes and owner release wake it. CKSyncEngine owns transport retry; application operations use the persisted bounded backoff. Background opportunities may transfer signed records while locked. Secret-dependent work waits for authorization.
+
+Content and key grants have separate signed representations. Additive enrollment commits membership and creates indexed grants without rewriting content or replacing pending edits. Recovery-recipient changes, revocation and recovery admission rotate keys. Prepared publications survive interruptions unchanged. Incoming records and asset bytes are durable before checkpoints. Committed membership heads advance independent pins; discovery and immutable proposals do not. Authenticated ancestry, authorized content comparison and retained conflict branches govern reconciliation.
+
+The native legacy runtime, independent enrollment/recovery/repair transports, whole-vault recipient rewrites, staged admission batches and legacy CloudKit item codec have been removed. Routine Refresh, manual recovery coverage checks, destructive connection-reset controls and conflict retry controls have been removed; force reconciliation is a DEBUG diagnostic. Recovery progress observes repository events. The independent push subscription and retry loop have also been retired. Portable archive support remains. Cleanup uses the publication lease, retains unresolved work and deletion notices, expires completed receipts after 30 days, bounds quarantine and prunes history behind active consumer checkpoints.
+
+The follow-up implementation audit closed transport recovery and lease handoff gaps: recovery restores uploads, expired application retries are cleared when CKSyncEngine takes ownership, public authority-read failures retain application backoff, and foreground/owner-release resets the delay without erasing attempt diagnostics. Explicit conflict choices now persist their encrypted replacement and a small journal reference before returning; the lease owner verifies the current head and commits the choice atomically. A non-owner client can exit without losing that choice. Legacy enrollment/checkpoint-import CLI commands and manual-sync error instructions are removed; CLI device management uses the shared native service.
+
+Release gates remain independent cryptographic review, CloudKit schema validation and signed macOS/iOS multi-device acceptance. Automated tests cannot establish Secure Enclave behavior, live iCloud ordering, OS background opportunities or cross-device convergence. Production activation must wait for those gates. Subscription/billing synchronization and cross-account sharing are outside this remediation.
+
 The current preview includes the following work. Implementation and recorded
 physical checks are separate from completion of the paid-release checklist.
 
 | Area | Implemented in the preview | Remaining work |
 | --- | --- | --- |
-| Item storage and synchronization (SALE-10) | Shared App Group Core Data store, CKSyncEngine transport, encrypted local saves/outbox, exact delivery receipts, automatic same-account connection, and cached display catalogs. User-reported checks cover iPhone → Mac/iPad delivery, Mac edits, and offline iPhone edits uploading after reconnect. | Physical restart/interruption, receipt supersession, account-change, and concurrent-edit acceptance; independent attachment transport and bounded cleanup. |
+| Item storage and synchronization (SALE-10) | Shared App Group Core Data store, CKSyncEngine transport, encrypted local saves/outbox, exact delivery receipts, automatic same-account connection, and cached display catalogs. User-reported checks cover iPhone → Mac/iPad delivery, Mac edits, and offline iPhone edits uploading after reconnect. | Physical restart/interruption, receipt supersession, account-change, and concurrent-edit acceptance; V3 schema and cryptographic review. |
 | Conflict review (SALE-10) | Conflict inbox and item banners, with a review dialog identifying each version's device, update time, and deletion state. Users can keep the local or remote version; failed resolution retains both versions for retry. | Physical concurrent-edit and conflict/history preservation checks. The current dialog offers whole-version selection, not field-by-field comparison or merging. |
 | Password security health (SALE-2) | Security findings for exposed, reused, and weak passwords; encrypted per-item check results and a local security index; independent check lifetimes, incremental results, and changed-password strength updates before network checks finish. | Real CloudKit propagation, simultaneous-device behavior, signed macOS UI, and full accessibility/appearance acceptance. Credential-account redundancy management (SALE-3) remains unavailable. |
 | Native AutoFill (SALE-12) | Password, TOTP, and passkey flows; incremental suggestion publication with durable retry state; selected-item resolution without a whole-catalog read; new-login saving on iOS/iPadOS 26.2+. | Signed platform and live-site acceptance, password generation and existing-login updates, and the Firefox/Chrome lifecycle (SALE-4/SALE-5). |
@@ -38,8 +52,7 @@ See [validation](VALIDATION.md) for the scope of recorded physical checks,
 
 The next durability milestone is physical validation of the implemented conflict
 review and queued-write lifecycle. In parallel, remaining feature integration
-includes recovery, cross-account sharing, device removal, permanent vault deletion,
-general document import, and credential-account management. Every implemented
+includes cross-account sharing, general document import, and credential-account management. Every implemented
 flow still needs the complete SALE-8 UI review before a paid release.
 
 ## Paid App Store release checklist

@@ -27,7 +27,7 @@ public struct VaultDeletionNotice: Codable, Equatable, Sendable {
     public let chain: [MembershipEnvelope]
     public let signature: Data
     private struct Statement: Encodable {
-        let domain = "2ndpass-vault-deletion-1"
+        let domain = "2ndpass-vault-deletion-3"
         let binding: Binding
         let operation: UUID
         let membership: String
@@ -39,21 +39,31 @@ public struct VaultDeletionNotice: Codable, Equatable, Sendable {
         guard history.current.membership.role(of: owner.identity) == .owner else { throw MopError.cloudPermission }
         let statement = Statement(binding: binding, operation: operation,
             membership: try history.current.digest(), author: owner.identity.fingerprint)
-        let result = Self(format: "2ndpass-vault-deletion-1", binding: binding, operation: operation, membership: statement.membership,
+        let result = Self(format: "2ndpass-vault-deletion-3", binding: binding, operation: operation, membership: statement.membership,
             author: statement.author, chain: history.orderedStates,
             signature: try owner.sign(Codec.encode(statement)))
         try result.verify(binding: binding, trusted: history)
         return result
     }
     public func verify(binding expected: Binding, trusted: TrustedMembershipHistory) throws {
-        guard format == "2ndpass-vault-deletion-1", binding == expected, binding.vault == trusted.vault,
+        _ = try verifiedHistory(binding: expected, trusted: trusted)
+    }
+    public func verifiedHistory(binding expected: Binding, trusted: TrustedMembershipHistory) throws -> TrustedMembershipHistory {
+        guard format == "2ndpass-vault-deletion-3", binding == expected, binding.vault == trusted.vault,
               !binding.container.isEmpty, ["Development", "Production"].contains(binding.environment),
               !binding.account.isEmpty, binding.database == "private", binding.owner == "__defaultOwner__",
-              binding.zone == "MopItems-" + binding.vault.uuidString,
+              binding.zone == "MopContent3-" + binding.vault.uuidString,
               chain.count > 0, chain.count <= 128, signature.count == 64,
               let genesis = chain.first else { throw MopError.vaultUntrusted }
         var history = try TrustedMembershipHistory(genesis: genesis, vault: binding.vault, pinnedDigest: binding.genesis)
-        for next in chain.dropFirst() { try history.append(next) }
+        for next in chain.dropFirst() {
+            if let request = next.recoveryRequest {
+                guard request.scope.container == binding.container, request.scope.environment == binding.environment,
+                      request.scope.account == binding.account else { throw MopError.vaultUntrusted }
+            }
+            try history.append(next)
+        }
+        try history.verifyAccountPath(from: binding.genesis, allowingDeviceRemoval: true)
         // A terminal notice can race an additive device admission. Accept a
         // common authenticated branch without replacing newer local checkpoints;
         // never accept a fork or a signer removed/demoted by our newer state.
@@ -65,6 +75,7 @@ public struct VaultDeletionNotice: Codable, Equatable, Sendable {
               history.current.membership.role(of: signer) == .owner,
               (trusted.count <= history.count || trusted.current.membership.role(of: signer) == .owner),
               signer.verifies(signature, message: try Codec.encode(statement)) else { throw MopError.vaultUntrusted }
+        return history
     }
     public func encoded() throws -> Data {
         let bytes = try Codec.encode(self)

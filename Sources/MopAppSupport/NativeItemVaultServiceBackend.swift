@@ -17,7 +17,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         let account: NativeItemCloudAccount
         let repository: EncryptedItemRepository
         let runtime: ItemVaultSyncRuntime
-        let recovery: ItemRecoveryCoordinator
+        let recovery: ContentRecoveryCoordinator
     }
     private struct State: @unchecked Sendable {
         var generation = 0
@@ -26,13 +26,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         var pendingAuthorization: ContextInvalidator?
         var listeners: [UUID: AsyncStream<Void>.Continuation] = [:]
         var changePump: Task<Void, Never>?
-        var remoteVaults: [VaultDescriptor]?
-        var discoveryAttempted = false
-        var discoveryTask: Task<Void, Never>?
-        var enrollmentTask: Task<Void, Never>?
-        var enrollmentTaskID: UUID?
         var provisionalBootstraps: [UUID: ItemVaultBootstrap] = [:]
-        var enrollmentAttempted = false
     }
     private let state = Mutex(State())
     private let directory: URL?
@@ -41,7 +35,6 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     public func lock() {
         let resources = state.withLock { value in
             value.generation += 1
-            value.enrollmentTask?.cancel(); value.enrollmentTask = nil; value.enrollmentTaskID = nil; value.enrollmentAttempted = false
             value.authorization?.invalidate(); value.authorization = nil
             value.pendingAuthorization?.invalidate(); value.pendingAuthorization = nil
             let bootstraps = Array(value.provisionalBootstraps.values)
@@ -54,7 +47,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     }
     deinit {
         lock()
-        state.withLock { $0.changePump?.cancel(); $0.discoveryTask?.cancel(); $0.enrollmentTask?.cancel(); $0.listeners.values.forEach { $0.finish() } }
+        state.withLock { $0.changePump?.cancel(); $0.listeners.values.forEach { $0.finish() } }
         if let context = state.withLock({ $0.context }) { context.runtime.invalidate() }
     }
     private func serialized<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
@@ -76,10 +69,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                     let resources = (value.authorization, value.pendingAuthorization, value.changePump, Array(value.provisionalBootstraps.values))
                     value.provisionalBootstraps.removeAll()
                     value.generation += 1
-                    value.remoteVaults = nil; value.discoveryAttempted = false
-                    value.discoveryTask?.cancel(); value.discoveryTask = nil
-                    value.enrollmentTask?.cancel(); value.enrollmentTask = nil; value.enrollmentTaskID = nil; value.enrollmentAttempted = false
-                    value.context = nil; value.authorization = nil
+                            value.context = nil; value.authorization = nil
                     value.pendingAuthorization = nil; value.changePump = nil
                     return resources
                 }
@@ -99,9 +89,9 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             catch MopError.cloudAccount { account = try await NativeItemCloudAccount.connect() }
         }
         let root = account.directory
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("Items.sqlite"))
+        let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
         let runtime = try ItemVaultSyncRuntime(account: account, repository: repository)
-        let context = Context(account: account, repository: repository, runtime: runtime, recovery: try ItemRecoveryCoordinator(account: account, repository: repository))
+        let context = Context(account: account, repository: repository, runtime: runtime, recovery: try ContentRecoveryCoordinator(account: account, repository: repository, runtime: runtime))
         let accepted = state.withLock { value in
             guard value.generation == generation else { return false }
             value.context = context; return true
@@ -111,6 +101,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             let stream = await repository.changes()
             for await _ in stream {
                 guard !Task.isCancelled, let self else { break }
+                _ = try? await context.recovery.progress()
                 let listeners = self.state.withLock { Array($0.listeners.values) }
                 listeners.forEach { $0.yield(()) }
             }
@@ -120,7 +111,17 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             guard let self else { return nil }
             return try await self.loadWithoutPrompt(record, account: account, repository: repository)
         }
+        await runtime.setRecoveryHandlers(work: { [weak recovery = context.recovery] operation, permit in
+            guard let recovery else { return .authorization }; return await recovery.handle(operation, permit: permit)
+        }, grant: { [weak recovery = context.recovery] operation, session, permit in
+            guard let recovery else { return nil }; return await recovery.grant(operation, session: session, permit: permit)
+        })
+        await runtime.setEnrollmentHandler { [weak self] vault, record, permit in
+            guard let self else { throw MopError.authentication }
+            try await self.progressEnrollment(vault, record: record, context: context, permit: permit)
+        }
         guard state.withLock({ $0.generation == generation && $0.context?.account === account }) else { throw MopError.authentication }
+        if !offline { try await runtime.start() }
         return context
     }
     public func changes() async -> AsyncStream<Void> {
@@ -137,7 +138,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         return try? await context.runtime.session(vaultID: vaultID)
     }
     public func invalidateDiscovery() {
-        state.withLock { $0.remoteVaults = nil; $0.discoveryAttempted = false; $0.enrollmentAttempted = false }
+
     }
     public var vaultDeletionAvailable: Bool {
         guard let configuration = try? SigningIdentity.cloudConfiguration() else { return false }
@@ -171,137 +172,18 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         return Dictionary(uniqueKeysWithValues: try await context.repository.deletions(account: context.account.accountNamespace).map { ($0.scope.vaultID, $0.phase) })
     }
     public func discover() async throws -> ItemVaultDiscovery {
-        _ = try await resumeDeletions()
         let local = try await inventory(offline: false)
         let context = try await serialized { try await self.connected() }
-        scheduleAutomaticEnrollment(context)
-        if let remote = state.withLock({ $0.remoteVaults }) {
-            return ItemVaultDiscovery(vaults: mergeDiscovery(local, remote), complete: true)
+        // Discovery is also invoked for repository notifications. It must remain
+        // a read: enqueueing reconciliation here feeds its own commits back into
+        // discovery and keeps the locked UI perpetually busy. connected() starts
+        // the account runtime; explicit lifecycle/unlock requests wake it.
+        let deleted = Set(try await context.repository.deletions(account: context.account.accountNamespace).map { $0.scope.vaultID })
+        let remote = try await context.repository.contentDiscovery(account: context.account.accountNamespace).filter { !deleted.contains($0.vaultID) }.map {
+            VaultDescriptor(id: $0.vaultID.uuidString, name: nil, format: "mop-content-v3", enrolled: false)
         }
-        if local.isEmpty {
-            // An empty local trust store is not evidence of an empty cloud account.
-            let remote = try await NativeItemEnrollmentTransport(account: context.account).discover()
-            try context.account.withWritePermission {}
-            state.withLock { if $0.context?.account === context.account { $0.remoteVaults = remote } }
-            return ItemVaultDiscovery(vaults: remote, complete: true)
-        }
-        let start = state.withLock { value in
-            guard !value.discoveryAttempted, value.discoveryTask == nil else { return false }
-            value.discoveryAttempted = true; return true
-        }
-        if start {
-            let task = Task { [weak self] in
-                let remote = try? await NativeItemEnrollmentTransport(account: context.account).discover()
-                guard !Task.isCancelled, let self else { return }
-                let listeners = self.state.withLock { current -> [AsyncStream<Void>.Continuation] in
-                    guard current.context?.account === context.account else { return [] }
-                    current.discoveryTask = nil
-                    current.remoteVaults = remote
-                    current.enrollmentAttempted = false
-                    return Array(current.listeners.values)
-                }
-                listeners.forEach { $0.yield(()) }
-                self.scheduleAutomaticEnrollment(context)
-            }
-            state.withLock { $0.discoveryTask = task }
-        }
-        return ItemVaultDiscovery(vaults: local, complete: false)
-    }
-    /// No prompts or timer: an unlocked existing device answers same-account
-    /// enrollment packets after foregrounding, cloud hints or explicit refresh.
-    private func scheduleAutomaticEnrollment(_ context: Context) {
-        let taskID = UUID()
-        let generation = state.withLock { value -> Int? in
-            guard value.context?.account === context.account, value.authorization != nil,
-                  !value.enrollmentAttempted, value.enrollmentTaskID == nil else { return nil }
-            value.enrollmentAttempted = true; value.enrollmentTaskID = taskID
-            return value.generation
-        }
-        guard let generation else { return }
-        let task = Task { [weak self] in
-            guard let self else { return }
-            var changed = false
-            defer {
-                let completion = self.state.withLock { value -> ([AsyncStream<Void>.Continuation], Bool) in
-                    guard value.enrollmentTaskID == taskID, value.generation == generation else { return ([], false) }
-                    value.enrollmentTask = nil; value.enrollmentTaskID = nil
-                    // A cloud hint arriving during this pass is retained as one
-                    // event-driven follow-up, rather than lost or polled for.
-                    let retry = !value.enrollmentAttempted && value.authorization != nil
-                        && value.context?.account === context.account
-                    return (changed ? Array(value.listeners.values) : [], retry)
-                }
-                completion.0.forEach { $0.yield(()) }
-                if completion.1 { self.scheduleAutomaticEnrollment(context) }
-            }
-            do {
-                try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
-                try self.requireNoRecovery(context)
-                let transport = NativeItemEnrollmentTransport(account: context.account)
-                let inventory = try await context.runtime.inventory()
-                // Repair is a shared enrollment service, retried by cloud hints and foreground sync.
-                try await context.runtime.performEnvelopeRepair {
-                    for record in inventory {
-                        let provider = try await self.device(context, vaultID: record.scope.binding.vaultID, create: false, allowPrompt: false)
-                        defer { provider.close() }
-                        try await NativeEnvelopeRepair(account: context.account).reconcile(vault: record.scope.binding.vaultID, device: provider) {
-                            try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
-                        }
-                    }
-                }
-                let requests = try await transport.requests()
-                Self.logger.notice("Enrollment trace: owner scan; requests=\(requests.count) localVaults=\(inventory.count)")
-                for (id, bytes) in requests {
-                    try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
-                    guard let request = try? DeviceEnrollmentRequest.decode(bytes), request.id == id,
-                          request.scope == self.enrollmentScope(context.account, vaultID: request.scope.vault),
-                          let record = inventory.first(where: { $0.scope.binding.vaultID == request.scope.vault }) else { continue }
-                    do {
-                        var session = await self.existing(request.scope.vault)
-                        if session?.isUnlocked != true {
-                            session = try await self.loadWithoutPrompt(record, account: context.account, repository: context.repository)
-                            if let session { try await context.runtime.register(session: session, synchronize: true) }
-                        }
-                        guard session?.isUnlocked == true else { continue }
-                        // Scope and signature checks are required even though the
-                        // authenticated private account is the bootstrap trust basis.
-                        do {
-                            try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
-                            let approval = try await context.runtime.approveEnrollment(request)
-                            try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
-                            try await transport.save(approval.encoded(), id: request.id, approval: true)
-                            Self.logger.notice("Enrollment trace: approval saved")
-                            changed = true
-                        } catch DeviceEnrollmentFailure.expired { continue }
-                    } catch {
-                        // A stale request must not starve independent requests.
-                        // Recheck cancellation/account authorization before continuing.
-                        try Task.checkCancellation()
-                        try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
-                        let native = error as NSError
-                        Self.logger.error("Enrollment trace: owner request failed; domain=\(native.domain, privacy: .public) code=\(native.code)")
-                    }
-                }
-                if let remote = self.state.withLock({ $0.remoteVaults }) {
-                    for vault in remote {
-                        if let record = inventory.first(where: { $0.scope.binding.vaultID.uuidString == vault.id }),
-                           try await context.repository.vaultInitialization(record.scope.repositoryScope) != nil { continue }
-                        guard let id = UUID(uuidString: vault.id), self.state.withLock({ $0.authorization != nil }) else { continue }
-                        try self.checkEnrollment(context, generation: generation, requireAuthorization: true)
-                        let result = try await self.enrollment(.automaticEnrollment, vaultID: id, allowPrompt: false)
-                        changed = changed || result.enrollmentCompleted
-                    }
-                }
-            } catch {
-                let native = error as NSError
-                Self.logger.error("Enrollment trace: automatic pass failed; domain=\(native.domain, privacy: .public) code=\(native.code)")
-                // A foreground or cloud event retries durable work.
-            }
-        }
-        state.withLock { value in
-            guard value.enrollmentTaskID == taskID, value.generation == generation else { task.cancel(); return }
-            value.enrollmentTask = task
-        }
+        let seeded = try await context.repository.engineState(account: context.account.accountNamespace, database: "MopContent3:content-v3:private:inventory") != nil
+        return ItemVaultDiscovery(vaults: mergeDiscovery(local, remote), complete: seeded)
     }
     private func mergeDiscovery(_ local: [VaultDescriptor], _ remote: [VaultDescriptor]) -> [VaultDescriptor] {
         let ids = Set(local.map(\.id))
@@ -317,16 +199,20 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                 let id = record.scope.binding.vaultID
                 var name = record.name
                 guard try await context.repository.vaultInitialization(record.scope.repositoryScope) != nil else {
-                    result.append(VaultDescriptor(id: id.uuidString, name: name, format: "mop-items-v2", enrolled: false))
+                    result.append(VaultDescriptor(id: id.uuidString, name: name, format: "mop-content-v3", enrolled: false))
                     continue
                 }
                 if let existing = try? await context.runtime.session(vaultID: id), existing.isUnlocked {
-                    name = try await existing.vaultMetadata().value.name
+                    do { name = try await existing.vaultMetadata().value.name }
+                    catch ItemVaultSessionFailure.missingVaultMetadata { }
+                    catch CloudSyncAdapterError.membershipUnavailable { }
                 } else if let session = try await loadWithoutPrompt(record, account: context.account, repository: context.repository) {
-                    name = try await session.vaultMetadata().value.name
-                    try await context.runtime.register(session: session, synchronize: !offline)
+                    do { name = try await session.vaultMetadata().value.name }
+                    catch ItemVaultSessionFailure.missingVaultMetadata { }
+                    catch CloudSyncAdapterError.membershipUnavailable { }
+                    try await context.runtime.register(session: session)
                 }
-                result.append(VaultDescriptor(id: id.uuidString, name: name, format: "mop-items-v2", enrolled: true))
+                result.append(VaultDescriptor(id: id.uuidString, name: name, format: "mop-content-v3", enrolled: true))
             }
             return result.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
         }
@@ -345,7 +231,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                 if let existing = try? await context.runtime.session(vaultID: id), existing.isUnlocked { session = existing }
                 else {
                     let device = try await device(context, vaultID: id, create: false)
-                    let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: record.scope, device: device)
+                    let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: record.scope, device: device)
                     session = try await bootstrap.open()
                     try await context.runtime.register(session: session, synchronize: !offline)
                 }
@@ -370,173 +256,82 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     }
     private func enrollment(_ action: VaultManagement, vaultID: UUID, allowPrompt: Bool) async throws -> VaultResult {
         let context = try await serialized { try await self.connected() }
-        let generation = state.withLock { $0.generation }
-        try checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
-        if try await context.repository.deletion((try context.account.setupScope(vaultID: vaultID)).repositoryScope) != nil {
-            throw VaultDeletionFailure.deleted
-        }
-        // Presence alone can block new admission, but cannot authorize erasure.
-        if try await NativeVaultDeletionTransport(database: context.account.container.privateCloudDatabase).read(vaultID: vaultID) != nil {
-            throw VaultDeletionFailure.deleted
-        }
-        let scope = enrollmentScope(context.account, vaultID: vaultID)
-        let store = ItemEnrollmentRequestStore(directory: context.account.directory, scope: scope)
-        let transport = NativeItemEnrollmentTransport(account: context.account)
-        // Reconcile an approval issued concurrently with cancellation/restart.
-        // Retained transcripts contain no private material; their exact request
-        // binding is still checked again by the joining bootstrap.
-        var recovered: DeviceEnrollmentRequest?
-        switch action {
-        case .automaticEnrollment, .checkEnrollment, .requestEnrollment, .restartEnrollment, .confirmEnrollment:
-            for previous in try store.history() {
-                if try await transport.read(id: previous.id, approval: true) != nil { recovered = previous; break }
-            }
-        default: break
-        }
-        if let recovered {
-            if try store.load()?.id != recovered.id { try store.clear(); _ = try store.reserve(recovered) }
-        }
-        try checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
-        var result = VaultResult(), view = ItemEnrollmentView()
-        func projection(_ request: DeviceEnrollmentRequest) -> ItemEnrollmentRequestView {
-            ItemEnrollmentRequestView(id: request.id, deviceID: request.identity.device, expiresAt: request.expiresAt)
-        }
-        switch action {
-        case .automaticEnrollment:
-            Self.logger.notice("Enrollment trace: checking automatic connection")
-            if try await context.repository.vaultInitialization((try context.account.setupScope(vaultID: vaultID)).repositoryScope) != nil {
-                result.enrollmentCompleted = true; return result
-            }
-            if let request = try store.load(), try await transport.read(id: request.id, approval: true) != nil {
-                return try await enrollment(.confirmEnrollment(code: ""), vaultID: vaultID, allowPrompt: allowPrompt)
-            }
-            if let request = try store.load(), (try? request.verify()) == nil {
-                _ = try await enrollment(.restartEnrollment(name: ""), vaultID: vaultID, allowPrompt: allowPrompt)
-            } else { _ = try await enrollment(.requestEnrollment(name: ""), vaultID: vaultID, allowPrompt: allowPrompt) }
-            result.message = "Connecting to your iCloud vault. Open 2ndPass on an existing device to finish securely sharing its keys."
+        var result = VaultResult()
+        if case .removeDevice(let id) = action {
+            let session = try await open(vaultID), content = session.contentSession!
+            let current = content.history.current.membership
+            guard let member = current.accounts.first, current.accounts.count == 1,
+                  member.devices.count > 1, member.devices.contains(where: { $0.device == id }) else { throw MopError.cloudPermission }
+            let updated = try Membership(accounts: [AccountMember(id: member.id, role: member.role, devices: member.devices.filter { $0.device != id })],
+                offlineRecovery: current.offlineRecovery, removedDevices: Array(Set((current.removedDevices ?? []) + [id])))
+            let operation = try await content.prepareMembership(updated, owner: context.account)
+            _ = try await context.repository.enqueue(operation)
+            try await context.runtime.wake(reason: .unlocked)
+            result.deviceRemovalIncomplete = true
+            result.message = "Device removal is saved. Key rotation continues automatically."
             return result
-        case .requestEnrollment, .restartEnrollment:
-            if case .restartEnrollment = action {
-                if let previous = try store.load() {
-                    // An issued approval must be completed, never replaced with a
-                    // new request for an identity already present in membership.
-                    if try await transport.read(id: previous.id, approval: true) != nil {
-                        view.request = projection(previous); view.approvalAvailable = true
-                        result.enrollment = view; result.message = "Secure access is ready. Connecting this device…"; return result
-                    }
-                    try await transport.removeRequest(previous.id)
-                }
-                try store.clear()
-            }
-            let request: DeviceEnrollmentRequest
-            if let existing = try store.load() { request = existing }
-            else {
-                request = try await serialized { [self] in
-                    try checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
-                    let token = generation
-                    let provider = try await device(context, vaultID: vaultID, create: true, allowPrompt: allowPrompt)
-                    defer { provider.close() }
-                    let candidate = try DeviceEnrollmentRequest.create(scope: scope, device: provider)
-                    return try state.withLock { value in
-                        guard value.generation == token else { throw MopError.authentication }
-                        return try context.account.withWritePermission { try store.reserve(candidate) }
-                    }
-                }
-            }
-            try request.verify()
-            try await transport.save(request.encoded(), id: request.id, approval: false)
-            view.request = projection(request)
-            result.message = "Connecting to iCloud. Keep an existing device unlocked to share this vault’s keys automatically."
-        case .checkEnrollment:
-            if let request = try store.load() {
-                view.request = projection(request)
-                view.approvalAvailable = try await transport.read(id: request.id, approval: true) != nil
-                result.message = view.approvalAvailable ? "Secure access is ready. Connecting this device…" : "Waiting for an existing unlocked device to share this vault’s keys automatically."
-            }
-        case .cancelEnrollment:
-            if let request = try store.load() {
-                guard try await transport.read(id: request.id, approval: true) == nil else {
-                    view.request = projection(request); view.approvalAvailable = true
-                    result.enrollment = view; result.message = "Secure access is ready. Connecting this device…"; return result
-                }
-                try await transport.removeRequest(request.id)
-            }
-            try store.clear(); result.message = "Connection paused."
-        case .enrollmentInbox:
-            try await transport.prepare()
-            view.inbox = try await transport.requests().compactMap { id, bytes in
-                guard let request = try? DeviceEnrollmentRequest.decode(bytes), request.id == id,
-                      request.scope == scope, (try? request.verify()) != nil else { return nil }
-                return projection(request)
-            }.sorted { $0.expiresAt < $1.expiresAt }
-        case .approveEnrollment(let id, _):
-            guard let bytes = try await transport.read(id: id, approval: false) else { throw MopError.notFound }
-            let request = try DeviceEnrollmentRequest.decode(bytes)
-            guard request.id == id, request.scope == scope else { throw DeviceEnrollmentFailure.invalidRequest }
-            _ = try await open(vaultID)
-            let approval = try await context.runtime.approveEnrollment(request)
-            try await transport.save(approval.encoded(), id: id, approval: true)
-            result.message = "Device connected. Encrypted changes will upload in the background."
-            result.addedDevices = [request.identity.device]
-            // The request is retained so a lost response can retry the same durable
-            // approval. Inbox filtering hides grants already present in the relay.
-        case .rejectEnrollment(let id):
-            guard let bytes = try await transport.read(id: id, approval: false) else { throw MopError.notFound }
-            let request = try DeviceEnrollmentRequest.decode(bytes)
-            guard request.id == id, request.scope == scope else { throw DeviceEnrollmentFailure.invalidRequest }
-            _ = try await open(vaultID)
-            guard try await transport.read(id: id, approval: true) == nil else { throw MopError.vaultConflict }
-            try await transport.removeRequest(id); result.message = "Connection canceled."
-        case .devices:
-            let session = try await open(vaultID)
-            let current = try session.currentDeviceID
+        }
+        if case .devices = action {
+            let session = try await open(vaultID), current = try session.currentDeviceID
             result.devices = try session.enrolledDevices.map {
-                VaultDeviceRecord(id: $0.device, name: $0.device == current ? "This device" : "Device " + $0.device.uuidString.prefix(8),
-                    isCurrent: $0.device == current)
+                VaultDeviceRecord(id: $0.device, name: $0.device == current ? "This device" : "Device " + $0.device.uuidString.prefix(8), isCurrent: $0.device == current)
             }
-        case .confirmEnrollment:
-            guard let request = try store.load(), let bytes = try await transport.read(id: request.id, approval: true) else { throw MopError.notFound }
-            let approval = try DeviceEnrollmentApproval.decode(bytes)
-            _ = try approval.acceptFromAuthenticatedPrivateCloudKit(request: request, scope: scope)
-            guard let (metadata, systemFields, successors) = try await transport.admissionMetadata(approval: approval) else {
-                try await serialized { [self] in
-                    try await context.runtime.performEnvelopeRepair { [self] in
-                        let provider = try await device(context, vaultID: vaultID, create: false, allowPrompt: allowPrompt)
-                        defer { provider.close() }
-                        try await NativeEnvelopeRepair(account: context.account).reconcile(vault: vaultID, device: provider) {
-                            try self.checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
-                        }
-                    }
-                }
-                view.request = projection(request); view.approvalAvailable = true
-                result.enrollment = view; result.message = "Waiting for an existing device to upload encrypted vault access. This device will connect automatically."; return result
-            }
-            let bootstrapID = UUID()
-            let bootstrap = try await serialized { [self] in
-                try checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
-                let provider = try await device(context, vaultID: vaultID, create: false, allowPrompt: allowPrompt)
-                let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(),
-                    scope: context.account.setupScope(vaultID: vaultID), device: provider)
-                let accepted = state.withLock { value in
-                    guard value.generation == generation, value.context?.account === context.account else { return false }
-                    value.provisionalBootstraps[bootstrapID] = bootstrap; return true
-                }
-                guard accepted else { bootstrap.lock(); throw MopError.authentication }
-                return bootstrap
-            }
-            defer { _ = state.withLock { $0.provisionalBootstraps.removeValue(forKey: bootstrapID) } }
-            let session = try await bootstrap.acceptFromAuthenticatedPrivateCloudKit(approval: approval, request: request,
-                metadata: metadata, metadataSystemFields: systemFields, successors: successors)
-            do { try checkEnrollment(context, generation: generation, requireAuthorization: true) }
-            catch { session.lock(); throw error }
-            try await context.runtime.register(session: session, synchronize: true)
-            invalidateDiscovery()
-            result.enrollmentCompleted = true; result.defaultVault = vaultID.uuidString
-            result.message = "Device connected. Vault items will download in the background."
+            return result
+        }
+        switch action {
+        case .automaticEnrollment, .requestEnrollment, .checkEnrollment: break
         default: throw ItemVaultServiceFailure.unavailable
         }
-        result.enrollment = view
+        if try await context.repository.vaultInitialization(context.account.setupScope(vaultID: vaultID).repositoryScope) != nil {
+            result.enrollmentCompleted = true; return result
+        }
+        try await progressEnrollment(vaultID, record: nil, context: context, permit: context.account, allowPrompt: allowPrompt)
+        try await context.runtime.wake(reason: .unlocked)
+        result.message = "Waiting for an existing unlocked device to share this vault’s keys. Connection continues automatically."
         return result
+    }
+    private func progressEnrollment(_ vault: UUID, record: PreparedCoordinationRecord?, context: Context,
+                                    permit: any RepositoryWritePermit, allowPrompt: Bool = false) async throws {
+        let generation = state.withLock { $0.generation }
+        try checkEnrollment(context, generation: generation, requireAuthorization: !allowPrompt)
+        let scope = enrollmentScope(context.account, vaultID: vault)
+        let store = ItemEnrollmentRequestStore(directory: context.account.directory.appendingPathComponent("ContentPreview3"), scope: scope)
+        if let record {
+            let envelope = try CoordinationEnvelope.decode(record.bytes, scope: scope)
+            let approval = try DeviceEnrollmentApproval.decode(envelope.payload)
+            let requests = try [store.load()].compactMap { $0 } + store.history()
+            guard let request = requests.first(where: { $0.id == approval.request.id }) else { return }
+            guard approval.request == request else { throw MopError.vaultUntrusted }
+            let provider = try await device(context, vaultID: vault, create: false, allowPrompt: allowPrompt)
+            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3),
+                scope: context.account.setupScope(vaultID: vault), device: provider)
+            let session = try await bootstrap.acceptContentEnrollment(approval: approval, request: request)
+            do {
+                try checkEnrollment(context, generation: generation, requireAuthorization: true)
+                try await context.runtime.register(session: session, synchronize: true)
+                let acknowledgment = EnrollmentAcknowledgment(request: request.id, approvalDigest: setupHash(record.bytes))
+                _ = try await session.contentSession!.coordination(kind: .enrollmentAcknowledgment, scope: scope, identity: request.id,
+                    payload: setupEncode(acknowledgment), owner: permit)
+            } catch { session.invalidate(); throw error }
+            return
+        }
+        if try await context.repository.vaultInitialization(context.account.setupScope(vaultID: vault).repositoryScope) != nil { return }
+        let provider = try await device(context, vaultID: vault, create: true, allowPrompt: allowPrompt)
+        defer { provider.close() }
+        let request: DeviceEnrollmentRequest
+        if let saved = try store.load(), saved.expiresAt > Date() { request = saved }
+        else {
+            request = try permit.withWritePermission {
+                try store.clear()
+                return try store.reserve(DeviceEnrollmentRequest.create(scope: scope, device: provider))
+            }
+        }
+        if try await context.repository.preparedCoordination(account: scope.account, vault: vault, kind: .enrollmentRequest, identity: request.id) == nil {
+            let envelope = try CoordinationEnvelope.sign(kind: .enrollmentRequest, scope: scope, identity: request.id, payload: request.encoded(), device: provider)
+            try checkEnrollment(context, generation: generation, requireAuthorization: true)
+            _ = try await context.repository.enqueueCoordination(PreparedCoordinationRecord(account: scope.account, vault: vault,
+                kind: .enrollmentRequest, identity: request.id, bytes: envelope.encoded()), authorization: permit)
+        }
     }
     public func endRecoverySession() {
         guard let context = state.withLock({ $0.context }) else { return }
@@ -550,59 +345,23 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     public var operationProgress: String? { state.withLock { $0.context }?.recovery.operationProgress ?? recoveryActivity.withLock { $0 } }
     public var operationFraction: Double? { state.withLock { $0.context }?.recovery.operationFraction }
     public var recoveryAvailable: Bool { true }
+    public var deviceRemovalAvailable: Bool { true }
     public func recoveryState() async throws -> ItemRecoveryState? {
         do {
             let context = try await connected(offline: true)
-            return try context.recovery.store.load()
+            return try await context.recovery.progress()
         } catch MopError.cloudAccount { return nil }
     }
     public func recovery(_ action: VaultManagement) async throws -> VaultResult {
         try await serialized { [self] in
             let context = try await connected()
             let generation = state.withLock { $0.generation }
-            let check: ItemRecoveryCoordinator.Check = { [self] in
+            return try await context.recovery.execute(action, device: { [self] id, create in
+                try await device(context, vaultID: id, create: create)
+            }, check: { [self] in
                 try context.account.withWritePermission {}
                 guard state.withLock({ $0.generation == generation }) else { throw MopError.authentication }
-            }
-            if case .recoveryGenerate = action {
-                return try await context.recovery.execute(action, device: { _, _ in throw MopError.invalidRecovery }, check: check)
-            }
-            state.withLock { $0.enrollmentTask?.cancel(); $0.enrollmentTask = nil; $0.enrollmentTaskID = nil }
-            recoveryActivity.withLock { $0 = "Waiting for background synchronization to finish…" }
-            defer { recoveryActivity.withLock { $0 = nil } }
-            try await context.runtime.pauseForRecovery()
-            let result: VaultResult
-            do {
-                let lease = try SynchronizationLease(url: context.account.leaseURL(database: "private"))
-                defer { withExtendedLifetime(lease) {} }
-                recoveryActivity.withLock { $0 = "Updating recovery protection…" }
-                result = try await context.recovery.execute(action, device: { [self] id, create in
-                    try check()
-                    return try await device(context, vaultID: id, create: create)
-                }, check: check)
-            } catch {
-                context.runtime.lock()
-                if Authentication.requiresRenewal(error) {
-                    // A completed LAContext forbids additional prompts. Once its
-                    // authorization expires, do not reuse it on every resume.
-                    let stale = state.withLock { value -> (ContextInvalidator?, ContextInvalidator?) in
-                        guard value.generation == generation else { return (nil, nil) }
-                        let stale = (value.authorization, value.pendingAuthorization)
-                        value.authorization = nil; value.pendingAuthorization = nil
-                        return stale
-                    }
-                    stale.0?.invalidate(); stale.1?.invalidate()
-                }
-                throw error
-            }
-            context.runtime.lock()
-            if try context.recovery.store.load()?.blocksRegularAccess != true {
-                // A background-sync startup failure does not undo the acknowledged recovery operation.
-                recoveryActivity.withLock { $0 = "Recovery finished. Restarting synchronization…" }
-                do { try await context.runtime.start() }
-                catch { Self.logger.error("Recovery completed; background sync restart failed: \(String(describing: error), privacy: .public)") }
-            }
-            return result
+            })
         }
     }
     private func requireNoRecovery(_ context: Context) throws {
@@ -628,17 +387,12 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             if let session = try? await context.runtime.session(vaultID: vaultID), session.isUnlocked { return session }
             let scope = try context.account.setupScope(vaultID: vaultID)
             if let deletion = try await context.repository.deletion(scope.repositoryScope), deletion.phase != .prepared { throw VaultDeletionFailure.deleted }
-            let trust = try KeychainItemVaultTrustStore()
+            let trust = try KeychainItemVaultTrustStore(namespace: .contentPreview3)
             guard try trust.load(scope: scope) != nil else { throw MopError.vaultMissing }
             let device = try await device(context, vaultID: vaultID, create: false)
             let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: trust, scope: scope, device: device)
             let session = try await bootstrap.open()
-            try await session.retireLegacyHealthSynchronization()
             try await context.runtime.register(session: session, synchronize: !offline)
-            if !offline {
-                state.withLock { $0.enrollmentAttempted = false }
-                scheduleAutomaticEnrollment(context)
-            }
             return session
         }
     }
@@ -646,17 +400,20 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         try await serialized { [self] in
             let context = try await connected(), scope = try context.account.setupScope(vaultID: id)
             try requireNoRecovery(context)
-            let (recoveryConfiguration, _) = try await NativeItemRecoveryTransport(account: context.account).configuration()
+            let recoveryConfiguration = try await context.recovery.configuration()
             guard !recoveryConfiguration.incomplete else { throw ItemRecoveryFailure.configurationBusy }
-            guard try await context.repository.deletion(scope.repositoryScope) == nil,
-                  try await NativeVaultDeletionTransport(database: context.account.container.privateCloudDatabase).read(vaultID: id) == nil else { throw VaultDeletionFailure.deleted }
+            guard try await context.repository.deletion(scope.repositoryScope) == nil else { throw VaultDeletionFailure.deleted }
             let device = try await device(context, vaultID: id, create: true)
-            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: scope, device: device, recovery: recoveryConfiguration.active)
+            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: scope, device: device, recovery: recoveryConfiguration.active)
             let session: ItemVaultSession
             if let archiveData, let recoveryKey { session = try await bootstrap.restore(archiveData: archiveData, recoveryKey: recoveryKey, name: name) }
             else if archiveData == nil, recoveryKey == nil { session = try await bootstrap.create(name: name) }
             else { throw PortableArchiveFailure.invalid }
-            do { try await context.runtime.register(session: session, synchronize: true) }
+            do {
+                try await context.runtime.register(session: session, synchronize: true)
+                _ = try await session.contentSession!.coordination(kind: .discovery, scope: enrollmentScope(context.account, vaultID: id),
+                    identity: id, payload: Data(id.uuidString.utf8), owner: context.account)
+            }
             catch {
                 // Bootstrap has already durably committed. Registration/lock is
                 // a separate delivery outcome, never evidence of a lost create.
@@ -668,21 +425,6 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             return session
         }
     }
-    public func activeConflictAdapter() async -> CloudKitSyncAdapter? {
-        guard let context = state.withLock({ $0.context }) else { return nil }
-        return try? await context.runtime.cloudAdapter()
-    }
-    public func conflictAdapter() async throws -> CloudKitSyncAdapter {
-        guard let context = state.withLock({ $0.context }) else { throw MopError.authentication }
-        let adapter: CloudKitSyncAdapter
-        do { adapter = try await context.runtime.cloudAdapter() }
-        catch CloudSyncAdapterError.engineNotStarted {
-            _ = try await context.runtime.requestSync()
-            adapter = try await context.runtime.cloudAdapter()
-        }
-        _ = try await adapter.requestForegroundSync()
-        return adapter
-    }
     public func requestSync() async throws {
         try Task.checkCancellation()
         let context = try await serialized { [self] in
@@ -692,6 +434,33 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         // Connection/authentication serialization protects local handles only.
         // A cloud request may outlive its caller and must not hold that gate.
         _ = try await context.runtime.requestSync()
+    }
+    public func enrollmentProgress() async throws -> [String: VaultEnrollmentProgress] {
+        guard let context = state.withLock({ $0.context }) else { return [:] }
+        try context.account.withWritePermission {}
+        var result: [String: VaultEnrollmentProgress] = [:]
+        for record in try await context.runtime.inventory() {
+            let vault = record.scope.binding.vaultID
+            let store = ItemEnrollmentRequestStore(directory: context.account.directory.appendingPathComponent("ContentPreview3"), scope: enrollmentScope(context.account, vaultID: vault))
+            let savedRecipient = try await context.repository.enrollmentProgressRecipient(scope: record.scope.repositoryScope)
+            guard let recipient = try savedRecipient ?? store.load()?.identity.fingerprint else { continue }
+            if let progress = try await context.repository.enrollmentDownloadProgress(scope: record.scope.repositoryScope,
+                recipient: recipient, metadata: ItemVaultSession.metadataRecordID) {
+                result[vault.uuidString] = VaultEnrollmentProgress(ready: progress.ready, total: progress.total)
+            }
+        }
+        return result
+    }
+
+    public func synchronizationHealth() async throws -> SyncHealthSnapshot? {
+        guard let context = state.withLock({ $0.context }) else { return nil }
+        try context.account.withWritePermission {}
+        return try await context.repository.syncHealth(account: context.account.accountNamespace, database: "private")
+    }
+    public func pendingDeliveryReceipts(vault: UUID?) async throws -> [UUID] {
+        let context = try await serialized { try await self.connected() }
+        return try await context.repository.pendingMutations(account: context.account.accountNamespace)
+            .filter { vault == nil || $0.version.scope.vaultID == vault }.map(\.id)
     }
     public func creationMutations(_ vaultID: UUID) async throws -> [UUID] {
         guard let context = state.withLock({ $0.context }) else { throw MopError.authentication }
@@ -722,20 +491,18 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     /// Called by the shared lease owner only with a locally pinned setup. It must
     /// never initiate authentication while responding to a background save.
     private func loadWithoutPrompt(_ record: ItemVaultSetupRecord, account: NativeItemCloudAccount, repository: EncryptedItemRepository) async throws -> ItemVaultSession? {
-        guard try ItemRecoveryStateStore(directory: account.directory, account: account.accountNamespace).load()?.blocksRegularAccess != true else { return nil }
         guard let snapshot = state.withLock({ value -> (Int, ContextInvalidator)? in
             value.authorization.map { (value.generation, $0) }
         }) else { return nil }
         try account.withWritePermission {}
         let device = try openDevice(account, vaultID: record.scope.binding.vaultID, context: snapshot.1.context, create: false)
-        let bootstrap = try ItemVaultBootstrap(repository: repository, trustStore: KeychainItemVaultTrustStore(), scope: record.scope, device: device)
+        let bootstrap = try ItemVaultBootstrap(repository: repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: record.scope, device: device)
         let session = try await bootstrap.open()
-        try await session.retireLegacyHealthSynchronization()
         guard state.withLock({ $0.generation == snapshot.0 }) else { session.lock(); return nil }
         return session
     }
     private func openDevice(_ account: NativeItemCloudAccount, vaultID: UUID, context: LAContext, create: Bool) throws -> any DeviceOperations {
-        let keyScope = account.containerIdentifier + "/" + account.environment + "/items/" + account.accountNamespace + "/" + vaultID.uuidString
+        let keyScope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vaultID.uuidString
         return SharedAuthorizationDevice(try DeviceKeychain.open(scope: keyScope, member: account.memberID, context: context, create: create))
     }
     private func device(_ context: Context, vaultID: UUID, create: Bool, allowPrompt: Bool = true) async throws -> any DeviceOperations {

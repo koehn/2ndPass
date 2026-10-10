@@ -34,6 +34,9 @@ public final class NativeItemCloudAccount: RepositoryWritePermit, @unchecked Sen
     /// actual cloud operation still verifies the live account before publication.
     public static func connect(offline: Bool = false) async throws -> NativeItemCloudAccount {
         let configuration = try SigningIdentity.cloudConfiguration()
+        #if !MOP_CONTENT_SYNC_V3_REVIEWED
+        guard configuration.environment != "Production" else { throw ContentSyncReleaseGate.reviewRequired }
+        #endif
         let directory = try AppStorageLocation.sharedItemSyncDirectory(container: configuration.container,
                                                                        environment: configuration.environment)
         let cache = ItemCloudAccountCache(container: configuration.container, environment: configuration.environment)
@@ -148,4 +151,13 @@ final class ItemCloudAccountLifetime: @unchecked Sendable {
         if first { onInvalidation() }
     }
     deinit { if let observer { center.removeObserver(observer) } }
+}
+
+/// Production builds opt in only after the recorded schema, cryptographic and
+/// physical-client gates. Development clients exercise the complete cutover.
+public enum ContentSyncReleaseGate: Error, LocalizedError {
+    case reviewRequired
+    public var errorDescription: String? {
+        "This preview’s new cloud protocol has not been enabled for Production. Use the Development build for validation and the previous preview to export existing vaults."
+    }
 }

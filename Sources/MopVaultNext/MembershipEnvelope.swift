@@ -113,11 +113,20 @@ public struct MembershipEnvelope: Codable, Equatable, Sendable {
 
     /// Supported account-private transitions: one device admission or an owner-signed
     /// recovery recipient change. Recovery signers cannot change recovery authority.
-    public func verifyAccountTransition(of parent: Self) throws {
+    public func verifyAccountTransition(of parent: Self, allowingDeviceRemoval: Bool = false) throws {
         try verifySuccessor(of: parent)
         if membership.accounts == parent.membership.accounts,
            membership.removedDevices == parent.membership.removedDevices,
            membership.offlineRecovery != parent.membership.offlineRecovery,
+           let author = parent.membership.key(header.author),
+           parent.membership.role(of: author) == .owner { return }
+        if allowingDeviceRemoval,
+           parent.membership.accounts.count == 1, membership.accounts.count == 1,
+           let before = parent.membership.accounts.first, let after = membership.accounts.first,
+           before.id == after.id, before.role == .owner, after.role == .owner,
+           membership.offlineRecovery == parent.membership.offlineRecovery,
+           after.devices.count < before.devices.count,
+           Set(after.devices.map(\.fingerprint)).isSubset(of: Set(before.devices.map(\.fingerprint))),
            let author = parent.membership.key(header.author),
            parent.membership.role(of: author) == .owner { return }
         let added = membership.devices.filter { !parent.membership.devices.contains($0) }

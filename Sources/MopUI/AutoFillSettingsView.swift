@@ -36,11 +36,14 @@ struct AutoFillSettingsView: View {
                 }
             }
             if let settingsError { Text(settingsError).font(.callout) }
-            if model.authenticated {
-                Button("Refresh Suggestions") { model.refreshAutoFillSuggestions() }.disabled(model.busy || model.refreshing)
-            } else {
-                Button("Unlock to Refresh Suggestions") { model.unlock() }.disabled(!model.canUnlock)
+            if !model.authenticated {
+                Button("Unlock to Update Suggestions") { model.unlock() }.disabled(!model.canUnlock)
             }
+            #if DEBUG
+            if model.authenticated {
+                Button("Reconcile Suggestions (diagnostic)") { model.refreshAutoFillSuggestions() }.disabled(model.busy || model.refreshing)
+            }
+            #endif
             Text("Websites and usernames appear in system suggestions and the account picker without authentication. Item and vault names stay encrypted. Filling a credential requires authentication, even when 2ndPass is locked or closed.").font(.caption)
             Text("2ndPass fills passwords, verification codes, and passkeys from cloud vaults, plus device-local passkeys. Choose Create Login in the password picker to generate a password, then Save and Fill to store the login before filling it.").font(.caption).foregroundStyle(.secondary)
         }

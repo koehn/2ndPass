@@ -1,4 +1,6 @@
 import Darwin
+import CryptoKit
+import CoreFoundation
 import Foundation
 import MopCore
 
@@ -35,6 +37,7 @@ struct CloudSyncSuspension {
 /// The descriptor is immutable and its advisory lock lasts exactly as long as this object.
 public final class SynchronizationLease: @unchecked Sendable {
     private let descriptor: Int32
+    private let notification: String
 
     public init(url: URL) throws {
         try LocalFile.privateDirectory(url.deletingLastPathComponent())
@@ -53,7 +56,27 @@ public final class SynchronizationLease: @unchecked Sendable {
             throw CloudSyncAdapterError.engineAlreadyOwned
         }
         descriptor = fd
+        notification = leaseNotification(url)
     }
 
-    deinit { close(descriptor) }
+    deinit { close(descriptor); CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFNotificationName(rawValue: notification as CFString), nil, nil, true) }
+}
+
+/// Cross-process notification is only a wake hint. The advisory lock remains
+/// authoritative, and persisted backoff covers crashes or missed notifications.
+public final class SynchronizationLeaseObserver: @unchecked Sendable {
+    private let released: @Sendable () -> Void
+    public init(url: URL, released: @escaping @Sendable () -> Void) throws {
+        self.released = released
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), Unmanaged.passUnretained(self).toOpaque(), { _, observer, _, _, _ in
+            guard let observer else { return }
+            Unmanaged<SynchronizationLeaseObserver>.fromOpaque(observer).takeUnretainedValue().released()
+        }, leaseNotification(url) as CFString, nil, .deliverImmediately)
+    }
+    deinit { CFNotificationCenterRemoveEveryObserver(CFNotificationCenterGetDarwinNotifyCenter(), Unmanaged.passUnretained(self).toOpaque()) }
+
+}
+
+private func leaseNotification(_ url: URL) -> String {
+    "com.koehn.mop.sync-owner-release." + SHA256.hash(data: Data(url.standardizedFileURL.path.utf8)).map { String(format: "%02x", $0) }.joined()
 }

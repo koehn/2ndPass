@@ -238,7 +238,7 @@ import MopLocalIdentity
                 guard token == generation, !Task.isCancelled else { return }
                 guard !identities.isEmpty else {
                     model.loading = false
-                    model.message = kind == .password ? "No login suggestions are available. If you already saved a login, open and unlock 2ndPass, then choose Settings → AutoFill → Refresh Suggestions. Return here and Retry to reload the list." : "No suggestions are available. Open 2ndPass to check your saved items."
+                    model.message = kind == .password ? "No login suggestions are available. If you already saved a login, open and unlock 2ndPass to update suggestions automatically. Return here to reload the list." : "No suggestions are available. Open 2ndPass to check your saved items."
                     updatePreferredContentSize(); return
                 }
                 // Browsing uses only published metadata. Start authentication and its
@@ -500,7 +500,7 @@ import MopLocalIdentity
         case .invalidIdentity, .signing: model.message = "AutoFill needs setup. Open 2ndPass, connect this device, then enable 2ndPass in Settings → AutoFill."
         case .invalidOTP: model.message = "The verification code expired or is unavailable. Retry to generate a fresh code."
         default:
-            model.message = error is AutoFillSessionError ? "AutoFill timed out. Retry to authenticate again." : "This vault is unavailable. Retry, choose another account, or open and unlock 2ndPass to refresh it."
+            model.message = error is AutoFillSessionError ? "AutoFill timed out. Retry to authenticate again." : "This vault is unavailable. Choose another account or unlock 2ndPass to authorize access. Sync resumes automatically."
         }
         updatePreferredContentSize()
     }

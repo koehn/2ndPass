@@ -125,12 +125,11 @@ private actor Barrier {
 @MainActor private final class Clock { var time: TimeInterval = 0 }
 
 @MainActor struct AppModelTests {
-    private func model(_ service: FakeService, clock: Clock = Clock(), repairEnabled: Bool = false) -> AppModel {
+    private func model(_ service: FakeService, clock: Clock = Clock()) -> AppModel {
         let defaults = UserDefaults(suiteName: "mop-session-test-" + UUID().uuidString)!
-        defaults.set(repairEnabled, forKey: "icloud-connection-repair-enabled")
         let model = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, now: { clock.time }, automaticTimer: false)
         model.vault = UUID().uuidString
-        model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)]
+        model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)]
         return model
     }
     @Test func repeatedConflictUpdatesCoalesceWhileScanIsBlocked() async throws {
@@ -211,7 +210,7 @@ private actor Barrier {
         }, { operation, _, _ in
             var result = VaultResult()
             switch operation {
-            case .discover: result.vaults = [id, other].map { VaultDescriptor(id: $0, name: "personal", format: "mop-items-v2", enrolled: true) }
+            case .discover: result.vaults = [id, other].map { VaultDescriptor(id: $0, name: "personal", format: "mop-content-v3", enrolled: true) }
             case .catalog: result.catalog = ItemCatalog(vault: "personal", revision: "initial", items: [])
             default: break
             }
@@ -321,7 +320,7 @@ private actor Barrier {
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             switch operation {
-            case .discover: result.vaults = [.init(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+            case .discover: result.vaults = [.init(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             case .catalog: result.catalog = ItemCatalog(vault: "personal", revision: "r", items: [])
             default: break
             }
@@ -358,7 +357,7 @@ private actor Barrier {
         #expect(empty.sheet == .createVault)
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
-            if case .discover = operation { result.vaults = [VaultDescriptor(id: "cloud-vault", name: "iCloud vault", format: "mop-items-v2", enrolled: false)] }
+            if case .discover = operation { result.vaults = [VaultDescriptor(id: "cloud-vault", name: "iCloud vault", format: "mop-content-v3", enrolled: false)] }
             return result
         }
         let fresh = model(service); fresh.vault = ""; fresh.vaults = []
@@ -376,8 +375,8 @@ private actor Barrier {
             if case .discover = operation {
                 let current = stage.withLock { $0 }
                 result.vaults = [
-                    .init(id: id, name: "personal", format: "mop-items-v2", enrolled: current >= 1),
-                    .init(id: second, name: "other", format: "mop-items-v2", enrolled: current >= 2)]
+                    .init(id: id, name: "personal", format: "mop-content-v3", enrolled: current >= 1),
+                    .init(id: second, name: "other", format: "mop-content-v3", enrolled: current >= 2)]
             } else if case .catalog = operation {
                 result.catalog = ItemCatalog(vault: vault == id ? "personal" : "other", revision: "ready", items: [])
             }
@@ -386,7 +385,7 @@ private actor Barrier {
         let app = model(service); app.vault = ""; app.vaults = []; app.start()
         try await finish(app)
         #expect(app.isConnectingVaults && !app.authenticated)
-        app.retryVaultConnection(); try await finish(app)
+        app.discover(autoUnlock: true); try await finish(app)
         #expect(app.isConnectingVaults && !app.authenticated)
         #expect(service.state.withLock { $0.operations.filter { if case .manage(.automaticEnrollment) = $0 { return true }; return false }.count } >= 2)
         // A cloud hint supplies key access after the initial operation returned.
@@ -413,6 +412,25 @@ private actor Barrier {
         app.cloudChanged(); try await finish(app)
         #expect(!app.authenticated && !app.isConnectingVaults)
         #expect(app.catalogs.isEmpty)
+    }
+
+    @Test func cancelledFirstVaultPromptStaysDismissedDuringDiscovery() async throws {
+        let app = model(FakeService()); app.vault = ""; app.vaults = []
+        app.discover(); try await finish(app)
+        #expect(app.sheet == .createVault)
+        app.sheet = nil
+        app.discover(); try await finish(app)
+        #expect(app.sheet == nil)
+        app.deactivate(); app.activate(); try await finish(app)
+        app.discover(); try await finish(app)
+        #expect(app.sheet == nil)
+        app.presentSheet(.restoreBackup)
+        let requestID = app.sheetRequest?.id
+        app.discover(); try await finish(app)
+        #expect(app.sheet == .restoreBackup && app.sheetRequest?.id == requestID)
+        app.sheet = nil
+        app.presentSheet(.createVault)
+        #expect(app.sheet == .createVault)
     }
 
     @Test func incompleteRemoteDiscoveryNeverOffersFreshVaultCreation() async throws {
@@ -462,48 +480,19 @@ private actor Barrier {
         #expect(service.state.withLock { $0.operations.contains { if case .manage(.reconnect) = $0 { return true }; return false } })
     }
 
-    @Test func trustFailureCanResetFromLockedScreenAndReachEnrollment() async throws {
-        let service = FakeService { operation, _, _ in
-            switch operation {
-            case .catalog: throw MopError.vaultUntrusted
-            case .manage(.resetCloudAccess): throw MopError.deviceRemoved
-            case .discover:
-                var result = VaultResult()
-                result.vaults = [.init(id: UUID().uuidString, name: "personal", format: "mop-items-v2", enrolled: false)]
-                return result
-            default: return VaultResult()
-            }
-        }
-        let app = model(service, repairEnabled: true)
-        app.resetCloudAccess()
-        #expect(service.state.withLock { $0.operations.isEmpty })
-        app.unlock(); try await finish(app)
-        #expect(app.sessionState == .needsRepair)
-        app.error = nil // Dismissing the alert must leave repair available.
-        app.offline = true // Cached catalog state survives the original trust failure.
-        app.resetCloudAccess(); try await finish(app)
-        #expect(app.deviceRemoved && app.sheet == .enrollDevice)
-        #expect(app.catalog == nil && !app.authenticated)
-        app.reconnectDevice(); try await finish(app)
-        #expect(!app.deviceRemoved && app.sessionState != .needsRepair)
-        #expect(app.sheet == .enrollDevice)
-        #expect(app.vaults.count == 1 && !app.vaults[0].enrolled)
-        #expect(!app.offline)
-    }
-
-    @Test func secondaryVaultTrustFailureLeavesRepairAvailable() async throws {
+    @Test func secondaryVaultTrustFailureRetainsRecoveryGuidance() async throws {
         let demo = UUID().uuidString, personal = UUID().uuidString
         let service = FakeService { _, id, _ in
             if id == personal { throw MopError.vaultUntrusted }
             var result = VaultResult(); result.catalog = Self.catalog; return result
         }
         service.authenticate()
-        let app = model(service, repairEnabled: true)
+        let app = model(service)
         app.vault = demo
-        app.vaults = [demo, personal].map { .init(id: $0, name: $0, format: "mop-items-v2", enrolled: true) }
+        app.vaults = [demo, personal].map { .init(id: $0, name: $0, format: "mop-content-v3", enrolled: true) }
         app.unlock(); try await finish(app)
         #expect(!app.authenticated && app.sessionState == .needsRepair)
-        #expect(app.error?.contains("Repair iCloud Connection") == true)
+        #expect(app.error?.contains("offline recovery copy") == true)
         app.error = nil
         #expect(app.sessionState == .needsRepair)
     }
@@ -555,7 +544,7 @@ private actor Barrier {
         let service = FakeService(); service.authenticate()
         let model = model(service)
         let target = UUID().uuidString
-        model.vaults = [VaultDescriptor(id: target, name: "personal", format: "mop-items-v2", enrolled: true)]
+        model.vaults = [VaultDescriptor(id: target, name: "personal", format: "mop-content-v3", enrolled: true)]
         model.allVaults = true
         model.catalogs[target] = Self.catalog; model.authenticated = true
         #expect(model.prepareVaultAction(target))
@@ -714,7 +703,7 @@ private actor Barrier {
             #expect(id != nil && !offline); var result = VaultResult(); result.deletionStatus = .complete; return result
         }
         let model = model(service)
-        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)
+        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)
         model.vaults = [target]
         model.deleteVault(target: target, confirmation: "wrong")
         #expect(!model.busy)
@@ -725,7 +714,7 @@ private actor Barrier {
         let service = FakeService { _, _, _ in throw MopError.cloudUnavailable }
         service.authenticate()
         let model = model(service); model.authenticated = true
-        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)
+        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)
         model.vaults = [target]
         model.deleteVault(target: target, confirmation: "personal"); try await finish(model)
         #expect(model.error != nil && model.authenticated)
@@ -738,7 +727,7 @@ private actor Barrier {
         }
         service.authenticate()
         let model = model(service); model.authenticated = true
-        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)
+        let target = VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)
         model.vaults = [target]; model.vaultDetailsTarget = target
         model.deleteVault(target: target, confirmation: "personal"); try await finish(model)
         #expect(model.hasPendingVaultDeletion && model.notice == "Pending deletion")
@@ -796,7 +785,7 @@ extension AppModelTests {
             #expect(vault == id && !offline && url == output); return VaultResult()
         }
         let model = model(service)
-        model.vault = id; model.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+        model.vault = id; model.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
         model.offline = true; model.sheet = .deleteVault
         model.exportBackup(to: output); try await finish(model)
         #expect(model.sheet == .deleteVault && model.notice?.contains("backup exported") == true)
@@ -878,8 +867,8 @@ extension AppModelTests {
             var result = VaultResult()
             switch operation {
             case .discover:
-                result.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-items-v2", enrolled: true),
-                                VaultDescriptor(id: second, name: "work", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-content-v3", enrolled: true),
+                                VaultDescriptor(id: second, name: "work", format: "mop-content-v3", enrolled: true)]
                 result.defaultVault = first
             case .catalog:
                 result.catalog = ItemCatalog(vault: id == first ? "personal" : "work", revision: "r1", items: Self.catalog.items)
@@ -904,7 +893,7 @@ extension AppModelTests {
         let id = UUID().uuidString
         let service = FakeService { operation, _, _ in
             if case .discover = operation {
-                var result = VaultResult(); result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]; return result
+                var result = VaultResult(); result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]; return result
             }
             throw MopError.authentication
         }
@@ -1084,8 +1073,8 @@ extension AppModelTests {
         }
         service.authenticate(at: ProcessInfo.processInfo.systemUptime)
         let model = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, automaticTimer: false)
-        let vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-items-v2", enrolled: true),
-                      VaultDescriptor(id: second, name: "work", format: "mop-items-v2", enrolled: true)]
+        let vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-content-v3", enrolled: true),
+                      VaultDescriptor(id: second, name: "work", format: "mop-content-v3", enrolled: true)]
         model.vaults = vaults; model.vault = first; model.allVaults = true; model.authenticated = true
         model.catalogs = [first: Self.catalog, second: ItemCatalog(vault: "work", revision: "work-r1", items: [])]
         model.createItem(VaultItem(name: "new", fields: [ItemField(path: "text", type: .text, value: "visible")]), in: second)
@@ -1107,8 +1096,8 @@ extension AppModelTests {
         let service = FakeService(); service.authenticate()
         let model = model(service)
         let first = model.vault, second = UUID().uuidString
-        model.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-items-v2", enrolled: true),
-                        VaultDescriptor(id: second, name: "work", format: "mop-items-v2", enrolled: true)]
+        model.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-content-v3", enrolled: true),
+                        VaultDescriptor(id: second, name: "work", format: "mop-content-v3", enrolled: true)]
         model.catalogs = [first: Self.catalog, second: ItemCatalog(vault: "work", revision: "r2", items: [])]
         model.allVaults = true; model.authenticated = true
         model.beginCreatingItem()
@@ -1204,8 +1193,8 @@ extension AppModelTests {
         let service = FakeService(); service.authenticate()
         let model = model(service)
         let first = model.vault, second = UUID().uuidString
-        model.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-items-v2", enrolled: true),
-                        VaultDescriptor(id: second, name: "work", format: "mop-items-v2", enrolled: true)]
+        model.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-content-v3", enrolled: true),
+                        VaultDescriptor(id: second, name: "work", format: "mop-content-v3", enrolled: true)]
         model.catalogs = [first: Self.catalog, second: ItemCatalog(vault: "work", revision: "work-r1", items: [])]
         model.authenticated = true
         let healthChanged = Mutex(false)
@@ -1239,7 +1228,7 @@ extension AppModelTests {
         let model = model(service)
         let first = model.vault
         model.catalogs[first] = Self.catalog; model.authenticated = true
-        model.vaults.append(VaultDescriptor(id: target, name: "work", format: "mop-items-v2", enrolled: true))
+        model.vaults.append(VaultDescriptor(id: target, name: "work", format: "mop-content-v3", enrolled: true))
         model.chooseVault(target); try await finish(model)
         #expect(model.catalog?.vault == "work" && model.catalogs[first]?.revision == "r1")
         model.chooseVault(first)
@@ -1291,7 +1280,7 @@ extension AppModelTests {
     @Test func lateBackupPickerCannotReauthenticateAfterLock() throws {
         let service = FakeService()
         let model = model(service)
-        model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-items-v2", enrolled: true)]
+        model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)]
         model.chooseExportBackup()
         let request = try #require(model.documentRequest)
         model.lock()
@@ -1313,7 +1302,6 @@ extension AppModelTests {
         try await finish(model)
         #expect(model.error?.contains("offline recovery copy") == true)
         #expect(model.error?.contains("Repair iCloud Connection") == false)
-        #expect(!model.cloudConnectionRepairEnabled)
         #expect(model.error?.contains("mop vault trust") == false)
         #expect(!model.authenticated)
     }
@@ -1336,13 +1324,13 @@ extension AppModelTests {
         let model = model(service)
         model.vault = first
         model.vaults = [first, second, unconnected].map {
-            VaultDescriptor(id: $0, name: $0, format: "mop-items-v2", enrolled: $0 != unconnected)
+            VaultDescriptor(id: $0, name: $0, format: "mop-content-v3", enrolled: $0 != unconnected)
         }
         model.unlock(); try await finish(model)
         #expect(attempts.withLock { $0 } == [first, second])
         #expect(model.authenticated && service.isAuthenticated)
         #expect(model.catalogs[first] != nil && model.catalogs[second] == nil)
-        #expect(model.notice?.contains("could not be loaded") == true)
+        #expect(model.notice?.contains("still loading") == true)
         #expect(model.vaultIcon(try #require(model.vaults.first { $0.id == unconnected })) == "externaldrive.badge.plus")
         #expect(model.vaultIcon(try #require(model.vaults.first { $0.id == first })) == "lock.open")
         #expect(model.vaultIcon(try #require(model.vaults.first { $0.id == second })) == "lock.rectangle")
@@ -1353,7 +1341,7 @@ extension AppModelTests {
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             } else { result.catalog = Self.catalog }
             return result
         }
@@ -1382,7 +1370,7 @@ extension AppModelTests {
         let service = FakeService { operation, _, _ in
             if case .discover = operation {
                 var result = VaultResult()
-                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
                 return result
             }
             throw MopError.authentication
@@ -1408,7 +1396,7 @@ extension AppModelTests {
         let service = FakeService { operation, _, _ in
             if case .discover = operation {
                 var result = VaultResult()
-                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
                 return result
             }
             throw MopError.vaultUntrusted
@@ -1464,13 +1452,13 @@ extension AppModelTests {
         #expect(app.sheet == nil && app.error != nil)
         #expect(service.state.withLock { $0.operations.isEmpty })
     }
-    @Test func refreshRetriesPausedCatalogWithoutAnotherStoreNotification() async throws {
+    @Test func projectionCompletionClearsPausedCatalog() async throws {
         let id = UUID().uuidString
         let phase = Mutex(0)
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [.init(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [.init(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             } else if case .catalog = operation {
                 let current = phase.withLock { $0 }
                 if current == 1 { throw MopError.inputOutput }
@@ -1488,15 +1476,56 @@ extension AppModelTests {
         try await finish(app)
         #expect(app.catalogUpdatePaused)
         app.showCatalogIssue()
-        #expect(app.error == "Local catalog update paused. Refresh to retry.")
+        #expect(app.error == "Local catalog is temporarily unavailable. It will update automatically.")
         app.error = nil
         phase.withLock { $0 = 2 }
-        // The fake sync request deliberately emits no store change notification.
-        app.refresh()
+        // The projection worker reports completion through the shared change stream.
+        app.cloudChanged()
         try await finish(app)
         #expect(app.catalog?.revision == "complete")
         #expect(!app.catalogUpdatePaused && !app.isUpdatingCatalog)
         #expect(app.catalogTransferStatus == nil)
+        app.shutdown()
+    }
+
+    @Test(arguments: [false, true]) func admittedVaultWaitsForMetadataAndAutomaticallyOpens(missingGrant: Bool) async throws {
+        let id = UUID().uuidString
+        let progress = Mutex(VaultEnrollmentProgress(ready: 250, total: 1000))
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [.init(id: id, name: nil, format: "mop-content-v3", enrolled: true)]
+                result.defaultVault = id
+                result.enrollmentProgress = [id: progress.withLock { $0 }]
+                return result
+            }
+            if missingGrant { throw CloudSyncAdapterError.membershipUnavailable }
+            throw ItemVaultSessionFailure.missingVaultMetadata
+        }
+        service.authenticate()
+        let app = model(service); app.vault = id; app.start()
+        try await finish(app)
+        #expect(!app.authenticated && app.catalog == nil)
+        #expect(app.error == nil)
+        #expect(app.status.contains("Downloading vault metadata"))
+        #expect(app.waitingForVaultMetadata)
+        #expect(service.isAuthenticated)
+        #expect(app.connectionProgress?.fraction == 0.25)
+        progress.withLock { $0 = VaultEnrollmentProgress(ready: 500, total: 1000) }
+        app.discover()
+        try await finish(app)
+        #expect(app.connectionProgress?.fraction == 0.5)
+        #expect(VaultEnrollmentProgress(ready: 10, total: 0).fraction == nil)
+        #expect(VaultEnrollmentProgress(ready: 110, total: 100).fraction == 1)
+        var complete = VaultResult()
+        complete.catalog = ItemCatalog(vault: "personal", revision: "downloaded", items: [])
+        service.state.withLock { $0.displayResult = complete }
+        service.notifyChange()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !app.authenticated, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(app.authenticated && app.catalog?.revision == "downloaded")
+        #expect(!app.waitingForVaultMetadata)
+        #expect(app.error == nil)
         app.shutdown()
     }
 
@@ -1505,7 +1534,7 @@ extension AppModelTests {
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [.init(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [.init(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             }
             return result
         }
@@ -1542,7 +1571,7 @@ extension AppModelTests {
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [.init(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [.init(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             } else if case .catalog = operation { Issue.record("Progressive UI opening must not request a full catalog") }
             return result
         }
@@ -1558,6 +1587,10 @@ extension AppModelTests {
         try await finish(app)
         #expect(app.authenticated && !app.busy && app.catalog?.items.count == 1)
         #expect(app.isUpdatingCatalog && app.catalogTransferStatus == nil)
+        let reconciliations = app.healthSession.reconciliationCount
+        for _ in 0..<100 { app.catalogs[id] = partial.catalog; app.refreshHealth() }
+        #expect(app.healthSession.reconciliationCount == reconciliations)
+        #expect(app.deferredHealthRefresh)
         app.selectedItem = "first"
         app.selected = try SecretReference("sp://personal/first/password")
         app.revealed = SecretBytes(utf8: "selected-secret")
@@ -1571,6 +1604,8 @@ extension AppModelTests {
         while app.catalog?.revision != "complete", ContinuousClock.now < deadline { await Task.yield() }
         #expect(app.catalog?.items.count == 2 && app.authenticated)
         #expect(!app.isUpdatingCatalog && app.catalogTransferStatus == nil)
+        #expect(app.healthSession.reconciliationCount > reconciliations)
+        #expect(!app.deferredHealthRefresh)
         #expect(app.selectedItem == "first" && app.revealed == SecretBytes(utf8: "selected-secret"))
     }
 
@@ -1582,7 +1617,7 @@ extension AppModelTests {
             var result = VaultResult()
             switch operation {
             case .discover:
-                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             case .catalog:
                 result.catalog = ItemCatalog(vault: "personal", revision: revision.withLock { $0 }, items: [])
             default: break
@@ -1611,7 +1646,7 @@ extension AppModelTests {
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             } else if case .catalog = operation { result.catalog = Self.catalog }
             return result
         }
@@ -1636,7 +1671,7 @@ extension AppModelTests {
             var result = VaultResult()
             switch operation {
             case .discover:
-                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             case .catalog:
                 if refresh.withLock({ $0 }) { await barrier.wait() }
                 result.catalog = ItemCatalog(vault: "personal", revision: refresh.withLock { $0 } ? "new" : "old", items: Self.catalog.items)
@@ -1662,7 +1697,7 @@ extension AppModelTests {
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
             } else if case .catalog = operation {
                 if refresh.withLock({ $0 }) { await barrier.wait() }
                 result.catalog = Self.catalog
@@ -1828,7 +1863,7 @@ extension AppModelTests {
         for route in ["item", "vault", "settings-vault", "sheet", "refresh", "refresh-suggestions", "trash"] {
             let service = FakeService(), app = try editingModel(service)
             let other = UUID().uuidString
-            app.vaults.append(VaultDescriptor(id: other, name: "other", format: "mop-items-v2", enrolled: true))
+            app.vaults.append(VaultDescriptor(id: other, name: "other", format: "mop-content-v3", enrolled: true))
             app.catalogs[other] = ItemCatalog(vault: "other", revision: "r1", items: [])
             let originalVault = app.vault
             switch route {
@@ -1900,14 +1935,6 @@ extension AppModelTests {
         app.search = ""
         #expect(app.listSelection == selection)
     }
-    @Test func recoveryTestResetClearsVaultsAndRoutesToRecovery() throws {
-        let service = FakeService(), app = try editingModel(service)
-        app.sheetRequest = SheetRequest(kind: .setupRecovery, inSettings: true, target: nil)
-        app.showRecoveryTestReset()
-        #expect(app.deviceRemoved)
-        #expect(app.vaults.isEmpty)
-        #expect(app.sheetRequest?.kind == .recover && app.sheetRequest?.inSettings == true)
-    }
     @Test func settingsCategoriesDoNotChangeVaultOrDraft() throws {
         let service = FakeService(), app = try editingModel(service)
         let selected = app.selectedRow
@@ -1931,7 +1958,7 @@ extension AppModelTests {
         let app = try editingModel(FakeService())
         let target = try #require(app.selectedVaultDescriptor)
         app.presentSheet(.renameVault, target: target)
-        app.vaultDetailsTarget = VaultDescriptor(id: UUID().uuidString, name: "other", format: "mop-items-v2", enrolled: true)
+        app.vaultDetailsTarget = VaultDescriptor(id: UUID().uuidString, name: "other", format: "mop-content-v3", enrolled: true)
         app.discardAndContinue()
         #expect(app.sheetRequest?.target?.id == target.id)
     }
@@ -1944,7 +1971,7 @@ extension AppModelTests {
             return VaultResult()
         }
         let app = model(service)
-        let target = VaultDescriptor(id: targetID, name: "personal", format: "mop-items-v2", enrolled: true)
+        let target = VaultDescriptor(id: targetID, name: "personal", format: "mop-content-v3", enrolled: true)
         app.vaults.append(target)
         app.chooseExportBackup(target: target)
         let request = try #require(app.documentRequest)
@@ -1972,7 +1999,7 @@ extension AppModelTests {
         try app.applyCatalog(Self.catalog)
         app.selectedRow = .init(vault: app.vault, name: "github")
         let selected = app.selectedRow
-        let target = VaultDescriptor(id: targetID, name: "other", format: "mop-items-v2", enrolled: true)
+        let target = VaultDescriptor(id: targetID, name: "other", format: "mop-content-v3", enrolled: true)
         app.vaults.append(target); app.openVaultDetails(target)
         app.renameVault(to: "renamed", target: target); try await finish(app)
         #expect(app.selectedRow == selected && app.vaultName == "personal")
@@ -2019,7 +2046,7 @@ extension AppModelTests {
     let defaults = UserDefaults(suiteName: "mop-import-ui-" + UUID().uuidString)!
     let model = AppModel(breachClient: TestBreachClient(), service: FakeService(), defaults: defaults, automaticTimer: false)
     model.authenticated = true; model.vault = "v"
-    model.vaults = [VaultDescriptor(id: "v", name: "personal", format: "mop-items-v2", enrolled: true)]
+    model.vaults = [VaultDescriptor(id: "v", name: "personal", format: "mop-content-v3", enrolled: true)]
     var active = VaultItem(name: "Active", type: .password, fields: [ItemField(path: "password", type: .password)])
     active.metadata = ItemMetadata(tags: ["work"], favorite: true)
     var archived = active; archived.name = "Archived"; archived.metadata?.archived = true
@@ -2373,7 +2400,7 @@ extension AppModelTests {
         let app = AppModel(breachClient: TestBreachClient(), service: service, defaults: UserDefaults(suiteName: UUID().uuidString)!, usageStore: store, now: { 0 }, automaticTimer: false, wallNow: { date })
         let account = UUID().uuidString, vault = UUID().uuidString
         app.vault = vault
-        app.vaults = [VaultDescriptor(id: vault, name: "personal", format: "mop-items-v2", enrolled: true)]
+        app.vaults = [VaultDescriptor(id: vault, name: "personal", format: "mop-content-v3", enrolled: true)]
         var items = (0..<60).map { n in
             var item = VaultItem(name: String(format: "Item %02d", n), type: .login, fields: [])
             item.storageID = UUID().uuidString
@@ -2523,7 +2550,7 @@ extension AppModelTests {
         }
         service.authenticate()
         let app = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, usageStore: RecentUsageMemory(), now: { 0 }, automaticTimer: false, localService: localService)
-        app.vaults = catalogs.map { VaultDescriptor(id: $0.key, name: $0.value.vault, format: "mop-items-v2", enrolled: true) }
+        app.vaults = catalogs.map { VaultDescriptor(id: $0.key, name: $0.value.vault, format: "mop-content-v3", enrolled: true) }
         return (app, service)
     }
 
@@ -2624,7 +2651,7 @@ extension AppModelTests {
         let service = FakeService { operation, id, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [VaultDescriptor(id: retained, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: retained, name: "personal", format: "mop-content-v3", enrolled: true)]
             } else if id == gone { throw MopError.vaultMissing }
             else { result.catalog = Self.catalog }
             return result
@@ -2632,7 +2659,7 @@ extension AppModelTests {
         service.authenticate()
         let app = model(service)
         app.vault = gone
-        app.vaults = [gone, retained].map { VaultDescriptor(id: $0, name: $0, format: "mop-items-v2", enrolled: true) }
+        app.vaults = [gone, retained].map { VaultDescriptor(id: $0, name: $0, format: "mop-content-v3", enrolled: true) }
         app.unlock(); try await finish(app)
         #expect(app.error == nil)
         #expect(app.authenticated)
@@ -2667,7 +2694,7 @@ extension AppModelTests {
         }
         service.authenticate()
         let app = model(service); app.vault = first
-        app.vaults = [second, third, first].map { VaultDescriptor(id: $0, name: $0, format: "mop-items-v2", enrolled: true) }
+        app.vaults = [second, third, first].map { VaultDescriptor(id: $0, name: $0, format: "mop-content-v3", enrolled: true) }
         app.unlock()
         try await entered(secondGate); try await entered(thirdGate)
         #expect(calls.withLock { $0.first } == first)
@@ -2686,7 +2713,7 @@ extension AppModelTests {
         }
         service.authenticate()
         let app = model(service); app.vault = first
-        app.vaults = [first, second].map { VaultDescriptor(id: $0, name: $0, format: "mop-items-v2", enrolled: true) }
+        app.vaults = [first, second].map { VaultDescriptor(id: $0, name: $0, format: "mop-content-v3", enrolled: true) }
         app.unlock(); try await entered(barrier)
         #expect(app.authenticated)
         app.lock(); await barrier.release()
@@ -2705,7 +2732,7 @@ extension AppModelTests {
         }
         service.authenticate()
         let app = model(service); app.vault = first
-        app.vaults = [first, second].map { VaultDescriptor(id: $0, name: $0, format: "mop-items-v2", enrolled: true) }
+        app.vaults = [first, second].map { VaultDescriptor(id: $0, name: $0, format: "mop-content-v3", enrolled: true) }
         app.unlock(); try await entered(barrier)
         app.perform { _ in
             app.catalogs[second] = ItemCatalog(vault: "updated", revision: "new", items: [])
@@ -2720,14 +2747,14 @@ extension AppModelTests {
         let service = FakeService { operation, id, _ in
             var result = VaultResult()
             if case .discover = operation {
-                result.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-items-v2", enrolled: true)]
+                result.vaults = [VaultDescriptor(id: first, name: "personal", format: "mop-content-v3", enrolled: true)]
             } else if id == deleted { throw MopError.vaultMissing }
             else { result.catalog = Self.catalog }
             return result
         }
         service.authenticate()
         let app = model(service); app.vault = first
-        app.vaults = [first, deleted].map { VaultDescriptor(id: $0, name: $0, format: "mop-items-v2", enrolled: true) }
+        app.vaults = [first, deleted].map { VaultDescriptor(id: $0, name: $0, format: "mop-content-v3", enrolled: true) }
         app.unlock(); try await finish(app)
         #expect(app.authenticated && app.vault == first && app.error == nil)
         #expect(app.vaults.map(\.id) == [first])

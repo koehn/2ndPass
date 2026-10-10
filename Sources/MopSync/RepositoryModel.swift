@@ -2,7 +2,7 @@
 import Foundation
 
 enum RepositoryModel {
-    static func make() -> NSManagedObjectModel {
+    static func make(contentPreview: Bool = false) -> NSManagedObjectModel {
         let model = NSManagedObjectModel()
         model.versionIdentifiers = ["MopEncryptedItems1"]
         model.entities = [
@@ -40,6 +40,20 @@ enum RepositoryModel {
             ]),
             entity("HistoryCheckpoint", [attribute("key", .stringAttributeType), attribute("value", .binaryDataAttributeType)])
         ]
+        if contentPreview {
+            model.versionIdentifiers = ["MopContentPreview3"]
+            for name in ["ContentKeyState", "ContentGrant", "MissingContentGrant", "ContentVersion", "ContentBranch"] {
+                let row = entity(name, [attribute("key", .stringAttributeType),
+                    attribute("scopeKey", .stringAttributeType), attribute("vaultKey", .stringAttributeType),
+                    attribute("keyGeneration", .UUIDAttributeType), attribute("recipient", .stringAttributeType),
+                    attribute("value", .binaryDataAttributeType)])
+                row.indexes = ["scopeKey", "vaultKey"].map { field in
+                    NSFetchIndexDescription(name: name + field,
+                        elements: [NSFetchIndexElementDescription(property: row.attributesByName[field]!, collationType: .binary)])
+                }
+                model.entities.append(row)
+            }
+        }
         return model
     }
 

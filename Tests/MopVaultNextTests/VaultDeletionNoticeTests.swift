@@ -9,7 +9,7 @@ import MopCore
     let root = try MembershipEnvelope.genesis(vault: vault.id, membership: vault.membership, owner: owner)
     let history = try TrustedMembershipHistory(genesis: root, vault: vault.id, pinnedDigest: root.digest())
     let binding = VaultDeletionNotice.Binding(container: "iCloud.test", environment: "Development", account: "account",
-        vault: vault.id, database: "private", zone: "MopItems-" + vault.id.uuidString, owner: "__defaultOwner__", genesis: try root.digest())
+        vault: vault.id, database: "private", zone: "MopContent3-" + vault.id.uuidString, owner: "__defaultOwner__", genesis: try root.digest())
     let notice = try VaultDeletionNotice.create(binding: binding, history: history, owner: owner)
     try VaultDeletionNotice.decode(notice.encoded()).verify(binding: binding, trusted: history)
     #expect(throws: MopError.cloudPermission) { try VaultDeletionNotice.create(binding: binding, history: history, owner: outsider) }
@@ -36,7 +36,7 @@ import MopCore
     let membership = try Membership(accounts: [AccountMember(id: owner.identity.member, role: .owner, devices: [owner.identity, peer.identity])])
     try next.append(MembershipEnvelope.successor(of: root, membership: membership, owner: owner))
     let binding = VaultDeletionNotice.Binding(container: "iCloud.test", environment: "Development", account: "account",
-        vault: vault.id, database: "private", zone: "MopItems-" + vault.id.uuidString, owner: "__defaultOwner__", genesis: try root.digest())
+        vault: vault.id, database: "private", zone: "MopContent3-" + vault.id.uuidString, owner: "__defaultOwner__", genesis: try root.digest())
     let current = try VaultDeletionNotice.create(binding: binding, history: next, owner: peer)
     try current.verify(binding: binding, trusted: old)
     let stale = try VaultDeletionNotice.create(binding: binding, history: old, owner: owner)

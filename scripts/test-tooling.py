@@ -30,6 +30,8 @@ with tempfile.TemporaryDirectory(prefix='sp-install-test-') as directory:
     direct = applications / '2ndPass CLI.app/Contents/MacOS/sp'
     identity = subprocess.check_output([str(direct), 'device', 'identity']).strip()
     assert identity
+    # Identity also requires Bundle.main's identifier: CloudKit/PushKit needs
+    # this even though our signing checks can resolve an external CLI symlink.
     assert subprocess.check_output([str(link), 'device', 'identity']).strip() == identity
     # A relative symlink chain must identify the same signed application too.
     alias = prefix / 'bin/sp-alias'

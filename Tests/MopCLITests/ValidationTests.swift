@@ -100,11 +100,12 @@ import MopCore
     #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "init", "personal", "--fingerprint", String(repeating: "a", count: 64)]) }
 }
 
-@Test func cloudEnrollmentCommandsRequireExplicitApprovalArguments() throws {
-    #expect(try Mop.parseAsRoot(["vault", "enrollment", "request", "--vault", UUID().uuidString]) is Vault.Enrollment)
-    #expect(try Mop.parseAsRoot(["vault", "enrollment", "approve", "--request-id", UUID().uuidString, "--code", "ABCD"]) is Vault.Enrollment)
-    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "enrollment", "approve", "--request-id", UUID().uuidString]) }
-    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "enrollment", "confirm"]) }
+@Test func retiredEnrollmentAndCheckpointImportCommandsAreNotAdvertised() throws {
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "enrollment", "request"]) }
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "import", "old-checkpoint"]) }
+    #expect(try Mop.parseAsRoot(["vault", "sync"]) is Vault.Sync)
+    #expect(!CloudConfirmationPending(mutationIDs: []).message.contains("Run sp vault sync"))
+    #expect(!VaultDeletionPending().message.contains("Run sp vault sync"))
 }
 
 @Test func importCLIRequiresExplicitVaultAndSupportsFormats() throws {

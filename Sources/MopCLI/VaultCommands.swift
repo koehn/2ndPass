@@ -25,12 +25,12 @@ private func readPortableBackupInput(_ path: String, key: Bool = false) throws -
 struct CloudConfirmationPending: Error {
     let mutationIDs: [UUID]
     var message: String {
-        "Saved locally; iCloud confirmation is pending. Do not repeat the write. Run sp vault sync to retry delivery."
+        "Saved locally; iCloud confirmation is pending. Do not repeat the write. Delivery resumes automatically at the next execution opportunity."
         + (mutationIDs.isEmpty ? "" : " Mutation receipts: " + mutationIDs.map(\.uuidString).joined(separator: ", "))
     }
 }
 struct VaultDeletionPending: Error {
-    let message = "Vault deletion is pending. Run sp vault sync to resume; do not start another deletion."
+    let message = "Vault deletion is pending. Cleanup resumes automatically at the next execution opportunity; do not start another deletion."
 }
 private func requireCloudConfirmation(_ result: VaultResult) throws -> VaultResult {
     if let phase = result.deletionStatus, phase != .complete { throw VaultDeletionPending() }
@@ -103,7 +103,7 @@ private func emit(_ result: VaultResult) throws {
 private func readFile(_ path: String) throws -> Data { try LocalFile.read(URL(fileURLWithPath: path), limit: 24 * 1024 * 1024) }
 
 struct Vault: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal and shared vaults.", subcommands: [Devices.self, Enrollment.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Export.self, Backup.self, RestoreBackup.self, Fingerprint.self, Members.self, Invite.self, Accept.self, Approve.self, RemoveMember.self, RemoveDevice.self, Role.self, Recovery.self, ReconcileShare.self, Import.self, DeleteVault.self])
+    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal and shared vaults.", subcommands: [Devices.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Export.self, Backup.self, RestoreBackup.self, Fingerprint.self, Members.self, Invite.self, Accept.self, Approve.self, RemoveMember.self, RemoveDevice.self, Role.self, Recovery.self, ReconcileShare.self, DeleteVault.self])
     struct Devices: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "List or remove devices across enrolled personal vaults.")
         @OptionGroup var storage: VaultOptions
@@ -111,22 +111,23 @@ struct Vault: AsyncParsableCommand {
         func validate() throws {
             if let remove, UUID(uuidString: remove) == nil { throw MopError.invalidProcess }
         }
-        func run() async throws { throw ItemVaultServiceFailure.unavailable }
-    }
-
-    struct Enrollment: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Manage own-device iCloud enrollment and explicit reconnection.")
-        @OptionGroup var storage: VaultOptions
-        @Argument(help: "request, restart, reconnect, cancel, status, confirm, inbox, approve, or decline") var action: String
-        @Option var name = "New device"
-        @Option var requestID: String?
-        @Option var code: String?
-        func validate() throws {
-            guard ["request", "restart", "reconnect", "cancel", "status", "confirm", "inbox", "approve", "decline"].contains(action),
-                  !["approve", "decline"].contains(action) || requestID.flatMap(UUID.init(uuidString:)) != nil,
-                  !["approve", "confirm"].contains(action) || code != nil else { throw MopError.invalidProcess }
+        func run() async throws {
+            try storage.requireOnline()
+            let service = storage.native(); defer { service.lock() }
+            let listed = try await service.execute(.manage(.devices), vault: storage.vault)
+            if let remove, let id = UUID(uuidString: remove) {
+                let matches = listed.devices.filter { $0.id == id }
+                guard !matches.isEmpty else { throw MopError.notFound }
+                let vaults = storage.vault.map { [$0] } ?? Array(Set(matches.flatMap { $0.vaultNames.keys })).sorted()
+                for vault in vaults { try emit(await service.execute(.manage(.removeDevice(id)), vault: vault)) }
+            } else {
+                for device in listed.devices.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+                    let vaults = device.vaultNames.values.sorted().joined(separator: ", ")
+                    try IO.output(device.id.uuidString + " " + device.name + (device.isCurrent ? " (current)" : "")
+                        + (vaults.isEmpty ? "" : " · " + vaults) + "\n")
+                }
+            }
         }
-        func run() async throws { throw ItemVaultServiceFailure.unavailable }
     }
 
     struct Initialize: AsyncParsableCommand {
@@ -159,7 +160,7 @@ struct Vault: AsyncParsableCommand {
         }
     }
     struct Sync: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Verify new revisions and reconcile uncertain writes; never replay a secret mutation.")
+        static let configuration = CommandConfiguration(abstract: "Wake automatic reconciliation and wait for pending receipts; use --local-save to return immediately.")
         @OptionGroup var storage: VaultOptions
         func run() async throws { try emit(await storage.execute(.sync)) }
     }
@@ -368,14 +369,6 @@ struct Vault: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Retry cloud participant permissions after a committed roster change.")
         @OptionGroup var storage: VaultOptions
         func run() async throws { try emit(await storage.execute(.manage(.reconcileShare))) }
-    }
-    struct Import: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Trust an independently verified v7 checkpoint for an already enrolled device; never converts old formats.")
-        @OptionGroup var storage: VaultOptions
-        @Argument(completion: .file()) var file: String
-        @Option var checkpoint: String
-        @Option(help: "Actual zone owner record name for a shared database vault; omit for your own private vault.") var sharedOwner: String?
-        func run() async throws { throw ItemVaultServiceFailure.unavailable }
     }
     struct DeleteVault: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "delete", abstract: "Permanently delete the selected cloud vault. Updated devices erase cached copies when they reconnect; backups remain.")

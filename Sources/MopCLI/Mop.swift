@@ -3,6 +3,7 @@ import ArgumentParser
 import Foundation
 import MopCore
 import MopAppSupport
+import MopKeychain
 
 @main
 struct Mop: AsyncParsableCommand {
@@ -23,6 +24,9 @@ struct Mop: AsyncParsableCommand {
 
     static func main() async {
         do {
+            if let executable = try SigningIdentity.bundledExecutableForRelaunch() {
+                try BundleLaunch.replaceProcess(executable: executable.path, arguments: Array(CommandLine.arguments.dropFirst()))
+            }
             var command = try parseAsRoot()
             await CLISubscription.reportIfNeeded(command, arguments: Array(CommandLine.arguments.dropFirst()))
             if var asyncCommand = command as? any AsyncParsableCommand { try await asyncCommand.run() }

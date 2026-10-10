@@ -1,8 +1,42 @@
 @preconcurrency import CloudKit
 import Foundation
+import MopCore
 import OSLog
 import CryptoKit
-import MopCore
+
+/// Whitelist numeric diagnostics only. CloudKit descriptions, partial-error
+/// dictionary keys and userInfo may contain private record identifiers/data.
+func cloudFailureSummary(_ errors: [CKError]) -> String {
+    var counts: [Int: Int] = [:]
+    var retryAfter: TimeInterval = 0
+    func collect(_ error: CKError, depth: Int) {
+        counts[error.code.rawValue, default: 0] += 1
+        if let delay = error.retryAfterSeconds, delay.isFinite, delay > retryAfter { retryAfter = delay }
+        if depth < 4, let partial = error.partialErrorsByItemID {
+            for nested in partial.values {
+                if let cloud = nested as? CKError { collect(cloud, depth: depth + 1) }
+            }
+        }
+    }
+    for error in errors { collect(error, depth: 0) }
+    let codes = counts.keys.sorted().map { "\($0):\(counts[$0]!)" }.joined(separator: ",")
+    return "CKError codes(counts)=\(codes) retryAfterSeconds=\(retryAfter)"
+}
+
+func publicationFailure(_ error: any Error) -> SyncFailure {
+    switch error {
+    case CloudSyncAdapterError.accountChanged, MopError.cloudAccount: return .accountChanged
+    case CloudSyncAdapterError.membershipUnavailable, ContentStoreError.staleAuthority: return .dependency
+    case MopError.authentication, MopError.vaultUntrusted, MopError.cloudPermission: return .authorization
+    case is CKError, MopError.cloudUnavailable, MopError.cloudThrottled, is CancellationError: return .transport
+    case SyncJournalError.inboxFull: return .storagePressure
+    default:
+        let native = error as NSError
+        if (native.domain == NSCocoaErrorDomain && native.code == NSFileWriteOutOfSpaceError)
+            || (native.domain == NSPOSIXErrorDomain && native.code == 28) { return .storagePressure }
+        return .processing
+    }
+}
 
 public struct VaultCloudAddress: Equatable, Codable, Sendable {
     public let vaultID: UUID
@@ -21,24 +55,35 @@ public struct VaultCloudAddress: Equatable, Codable, Sendable {
 
 public enum CloudRecordDirection: Sendable { case receiving, sending, cached }
 
-/// Verification must authenticate the ciphertext envelope AND bind its signed identity,
-/// version, predecessor and membership to every outer EncryptedItemVersion field.
-/// Outgoing authorization must also refresh membership and reject stale key generations.
-public typealias CloudItemValidator = @Sendable (EncryptedItemVersion, CloudRecordDirection) async throws -> Void
 public typealias CloudAccountValidator = @Sendable () async throws -> Bool
-public typealias CloudVaultUploadEligibility = @Sendable (VaultScope) async -> Bool
 
-/// Local account namespaces never travel in shared records. Every recipient binds
-/// the authenticated wire identity to its own account/container/database namespace.
-private struct CloudItemWireEnvelope: Codable {
-    let vaultID: UUID
-    let itemID: UUID
-    let versionID: UUID
-    let baseVersionID: UUID?
-    let ciphertext: Data
-    let isTombstone: Bool
-    let healthItemID: UUID?
-    let generation: UInt64
+/// Transport for the isolated content store with public publication authority checks.
+/// The handler receives the engine owner's public account/lease permit; it must
+/// authenticate with pinned membership, never with CloudKit routing hints.
+public struct CloudCoordinationTransport: Sendable {
+    public let validate: @Sendable (PreparedCoordinationRecord, PublicationAuthorityChecks) async throws -> Void
+    public let discovered: @Sendable ([VaultCloudAddress]) async throws -> Void
+    public init(validate: @escaping @Sendable (PreparedCoordinationRecord, PublicationAuthorityChecks) async throws -> Void,
+                discovered: @escaping @Sendable ([VaultCloudAddress]) async throws -> Void) {
+        self.validate = validate; self.discovered = discovered
+    }
+}
+
+public struct CloudContentReception: Sendable {
+    public let coordination: CloudCoordinationTransport?
+    public let publicationValidator: ContentPublicationValidator?
+    public let authorizedWork: (@Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome)?
+    public let apply: @Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome
+    public let dependencyAvailable: @Sendable (SyncDependency) async throws -> Bool
+    public init(apply: @escaping @Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome,
+                dependencyAvailable: @escaping @Sendable (SyncDependency) async throws -> Bool,
+                publicationValidator: ContentPublicationValidator? = nil,
+                coordination: CloudCoordinationTransport? = nil,
+                authorizedWork: (@Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome)? = nil) {
+        self.coordination = coordination
+        self.apply = apply; self.dependencyAvailable = dependencyAvailable
+        self.publicationValidator = publicationValidator; self.authorizedWork = authorizedWork
+    }
 }
 
 // Cancellation is transport interruption, not evidence of invalid ciphertext or
@@ -61,21 +106,61 @@ func completeCloudSyncEvent(_ process: @escaping @Sendable () async -> Void) asy
 /// Construct one adapter per account/container/environment/database binding with a
 /// distinct lease URL. Initialization performs no cloud calls; start is explicit.
 public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
-    public static let recordType = "MopEncryptedItemV1"
     public static let maximumInlineBytes = 512 * 1024
     public static let assetChunkBytes = 16 * 1024 * 1024
-    private static let maximumWireBytes = (EncryptedItemRepository.maximumCiphertextBytes * 4 / 3) + 16_384
     private let repository: EncryptedItemRepository
     private let database: CKDatabase
     private let account: String
     private let stateNamespace: String
     private let leaseURL: URL
     private let assetDirectory: URL
-    private let validator: CloudItemValidator
     private let accountValidator: CloudAccountValidator
-    private let controlValidator: CloudControlValidator?
-    private let uploadEligibility: CloudVaultUploadEligibility
+    private let accountAuthorization: any RepositoryWritePermit
+    private let contentReception: CloudContentReception?
+    private var contentPermit: ConflictPublicationPermit?
     private var addresses: [String: VaultCloudAddress]
+    private var pendingAddressRegistration: UUID?
+    private var coordinationZoneID: CKRecordZone.ID { CKRecordZone.ID(zoneName: SyncStoreLayout.contentCoordinationZone, ownerName: CKCurrentUserDefaultName) }
+    private var receiveZoneIDs: [CKRecordZone.ID] {
+        addresses.values.map(\.zoneID) + (contentReception?.coordination == nil ? [] : [coordinationZoneID])
+    }
+
+    /// Adding independently trusted addresses updates the existing engine. Cloud
+    /// discovery alone must never call this method or install a trust pin.
+    private static func contentAddressHints(_ zones: [CKRecordZone.ID]) -> [VaultCloudAddress] {
+        zones.compactMap { zone in
+            let prefix = "MopContent3-"
+            guard zone.ownerName == CKCurrentUserDefaultName, zone.zoneName.hasPrefix(prefix),
+                  let id = UUID(uuidString: String(zone.zoneName.dropFirst(prefix.count))),
+                  zone.zoneName == SyncStoreLayout.contentZone(vault: id) else { return nil }
+            return VaultCloudAddress(vaultID: id, zoneName: zone.zoneName, ownerName: zone.ownerName)
+        }
+    }
+
+    public func addContentAddresses(_ added: [VaultCloudAddress]) async throws {
+        guard contentReception != nil, added.allSatisfy({ $0.zoneName == SyncStoreLayout.contentZone(vault: $0.vaultID) && $0.ownerName == CKCurrentUserDefaultName }) else { throw CloudSyncAdapterError.invalidBinding }
+        for address in added where addresses[address.storageKey] != address {
+            addresses[address.storageKey] = address
+            pendingAddressRegistration = UUID()
+        }
+        guard engine != nil, let revision = pendingAddressRegistration else { return }
+        try await registerPendingChanges()
+        // Keep failed registration retryable, and don't consume a newer address
+        // update that arrived while registration awaited repository work.
+        if pendingAddressRegistration == revision { pendingAddressRegistration = nil }
+    }
+
+    public func removeContentAddress(_ address: VaultCloudAddress) async throws {
+        guard contentReception != nil, address.zoneName == SyncStoreLayout.contentZone(vault: address.vaultID) else { throw CloudSyncAdapterError.invalidBinding }
+        addresses.removeValue(forKey: address.storageKey)
+        if let engine {
+            let changes = engine.state.pendingRecordZoneChanges.filter {
+                switch $0 { case .saveRecord(let id), .deleteRecord(let id): return id.zoneID == address.zoneID; @unknown default: return false }
+            }
+            engine.state.remove(pendingRecordZoneChanges: changes)
+        }
+    }
+
     private var engine: CKSyncEngine?
     private var lease: SynchronizationLease?
     private var uploadsAllowed = false
@@ -86,8 +171,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     private var resolutionPermit: ConflictPublicationPermit?
     private var generation = 0
     private var identityGeneration = 0
-    private var requestPump: Task<Void, Never>?
-    private var lastAttemptedRequest: Int64?
+    private var activeAssetVersions: Set<UUID> = []
+    private var activeContentAssets: [String: UUID] = [:]
+    private var lastRetentionPrune = Date.distantPast
+    private var recoveryOperation: UUID?
     private var activeDataEvents = 0
     private var deferredEngineState: Data?
     private var databaseName: String { database.databaseScope == .shared ? "shared" : "private" }
@@ -103,26 +190,33 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     public init(repository: EncryptedItemRepository, database: CKDatabase, account: String,
                 stateNamespace: String, leaseURL: URL, addresses: [VaultCloudAddress],
                 accountValidator: @escaping CloudAccountValidator,
-                validator: @escaping CloudItemValidator,
-                controlValidator: CloudControlValidator? = nil,
-                uploadEligibility: @escaping CloudVaultUploadEligibility = { _ in true }) throws {
+                accountAuthorization: any RepositoryWritePermit,
+                contentReception: CloudContentReception) throws {
         guard !account.isEmpty, !stateNamespace.isEmpty,
               database.databaseScope == .private || database.databaseScope == .shared,
               Set(addresses.map(\.storageKey)).count == addresses.count,
               Set(addresses.map { $0.ownerName + ":" + $0.zoneName }).count == addresses.count else {
             throw CloudSyncAdapterError.invalidBinding
         }
+        guard repository.layout == .contentPreview3 else {
+            throw ContentStoreError.wrongLayout
+        }
+        do {
+            guard database.databaseScope == .private,
+                  addresses.allSatisfy({ $0.zoneName == SyncStoreLayout.contentZone(vault: $0.vaultID) }) else {
+                throw CloudSyncAdapterError.invalidBinding
+            }
+        }
+        self.contentReception = contentReception
         self.repository = repository
         self.database = database
         self.account = account
-        self.stateNamespace = stateNamespace + ":" + (database.databaseScope == .shared ? "shared" : "private")
+        self.stateNamespace = stateNamespace + ":content-v3" + ":" + (database.databaseScope == .shared ? "shared" : "private")
         self.leaseURL = leaseURL
         self.assetDirectory = leaseURL.deletingLastPathComponent().appendingPathComponent("EncryptedAssets", isDirectory: true)
         self.addresses = Dictionary(uniqueKeysWithValues: addresses.map { ($0.storageKey, $0) })
-        self.validator = validator
-        self.controlValidator = controlValidator
-        self.uploadEligibility = uploadEligibility
         self.accountValidator = accountValidator
+        self.accountAuthorization = accountAuthorization
     }
 
     public func start(automaticallySync: Bool = true) async throws {
@@ -133,26 +227,34 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         let expectedGeneration = identityGeneration
         let acquired = try SynchronizationLease(url: leaseURL)
         guard try await accountValidator() else { throw CloudSyncAdapterError.accountChanged }
+        try await cleanupUploadAssets(holding: acquired)
+        try await repository.pruneCompletedOperations(account: account, database: databaseName)
+        try await repository.pruneHistory(permit: ConflictPublicationPermit(lease: acquired, authorization: accountAuthorization))
+        lastRetentionPrune = Date()
         let data = try await repository.engineState(account: account, database: stateNamespace)
         let state = try data.map { try JSONDecoder().decode(CKSyncEngine.State.Serialization.self, from: $0) }
         try Task.checkCancellation()
         guard expectedGeneration == identityGeneration, !suspended, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
         var configuration = CKSyncEngine.Configuration(database: database, stateSerialization: state, delegate: self)
         configuration.automaticallySync = automaticallySync
+        configuration.subscriptionID = SyncStoreLayout.contentSubscriptionID
         lease = acquired
+        if contentReception != nil { contentPermit = ConflictPublicationPermit(lease: acquired, authorization: accountAuthorization) }
         let startedEngine = CKSyncEngine(configuration)
         engine = startedEngine
+        if contentReception?.coordination != nil { startedEngine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: coordinationZoneID))]) }
         do {
+            if let coordination = contentReception?.coordination,
+               try await repository.engineState(account: account, database: stateNamespace + ":inventory") == nil {
+                let zones = try await database.allRecordZones()
+                try await validateAccount(generation: expectedGeneration)
+                try await coordination.discovered(Self.contentAddressHints(zones.map(\.zoneID)))
+                try await validateAccount(generation: expectedGeneration)
+                try await repository.saveEngineState(Data([1]), account: account, database: stateNamespace + ":inventory")
+            }
             try await registerPendingChanges()
-            let stream = await repository.changes()
             guard expectedGeneration == identityGeneration, engine === startedEngine, !suspended, !stopping else {
                 throw CloudSyncAdapterError.operationInterrupted
-            }
-            requestPump = Task { [weak self] in
-                for await _ in stream {
-                    guard !Task.isCancelled else { break }
-                    await self?.processDurableRequests()
-                }
             }
         } catch {
             if engine === startedEngine { await stop() }
@@ -163,15 +265,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     public func stop() async {
         guard !stopping else { return }
         stopping = true
+        contentPermit?.invalidate(); contentPermit = nil
         resolutionPermit?.invalidate()
         resolutionPermit = nil
         resolutionInProgress = false
         uploadsAllowed = false
         generation += 1
         identityGeneration += 1
-        requestPump?.cancel()
-        requestPump = nil
-        lastAttemptedRequest = nil
         deferredEngineState = nil
         activeDataEvents = 0
         let oldEngine = engine
@@ -181,11 +281,12 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             await oldEngine.cancelOperations()
         }
         lease = nil
+        activeAssetVersions = []; activeContentAssets = [:]
         stopping = false
     }
 
     public func setUploadsAllowed(_ allowed: Bool) async {
-        let next = allowed && !suspended
+        let next = allowed && !suspended && (contentReception == nil || contentReception?.publicationValidator != nil)
         // Reapplying the read-only startup policy must not cancel downloads.
         // Only a transition from allowed to disallowed revokes active sends.
         guard next != uploadsAllowed else { return }
@@ -199,115 +300,6 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             do { try await registerPendingChanges() }
             catch { lastFailure = suspension.failure ?? cloudSyncFailure(error, fallback: .storageFailure) }
         }
-    }
-
-    /// Production conflict choices execute only in the process holding this
-    /// database's publication lease. A requester in another process must contact
-    /// that owner or start an adapter after acquiring the lease; direct repository
-    /// resolution is not a substitute for quiescing outstanding publication.
-    public func resolveConflictUsingRemote(_ expected: EncryptedItemConflict,
-                                           authorization: any RepositoryWritePermit) async throws -> EncryptedItemVersion {
-        let owner = try claimResolution(expected)
-        guard let lease else { throw CloudSyncAdapterError.engineNotStarted }
-        let permit = ConflictPublicationPermit(lease: lease, authorization: authorization)
-        resolutionPermit = permit
-        defer {
-            permit.invalidate()
-            if resolutionPermit === permit { resolutionPermit = nil; resolutionInProgress = false }
-        }
-        let expectedGeneration = identityGeneration
-        try await quiesceResolution(expected, engine: owner, generation: expectedGeneration)
-        let result = try await repository.resolveConflictUsingRemote(expected, authorization: permit)
-        await finishResolution(engine: owner, generation: expectedGeneration)
-        return result
-    }
-
-    public func resolveConflict(_ expected: EncryptedItemConflict, with resolved: EncryptedItemVersion,
-                                authorization: any RepositoryWritePermit) async throws -> PendingItemMutation {
-        let owner = try claimResolution(expected)
-        guard let lease else { throw CloudSyncAdapterError.engineNotStarted }
-        let permit = ConflictPublicationPermit(lease: lease, authorization: authorization)
-        resolutionPermit = permit
-        defer {
-            permit.invalidate()
-            if resolutionPermit === permit { resolutionPermit = nil; resolutionInProgress = false }
-        }
-        let expectedGeneration = identityGeneration
-        try await quiesceResolution(expected, engine: owner, generation: expectedGeneration)
-        try await validator(resolved, .sending)
-        try await validateAccount(generation: expectedGeneration)
-        guard engine === owner, resolutionInProgress, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
-        let result = try await repository.resolveConflict(expected, with: resolved, authorization: permit)
-        await finishResolution(engine: owner, generation: expectedGeneration)
-        return result
-    }
-
-    /// Each entry still commits through the repository's reviewed-version CAS.
-    /// One lease and transport pause cover the bounded batch, including failures.
-    public func resolveConflictBatch(_ entries: [(conflict: EncryptedItemConflict, replacement: EncryptedItemVersion?)],
-                                     authorization: any RepositoryWritePermit) async throws -> [UUID: Result<EncryptedItemVersion, any Error>] {
-        guard !entries.isEmpty else { return [:] }
-        guard entries.count <= 25, Set(entries.map { $0.conflict.id }).count == entries.count else {
-            throw CloudSyncAdapterError.invalidBinding
-        }
-        let owner = try claimResolution(entries[0].conflict)
-        guard let lease else { throw CloudSyncAdapterError.engineNotStarted }
-        let permit = ConflictPublicationPermit(lease: lease, authorization: authorization)
-        resolutionPermit = permit
-        defer {
-            permit.invalidate()
-            if resolutionPermit === permit { resolutionPermit = nil; resolutionInProgress = false }
-        }
-        let expectedGeneration = identityGeneration
-        return try await performConflictResolutionBatch(entries, quiesce: {
-            Self.logger.notice("Sync trace: cancelling operations; reason=conflict batch records=\(entries.count)")
-            await owner.cancelOperations()
-        }, resolve: { entry in
-            try await self.validateAccount(generation: expectedGeneration)
-            guard self.engine === owner, self.resolutionInProgress, !self.stopping else { throw CloudSyncAdapterError.operationInterrupted }
-            try self.validateResolutionBinding(entry.conflict)
-            try await self.validator(entry.conflict.local, .cached)
-            try await self.validator(entry.conflict.remote, .receiving)
-            if let replacement = entry.replacement { try await self.validator(replacement, .sending) }
-            try await self.validateAccount(generation: expectedGeneration)
-            guard self.engine === owner, self.resolutionInProgress, !self.stopping else { throw CloudSyncAdapterError.operationInterrupted }
-            if let replacement = entry.replacement {
-                return try await self.repository.resolveConflict(entry.conflict, with: replacement, authorization: permit).version
-            }
-            return try await self.repository.resolveConflictUsingRemote(entry.conflict, authorization: permit)
-        }, finish: {
-            await self.finishResolution(engine: owner, generation: expectedGeneration)
-        })
-    }
-
-    private func validateResolutionBinding(_ expected: EncryptedItemConflict) throws {
-        guard expected.local.scope == expected.remote.scope, expected.local.scope.account == account,
-              expected.local.scope.database == databaseName, address(for: expected.local.scope) != nil else {
-            throw CloudSyncAdapterError.invalidBinding
-        }
-    }
-
-    private func claimResolution(_ expected: EncryptedItemConflict) throws -> CKSyncEngine {
-        guard let engine, lease != nil else { throw CloudSyncAdapterError.engineNotStarted }
-        guard !suspended, !stopping, !resolutionInProgress else { throw CloudSyncAdapterError.operationInterrupted }
-        try validateResolutionBinding(expected)
-        resolutionInProgress = true
-        generation += 1
-        return engine
-    }
-
-    private func quiesceResolution(_ expected: EncryptedItemConflict, engine owner: CKSyncEngine,
-                                   generation expectedGeneration: Int) async throws {
-        Self.logger.notice("Sync trace: cancelling operations; reason=conflict resolution")
-        await owner.cancelOperations()
-        try await validateAccount(generation: expectedGeneration)
-        guard engine === owner, resolutionInProgress, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
-        try await validator(expected.local, .cached)
-        try await validator(expected.remote, .receiving)
-        try await validateAccount(generation: expectedGeneration)
-        guard engine === owner, resolutionInProgress, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
-        // Cancellation cannot revoke an already-submitted server write. Superseded
-        // receipt/version tracking keeps a later result from silently undoing the choice.
     }
 
     private func finishResolution(engine owner: CKSyncEngine, generation expectedGeneration: Int) async {
@@ -335,7 +327,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         let pendingCount = try await repository.pendingScopes(account: account).count
         let conflictCount = try await repository.conflictedScopes(account: account).count
         Self.logger.notice("Sync trace: fetch starting; zones=\(self.addresses.count) pendingItems=\(pendingCount) conflicts=\(conflictCount) uploadsAllowed=\(self.uploadsAllowed)")
-        try await engine.fetchChanges(.init(scope: .zoneIDs(addresses.values.map(\.zoneID))))
+        try await engine.fetchChanges(.init(scope: .zoneIDs(receiveZoneIDs)))
         Self.logger.notice("Sync trace: fetch returned; suspended=\(self.suspended)")
         guard expectedGeneration == identityGeneration, self.engine === engine, !suspended else {
             throw CloudSyncAdapterError.operationInterrupted
@@ -350,90 +342,61 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             try await engine.sendChanges()
             Self.logger.notice("Sync trace: send returned")
         }
+        guard expectedGeneration == identityGeneration, self.engine === engine, !suspended else {
+            throw CloudSyncAdapterError.operationInterrupted
+        }
+        recoveryOperation = nil
     }
 
     /// Call after a durable local transaction; restart reconstructs this list from Core Data.
     public func registerPendingChanges() async throws {
         try checkSuspension()
-        guard let engine else { throw CloudSyncAdapterError.engineNotStarted }
-        let expectedGeneration = identityGeneration
-        let pending = try await repository.pendingScopes(account: account, excludingConflicts: true)
-        guard expectedGeneration == identityGeneration, self.engine === engine, !suspended else {
-            throw CloudSyncAdapterError.operationInterrupted
-        }
-        var ids = Set<CKRecord.ID>()
-        var readiness: [VaultScope: Bool] = [:]
-        for scope in pending {
-            // Conflict resolution re-registers the chosen durable mutation. Until
-            // then keep both versions locally, not an unsendable engine entry.
-            let vault = VaultScope(scope)
-            if readiness[vault] == nil { readiness[vault] = try await isPublicationReady(vault) }
-            if let address = address(for: scope),
-               scope.database == databaseName, scope.zoneOwner == address.ownerName,
-               readiness[vault] == true {
-                ids.insert(CKRecord.ID(recordName: scope.itemID.uuidString, zoneID: address.zoneID))
+        // Long-lived foreground owners also age out completed receipts/history.
+        // Reuse reconciliation opportunities rather than adding a cleanup timer.
+        if Date().timeIntervalSince(lastRetentionPrune) >= 86400, let lease {
+            lastRetentionPrune = Date()
+            do {
+                let permit = ConflictPublicationPermit(lease: lease, authorization: accountAuthorization)
+                try permit.withWritePermission {}
+                try await repository.pruneCompletedOperations(account: account, database: databaseName)
+                try await repository.pruneHistory(permit: permit)
+            } catch {
+                lastRetentionPrune = .distantPast
+                Self.logger.error("Deferred completed sync history cleanup")
             }
         }
-        guard expectedGeneration == identityGeneration, self.engine === engine, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
-        let registered = Set(engine.state.pendingRecordZoneChanges.compactMap { change -> CKRecord.ID? in
-            if case .saveRecord(let id) = change { return id }
-            return nil
-        })
-        let added = ids.subtracting(registered)
-        let removed = registered.subtracting(ids)
-        if !added.isEmpty { engine.state.add(pendingRecordZoneChanges: added.map { .saveRecord($0) }) }
-        if !removed.isEmpty { engine.state.remove(pendingRecordZoneChanges: removed.map { .saveRecord($0) }) }
+            guard let engine else { throw CloudSyncAdapterError.engineNotStarted }
+            let expected = identityGeneration
+            let candidates = try await repository.contentPublications(account: account)
+            guard expected == identityGeneration, self.engine === engine, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
+            let coordination = contentReception?.coordination == nil ? [] : try await repository.coordinationPublications(account: account)
+            let removals = try await repository.coordinationRemovals(account: account).compactMap { operation -> CKSyncEngine.PendingRecordZoneChange? in
+                guard let name = String(data: operation.payload, encoding: .utf8) else { throw ContentStoreError.invalidRecord }
+                return .deleteRecord(CKRecord.ID(recordName: name, zoneID: coordinationZoneID))
+            }
+            engine.state.add(pendingRecordZoneChanges: removals)
+            let ids = Set(candidates.filter { address(for: $0.scope) != nil }.map(\.recordID) + coordination.map(\.recordID))
+            let registered = Set(engine.state.pendingRecordZoneChanges.compactMap { change -> CKRecord.ID? in
+                if case .saveRecord(let id) = change { return id }; return nil
+            })
+            engine.state.add(pendingRecordZoneChanges: ids.subtracting(registered).map { .saveRecord($0) })
+            engine.state.remove(pendingRecordZoneChanges: registered.subtracting(ids).map { .saveRecord($0) })
+
     }
 
-    /// Requesters persist a wake-up even when another process owns the engine lease.
-    /// A caller may retry start after foregrounding/owner exit; there is no lease timer.
-    public func requestForegroundSync() async throws -> DurableSyncRequest {
-        try Task.checkCancellation()
-        Self.logger.notice("Sync trace: foreground wake; enginePresent=\(self.engine != nil) suspended=\(self.suspended)")
-        lastAttemptedRequest = nil
-        let request = try await repository.requestSync(account: account, database: databaseName, reason: .foreground)
+    /// The account coordinator retries this same durable operation until lease
+    /// reacquisition and upload restoration both succeed. No nested wake/pump.
+    public func resumeAutomaticSync() async throws {
         if suspended {
-            // Recreate from the last DURABLE token after unavailable protected
-            // storage or an unreadable asset. Never resume under a different account.
             guard try await accountValidator() else { throw CloudSyncAdapterError.accountChanged }
             await stop()
-            suspension = CloudSyncSuspension()
-            lastFailure = nil
+            suspension = CloudSyncSuspension(); lastFailure = nil
         }
-        if engine == nil {
-            do { try await start() }
-            catch CloudSyncAdapterError.engineAlreadyOwned {
-                // The other process observes the same durable request through
-                // Core Data notifications. This result is not upload confirmation.
-            }
-        }
-        return request
-    }
-
-    private func processDurableRequests() async {
-        guard !suspended, engine != nil else { return }
-        let expectedGeneration = identityGeneration
-        do {
-            try await registerPendingChanges()
-            let requests = try await repository.pendingSyncRequests(account: account, database: databaseName)
-            for request in requests {
-                guard expectedGeneration == identityGeneration, !suspended, !Task.isCancelled else { return }
-                guard request.generation != lastAttemptedRequest else { continue }
-                lastAttemptedRequest = request.generation
-                try await requestSync()
-                guard expectedGeneration == identityGeneration, !suspended, !Task.isCancelled else { return }
-                try await repository.markSyncRequestHandled(request)
-            }
-        } catch {
-            // A delegate may already have suspended the adapter with a precise
-            // cause. The enclosing send can then throw a generic partialFailure;
-            // do not replace that diagnosis or mutate a retired engine's state.
-            if expectedGeneration == identityGeneration, !suspended {
-                lastFailure = cloudSyncFailure(error, fallback: .storageFailure)
-            }
-            // CKSyncEngine owns network retry. A new explicit request or restart
-            // retries this wake-up; unrelated store events must not create a loop.
-        }
+        try await start()
+        await setUploadsAllowed(true)
+        try checkSuspension()
+        guard engine != nil, lease != nil, uploadsAllowed else { throw CloudSyncAdapterError.engineNotStarted }
+        recoveryOperation = nil
     }
 
     public func handleEvent(_ event: CKSyncEngine.Event, syncEngine: CKSyncEngine) async {
@@ -472,7 +435,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                         throw CloudSyncAdapterError.operationInterrupted
                     }
                     do { try await receive(change.record) }
-                    catch let error as CloudSyncAdapterError { lastFailure = error }
+                    catch let error as CloudSyncAdapterError {
+                        suspend(error); throw error
+                    }
                     catch {
                         suspend(cloudSyncFailure(error, fallback: .storageFailure))
                         throw error
@@ -482,11 +447,28 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                     try await validateAccount(generation: expectedGeneration)
                     try await blockZone(deletion.recordID.zoneID)
                 }
-                if !changes.deletions.isEmpty {
+                if let contentPermit {
+                    for deletion in changes.deletions where deletion.recordID.zoneID == coordinationZoneID {
+                        if let hint = try? PreparedCoordinationRecord.address(recordType: deletion.recordType, zone: coordinationZoneID.zoneName, record: deletion.recordID.recordName), hint.kind == .discovery {
+                            try await repository.removeContentDiscovery(account: account, vault: hint.vault, publishRemoval: false, permit: contentPermit)
+                        }
+                    }
+                }
+                if changes.deletions.contains(where: { $0.recordID.zoneID != coordinationZoneID }) {
                     // Only authenticated tombstones authorize deletion of local data.
                     lastFailure = .unexpectedRemoteDeletion
                 }
+            case .didFetchRecordZoneChanges(let completion):
+                if contentReception != nil, completion.error == nil,
+                   let address = addresses.values.first(where: { $0.zoneID == completion.zoneID }), let contentPermit {
+                    try await validateAccount(generation: expectedGeneration)
+                    try await repository.saveEngineState(Data([1]), account: account, database: "content-initial-fetch:" + address.vaultID.uuidString, permit: contentPermit)
+                }
             case .fetchedDatabaseChanges(let changes):
+                if let coordination = contentReception?.coordination {
+                    try await validateAccount(generation: expectedGeneration)
+                    try await coordination.discovered(Self.contentAddressHints(changes.modifications.map(\.zoneID)))
+                }
                 for deletion in changes.deletions {
                     try await validateAccount(generation: expectedGeneration)
                     try await blockZone(deletion.zoneID)
@@ -494,15 +476,25 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 if !changes.deletions.isEmpty { lastFailure = .unexpectedRemoteDeletion }
             case .sentRecordZoneChanges(let changes):
                 Self.logger.notice("Sync trace: sent records=\(changes.savedRecords.count) failed=\(changes.failedRecordSaves.count)")
+                if !changes.failedRecordSaves.isEmpty {
+                    let summary = cloudFailureSummary(changes.failedRecordSaves.map(\.error))
+                    Self.logger.error("Cloud record saves failed: \(summary, privacy: .public)")
+                }
                 for saved in changes.savedRecords { try await acknowledge(saved) }
+                if contentReception != nil, let contentPermit {
+                    for id in changes.deletedRecordIDs where id.zoneID == coordinationZoneID {
+                        try await repository.acknowledgeCoordinationRemoval(account: account, record: id.recordName, permit: contentPermit)
+                    }
+                }
                 for failure in changes.failedRecordSaves {
                     if failure.error.code == .serverRecordChanged {
                         // A conflict response is not an asset download. Fetch the
                         // complete current record before validating its ciphertext;
                         // error.serverRecord may contain asset references only.
                         try await validateAccount(generation: expectedGeneration)
-                        let remote = try await Self.fetchConflictRecord(failure.record.recordID) { [database] id in
-                            try await database.record(for: id)
+                        let remote = try await database.record(for: failure.record.recordID)
+                        guard remote.recordID == failure.record.recordID, remote.recordType == failure.record.recordType else {
+                            throw CloudSyncAdapterError.invalidBinding
                         }
                         guard expectedGeneration == identityGeneration, engine === syncEngine, !suspended else {
                             throw CloudSyncAdapterError.operationInterrupted
@@ -514,6 +506,18 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                     }
                 }
                 try await registerPendingChanges()
+                for record in changes.savedRecords + changes.failedRecordSaves.map(\.record) {
+                    if contentReception != nil, let incoming = try? (record.recordID.zoneID == coordinationZoneID ? PreparedCoordinationRecord.materialize(record, account: account) : ContentRecordTransport.materialize(record, account: account)) {
+                        let key = record.recordID.recordName + ":" + SHA256.hash(data: incoming.bytes).map { String(format: "%02x", $0) }.joined()
+                        if let version = activeContentAssets.removeValue(forKey: key), !activeContentAssets.values.contains(version) {
+                            activeAssetVersions.remove(version)
+                        }
+                    }
+                }
+                if let lease {
+                    do { try await cleanupUploadAssets(holding: lease) }
+                    catch { Self.logger.error("Deferred encrypted upload asset cleanup") }
+                }
             default: break
             }
         } catch {
@@ -536,7 +540,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         guard activeDataEvents == 0, !suspended, expectedGeneration == identityGeneration,
               engine === syncEngine, let state = deferredEngineState else { return }
         deferredEngineState = nil
-        do { try await repository.saveEngineState(state, account: account, database: stateNamespace) }
+        do {
+            if let contentPermit {
+                try await repository.saveEngineState(state, account: account, database: stateNamespace, permit: contentPermit)
+            } else {
+                try await repository.saveEngineState(state, account: account, database: stateNamespace)
+            }
+        }
         catch {
             if expectedGeneration == identityGeneration, engine === syncEngine {
                 suspend(.storageFailure)
@@ -548,164 +558,275 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                                         syncEngine: CKSyncEngine) async -> CKSyncEngine.FetchChangesOptions {
         guard engine === syncEngine, !suspended else { return .init(scope: .zoneIDs([])) }
         var options = context.options
-        options.scope = .zoneIDs(addresses.values.map(\.zoneID).filter { context.options.scope.contains($0) })
+        options.scope = .zoneIDs(receiveZoneIDs.filter { context.options.scope.contains($0) })
         return options
     }
 
     public func nextRecordZoneChangeBatch(_ context: CKSyncEngine.SendChangesContext,
                                          syncEngine: CKSyncEngine) async -> CKSyncEngine.RecordZoneChangeBatch? {
         guard uploadsAllowed, !suspended, !resolutionInProgress, engine === syncEngine else { return nil }
-        let expectedGeneration = generation
+        return await nextContentBatch(context, syncEngine: syncEngine)
+    }
+
+    private func nextContentBatch(_ context: CKSyncEngine.SendChangesContext, syncEngine: CKSyncEngine) async -> CKSyncEngine.RecordZoneChangeBatch? {
+        guard let validate = contentReception?.publicationValidator, let contentPermit else { return nil }
+        let expected = identityGeneration, expectedUploads = generation
+        var pending: [(UUID, CKRecord.ID)] = []
         do {
-            guard try await accountValidator(), expectedGeneration == generation, !suspended else { return nil }
-            var blocked = try await repository.conflictedScopes(account: account)
-            var readiness: [VaultScope: Bool] = [:]
-            for scope in try await repository.pendingScopes(account: account) {
-                guard let address = address(for: scope) else { blocked.insert(scope); continue }
-                let id = CKRecord.ID(recordName: scope.itemID.uuidString, zoneID: address.zoneID)
-                let vault = VaultScope(scope)
-                if readiness[vault] == nil {
-                    let allowed = await uploadEligibility(vault)
-                    readiness[vault] = allowed ? try await isPublicationReady(vault) : false
+            let candidates = try await repository.contentPublications(account: account)
+            let controls = try await repository.coordinationPublications(account: account)
+            pending = candidates.map { ($0.operationID, $0.recordID) } + controls.map { ($0.operationID, $0.recordID) }
+            try await validateAccount(generation: expected)
+            var records: [CKRecord] = [], selected: [ContentUpload] = [], bytes = 0
+            var selectedCoordination: [PreparedCoordinationRecord] = []
+            let preparationAuthority = PublicationAuthorityChecks()
+            if let coordination = contentReception?.coordination {
+                for candidate in controls {
+                    guard records.count < 100, context.options.scope.contains(.saveRecord(candidate.recordID)) else { continue }
+                    if !records.isEmpty, candidate.bytes.count > Self.assetChunkBytes - min(bytes, Self.assetChunkBytes) { break }
+                    do {
+                        try await coordination.validate(candidate, preparationAuthority)
+                    }
+                    catch {
+                        try await deferUpload(candidate.operationID, recordID: candidate.recordID, error: error, permit: contentPermit, engine: syncEngine)
+                        continue
+                    }
+                    records.append(try candidate.record(assetDirectory: assetDirectory))
+                    selectedCoordination.append(candidate); bytes += candidate.bytes.count
                 }
-                if !context.options.scope.contains(.saveRecord(id)) || readiness[vault] != true { blocked.insert(scope) }
             }
-            let pending = try await repository.pendingMutationHeads(account: account, database: databaseName, excluding: blocked)
-            var seen = Set<ItemScope>()
-            var records: [CKRecord] = []
-            var publicationVaults = Set<VaultScope>()
-            var payloadBytes = 0
-            for mutation in pending {
-                let version = mutation.version
-                guard !blocked.contains(version.scope), seen.insert(version.scope).inserted,
-                      let address = address(for: version.scope), version.scope.database == databaseName,
-                      version.scope.zoneOwner == address.ownerName else { continue }
-                let id = CKRecord.ID(recordName: version.scope.itemID.uuidString, zoneID: address.zoneID)
-                guard context.options.scope.contains(.saveRecord(id)) else { continue }
-                // One large item is permitted, but never accumulate many maximum-
-                // sized assets in a single batch. Small records still cap at 100.
-                if !records.isEmpty, version.ciphertext.count > Self.assetChunkBytes - min(payloadBytes, Self.assetChunkBytes) { break }
-                try await validator(version, .sending)
-                let fields = try await repository.serverSystemFields(version.scope)
-                let record = try Self.makeRecord(version, address: address, serverSystemFields: fields, assetDirectory: assetDirectory)
-                records.append(record)
-                publicationVaults.insert(VaultScope(version.scope))
-                payloadBytes += version.ciphertext.count
-                if records.count == 100 || payloadBytes >= Self.assetChunkBytes { break }
+            for candidate in candidates {
+                guard records.count < 100 else { break }
+                guard address(for: candidate.scope) != nil, context.options.scope.contains(.saveRecord(candidate.recordID)) else { continue }
+                // Authority failures are scoped to this operation, not the engine.
+                do {
+                    try await validate(candidate, preparationAuthority)
+                } catch {
+                    try await deferUpload(candidate.operationID, recordID: candidate.recordID, error: error, permit: contentPermit, engine: syncEngine)
+                    continue
+                }
+                if !records.isEmpty, candidate.byteCount > Self.assetChunkBytes - min(bytes, Self.assetChunkBytes) { break }
+                let record = try candidate.record(assetDirectory: assetDirectory)
+                records.append(record); selected.append(candidate); bytes += candidate.byteCount
+                if records.count == 100 || bytes >= Self.assetChunkBytes { break }
             }
-            for vault in publicationVaults {
-                guard await uploadEligibility(vault), try await isPublicationReady(vault) else { return nil }
+            let removals = try await repository.coordinationRemovals(account: account).prefix(max(0, 100 - records.count)).compactMap { operation -> CKRecord.ID? in
+                guard let name = String(data: operation.payload, encoding: .utf8) else { throw ContentStoreError.invalidRecord }
+                let id = CKRecord.ID(recordName: name, zoneID: coordinationZoneID)
+                return context.options.scope.contains(.deleteRecord(id)) ? id : nil
             }
-            guard expectedGeneration == generation, uploadsAllowed, !suspended, !resolutionInProgress, engine === syncEngine, !records.isEmpty else { return nil }
-            return CKSyncEngine.RecordZoneChangeBatch(recordsToSave: records, atomicByZone: false)
+            var rejected: Set<CKRecord.ID> = []
+            // Assets may have taken time to prepare. Read authority afresh for
+            // this phase, sharing only within this batch and exact pinned head.
+            let submissionAuthority = PublicationAuthorityChecks()
+            for candidate in selected {
+                do {
+                    try await validate(candidate, submissionAuthority)
+                    try await repository.setContentUploadBlocked(candidate.operationID, account: account, blocked: false, permit: contentPermit)
+                }
+                catch {
+                    try await deferUpload(candidate.operationID, recordID: candidate.recordID, error: error, permit: contentPermit, engine: syncEngine)
+                    rejected.insert(candidate.recordID)
+                }
+            }
+            if let coordination = contentReception?.coordination {
+                for candidate in selectedCoordination {
+                    do {
+                        try await coordination.validate(candidate, submissionAuthority)
+                        try await repository.setContentUploadBlocked(candidate.operationID, account: account, blocked: false, permit: contentPermit)
+                    }
+                    catch {
+                        try await deferUpload(candidate.operationID, recordID: candidate.recordID, error: error, permit: contentPermit, engine: syncEngine)
+                        rejected.insert(candidate.recordID)
+                    }
+                }
+            }
+            records.removeAll { rejected.contains($0.recordID) }
+            selected.removeAll { rejected.contains($0.recordID) }
+            selectedCoordination.removeAll { rejected.contains($0.recordID) }
+            try contentPermit.withWritePermission {}
+            guard expected == identityGeneration, expectedUploads == generation, engine === syncEngine,
+                  !suspended, uploadsAllowed, (!records.isEmpty || !removals.isEmpty) else { return nil }
+            for candidate in selectedCoordination {
+                activeAssetVersions.insert(candidate.operationID)
+                activeContentAssets[candidate.recordName + ":" + SHA256.hash(data: candidate.bytes).map { String(format: "%02x", $0) }.joined()] = candidate.operationID
+            }
+            for candidate in selected where candidate.grant == nil {
+                let key = candidate.recordID.recordName + ":" + SHA256.hash(data: candidate.content.version.ciphertext).map { String(format: "%02x", $0) }.joined()
+                activeContentAssets[key] = candidate.content.version.versionID
+                activeAssetVersions.insert(candidate.content.version.versionID)
+            }
+            return CKSyncEngine.RecordZoneChangeBatch(recordsToSave: records, recordIDsToDelete: removals, atomicByZone: false)
         } catch {
-            lastFailure = cloudSyncFailure(error, fallback: .untrustedRecord)
+            lastFailure = cloudSyncFailure(error, fallback: .storageFailure)
+            do {
+                for (id, recordID) in pending {
+                    try await deferUpload(id, recordID: recordID, error: error, permit: contentPermit, engine: syncEngine)
+                }
+            } catch { suspend(.storageFailure) }
             return nil
         }
+    }
+
+    private func deferUpload(_ id: UUID, recordID: CKRecord.ID, error: any Error,
+                             permit: ConflictPublicationPermit, engine owner: CKSyncEngine) async throws {
+        if error as? CloudSyncAdapterError == .accountChanged || error as? MopError == .cloudAccount {
+            suspend(.accountChanged); throw CloudSyncAdapterError.accountChanged
+        }
+        let failure = publicationFailure(error)
+        let retryAfter = (error as? CKError)?.retryAfterSeconds
+        let native = error as NSError
+        // Only error type and numeric code; never descriptions, payloads or IDs.
+        let typeName = String(reflecting: type(of: error))
+        Self.logger.error("Upload preparation deferred: classification=\(failure.rawValue, privacy: .public) type=\(typeName, privacy: .public) code=\(native.code)")
+        try await repository.deferContentUpload(id, account: account, failure: failure, retryAfter: retryAfter,
+            jitter: Double.random(in: -1...1), permit: permit)
+        // Re-add at the persisted deadline. Returning an empty batch otherwise
+        // leaves the engine unaware that application preflight needs another try.
+        if engine === owner { owner.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)]) }
     }
 
     /// Public for deterministic transport tests without CloudKit network execution.
     public func receive(_ record: CKRecord) async throws {
         try checkSuspension()
-        let expectedGeneration = identityGeneration
-        try await validateAccount(generation: expectedGeneration)
-        // Enrollment relay zones are outside this engine's trusted item inventory.
-        guard addresses.values.contains(where: { $0.zoneID == record.recordID.zoneID }) else { return }
-        if record.recordType == NativeVaultProvisioningTransport.recordType
-            || record.recordID.recordName == "membership-head"
-            || record.recordID.recordName.hasPrefix("membership-") {
-            try await receiveControl(record, generation: expectedGeneration)
-            return
+        try await validateAccount(generation: identityGeneration)
+        guard receiveZoneIDs.contains(record.recordID.zoneID) else { return }
+            guard let contentPermit, engine != nil else { throw CloudSyncAdapterError.engineNotStarted }
+            let incoming = try record.recordID.zoneID == coordinationZoneID
+                ? PreparedCoordinationRecord.materialize(record, account: account)
+                : record.recordType == NativeVaultProvisioningTransport.recordType
+                    ? ContentMembershipTransport.materialize(record, account: account)
+                    : ContentRecordTransport.materialize(record, account: account, database: databaseName)
+            try await repository.stageIncoming(incoming, permit: contentPermit)
+
+    }
+
+    public func processIncomingOperation(_ operation: SyncOperation) async -> SyncOperationOutcome {
+        if let contentReception {
+            guard operation.account == account, operation.database == databaseName,
+                  operation.vaultID != nil, operation.zoneOwner == CKCurrentUserDefaultName else { return .attention(.invalidAuthority) }
+            guard engine != nil, !suspended, !stopping, let contentPermit else { return .retry(.transport) }
+            let expected = identityGeneration
+            do { try await validateAccount(generation: expected) }
+            catch { return .retry(.authorization) }
+            if operation.kind == .fetchContentVersion {
+                let fetcher = ContentVersionFetcher(repository: repository, account: account) { [weak self] id in
+                    guard let self else { throw CloudSyncAdapterError.operationInterrupted }
+                    return try await self.fetchContentVersionRecord(id)
+                }
+                return await fetcher.handle(operation, permit: contentPermit)
+            }
+            if operation.kind == .fetchMembership {
+                let fetcher = ContentMembershipFetcher(repository: repository, account: account, fetch: { [weak self] id in
+                    guard let self else { throw CloudSyncAdapterError.operationInterrupted }
+                    return try await self.fetchContentVersionRecord(id)
+                }, available: contentReception.dependencyAvailable)
+                return await fetcher.handle(operation, permit: contentPermit)
+            }
+            if [.prepareGrant, .rotateContent, .provision, .membership, .enrollment, .deletion, .recovery, .resolveConflict].contains(operation.kind) {
+                guard let work = contentReception.authorizedWork else { return .authorization }
+                if operation.kind == .rotateContent {
+                    return await performContentRotation(operation, permit: contentPermit, work: work)
+                }
+                if operation.kind == .membership {
+                    guard let owner = engine, !resolutionInProgress else { return .retry(.dependency) }
+                    resolutionInProgress = true; generation += 1
+                    let token = identityGeneration
+                    await owner.cancelOperations()
+                    do { try await checkContentRotationOwner(owner, generation: token) }
+                    catch { await finishResolution(engine: owner, generation: token); return .retry(.authorization) }
+                    let outcome = await work(operation, contentPermit)
+                    await finishResolution(engine: owner, generation: token)
+                    return outcome
+                }
+                return await work(operation, contentPermit)
+            }
+            guard operation.kind == .applyIncoming else { return .attention(.invalidAuthority) }
+            return await contentReception.apply(operation, contentPermit)
         }
-        let wireBytes: Data
-        do { wireBytes = try Self.wireBytes(record) }
-        catch {
-            suspend(.unreadableRemoteRecord)
-            throw CloudSyncAdapterError.unreadableRemoteRecord
-        }
-        let version: EncryptedItemVersion
+        return .attention(.invalidAuthority)
+    }
+
+    /// A security transition needs a bounded send barrier, not an engine
+    /// restart. Read back the head after cancellation before superseding an old
+    /// outbox: a lost acknowledgment must not be mistaken for an unsent edit.
+    private func performContentRotation(_ operation: SyncOperation, permit: ConflictPublicationPermit,
+        work: @Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome) async -> SyncOperationOutcome {
+        guard let owner = engine, !resolutionInProgress, let reception = contentReception,
+              let scope = try? JSONDecoder().decode(ItemScope.self, from: operation.payload),
+              scope.account == account, scope.database == databaseName, scope.vaultID == operation.vaultID,
+              scope.zoneOwner == operation.zoneOwner, address(for: scope) != nil else { return .retry(.dependency) }
+        resolutionInProgress = true; generation += 1
+        let expected = identityGeneration
+        let outcome: SyncOperationOutcome
         do {
-            version = try decode(record, bytes: wireBytes)
-            try await validator(version, .receiving)
+            await owner.cancelOperations()
+            try await validateAccount(generation: expected)
+            guard engine === owner, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
+            let readback = ContentRotationReadback(repository: repository, account: account) { [database] id in
+                try await database.record(for: id)
+            }
+            outcome = try await readback.perform(scope: scope, permit: permit, check: { [self] in
+                try await checkContentRotationOwner(owner, generation: expected)
+            }, apply: reception.apply, rotate: {
+                await work(operation, permit)
+            })
+        } catch let error as CKError { outcome = .retry(.transport, retryAfter: error.retryAfterSeconds) }
+        catch CloudSyncAdapterError.operationInterrupted { outcome = .retry(.authorization) }
+        catch { outcome = .retry(.transport) }
+        if expected == identityGeneration, engine === owner {
+            resolutionInProgress = false
+            do { try await registerPendingChanges() }
+            catch { lastFailure = cloudSyncFailure(error, fallback: .storageFailure) }
         }
-        catch CloudSyncAdapterError.membershipUnavailable {
-            suspend(.membershipUnavailable)
-            throw CloudSyncAdapterError.membershipUnavailable
-        } catch CloudSyncAdapterError.operationInterrupted {
-            suspend(.operationInterrupted)
-            throw CloudSyncAdapterError.operationInterrupted
-        } catch CloudSyncAdapterError.storageFailure {
-            suspend(.storageFailure)
-            throw CloudSyncAdapterError.storageFailure
-        } catch where cloudSyncFailure(error, fallback: .untrustedRecord) == .operationInterrupted {
-            // An interrupted validator has not established whether this record
-            // is trustworthy. Do not quarantine it or advance the durable token.
-            suspend(.operationInterrupted)
-            throw CloudSyncAdapterError.operationInterrupted
+        return outcome
+    }
+
+    public func resolveContentConflict<T: Sendable>(_ expected: EncryptedItemConflict, authorization: any RepositoryWritePermit,
+            commit: @Sendable (Data, any RepositoryWritePermit) async throws -> T) async throws -> T {
+        guard let owner = engine, contentReception != nil, let contentPermit, !resolutionInProgress else { throw CloudSyncAdapterError.engineNotStarted }
+        try authorization.withWritePermission {}; try contentPermit.withWritePermission {}
+        resolutionInProgress = true; generation += 1
+        let token = identityGeneration
+        do {
+            await owner.cancelOperations()
+            try await checkContentRotationOwner(owner, generation: token)
+            let scope = expected.remote.scope
+            let record = try await database.record(for: CKRecord.ID(recordName: scope.itemID.uuidString,
+                zoneID: CKRecordZone.ID(zoneName: SyncStoreLayout.contentZone(vault: scope.vaultID), ownerName: scope.zoneOwner)))
+            let incoming = try ContentRecordTransport.materialize(record, account: account)
+            guard incoming.bytes == expected.remote.ciphertext else {
+                try await repository.stageIncoming(incoming, permit: contentPermit)
+                throw ItemRepositoryError.staleConflict
+            }
+            try await checkContentRotationOwner(owner, generation: token)
+            try authorization.withWritePermission {}; try contentPermit.withWritePermission {}
+            let result = try await commit(incoming.systemFields, contentPermit)
+            await finishResolution(engine: owner, generation: token)
+            return result
         } catch {
-            // Persist opaque invalid input for recovery rather than applying it or dropping
-            // it while CKSyncEngine advances its change token.
-            try await repository.saveEngineState(wireBytes, account: account,
-                database: stateNamespace + ":quarantine:" + UUID().uuidString)
-            throw CloudSyncAdapterError.untrustedRecord
-        }
-        try await validateAccount(generation: expectedGeneration)
-        // Legacy devices may still publish signed health envelopes. They are
-        // optional derived data: authenticate above, retire old local uploads,
-        // and consume the cloud event without importing or merging the result.
-        if version.healthItemID != nil {
-            try await repository.retireHealthSynchronization(version)
-            return
-        }
-        if let accepted = try await repository.acceptedVersion(version.scope) {
-            // Authenticate the stored watermark too; an editable database column
-            // alone must not decide whether a signed remote version is fresh.
-            try await validator(accepted, .cached)
-        }
-        try await validateAccount(generation: expectedGeneration)
-        let fields = Self.systemFields(record)
-        let matching = try await repository.pendingMutation(matching: version)
-        let firstPending = try await repository.oldestPendingMutation(scope: version.scope)
-        guard expectedGeneration == identityGeneration, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
-        if let matching {
-            do { try await repository.acknowledge(mutationID: matching.id, account: account, serverSystemFields: fields) }
-            catch ItemRepositoryError.outOfOrderAcknowledgement {
-                try await repository.recordConflict(remote: version, serverSystemFields: fields)
-            }
-        } else if firstPending?.version.baseVersionID == version.versionID {
-            do { try await repository.rememberAcceptedVersion(version, serverSystemFields: fields) }
-            catch ItemRepositoryError.remoteVersionConflict {
-                try await repository.recordConflict(remote: version, serverSystemFields: fields)
-            }
-        } else if firstPending != nil {
-            try await repository.recordConflict(remote: version, serverSystemFields: fields)
-        } else {
-            do { try await repository.applyRemote(version, serverSystemFields: fields) }
-            catch ItemRepositoryError.remoteVersionConflict {
-                // A valid signature does not prove freshness. Preserve replays and
-                // equal-generation forks; higher signed generations allow catch-up
-                // when CloudKit coalesces intermediate item versions.
-                try await repository.recordConflict(remote: version, serverSystemFields: fields)
-            } catch ItemRepositoryError.pendingLocalChanges {
-                // A local save may have committed during the repository await.
-                try await repository.recordConflict(remote: version, serverSystemFields: fields)
-            } catch ItemRepositoryError.unresolvedConflict {
-                try await repository.recordConflict(remote: version, serverSystemFields: fields)
-            }
+            await finishResolution(engine: owner, generation: token)
+            throw error
         }
     }
 
+    private func checkContentRotationOwner(_ owner: CKSyncEngine, generation expected: Int) async throws {
+        try await validateAccount(generation: expected)
+        guard engine === owner, !stopping, resolutionInProgress else { throw CloudSyncAdapterError.operationInterrupted }
+    }
+
+    private func fetchContentVersionRecord(_ id: CKRecord.ID) async throws -> CKRecord {
+        let expected = identityGeneration
+        try await validateAccount(generation: expected)
+        guard engine != nil, !stopping, contentReception != nil,
+              addresses.values.contains(where: { $0.zoneID == id.zoneID }) else { throw CloudSyncAdapterError.invalidBinding }
+        let record = try await database.record(for: id)
+        try await validateAccount(generation: expected)
+        return record
+    }
+
     private func acknowledge(_ record: CKRecord) async throws {
-        let expectedGeneration = identityGeneration
-        try await validateAccount(generation: expectedGeneration)
-        let version = try decode(record)
-        if let mutation = try await repository.pendingMutation(matching: version) {
-            guard expectedGeneration == identityGeneration, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
-            do { try await repository.acknowledge(mutationID: mutation.id, account: account, serverSystemFields: Self.systemFields(record)) }
-            catch ItemRepositoryError.outOfOrderAcknowledgement {
-                try await repository.recordConflict(remote: version, serverSystemFields: Self.systemFields(record))
-            }
-        }
+        try await receive(record)
     }
 
     private func checkSuspension() throws {
@@ -716,9 +837,16 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         // Preserve the first cause even if subsequent callbacks fail because the
         // engine is suspended. A confirmed account change always takes priority.
         suspension.record(failure)
+        contentPermit?.invalidate()
         resolutionPermit?.invalidate()
         uploadsAllowed = false
         lastFailure = suspension.failure
+        if failure != .accountChanged, recoveryOperation == nil {
+            let operation = SyncOperation(account: account, database: databaseName, kind: .recoverTransport)
+            recoveryOperation = operation.id
+            let repository = repository
+            Task { try? await repository.enqueue(operation) }
+        }
     }
 
     private func validateAccount(generation expected: Int) async throws {
@@ -734,79 +862,14 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         try checkSuspension()
     }
 
-    private func decode(_ record: CKRecord, bytes: Data? = nil) throws -> EncryptedItemVersion {
-        guard record.recordType == Self.recordType else { throw CloudSyncAdapterError.malformedRecord }
-        let wire = try JSONDecoder().decode(CloudItemWireEnvelope.self, from: bytes ?? Self.wireBytes(record))
-        let version = EncryptedItemVersion(scope: ItemScope(account: account, vaultID: wire.vaultID, itemID: wire.itemID,
-            database: databaseName, zoneOwner: record.recordID.zoneID.ownerName),
-            versionID: wire.versionID, baseVersionID: wire.baseVersionID, ciphertext: wire.ciphertext,
-            isTombstone: wire.isTombstone, generation: wire.generation, healthItemID: wire.healthItemID)
-        guard let address = address(for: version.scope),
-              record.recordID.zoneID == address.zoneID,
-              record.recordID.recordName == version.scope.itemID.uuidString else { throw CloudSyncAdapterError.invalidBinding }
-        return version
-    }
-
-    /// Missing provisioning or verifier always denies publication. Native setup
-    /// confirms both history and head before this gate can open.
-    public func isPublicationReady(_ scope: VaultScope) async throws -> Bool {
-        try await VaultPublicationGate.isReady(scope, repository: repository, account: account,
-            database: databaseName, addresses: Array(addresses.values), validator: controlValidator)
-    }
-
     private func blockZone(_ zone: CKRecordZone.ID) async throws {
         for address in addresses.values where address.zoneID == zone {
-            try await repository.blockProvisioning(VaultScope(account: account, vaultID: address.vaultID,
-                database: databaseName, zoneOwner: address.ownerName))
-        }
-    }
-
-    private func receiveControl(_ record: CKRecord, generation expected: Int) async throws {
-        guard let address = addresses.values.first(where: { $0.zoneID == record.recordID.zoneID }) else {
-            throw CloudSyncAdapterError.invalidBinding
-        }
-        let scope = VaultScope(account: account, vaultID: address.vaultID, database: databaseName, zoneOwner: address.ownerName)
-        do {
-            guard let controlValidator, let state = try await repository.provisioning(scope),
-                  state.binding.address == address, state.phase == .controlConfirmed else { throw CloudSyncAdapterError.operationInterrupted }
-            guard record.recordType == NativeVaultProvisioningTransport.recordType,
-                  let bytes = record["membership"] as? Data, !bytes.isEmpty, bytes.count <= 512 * 1024 else {
-                throw VaultProvisioningError.controlMismatch
-            }
-            if record.recordID.recordName != "membership-head" {
-                let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-                guard record.recordID.recordName == "membership-" + digest else { throw VaultProvisioningError.controlMismatch }
-            }
-            try await controlValidator(state.binding, bytes)
-            try await validateAccount(generation: expected)
-        } catch {
-            if record.recordID.recordName != "membership-head",
-               (error as? CloudSyncAdapterError) == .membershipUnavailable {
-                // Immutable proposals can precede the conditional head update.
-                // The eventual head fetch retrieves its entire chain by digest;
-                // merely observing a proposal neither grants authority nor blocks
-                // fetching the head that will establish whether it was accepted.
-                return
-            }
-            let provenMismatch = (error as? VaultProvisioningError) == .controlMismatch
-                || (error as? CloudSyncAdapterError) == .untrustedRecord
-            if !provenMismatch {
-                // Protected storage, account retirement, and unavailable local
-                // trust are not evidence that a remote authority is invalid.
-                suspend(cloudSyncFailure(error, fallback: .storageFailure))
-                throw suspension.failure ?? .storageFailure
-            }
-            do {
-                try await validateAccount(generation: expected)
-                if let bytes = record["membership"] as? Data {
-                    try await repository.saveEngineState(bytes, account: account, database: stateNamespace + ":control-quarantine:" + UUID().uuidString)
-                }
+            let scope = VaultScope(account: account, vaultID: address.vaultID, database: databaseName, zoneOwner: address.ownerName)
+            // A newly created vault may be discovered locally before its
+            // journaled commissioning creates the zone. Do not poison that work.
+            if let state = try await repository.provisioning(scope), state.phase == .controlConfirmed {
                 try await repository.blockProvisioning(scope)
-            } catch {
-                suspend(cloudSyncFailure(error, fallback: .storageFailure))
-                throw error
             }
-            throw CloudSyncAdapterError.untrustedRecord
         }
     }
 
@@ -814,113 +877,31 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         addresses[scope.vaultID.uuidString + ":" + scope.zoneOwner]
     }
 
-    public static func makeRecord(_ version: EncryptedItemVersion, address: VaultCloudAddress,
-                                  serverSystemFields: Data? = nil, assetDirectory: URL? = nil) throws -> CKRecord {
-        guard address.vaultID == version.scope.vaultID, address.ownerName == version.scope.zoneOwner else { throw CloudSyncAdapterError.invalidBinding }
-        guard version.ciphertext.count <= EncryptedItemRepository.maximumCiphertextBytes else { throw ItemRepositoryError.oversizedCiphertext }
-        let id = CKRecord.ID(recordName: version.scope.itemID.uuidString, zoneID: address.zoneID)
-        let record: CKRecord
-        if let serverSystemFields {
-            let decoder = try NSKeyedUnarchiver(forReadingFrom: serverSystemFields)
-            decoder.requiresSecureCoding = true
-            guard let existing = CKRecord(coder: decoder), existing.recordID == id,
-                  existing.recordType == recordType else { throw CloudSyncAdapterError.invalidBinding }
-            decoder.finishDecoding()
-            record = existing
-        } else { record = CKRecord(recordType: recordType, recordID: id) }
-        let wire = CloudItemWireEnvelope(vaultID: version.scope.vaultID, itemID: version.scope.itemID,
-            versionID: version.versionID, baseVersionID: version.baseVersionID, ciphertext: version.ciphertext,
-            isTombstone: version.isTombstone, healthItemID: version.healthItemID, generation: version.generation)
-        let data = try JSONEncoder().encode(wire)
-        guard data.count <= maximumWireBytes else { throw ItemRepositoryError.oversizedCiphertext }
-        if data.count <= maximumInlineBytes {
-            record["envelope"] = data as CKRecordValue
-            record["envelopeAssets"] = nil
-        } else {
-            guard var assetDirectory else { throw CloudSyncAdapterError.assetDirectoryRequired }
-            let accountDirectory = SHA256.hash(data: Data(version.scope.account.utf8)).map { String(format: "%02x", $0) }.joined()
-            assetDirectory = assetDirectory.appendingPathComponent(accountDirectory, isDirectory: true)
-                .appendingPathComponent(version.scope.vaultID.uuidString, isDirectory: true)
-            try LocalFile.privateDirectory(assetDirectory)
-            var protection = URLResourceValues()
-            protection.isExcludedFromBackup = true
-            try assetDirectory.setResourceValues(protection)
-            var assets: [CKAsset] = []
-            for start in stride(from: 0, to: data.count, by: assetChunkBytes) {
-                let chunk = data.subdata(in: start..<min(start + assetChunkBytes, data.count))
-                let digest = SHA256.hash(data: chunk).map { String(format: "%02x", $0) }.joined()
-                let path = assetDirectory.appendingPathComponent(version.versionID.uuidString + "-" + digest + ".ciphertext")
-                if FileManager.default.fileExists(atPath: path.path) {
-                    guard try LocalFile.read(path, privateFile: true, limit: assetChunkBytes) == chunk else {
-                        throw CloudSyncAdapterError.invalidBinding
-                    }
-                } else {
-                    do { try LocalFile.write(chunk, to: path) }
-                    catch MopError.duplicate {
-                        guard try LocalFile.read(path, privateFile: true, limit: assetChunkBytes) == chunk else {
-                            throw CloudSyncAdapterError.invalidBinding
-                        }
-                    }
-                }
-                assets.append(CKAsset(fileURL: path))
+    /// The caller owns the publication lease. Never remove an asset referenced by
+    /// the outbox or an outstanding native batch, including failed/conflicted work.
+    private func cleanupUploadAssets(holding lease: SynchronizationLease) async throws {
+        defer { withExtendedLifetime(lease) {} }
+        let accountDirectory = SHA256.hash(data: Data(account.utf8)).map { String(format: "%02x", $0) }.joined()
+        let root = assetDirectory.appendingPathComponent(accountDirectory)
+        guard FileManager.default.fileExists(atPath: root.path) else { return }
+        var pending = try await repository.pendingAssetVersions(account: account, database: databaseName)
+        if contentReception?.coordination != nil {
+            pending.formUnion(try await repository.pendingCoordinationAssetOperations(account: account, database: databaseName))
+        }
+        let keep = pending.union(activeAssetVersions)
+        let directories = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        for directory in directories {
+            let attributes = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard UUID(uuidString: directory.lastPathComponent) != nil, attributes.isDirectory == true, attributes.isSymbolicLink != true else { continue }
+            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            for file in files where file.pathExtension == "ciphertext" {
+                guard let id = UUID(uuidString: String(file.lastPathComponent.prefix(36))), !keep.contains(id) else { continue }
+                let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                try FileManager.default.removeItem(at: file)
             }
-            record["envelope"] = nil
-            record["envelopeAssets"] = assets as CKRecordValue
         }
-        return record
     }
 
-    /// Decode transport bytes only. Never apply the returned version before signature,
-    /// membership, predecessor and scope validation by the application's verifier.
-    public static func unverifiedVersion(from record: CKRecord, account: String, database: String,
-                                         address: VaultCloudAddress) throws -> EncryptedItemVersion {
-        guard record.recordType == recordType else { throw CloudSyncAdapterError.malformedRecord }
-        let wire = try JSONDecoder().decode(CloudItemWireEnvelope.self, from: wireBytes(record))
-        guard wire.vaultID == address.vaultID, record.recordID.zoneID == address.zoneID,
-              record.recordID.recordName == wire.itemID.uuidString else { throw CloudSyncAdapterError.invalidBinding }
-        return EncryptedItemVersion(scope: ItemScope(account: account, vaultID: wire.vaultID, itemID: wire.itemID,
-            database: database, zoneOwner: address.ownerName), versionID: wire.versionID,
-            baseVersionID: wire.baseVersionID, ciphertext: wire.ciphertext, isTombstone: wire.isTombstone,
-            generation: wire.generation, healthItemID: wire.healthItemID)
-    }
 
-    /// Conflict error records are not guaranteed to carry downloaded asset files.
-    /// Always retrieve the current record, including all fields/assets. A newer
-    /// version arriving during the fetch is handled by normal authenticated receive.
-    static func fetchConflictRecord(_ id: CKRecord.ID,
-                                    fetch: (CKRecord.ID) async throws -> CKRecord) async throws -> CKRecord {
-        let record = try await fetch(id)
-        guard record.recordID == id, record.recordType == recordType else {
-            throw CloudSyncAdapterError.invalidBinding
-        }
-        return record
-    }
-
-    private static func wireBytes(_ record: CKRecord) throws -> Data {
-        if let data = record["envelope"] as? Data {
-            guard record["envelopeAssets"] == nil, data.count <= maximumInlineBytes else { throw CloudSyncAdapterError.malformedRecord }
-            return data
-        }
-        guard let assets = record["envelopeAssets"] as? [CKAsset], !assets.isEmpty,
-              assets.count <= (maximumWireBytes + assetChunkBytes - 1) / assetChunkBytes else {
-            throw CloudSyncAdapterError.malformedRecord
-        }
-        var result = Data()
-        for asset in assets {
-            guard let url = asset.fileURL else { throw CloudSyncAdapterError.malformedRecord }
-            // CloudKit owns downloaded temporary files; ownership/mode is not an
-            // authentication signal. LocalFile still rejects symlinks/nonregular files.
-            let bytes = try LocalFile.read(url, limit: assetChunkBytes)
-            guard !bytes.isEmpty, result.count <= maximumWireBytes - bytes.count else { throw CloudSyncAdapterError.malformedRecord }
-            result.append(bytes)
-        }
-        return result
-    }
-
-    private static func systemFields(_ record: CKRecord) -> Data {
-        let encoder = NSKeyedArchiver(requiringSecureCoding: true)
-        record.encodeSystemFields(with: encoder)
-        encoder.finishEncoding()
-        return encoder.encodedData
-    }
 }

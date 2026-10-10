@@ -90,7 +90,6 @@ struct ContentView: View {
                             Label("Connecting iCloud vault", systemImage: model.vaultIcon(descriptor))
                         } description: {
                             Text("This vault connects automatically. Open and unlock 2ndPass on an existing device so key access can sync.")
-                            if model.canPresent(.enrollDevice) { Button("Retry Connection") { model.enrollmentAction(.automaticEnrollment, vaultID: descriptor.id) } }
                         }
                     } else if model.authenticated {
                         VaultItemList(model: model)
@@ -311,8 +310,7 @@ struct ContentView: View {
         .safeAreaInset(edge: .bottom) {
             if model.hasPendingVaultDeletion {
                 HStack {
-                    Text("Vault deletion is pending.")
-                    Button("Retry") { model.retryVaultDeletions() }.disabled(model.busy || model.offline)
+                    ProgressView("Vault deletion is pending. Cleanup continues automatically.")
                 }.padding().frame(maxWidth: .infinity).background(.bar)
             }
         }

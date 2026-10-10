@@ -11,6 +11,7 @@ public protocol ItemVaultServiceBackend: Sendable {
     var operationProgress: String? { get }
     var operationFraction: Double? { get }
     var recoveryAvailable: Bool { get }
+    var deviceRemovalAvailable: Bool { get }
     func recovery(_ action: VaultManagement) async throws -> VaultResult
     func endRecoverySession()
     func recoveryState() async throws -> ItemRecoveryState?
@@ -27,10 +28,11 @@ public protocol ItemVaultServiceBackend: Sendable {
     func inventory(offline: Bool) async throws -> [VaultDescriptor]
     func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession
     func requestSync() async throws
-    func conflictAdapter() async throws -> CloudKitSyncAdapter
-    func activeConflictAdapter() async -> CloudKitSyncAdapter?
+    func enrollmentProgress() async throws -> [String: VaultEnrollmentProgress]
+    func synchronizationHealth() async throws -> SyncHealthSnapshot?
     func waitForDelivery(_ mutationIDs: [UUID], timeout: Duration) async throws -> Bool
     func creationMutations(_ vaultID: UUID) async throws -> [UUID]
+    func pendingDeliveryReceipts(vault: UUID?) async throws -> [UUID]
     func lock()
     func changes() async -> AsyncStream<Void>
     func existing(_ vaultID: UUID) async -> ItemVaultSession?
@@ -40,6 +42,7 @@ public extension ItemVaultServiceBackend {
     var operationProgress: String? { nil }
     var operationFraction: Double? { nil }
     var recoveryAvailable: Bool { false }
+    var deviceRemovalAvailable: Bool { false }
     func recovery(_ action: VaultManagement) async throws -> VaultResult { throw ItemVaultServiceFailure.unavailable }
     func endRecoverySession() {}
     func recoveryState() async throws -> ItemRecoveryState? { nil }
@@ -47,8 +50,6 @@ public extension ItemVaultServiceBackend {
     func deletionStates() async throws -> [UUID: VaultDeletionPhase] { [:] }
     func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase { throw ItemVaultServiceFailure.unavailable }
     func resumeDeletions() async throws -> [UUID: VaultDeletionPhase] { [:] }
-    func conflictAdapter() async throws -> CloudKitSyncAdapter { throw ItemVaultServiceFailure.unavailable }
-    func activeConflictAdapter() async -> CloudKitSyncAdapter? { nil }
     func discover() async throws -> ItemVaultDiscovery { try await ItemVaultDiscovery(vaults: inventory(), complete: true) }
     func invalidateDiscovery() {}
     func enrollment(_ action: VaultManagement, vaultID: UUID) async throws -> VaultResult { throw ItemVaultServiceFailure.unavailable }
@@ -62,7 +63,10 @@ public extension ItemVaultServiceBackend {
     func inventory(offline: Bool) async throws -> [VaultDescriptor] { try await inventory() }
     func waitForDelivery(_ mutationIDs: [UUID], timeout: Duration) async throws -> Bool { false }
     func creationMutations(_ vaultID: UUID) async throws -> [UUID] { [] }
+    func pendingDeliveryReceipts(vault: UUID?) async throws -> [UUID] { [] }
     func changes() async -> AsyncStream<Void> { AsyncStream { $0.finish() } }
+    func enrollmentProgress() async throws -> [String: VaultEnrollmentProgress] { [:] }
+    func synchronizationHealth() async throws -> SyncHealthSnapshot? { nil }
 }
 
 public enum ItemVaultServiceFailure: Error, LocalizedError, Equatable {
@@ -70,9 +74,9 @@ public enum ItemVaultServiceFailure: Error, LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .awaitingAdmission: "Waiting for encrypted items from another enrolled device. Synchronization will finish in the background."
-        case .enrollmentExpired: "This access request expired. Start a new request from the device you are connecting."
+        case .enrollmentExpired: "This access request expired. A replacement is prepared automatically when this device is unlocked."
         case .localStorageUnavailable: "The local encrypted vault store or device trust is unavailable. Unlock this device and try again."
-        case .synchronizationUnavailable: "Synchronization is unavailable. Previously saved local changes remain durable; try sync again when cloud access is restored."
+        case .synchronizationUnavailable: "Synchronization is unavailable. Previously saved local changes remain durable and resume when cloud access is restored."
         case .isolatedStateUnsupported: "Cloud vaults use the shared app-group database. A separate state directory is not supported."
         case .unavailable: "This feature is not available in the item-level vault backend yet. No legacy vault was changed."
         case .ambiguousVault: "Choose a vault by UUID; more than one vault has this name."
@@ -117,7 +121,6 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let projection: ItemCatalogProjection
         let sourceVersions: [UUID: UUID]
         let pending: ArraySlice<UUID>
-        let projectedIDs: Set<UUID>
         let waiting: [UUID: UUID]
         var versions: [UUID: UUID] { projection.versions }
         var entries: [UUID: ItemVaultCatalogEntry] { projection.entries }
@@ -180,6 +183,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     public var capabilities: Set<VaultServiceCapability> {
         var result: Set<VaultServiceCapability> = [.portableBackup, .enrollment, .passwordCheckCache]
         if backend.recoveryAvailable { result.insert(.recovery) }
+        if backend.deviceRemovalAvailable { result.insert(.deviceRemoval) }
         if backend.vaultDeletionAvailable { result.insert(.vaultDeletion) }
         return result
     }
@@ -230,6 +234,12 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         try await backend.requestSync()
         try checked(token)
     }
+    public func synchronizationHealth() async throws -> SyncHealthSnapshot? {
+        let token = sessionGeneration
+        let result = try await backend.synchronizationHealth()
+        try checked(token)
+        return result
+    }
     public var sessionGeneration: Int { state.withLock { $0.generation } }
     public var authenticatedAt: TimeInterval? { state.withLock { $0.authenticated } }
     public func changes() async -> AsyncStream<Void> {
@@ -246,23 +256,28 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         return pair.stream
     }
     public func events() async -> AsyncStream<VaultChange> {
-        let id = UUID(), pair = AsyncStream<VaultChange>.makeStream()
+        let id = UUID(), pair = AsyncStream<VaultChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
         displayListeners.withLock { $0[id] = pair.continuation }
         let backend = self.backend
         let pump = Task {
             for await _ in await backend.changes() {
                 guard !Task.isCancelled else { break }
-                pair.continuation.yield(.store)
+                Self.emitChange(.store, to: pair.continuation)
             }
         }
         pair.continuation.onTermination = { [weak self] _ in
             pump.cancel(); self?.displayListeners.withLock { $0[id] = nil }
         }
-        pair.continuation.yield(.store)
+        Self.emitChange(.store, to: pair.continuation)
         return pair.stream
     }
+    /// If a slow consumer loses a scoped hint, retain a full invalidation.
+    /// This bounds notification backlog without losing changes to another vault.
+    static func emitChange(_ event: VaultChange, to continuation: AsyncStream<VaultChange>.Continuation) {
+        if case .dropped = continuation.yield(event) { continuation.yield(.store) }
+    }
     private func displayChanged(_ vault: UUID) {
-        displayListeners.withLock { Array($0.values) }.forEach { $0.yield(.display(vault: vault.uuidString)) }
+        displayListeners.withLock { Array($0.values) }.forEach { Self.emitChange(.display(vault: vault.uuidString), to: $0) }
     }
     public func lock() {
         idleWork.activity()
@@ -291,7 +306,6 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let opening = authenticatedAt == nil
         let session = try await backend.open(id, offline: offline)
         if localHealthSessions.withLock({ $0[id] }) != ObjectIdentifier(session) {
-            try await session.retireLegacyHealthSynchronization()
             localHealthSessions.withLock { $0[id] = ObjectIdentifier(session) }
         }
         if opening { idleWork.activity() }
@@ -307,60 +321,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let token = sessionGeneration
         guard let id = UUID(uuidString: vault), let session = await backend.existing(id), session.isUnlocked else { return ItemVaultConflictCheck(choices: [], pending: 0) }
         let previews = try await session.conflictPreviews()
-        var remaining: [ItemVaultConflictPreview] = []
-        var duplicates = 0, resolved = 0, deferred = 0, failed = 0
-        if !previews.isEmpty { Self.conflictLogger.notice("Conflict cleanup starting; records=\(previews.count)") }
-        defer {
-            if !previews.isEmpty {
-                Self.conflictLogger.notice("Conflict cleanup finished; checked=\(resolved + remaining.count + deferred + failed) duplicates=\(duplicates) resolved=\(resolved) deferred=\(deferred) failed=\(failed)")
-            }
-        }
-        for start in stride(from: 0, to: previews.count, by: 25) {
-            try Task.checkCancellation()
-            try checked(token)
-            let batch = Array(previews[start..<min(start + 25, previews.count)])
-            var matching: [ItemVaultConflictPreview] = []
-            for preview in batch {
-                try Task.checkCancellation()
-                do {
-                    if try await session.isDuplicateConflict(preview.conflict) { matching.append(preview) }
-                    else { remaining.append(preview) }
-                } catch {
-                    try Task.checkCancellation()
-                    failed += 1
-                    if failed == 1 {
-                        let native = error as NSError
-                        Self.conflictLogger.error("Conflict comparison deferred: domain=\(native.domain, privacy: .public) code=\(native.code)")
-                    }
-                }
-            }
-            duplicates += matching.count
-            guard !matching.isEmpty else { continue }
-            guard let adapter = await backend.activeConflictAdapter() else {
-                deferred += matching.count; continue
-            }
-            do {
-                let results = try await session.resolveDuplicateConflictBatch(matching.map(\.conflict), coordinator: adapter)
-                for preview in matching {
-                    if case .success = results[preview.conflict.id] { resolved += 1 }
-                    else {
-                        failed += 1
-                        if failed == 1, case .failure(let error) = results[preview.conflict.id] {
-                            let native = error as NSError
-                            Self.conflictLogger.error("Duplicate conflict cleanup failed: domain=\(native.domain, privacy: .public) code=\(native.code)")
-                        }
-                    }
-                }
-            } catch {
-                try Task.checkCancellation()
-                failed += matching.count
-                let native = error as NSError
-                Self.conflictLogger.error("Duplicate conflict batch interrupted: domain=\(native.domain, privacy: .public) code=\(native.code)")
-            }
-            Self.conflictLogger.notice("Conflict cleanup progress; checked=\(resolved + remaining.count + deferred + failed)/\(previews.count) duplicates=\(duplicates) resolved=\(resolved) failed=\(failed)")
-        }
         try checked(token)
-        return ItemVaultConflictCheck(choices: remaining, pending: deferred + failed)
+        return ItemVaultConflictCheck(choices: previews, pending: 0)
     }
 
     public func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes {
@@ -376,24 +338,22 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     public func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws {
         let token = sessionGeneration
         guard let session = await backend.existing(preview.conflict.local.scope.vaultID), session.isUnlocked else { throw MopError.authentication }
-        let adapter = try await backend.conflictAdapter()
-        try checked(token)
-        do {
+        if let content = session.contentSession {
             switch choice {
-            case .remote:
-                _ = try await session.resolveConflictUsingRemote(preview.conflict, coordinator: adapter)
-            case .local:
-                _ = try await session.resolveConflict(preview.conflict, catalog: preview.local, coordinator: adapter)
+            case .remote: try await content.queueConflictChoice(preview.conflict, catalog: nil)
+            case .local: try await content.queueConflictChoice(preview.conflict, catalog: preview.local)
             case .combine(let metadata, let fields):
                 let patch = try await session.combinedConflict(preview.conflict, metadata: metadata, fields: fields)
-                _ = try await session.resolveConflict(preview.conflict, catalog: patch.catalog,
-                    changedRecords: patch.changedRecords, removedRecords: patch.removedRecords, coordinator: adapter)
+                try await content.queueConflictChoice(preview.conflict, catalog: patch.catalog,
+                    changedRecords: patch.changedRecords, removedRecords: patch.removedRecords)
             }
-        } catch {
-            if Authentication.requiresRenewal(error) { lock(); throw MopError.authentication }
-            throw error
+            try checked(token)
+            // The shared journal notifies the owner even if this process exits.
+            // Failure to wake is never reported as failure of the durable choice.
+            try? await backend.requestSync()
+            return
         }
-        try checked(token)
+        throw ContentStoreError.wrongLayout
     }
 
     public func cachedCatalog(vault: String) async throws -> VaultResult? {
@@ -490,35 +450,37 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         catalogUpdates.withLock { values in
             guard values[vault] == nil else { return }
             let task = Task(priority: .utility) { [weak self] in
-                do {
-                    var staleRetries = 0
-                    while !Task.isCancelled {
-                        do {
-                            guard let self else { break }
-                            let complete = try await self.idleWork.run {
-                                try await self.advanceCatalogProjection(session, token: token)
-                            }
-                            staleRetries = 0
-                            if complete { break }
-                        } catch ItemRepositoryError.staleLocalVersion where staleRetries < 2 {
-                            // An edit during this chunk invalidates its snapshot,
-                            // not the vault. Resnapshot at most twice, never spin.
-                            staleRetries += 1
+                var delay = 2.0
+                var preparedBatches = 0
+                while !Task.isCancelled {
+                    guard session.isUnlocked, self?.sessionGeneration == token else { break }
+                    do {
+                        guard let self else { break }
+                        // Keep UI projection batches small, but publish AutoFill
+                        // at most once per eight batches (128 items). Settling
+                        // or waiting for grants always flushes the remainder.
+                        let publishPartial = preparedBatches % 8 == 7
+                        let complete = try await self.idleWork.run {
+                            try await self.advanceCatalogProjection(session, token: token, publishPartial: publishPartial)
                         }
+                        preparedBatches += 1
+                        let recovered = self.catalogUpdateFailures.withLock { $0.removeValue(forKey: vault) != nil }
+                        if recovered { self.displayChanged(vault) }
+                        delay = 2
+                        if complete { break }
                         await Task.yield()
-                    }
-                } catch {
-                    if !Task.isCancelled, session.isUnlocked, self?.sessionGeneration == token {
+                    } catch {
+                        guard !Task.isCancelled, session.isUnlocked, self?.sessionGeneration == token else { break }
                         if let self {
-                            let accepted = self.state.withLock { current in
-                                guard current.generation == token, session.isUnlocked, !Task.isCancelled else { return false }
-                                self.catalogUpdateFailures.withLock {
-                                    $0[vault] = CatalogFailure(error: error, retryAfter: .now.advanced(by: .seconds(2)))
-                                }
-                                return true
+                            self.catalogUpdateFailures.withLock {
+                                $0[vault] = CatalogFailure(error: error, retryAfter: .now.advanced(by: .seconds(delay)))
                             }
-                            if accepted { self.displayChanged(vault) }
+                            self.displayChanged(vault)
                         }
+                        // A local projection retries independently of cloud transport.
+                        // Lock/session replacement cancels this task and drops plaintext.
+                        do { try await Task.sleep(for: .seconds(delay)) } catch { break }
+                        delay = min(delay * 2, 300)
                     }
                 }
                 self?.catalogUpdates.withLock { current in
@@ -528,7 +490,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             values[vault] = CatalogUpdate(id: identifier, task: task)
         }
     }
-    private func advanceCatalogProjection(_ session: ItemVaultSession, token: Int) async throws -> Bool {
+    private func advanceCatalogProjection(_ session: ItemVaultSession, token: Int, publishPartial: Bool) async throws -> Bool {
         try checked(token)
         let previous = catalogCache.withLock { $0[session.binding.vaultID] }
         _ = try await prepareCatalog(session, limit: 16)
@@ -552,8 +514,11 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             }
             let downloading = try await session.initialDownloadExpectedCount() != nil
             _ = await publish(enriched, session: session, token: token, complete: complete && !downloading)
-        } else {
-            let batch = try cached.projection.catalog(for: cached.projectedIDs.sorted { $0.uuidString < $1.uuidString })
+        } else if publishPartial {
+            let published = publishedCatalogs.withLock { $0[session.binding.vaultID] }
+                .flatMap { $0.session == ObjectIdentifier(session) ? $0.versions : nil } ?? [:]
+            let pending = cached.entries.values.filter { published[$0.itemID.uuidString] != $0.versionID.uuidString }.map(\.itemID)
+            let batch = try cached.projection.catalog(for: pending.sorted { $0.uuidString < $1.uuidString })
             _ = await publish(batch, session: session, token: token, complete: false)
         }
         if changed { displayChanged(session.binding.vaultID) }
@@ -575,11 +540,12 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             if try await backend.recoveryState()?.blocksRegularAccess == true { try await publisher?.prune(keeping: []) }
             return result
         }
-        if case .discover = operation {} else {
-            guard try await backend.recoveryState()?.blocksRegularAccess != true else { throw ItemRecoveryFailure.recoveryInProgress }
+        switch operation {
+        case .discover, .sync: break
+        default: guard try await backend.recoveryState()?.blocksRegularAccess != true else { throw ItemRecoveryFailure.recoveryInProgress }
         }
         switch operation {
-        case .manage(.automaticEnrollment), .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.checkEnrollment), .manage(.enrollmentInbox), .manage(.approveEnrollment), .manage(.confirmEnrollment), .manage(.cancelEnrollment), .manage(.rejectEnrollment), .manage(.devices): break
+        case .manage(.automaticEnrollment), .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.checkEnrollment), .manage(.enrollmentInbox), .manage(.approveEnrollment), .manage(.confirmEnrollment), .manage(.cancelEnrollment), .manage(.rejectEnrollment), .manage(.devices), .manage(.removeDevice): break
         case .discover, .catalog, .recentlyDeleted, .read, .save, .write, .delete, .deleteVault, .create, .restorePortable,
              .trashItem, .restoreItem, .rename, .exportPortable, .sync, .readHistory, .restoreHistory, .clearHistory, .passwordQuality, .savePasswordChecks: break
         default: throw ItemVaultServiceFailure.unavailable
@@ -621,7 +587,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             let phase = try await backend.deleteVault(id)
             var result = VaultResult(); result.deletionStatus = phase
             result.message = phase == .complete ? "Vault deleted. Updated devices erase their copies when they reconnect. Backups remain."
-                : "Vault deletion is pending. Run sync to resume; do not start another deletion."
+                : "Vault deletion is pending. Cleanup continues automatically."
             if phase != .prepared {
                 catalogUpdates.withLock { $0.removeValue(forKey: id) }?.task.cancel()
                 catalogCache.withLock { $0[id] = nil }; publishedCatalogs.withLock { $0[id] = nil }
@@ -630,25 +596,20 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             return result
         case .sync:
             guard !offline else { throw MopError.offlineWrite }
-            let deletions = try await backend.resumeDeletions()
-            var result = VaultResult()
-            if let pending = deletions.values.first(where: { $0 != .complete }) {
-                result.deletionStatus = pending; result.message = "Vault deletion is pending. Run sync again to retry."
-                return result
-            }
-            let selectedDeletion = vault.flatMap(UUID.init(uuidString:)).flatMap { deletions[$0] }
-            if (vault != nil && selectedDeletion == nil) || deletions.isEmpty {
-                let selected = try await select(vault, offline: false)
-                _ = try await opened(selected, token: token, offline: false)
-            }
             try await backend.requestSync()
-            result.message = deletions.isEmpty ? "Synchronization requested." : "Vault deletion completed. Synchronization requested."
+            var result = VaultResult()
+            result.message = "Synchronization requested."
+            result.mutationIDs = try await backend.pendingDeliveryReceipts(vault: vault.flatMap(UUID.init(uuidString:)))
+            if !result.mutationIDs.isEmpty {
+                result.saveStatus = .pending
+                await delivered(&result)
+            }
             return result
         case .discover:
             var result = VaultResult()
             if let recovery = try await backend.recoveryState(), recovery.blocksRegularAccess {
                 result.recoveryNeeded = true
-                result.vaults = recovery.vaults.map { VaultDescriptor(id: $0.uuidString, name: nil, format: "mop-items-v2", enrolled: false) }
+                result.vaults = recovery.vaults.map { VaultDescriptor(id: $0.uuidString, name: nil, format: "mop-content-v3", enrolled: false) }
                 try await publisher?.prune(keeping: [])
                 return result
             }
@@ -661,6 +622,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 guard let id = UUID(uuidString: descriptor.id), let phase = deletions[id] else { return false }
                 return phase != .prepared
             }
+            result.enrollmentProgress = (try? await backend.enrollmentProgress()) ?? [:]
             result.defaultVault = result.vaults.count == 1 ? result.vaults.first?.id : nil
             // Offline inventory is a complete local enrollment snapshot. Online
             // discovery may be partial; absence then is not evidence of removal.
@@ -1056,7 +1018,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             try? await session.seedNameIndex(projection.orderedIDs.compactMap { entries[$0] }, versions: projection.versions)
         }
         let prepared = CachedCatalog(session: ObjectIdentifier(session), projection: projection, sourceVersions: index,
-            pending: remaining, projectedIDs: changedIDs, waiting: waiting)
+            pending: remaining, waiting: waiting)
         try state.withLock { current in
             guard current.generation == token, session.isUnlocked else { throw MopError.authentication }
             catalogCache.withLock { $0[session.binding.vaultID] = prepared }
@@ -1183,21 +1145,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             try checked(token)
             return complete ? expected == versions : versions.allSatisfy { expected[$0.key] == $0.value }
         }
-        let batches: [ItemCatalog]
-        if !complete, delta.items.count > 16 {
-            batches = stride(from: 0, to: delta.items.count, by: 16).map { offset in
-                var batch = delta
-                batch.items = Array(delta.items[offset..<min(offset + 16, delta.items.count)])
-                return batch
-            }
-        } else { batches = [delta] }
-        var accepted = true
-        for batch in batches {
-            if try await !publisher.publish(catalog: batch, vaultID: vault.uuidString, complete: complete,
-                                             removing: [], deferred: deferred, validating: validate) {
-                accepted = false; break
-            }
-        }
+        // The background projector already coalesces partial work. Splitting
+        // again would repeat index reads and OS publication for each 16 rows.
+        let accepted = try await publisher.publish(catalog: delta, vaultID: vault.uuidString, complete: complete,
+                                                   removing: [], deferred: deferred, validating: validate)
         if accepted {
             state.withLock { value in
                 guard value.generation == token, session.isUnlocked else { return }
@@ -1221,7 +1172,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                 result.message = "Saved and confirmed by iCloud."
             } else { result.message = "Saved on this device; iCloud confirmation is pending. The durable save will retry automatically." }
         } catch {
-            result.message = "Saved on this device; iCloud confirmation is pending. Run sync when cloud access is available."
+            result.message = "Saved on this device; iCloud confirmation is pending. Delivery continues automatically when cloud access is available."
         }
     }
     private func renamed(_ catalog: ItemEnvelopeCatalog, to name: String) -> ItemEnvelopeCatalog {

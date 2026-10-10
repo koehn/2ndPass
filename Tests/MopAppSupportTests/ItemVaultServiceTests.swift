@@ -24,10 +24,7 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
         if offline { offlineOpens.withLock { $0 += 1 } }
         return try await open(vaultID)
     }
-    let conflictAdapterFailure = Mutex<CloudSyncAdapterError>(.engineNotStarted)
-    func conflictAdapter() async throws -> CloudKitSyncAdapter {
-        throw conflictAdapterFailure.withLock { $0 }
-    }
+
     func discover() async throws -> ItemVaultDiscovery {
         try await ItemVaultDiscovery(vaults: inventory(), complete: discoveryComplete.withLock { $0 })
     }
@@ -51,7 +48,7 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
         return result
     }
     func inventory() async throws -> [VaultDescriptor] {
-        names.withLock { values in values.map { VaultDescriptor(id: $0.key.uuidString, name: $0.value, format: "mop-items-v2", enrolled: true) } }
+        names.withLock { values in values.map { VaultDescriptor(id: $0.key.uuidString, name: $0.value, format: "mop-content-v3", enrolled: true) } }
     }
     func open(_ vaultID: UUID) async throws -> ItemVaultSession {
         guard let session = sessions.withLock({ $0[vaultID] }) else { throw MopError.vaultMissing }
@@ -143,7 +140,7 @@ func loginDestinationsUseCurrentMetadataWithoutReadingLoginItems(itemCount: Int)
     let service = ItemVaultService(backend: backend)
     let before = backend.unwrapCount
     let destinations = try await service.loginDestinations()
-    #expect(destinations == [VaultDescriptor(id: id.uuidString, name: "renamed", format: "mop-items-v2", enrolled: true)])
+    #expect(destinations == [VaultDescriptor(id: id.uuidString, name: "renamed", format: "mop-content-v3", enrolled: true)])
     #expect(backend.unwrapCount - before == 1)
     let latest = try await session.vaultMetadata()
     metadata.name = "renamed-again"
@@ -152,7 +149,7 @@ func loginDestinationsUseCurrentMetadataWithoutReadingLoginItems(itemCount: Int)
 }
 
 @Test(arguments: [false, true])
-func conflictChoicesExcludeDuplicatesEvenWithoutSyncAdapter(different: Bool) async throws {
+func conflictReviewDoesNotExecuteSynchronizationWork(different: Bool) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
     let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
@@ -169,8 +166,8 @@ func conflictChoicesExcludeDuplicatesEvenWithoutSyncAdapter(different: Bool) asy
     _ = try await repository.recordConflict(remote: original, serverSystemFields: Data([1]))
     let service = ItemVaultService(backend: backend)
     let report = try await service.checkConflicts(vault: id.uuidString)
-    #expect(report.choices.count == (different ? 1 : 0))
-    #expect(report.pending == (different ? 0 : 1))
+    #expect(report.choices.count == 1)
+    #expect(report.pending == 0)
     #expect(try await repository.conflicts(account: "service").count == 1)
 }
 
@@ -818,18 +815,6 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
     await #expect(throws: MopError.vaultConflict) {
         try await service.execute(.savePasswordChecks(checks, revision: "stale"), vault: id.uuidString, offline: true)
     }
-    // Simulate an old build's queued/conflicted health record. Opening with the
-    // new service retires only that work, without editing secret ciphertext.
-    let legacy = try #require(health.first)
-    _ = try await repository.commitLocalMutation(legacy)
-    _ = try await repository.recordConflict(remote: legacy, serverSystemFields: Data([1]))
-    let migrated = ItemVaultService(backend: backend)
-    _ = try await migrated.displayCatalog(vault: id.uuidString)
-    #expect(try await session.healthConflicts().isEmpty)
-    #expect(try await repository.healthItems(account: session.binding.account, vaultID: id).isEmpty)
-    #expect(try await repository.item(session.binding.item(itemID))?.ciphertext == original.ciphertext)
-    #expect(try await migrated.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog().security?.passwordChecks?.first?.breachResult == newer.breachResult)
-
     #expect(try await repository.pendingMutations(account: session.binding.account).allSatisfy { $0.version.healthItemID == nil })
 
 }
@@ -927,7 +912,7 @@ func waitForDisplay(_ service: ItemVaultService, vault: UUID,
     #expect(try await session.revisionIndex() == originalVersions)
 }
 
-@Test(arguments: [17, 257])
+@Test(arguments: [17, 257, 1025])
 func idlePreparationMaterializesOnlyRequestedSnapshots(itemCount: Int) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -950,7 +935,8 @@ func idlePreparationMaterializesOnlyRequestedSnapshots(itemCount: Int) async thr
     let work = try #require(service.catalogProjectionWork(vault: id))
     #expect(work.snapshots == 2) // Initial empty display and final inventory.
     #expect(work.sortedRows == itemCount) // Each row sorted once, not once per batch.
-    #expect(await publisher.partialRevisionCounts.allSatisfy { $0 <= 16 })
+    #expect(await publisher.partialRevisionCounts.allSatisfy { $0 <= 128 })
+    #expect(await publisher.partialCounts == Array(repeating: 128, count: itemCount / 128))
     #expect(await publisher.partialCounts.reduce(0, +) <= itemCount)
     let first = try #require(try await service.cachedCatalog(vault: id.uuidString)?.catalog)
     let second = try #require(try await service.cachedCatalog(vault: id.uuidString)?.catalog)

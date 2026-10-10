@@ -395,26 +395,23 @@ import XCTest
         XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 5), app.debugDescription)
         XCUIDevice.shared.orientation = .portrait
     }
-    func testTrustFailureOffersCancellableRepairOnLockedScreen() {
+    func testTrustFailurePreservesDataWithoutResetOrRefreshWorkarounds() {
         let app = XCUIApplication()
-        app.launchArguments += ["-icloud-connection-repair-enabled", "YES"]
         app.launchEnvironment["MOP_UI_TESTING"] = "1"
         app.launchEnvironment["MOP_UI_VAULT_TRUST_FAILURE"] = "1"
         app.launch()
         let alert = app.alerts["Operation not completed"]
         XCTAssertTrue(alert.waitForExistence(timeout: 10))
         alert.buttons["OK"].tap()
-        let repair = app.buttons["Repair iCloud Connection…"]
-        XCTAssertTrue(repair.waitForExistence(timeout: 5))
-        repair.tap()
-        XCTAssertTrue(app.buttons["Reset Connection"].waitForExistence(timeout: 5))
-        app.buttons["Cancel"].tap()
-        XCTAssertTrue(repair.exists)
-        XCTAssertFalse(app.buttons["Reconnect"].exists)
+        XCTAssertTrue(app.buttons["Unlock 2ndPass"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Repair iCloud Connection…"].exists)
+        XCTAssertFalse(app.buttons["Reset Connection"].exists)
+        XCTAssertFalse(app.buttons["Refresh"].exists)
+        XCTAssertFalse(app.buttons["Retry Sync Check"].exists)
         XCUIDevice.shared.press(.home)
         app.activate()
         XCTAssertFalse(alert.waitForExistence(timeout: 3))
-        XCTAssertTrue(repair.exists)
+        XCTAssertFalse(app.buttons["Reset Connection"].exists)
     }
     func testTrustFailureDoesNotAutomaticallyRetry() {
         let app = XCUIApplication()

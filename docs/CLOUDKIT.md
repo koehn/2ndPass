@@ -1,66 +1,30 @@
-# Item CloudKit schema
+# V3 item CloudKit schema
 
-Current application entry points use `ItemVaultSyncRuntime` and `CloudKitSyncAdapter`, backed by a device-local Core Data store. Validate the configured Development schema before an explicit Production deployment; device checks do not establish Production readiness.
+The native clients use one `ItemVaultSyncRuntime` and one CKSyncEngine per private account/database. Trusted vaults use `MopContent3-UUID`; account coordination uses `MopCoordination3`. Initial zone inventory seeds discovery; subsequent zone/account changes maintain the local index. Addresses never establish trust. CKSyncEngine owns the `mop-content-v3-private` subscription and transport retries; the application delegate only registers for notifications and routes wake hints.
 
-Each owned private vault uses a custom zone `MopItems-UUID`. A single CKSyncEngine handles the trusted, commissioned zones in one account/database. The independently pinned control record must be verified before item publication; zone creation is controlled by durable commissioning state, not queued blindly into CKSyncEngine.
+| Zone | Type | Record name | Fields |
+| --- | --- | --- | --- |
+| Vault | `MopMembershipControlV1` | `membership-head`, immutable membership digest | `membership`: Bytes |
+| Vault | `MopContentHeadV3` | item/settings UUID | `payload`: Bytes, `asset`: Asset or `assets`: Asset list |
+| Vault | `MopContentVersionV3` | item UUID + version UUID | `payload`: Bytes, `asset`: Asset or `assets`: Asset list |
+| Vault | `MopContentGrantV3` | item UUID + signed grant digest | `payload`: Bytes |
+| Coordination | `MopCoordinationDiscoveryV3` | kind + vault UUID + identity UUID | `payload`: Bytes, or `asset`: Asset |
+| Coordination | `MopCoordinationEnrollmentRequestV3` | same routing pattern | `payload`: Bytes |
+| Coordination | `MopCoordinationEnrollmentApprovalV3` | same routing pattern | `payload`: Bytes, or `asset`: Asset |
+| Coordination | `MopCoordinationEnrollmentAcknowledgmentV3` | same routing pattern | `payload`: Bytes |
+| Coordination | `MopCoordinationGrantRequestV3` | same routing pattern | `payload`: Bytes |
+| Coordination | `MopCoordinationDeletionV3` | same routing pattern | `payload`: Bytes, or `asset`: Asset |
 
-| Type | Record name | Fields |
-| --- | --- | --- |
-| `MopMembershipControlV1` | `membership-head` or the immutable membership name | `membership`: Bytes containing signed public authority |
-| `MopEncryptedItemV1` | item/settings UUID | `envelope`: Bytes for small encrypted envelopes, or `envelopeAssets`: Asset list for larger envelopes |
+Names use colon separators; the codecs define canonical UUID casing. Inline payloads are limited to 512 KiB, grants to 16 KiB, coordination approvals to 16 MiB, deletion notices to 1 MiB and other coordination messages to 256 KiB. Existing content size limits apply; larger content uses 16 MiB asset chunks. Downloaded assets are copied into the durable inbox before an engine token can advance. The account inbox budget is 256 MiB with the specified single-record exception; quarantine payloads are limited to 32 MiB.
 
-The adapter uses inline bytes through 512 KiB and 16 MiB asset chunks above that. These are encrypted complete item envelopes; independent attachment/blob transfer is still pending. CKSyncEngine handles change tokens, native push scheduling and retry behavior. Durable Core Data mutations and receipts bridge process exits. No automatic `NSPersistentCloudKitContainer` mirroring is enabled alongside it. Shared recipient enrollment and CKShare creation remain unavailable.
+Membership genesis and head commissioning are durable operations. Membership advancement uses conditional head writes and exact readback after an uncertain result. Only independently verified committed heads advance trust. Content publication sends an immutable version before its mutable head; only the exact head echo confirms its receipt. Grants are independently signed and delivered.
 
+Deletion notices retain the signed terminal statement and its authenticated membership history, so returning devices can verify against their independent pins after the item zone has been deleted. Removing a cloud zone without a verified notice never authorizes local erasure. Completed enrollment relays are deleted only after the recipient's durable acknowledgment; compact receipts remain for 30 days. Legacy `MopItems-*`, enrollment and deletion zones remain untouched.
 
-## Enrollment and provisioning
+## Release validation
 
-The private `MopEnrollment-v1` zone relays scoped enrollment packets using `MopMembershipControlV1.membership`. Discovery and relay fetching complement CKSyncEngine item transfer. An existing device must be unlocked to sign admission and rewrap keys.
+Use the same signed container, environment, App Group and Keychain access group for app, CLI and AutoFill. Export the complete Development schema, add these types without dropping existing types, validate it, and inspect it before any explicit Production deployment. Do not reset schema or publish a real deletion notice as a probe. This implementation does not deploy schema.
 
-Persist commissioning intent before control publication. Verify independently pinned signed membership history/head before permitting item uploads. Once control publication may have reached the server, a missing zone is a recovery condition, not permission to silently recreate it. Discovery alone never installs a trust pin.
+Independent cryptographic review and signed physical macOS/iOS tests must pass before Production activation. Test disposable vaults with offline edits, enrollment during editing, relaunch, missing notifications, locked prepared transfers, background suspension, recovery, returning old devices and deletion interruption. Require convergence at the next execution opportunity without Refresh. OS scheduling does not promise background delivery by a fixed time. Subscription/billing synchronization and cross-account sharing are separate systems.
 
-Provision the app, AutoFill and separate CLI for the same container, environment, App Group and Keychain access group. Validate with disposable zones and signed clients. See [validation](VALIDATION.md) and [architecture](VAULT.md).
-
-## Permanent vault deletion
-
-Updated clients use a separate private zone, `MopVaultDeletions1`. Add this record
-before enabling Production deletion:
-
-| Type | Record name | Fields |
-| --- | --- | --- |
-| `MopVaultDeletionV1` | vault UUID | `notice`: Bytes, maximum 1 MiB |
-
-Use the same private-record permissions as the existing owner records. Notices
-are create-only, owner-signed terminal statements rooted in independently pinned
-membership. They include account/container/environment/zone binding and the
-shared genesis digest, not a device-local setup receipt. Never expire or delete
-these notices. They contain public authorization history but no vault name or
-secrets. No query indexes are needed; clients fetch by record ID.
-
-Deletion is available in Development. Production initiation is disabled unless
-`MopAppSupport` is built with `MOP_VAULT_DELETION` (Xcode Swift active compilation
-conditions, or SwiftPM `-Xswiftc -DMOP_VAULT_DELETION`). Keep that condition absent
-until the schema is deployed and two signed devices pass the checks below.
-Receiving authenticated notices and retrying existing operations do not depend
-on the initiation flag.
-
-1. Export the current Development schema with `cktool`, add the record type and
-   bytes field, validate, and import the complete schema without dropping existing
-   types. Review and deploy the schema in CloudKit Console before enabling the
-   Production build condition. Never reset the schema or create a real deletion
-   notice as a schema probe.
-2. On disposable vaults, confirm typed-name deletion and
-   `sp vault delete --vault UUID --confirm UUID`. Verify that history and pending
-   edits disappear, a second connected device purges its copy, and an offline
-   second device purges after reconnecting.
-3. Interrupt after notice publication and after zone deletion, relaunch, then use
-   the app's retry action or `sp vault sync`. Verify completion, keychain/cache
-   cleanup, and preservation of another vault and exported backups.
-4. Verify an older client does not recreate the missing zone. Older/offline
-   clients and exported backups cannot be remotely erased by this protocol.
-
-The local journal distinguishes prepared, publication uncertain, committed,
-cloud deleted, and complete. Uncertain publication blocks access until resolved.
-The authenticated commitment atomically removes ciphertext and the outbox; cloud
-zone deletion and scoped cache/key cleanup are idempotent retries. A missing zone
-without a verified notice never authorizes local erasure. This is logical deletion,
-not a guarantee of forensic erasure of SQLite pages, OS snapshots, or backups.
+Production connections are disabled unless `MopAppSupport` is compiled with `MOP_CONTENT_SYNC_V3_REVIEWED`. Leave this condition absent until schema validation, independent cryptographic review and physical-client acceptance are recorded. This flag is not enabled by this change.

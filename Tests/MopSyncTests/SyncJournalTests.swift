@@ -1,0 +1,876 @@
+import Foundation
+import Testing
+import Synchronization
+@testable import MopSync
+
+@Suite struct SyncJournalTests: Sendable {
+    private func journalStore() throws -> (URL, EncryptedItemRepository) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-journal-" + UUID().uuidString)
+        return (root, try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite")))
+    }
+    private func incoming(_ id: String, account: String = "a", bytes: Int = 10) -> IncomingRecord {
+        IncomingRecord(id: id, account: account, database: "private", zoneName: "zone", zoneOwner: "owner",
+            recordName: id, recordType: "item", bytes: Data(repeating: 1, count: bytes), systemFields: Data())
+    }
+
+    @Test func journalPersistsExactPublicationAndRejectsStaleCompletion() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let work = SyncOperation(account: "a", kind: .enrollment, payload: Data([1, 2, 3]))
+        #expect(try await repository.enqueue(work) == work)
+        let waiting = try await repository.transition(work, to: .retryScheduled, failure: .transport,
+            nextAttempt: Date(timeIntervalSince1970: 100), attempted: true)
+        let reopened = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        #expect(try await reopened.operations(account: "a", database: "private") == [waiting])
+        #expect(try await reopened.enqueue(work) == waiting)
+        await #expect(throws: SyncJournalError.staleOperation) { try await repository.transition(work, to: .completed) }
+        let collision = SyncOperation(id: work.id, account: "a", kind: .enrollment, payload: Data([4]))
+        await #expect(throws: SyncJournalError.identityCollision) { try await repository.enqueue(collision) }
+        #expect(try await repository.operations(account: "other", database: "private").isEmpty)
+    }
+
+    @Test func incomingBudgetNeverEvictsUnappliedRecordsAndAllowsSingleLargeRecord() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let first = incoming("first", bytes: 101)
+        _ = try await repository.stageIncoming(first, budget: 100)
+        _ = try await repository.stageIncoming(first, budget: 100)
+        await #expect(throws: SyncJournalError.inboxFull) { try await repository.stageIncoming(incoming("second"), budget: 100) }
+        #expect(try await repository.incomingRecords(account: "a", database: "private") == [first])
+        #expect(try await repository.syncHealth(account: "a", database: "private").pendingCount == 1)
+        _ = try await repository.stageIncoming(incoming("other", account: "b"), budget: 100)
+        let reopened = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        #expect(try await reopened.incomingRecords(account: "a", database: "private") == [first])
+        try await repository.completeIncoming(first)
+        #expect(try await repository.incomingRecords(account: "a", database: "private").isEmpty)
+        #expect(try await repository.operations(account: "a", database: "private").first?.state == .completed)
+    }
+
+    @Test func independentIncomingWritersCannotExceedAccountBudget() async throws {
+        let (root, first) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let second = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        async let one: IncomingRecord? = try? first.stageIncoming(incoming("one", bytes: 60), budget: 100)
+        async let two: IncomingRecord? = try? second.stageIncoming(incoming("two", bytes: 60), budget: 100)
+        let results = await [one, two]
+        #expect(results.compactMap { $0 }.count == 1)
+        #expect(try await first.incomingRecords(account: "a", database: "private").count == 1)
+    }
+
+    @Test func localSaveAndDeliveryUpdateJournalAtomically() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let version = EncryptedItemVersion(scope: ItemScope(account: "a", vaultID: UUID(), itemID: UUID()),
+            baseVersionID: nil, ciphertext: Data([1]))
+        let mutation = try await repository.commitLocalMutation(version)
+        #expect(try await repository.operations(account: "a", database: "private").filter { $0.kind == .publishItem }.map(\.id) == [mutation.id])
+        #expect(try await repository.syncHealth(account: "a", database: "private").pendingCount == 2)
+        try await repository.acknowledge(mutationID: mutation.id, account: "a", serverSystemFields: Data([2]))
+        let health = try await repository.syncHealth(account: "a", database: "private")
+        #expect(health.pendingCount == 1) // the account reconciliation wake remains
+        #expect(health.lastDeliveryAt != nil)
+    }
+
+    @Test func retryPolicyIsBoundedAndHonorsServerThrottle() {
+        #expect(SyncRetryPolicy.delay(attempt: 1, jitter: 0) == 2)
+        #expect(SyncRetryPolicy.delay(attempt: 2, jitter: 0) == 4)
+        #expect(SyncRetryPolicy.delay(attempt: 100, jitter: 1) == 360)
+        #expect(SyncRetryPolicy.delay(attempt: 1, jitter: -1) == 1.6)
+        #expect(SyncRetryPolicy.delay(attempt: 1, jitter: 0, retryAfter: 900) == 900)
+    }
+
+    @Test func quarantineDeduplicatesAndEvictsPayloadWithoutLosingDiagnostics() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        for _ in 0..<2 {
+            try await repository.quarantine(Data(repeating: 1, count: 60), account: "a", database: "private",
+                zone: "zone", owner: "owner", record: "one", now: Date(timeIntervalSince1970: 1), budget: 100)
+        }
+        try await repository.quarantine(Data(repeating: 2, count: 60), account: "a", database: "private",
+            zone: "zone", owner: "owner", record: "two", now: Date(timeIntervalSince1970: 2), budget: 100)
+        let summary = try await repository.quarantineSummary(account: "a")
+        #expect(summary.records == 2)
+        #expect(summary.retainedBytes == 60)
+        #expect(try await repository.quarantineSummary(account: "b").records == 0)
+    }
+
+    private actor JournalBarrier {
+        private var entered = false
+        private var entry: CheckedContinuation<Void, Never>?
+        private var resumes: [UUID: CheckedContinuation<Void, Never>] = [:]
+        func wait() async {
+            let id = UUID()
+            entered = true; entry?.resume(); entry = nil
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled { continuation.resume() }
+                    else { resumes[id] = continuation }
+                }
+            } onCancel: { Task { await self.cancel(id) } }
+        }
+        private func cancel(_ id: UUID) { resumes.removeValue(forKey: id)?.resume() }
+        func waitForEntry() async { if !entered { await withCheckedContinuation { entry = $0 } } }
+        func release() { let all = resumes; resumes = [:]; all.values.forEach { $0.resume() } }
+    }
+
+    @Test func stoppedCoordinatorCannotCommitLateHandlerResult() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let work = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
+        let barrier = JournalBarrier()
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.enrollment],
+            dependencyAvailable: { _ in false }, handler: { _ in await barrier.wait(); return .completed })
+        let startup = Task { await coordinator.start() }
+        await barrier.waitForEntry()
+        await coordinator.stop()
+        await barrier.release()
+        await startup.value
+        await coordinator.waitUntilIdle()
+        #expect(try await repository.operations(account: "a", database: "private") == [work])
+    }
+
+    @Test func throttleDeadlineCannotScheduleAnExpiredBusyLoop() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 100), deadline = Date(timeIntervalSince1970: 1000)
+        let operation = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
+        _ = try await repository.transition(operation, to: .retryScheduled, failure: .transport,
+            nextAttempt: now.addingTimeInterval(-10), retryNotBefore: deadline)
+        let timer = JournalBarrier(), scheduled = Mutex<Date?>(nil), calls = Mutex(0)
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.enrollment],
+            clock: SyncClock(now: { now }, sleep: { date in
+                scheduled.withLock { $0 = date }; await timer.wait()
+            }, jitter: { 0 }), dependencyAvailable: { _ in false }, handler: { _ in
+                calls.withLock { $0 += 1 }; return .completed
+            })
+        await coordinator.start()
+        await timer.waitForEntry()
+        #expect(scheduled.withLock { $0 } == deadline)
+        #expect(calls.withLock { $0 } == 0)
+        await coordinator.stop()
+        await timer.release()
+    }
+
+    @Test func coordinatorRetriesAutomaticallyAtPersistedDeadline() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Mutex(Date(timeIntervalSince1970: 100))
+        let timer = JournalBarrier()
+        let calls = Mutex(0)
+        let work = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.enrollment],
+            clock: SyncClock(now: { now.withLock { $0 } }, sleep: { deadline in
+                if deadline > now.withLock({ $0 }) { await timer.wait() }
+            }, jitter: { 0 }),
+            dependencyAvailable: { _ in false }, handler: { _ in
+                let count = calls.withLock { $0 += 1; return $0 }
+                return count == 1 ? .retry(.transport) : .completed
+            })
+        let changes = await repository.changes()
+        await coordinator.start()
+        await timer.waitForEntry()
+        let retry = try #require(try await repository.operations(account: "a", database: "private").first)
+        #expect(retry.state == .retryScheduled)
+        #expect(retry.nextAttempt == Date(timeIntervalSince1970: 102))
+        now.withLock { $0 = Date(timeIntervalSince1970: 102) }
+        await timer.release()
+        for await _ in changes {
+            if try await repository.operations(account: "a", database: "private").first?.state == .completed { break }
+        }
+        await coordinator.stop(); await coordinator.waitUntilIdle()
+        #expect(calls.withLock { $0 } == 2)
+        #expect(try await repository.operations(account: "a", database: "private").first?.id == work.id)
+    }
+
+    @Test func replayAfterCompletedIncomingRearmsDurableApplication() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let record = incoming("replayed")
+        _ = try await repository.stageIncoming(record)
+        try await repository.completeIncoming(record)
+        _ = try await repository.stageIncoming(record)
+        #expect(try await repository.operations(account: "a", database: "private").first?.state == .ready)
+        #expect(try await repository.incomingRecords(account: "a", database: "private") == [record])
+    }
+
+    @Test func quarantinedIncomingRemainsVisibleAsAnActionableHealthFailure() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let record = incoming("untrusted")
+        _ = try await repository.stageIncoming(record)
+        try await repository.completeIncoming(record, failure: .invalidAuthority)
+        let health = try await repository.syncHealth(account: "a", database: "private")
+        #expect(health.pendingCount == 1)
+        #expect(health.blockedReasons == [.invalidAuthority])
+        #expect(try await repository.incomingRecords(account: "a", database: "private").isEmpty)
+    }
+
+    @Test func foregroundWakeCannotBypassServerRetryAfter() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
+        let calls = Mutex(0), now = Date(timeIntervalSince1970: 100)
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.enrollment],
+            clock: SyncClock(now: { now }, sleep: { _ in try await Task.sleep(for: .seconds(60)) }, jitter: { 0 }),
+            dependencyAvailable: { _ in false }, handler: { _ in
+                calls.withLock { $0 += 1 }
+                return .retry(.transport, retryAfter: 30)
+            })
+        await coordinator.start(); await coordinator.waitUntilIdle()
+        await coordinator.wake(reason: .foreground); await coordinator.waitUntilIdle()
+        #expect(calls.withLock { $0 } == 1)
+        #expect(try await repository.operations(account: "a", database: "private").first?.retryNotBefore == now.addingTimeInterval(30))
+        await coordinator.stop(); await coordinator.waitUntilIdle()
+    }
+
+    private struct JournalWritePermit: RepositoryWritePermit {
+        func withWritePermission<T>(_ body: () throws -> T) throws -> T { try body() }
+    }
+
+    @Test func receiptExpiryPreservesSupersededVersionReplayProtection() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID())
+        let base = EncryptedItemVersion(scope: scope, baseVersionID: nil, ciphertext: Data([1]))
+        try await repository.applyRemote(base, serverSystemFields: Data([1]))
+        let second = EncryptedItemVersion(scope: scope, baseVersionID: base.versionID, ciphertext: Data([2]), generation: 2)
+        _ = try await repository.commitLocalMutation(second)
+        let third = EncryptedItemVersion(scope: scope, baseVersionID: second.versionID, ciphertext: Data([3]), generation: 3)
+        let pending = try await repository.commitLocalMutation(third)
+        let remote = EncryptedItemVersion(scope: scope, baseVersionID: base.versionID, ciphertext: Data([4]), generation: 2)
+        let conflict = try await repository.recordConflict(remote: remote, serverSystemFields: Data([2]))
+        _ = try await repository.resolveConflictUsingRemote(conflict, authorization: JournalWritePermit())
+        try await repository.pruneCompletedOperations(account: "a", database: "private", now: Date().addingTimeInterval(31 * 86400))
+        #expect(try await repository.mutationReceipt(id: pending.id, account: "a") == nil)
+        await #expect(throws: ItemRepositoryError.remoteVersionConflict) {
+            try await repository.applyRemote(third, serverSystemFields: Data([3]))
+        }
+        #expect(try await repository.item(scope) == remote)
+    }
+}
+
+extension SyncJournalTests {
+    private func previewStore() throws -> (URL, EncryptedItemRepository) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-content-" + UUID().uuidString)
+        return (root, try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3))
+    }
+    private func policy(_ membership: Character = "a", recipients: Set<String>? = nil, authority: Character = "a") -> ContentRecipientPolicy {
+        ContentRecipientPolicy(membership: String(repeating: membership, count: 64),
+            recipients: recipients ?? [String(repeating: "b", count: 64)], keyAuthority: String(repeating: authority, count: 64))
+    }
+    private func content(scope: ItemScope, policy: ContentRecipientPolicy, base: PreparedContentVersion? = nil,
+                         key: UUID? = nil) -> PreparedContentVersion {
+        PreparedContentVersion(version: EncryptedItemVersion(scope: scope, baseVersionID: base?.version.versionID,
+            ciphertext: Data(UUID().uuidString.utf8), generation: (base?.version.generation ?? 0) + 1),
+            keyGeneration: key ?? base?.keyGeneration ?? UUID(), contentRevision: UUID(),
+            membership: policy.membership, keyAuthority: policy.keyAuthority)
+    }
+    private func grant(_ content: PreparedContentVersion, recipient: String = String(repeating: "b", count: 64),
+                       id: Character = "c", bytes: Data = Data([1, 2, 3])) -> PreparedContentGrant {
+        PreparedContentGrant(scope: content.version.scope, keyGeneration: content.keyGeneration, recipient: recipient,
+            identifier: String(repeating: id, count: 64), bytes: bytes)
+    }
+    private func vaultScope(_ item: ItemScope) -> VaultScope {
+        VaultScope(account: item.account, vaultID: item.vaultID, database: item.database, zoneOwner: item.zoneOwner)
+    }
+
+    @Test func previewContentAndExactGrantsCommitAndReopenTogether() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID()), policy = policy()
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: policy, authorization: JournalWritePermit())
+        let content = content(scope: scope, policy: policy), grant = grant(content)
+        let prerequisite = SyncOperation(account: scope.account, vaultID: scope.vaultID, kind: .membership, payload: Data([5, 6]))
+        let mutation = try await repository.commitContent(content, grants: [grant], expectedPolicy: policy,
+            prerequisites: [prerequisite], authorization: JournalWritePermit())
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(try await reopened.contentState(scope: scope)?.versionID == content.version.versionID)
+        #expect(try await reopened.pendingMutations(account: "a") == [mutation])
+        #expect(try await reopened.contentGrants(scope: scope, keyGeneration: content.keyGeneration) == [grant])
+        #expect(try await reopened.missingContentGrants(scope: vaultScope(scope)).isEmpty)
+        let operations = try await reopened.operations(account: "a", database: "private")
+        #expect(try JSONDecoder().decode(PreparedContentGrant.self, from: #require(operations.first { $0.kind == .grant }).payload) == grant)
+        #expect(operations.contains(prerequisite))
+        let publication = try #require(operations.first { $0.kind == .publishItem })
+        #expect(publication.state == .waitingForDependency)
+        #expect(publication.dependencies == [SyncDependency(.operation, identifier: prerequisite.id.uuidString)])
+        #expect(operations.first { $0.kind == .grant }?.dependencies == publication.dependencies)
+        #expect(try await reopened.contentGrantDelivery(grant) == .queued)
+        try await reopened.acknowledgeContentGrant(grant, serverSystemFields: Data([9]))
+        #expect(try await repository.contentGrantDelivery(grant) == .cloudConfirmed)
+        try await reopened.acknowledgeContentGrant(grant, serverSystemFields: Data([9]), now: Date().addingTimeInterval(29 * 86_400))
+        #expect(try await repository.contentGrantDelivery(grant, now: Date().addingTimeInterval(31 * 86_400)) == .expiredOrUnknown)
+        #expect(try await repository.pendingMutations(account: "a") == [mutation])
+    }
+
+    @Test func previewGrantFailureRollsBackContentOutboxAndReceipt() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID()), policy = policy()
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: policy, authorization: JournalWritePermit())
+        let content = content(scope: scope, policy: policy)
+        await #expect(throws: ContentStoreError.invalidRecord) {
+            try await repository.commitContent(content, grants: [grant(content, bytes: Data())], expectedPolicy: policy,
+                prerequisites: [SyncOperation(account: scope.account, vaultID: scope.vaultID, kind: .provision, payload: Data([7]))],
+                authorization: JournalWritePermit())
+        }
+        #expect(try await repository.contentState(scope: scope) == nil)
+        #expect(try await repository.pendingMutations(account: "a").isEmpty)
+        #expect(try await repository.operations(account: "a", database: "private").isEmpty)
+        #expect(try await repository.contentGrants(scope: scope, keyGeneration: content.keyGeneration).isEmpty)
+    }
+
+    @Test func previewEnrollmentIndexesGrantsWithoutReplacingPendingEdits() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID()), original = policy()
+        let joining = String(repeating: "d", count: 64)
+        let admitted = policy("e", recipients: original.recipients.union([joining]))
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: original, authorization: JournalWritePermit())
+        let first = content(scope: scope, policy: original)
+        _ = try await repository.commitContent(first, grants: [grant(first)], expectedPolicy: original, authorization: JournalWritePermit())
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: original, policy: admitted, authorization: JournalWritePermit())
+        let edit = content(scope: scope, policy: admitted, base: first)
+        _ = try await repository.commitContent(edit, grants: [], expectedPolicy: admitted, authorization: JournalWritePermit())
+        let before = try await repository.pendingMutations(account: "a")
+        let missing = try await repository.missingContentGrants(scope: vaultScope(scope))
+        #expect(missing.count == 1)
+        #expect(missing.first?.recipient == joining)
+        let newGrant = grant(edit, recipient: joining, id: "f")
+        try await repository.commitContentGrant(newGrant, expectedPolicy: admitted, authorization: JournalWritePermit())
+        try await repository.commitContentGrant(newGrant, expectedPolicy: admitted, authorization: JournalWritePermit())
+        #expect(try await repository.pendingMutations(account: "a") == before)
+        #expect(try await repository.contentState(scope: scope)?.versionID == edit.version.versionID)
+        #expect(try await repository.missingContentGrants(scope: vaultScope(scope)).isEmpty)
+        let work = try await repository.operations(account: "a", database: "private")
+        let preparation = try #require(work.first { $0.id == missing.first?.operationID })
+        #expect(preparation.state == .completed && preparation.deliveredAt == nil)
+        let nextScope = ItemScope(account: "a", vaultID: scope.vaultID, itemID: UUID())
+        let next = content(scope: nextScope, policy: admitted)
+        _ = try await repository.commitContent(next, grants: [grant(next)], expectedPolicy: admitted, authorization: JournalWritePermit())
+        #expect(try await repository.missingContentGrants(scope: vaultScope(scope)).map(\.scope) == [nextScope])
+        await #expect(throws: ContentStoreError.identityCollision) {
+            try await repository.commitContentGrant(grant(edit, recipient: joining, id: "f", bytes: Data([99])),
+                expectedPolicy: admitted, authorization: JournalWritePermit())
+        }
+    }
+
+    @Test(arguments: [true, false]) func lateContentRotationChecksCurrentAuthorization(authorized: Bool) async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID())
+        let currentPolicy = policy("d", authority: "d")
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: currentPolicy, authorization: JournalWritePermit())
+        let authorization = Mutex(authorized), calls = Mutex(0)
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.rotateContent],
+            dependencyAvailable: { _ in false }, handler: { _ in
+                calls.withLock { $0 += 1 }
+                return authorization.withLock { $0 } ? .completed : .authorization
+            })
+        await coordinator.start()
+        await coordinator.wake(reason: .unlocked)
+        await coordinator.waitUntilIdle()
+
+        // The membership/unlock wake has finished before historical content
+        // arrives. Its key must still rotate under the current recipient policy.
+        let historical = content(scope: scope, policy: policy())
+        let incoming = IncomingRecord(id: UUID().uuidString, account: "a", database: "private",
+            zoneName: SyncStoreLayout.contentZone(vault: scope.vaultID), zoneOwner: scope.zoneOwner,
+            recordName: scope.itemID.uuidString, recordType: ContentRecordKind.head.rawValue,
+            bytes: historical.version.ciphertext, systemFields: Data(), vaultID: scope.vaultID)
+        try await repository.stageIncoming(incoming, permit: JournalWritePermit())
+        try await repository.receiveContent(historical, from: incoming, action: .install,
+            expectedHead: nil, expectedPolicy: currentPolicy, permit: JournalWritePermit())
+        await coordinator.wake(reason: .storeChanged)
+        await coordinator.wake(reason: .dependenciesChanged)
+        await coordinator.waitUntilIdle()
+        let rotation = try #require(await repository.operations(account: "a", database: "private").first { $0.kind == .rotateContent })
+        #expect(calls.withLock { $0 } == 1)
+        #expect(rotation.state == (authorized ? .completed : .waitingForAuthorization))
+
+        if !authorized {
+            // A real authorization failure stays deferred without repeatedly
+            // calling the handler on unrelated store or foreground events.
+            await coordinator.wake(reason: .storeChanged)
+            await coordinator.wake(reason: .foreground)
+            await coordinator.waitUntilIdle()
+            #expect(calls.withLock { $0 } == 1)
+            authorization.withLock { $0 = true }
+            await coordinator.wake(reason: .unlocked)
+            await coordinator.waitUntilIdle()
+            #expect(calls.withLock { $0 } == 2)
+            #expect(try await repository.operations(account: "a", database: "private").first { $0.id == rotation.id }?.state == .completed)
+        }
+        await coordinator.stop()
+    }
+
+    @Test func previewSecurityTransitionRequiresRotationInsteadOfObsoleteGrants() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID()), original = policy()
+        let rotatedPolicy = policy("d", authority: "d")
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: original, authorization: JournalWritePermit())
+        let first = content(scope: scope, policy: original)
+        _ = try await repository.commitContent(first, grants: [], expectedPolicy: original, authorization: JournalWritePermit())
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: original, policy: rotatedPolicy, authorization: JournalWritePermit())
+        #expect(try await repository.missingContentGrants(scope: vaultScope(scope)).isEmpty)
+        let work = try await repository.operations(account: "a", database: "private")
+        #expect(work.filter { $0.kind == .rotateContent && $0.state == .ready }.count == 1)
+        await #expect(throws: ContentStoreError.staleAuthority) {
+            try await repository.commitContentGrant(grant(first), expectedPolicy: rotatedPolicy, authorization: JournalWritePermit())
+        }
+        await #expect(throws: ContentStoreError.staleAuthority) {
+            try await repository.commitContent(content(scope: scope, policy: rotatedPolicy, base: first), grants: [],
+                expectedPolicy: rotatedPolicy, authorization: JournalWritePermit())
+        }
+        let rotated = content(scope: scope, policy: rotatedPolicy, base: first, key: UUID())
+        _ = try await repository.commitContent(rotated, grants: [grant(rotated)], expectedPolicy: rotatedPolicy, authorization: JournalWritePermit())
+        #expect(try await repository.operations(account: "a", database: "private").filter { $0.kind == .rotateContent }.allSatisfy { $0.state == .completed && $0.deliveredAt == nil })
+    }
+
+    @Test func previewStoreCannotOpenOrMigrateLegacyPaths() async throws {
+        let (root, legacy) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID())
+        let version = EncryptedItemVersion(scope: scope, baseVersionID: nil, ciphertext: Data([1]))
+        let mutation = try await legacy.commitLocalMutation(version)
+        #expect(throws: ContentStoreError.wrongLayout) {
+            try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"), layout: .contentPreview3)
+        }
+        let preview = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(throws: ContentStoreError.wrongLayout) {
+            try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+        }
+        #expect(throws: ContentStoreError.wrongLayout) {
+            try EncryptedItemRepository(storeURL: root.appendingPathComponent("contentpreview3/content3.sqlite"))
+        }
+        let copied = root.appendingPathComponent("copied", isDirectory: true)
+        try FileManager.default.copyItem(at: SyncStoreLayout.contentPreviewURL(in: root).deletingLastPathComponent(), to: copied)
+        for suffix in ["", "-wal", "-shm"] {
+            let source = copied.appendingPathComponent("Content3.sqlite" + suffix)
+            if FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.moveItem(at: source, to: copied.appendingPathComponent("items.sqlite" + suffix))
+            }
+        }
+        #expect(throws: ContentStoreError.wrongLayout) {
+            try EncryptedItemRepository(storeURL: copied.appendingPathComponent("items.sqlite"))
+        }
+        await #expect(throws: ContentStoreError.wrongLayout) { try await preview.commitLocalMutation(version) }
+        #expect(try await legacy.pendingMutations(account: "a") == [mutation])
+        #expect(try await preview.pendingMutations(account: "a").isEmpty)
+    }
+}
+
+extension SyncJournalTests {
+    @Test func previewConcurrentWritersPreserveOneHeadAndRejectStaleAuthority() async throws {
+        let (root, first) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let second = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID()), original = policy()
+        try await first.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: original, authorization: JournalWritePermit())
+        let base = content(scope: scope, policy: original)
+        _ = try await first.commitContent(base, grants: [grant(base)], expectedPolicy: original, authorization: JournalWritePermit())
+        let one = content(scope: scope, policy: original, base: base), two = content(scope: scope, policy: original, base: base)
+        async let a: PendingItemMutation? = try? first.commitContent(one, grants: [], expectedPolicy: original, authorization: JournalWritePermit())
+        async let b: PendingItemMutation? = try? second.commitContent(two, grants: [], expectedPolicy: original, authorization: JournalWritePermit())
+        let results = await [a, b].compactMap { $0 }
+        #expect(results.count == 1)
+        #expect(try await first.contentState(scope: scope)?.versionID == results.first?.version.versionID)
+        #expect(try await second.pendingMutations(account: "a").count == 2)
+        let next = policy("d", recipients: original.recipients.union([String(repeating: "e", count: 64)]))
+        try await first.setContentRecipients(scope: vaultScope(scope), expected: original, policy: next, authorization: JournalWritePermit())
+        await #expect(throws: ContentStoreError.staleAuthority) {
+            try await second.commitContentGrant(grant(base), expectedPolicy: original, authorization: JournalWritePermit())
+        }
+        #expect(try await second.contentRecipients(scope: vaultScope(scope)) == next)
+    }
+}
+
+extension SyncJournalTests {
+    @Test func inboxBatchAndCheckpointRollbackTogetherAtCapacity() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        try await repository.saveEngineState(Data([1]), account: "a", database: "private")
+        await #expect(throws: SyncJournalError.inboxFull) {
+            try await repository.stageIncomingBatch([incoming("one", bytes: 60), incoming("two", bytes: 60)],
+                checkpoint: Data([2]), account: "a", database: "private", budget: 100, permit: JournalWritePermit())
+        }
+        #expect(try await repository.incomingRecords(account: "a", database: "private").isEmpty)
+        #expect(try await repository.engineState(account: "a", database: "private") == Data([1]))
+        try await repository.stageIncomingBatch([incoming("one", bytes: 60)], checkpoint: Data([3]),
+            account: "a", database: "private", budget: 100, permit: JournalWritePermit())
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(try await reopened.incomingRecords(account: "a", database: "private").count == 1)
+        #expect(try await reopened.engineState(account: "a", database: "private") == Data([3]))
+    }
+}
+
+extension SyncJournalTests {
+    @Test func contentDependencyFetchIsAtomicScopedAndDeduplicatedAcrossRestart() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let vault = UUID(), item = UUID(), version = UUID()
+        let dependency = SyncDependency(.content, identifier: vault.uuidString + ":" + item.uuidString + ":" + version.uuidString)
+        let input = IncomingRecord(id: "head", account: "a", database: "private", zoneName: SyncStoreLayout.contentZone(vault: vault),
+            zoneOwner: "owner", recordName: item.uuidString, recordType: ContentRecordKind.head.rawValue,
+            bytes: Data([1]), systemFields: Data(), vaultID: vault)
+        let staged = try await repository.stageIncoming(input)
+        let foreign = SyncDependency(.content, identifier: UUID().uuidString + ":" + item.uuidString + ":" + version.uuidString)
+        await #expect(throws: SyncJournalError.invalidOperation) {
+            try await repository.deferContentIncoming(staged, dependencies: [dependency, foreign], permit: JournalWritePermit())
+        }
+        #expect(try await repository.operations(account: "a", database: "private").allSatisfy { $0.kind != .fetchContentVersion })
+        #expect(try await repository.incomingRecord(id: staged.id, account: "a", database: "private")?.dependencies.isEmpty == true)
+        try await repository.deferContentIncoming(staged, dependencies: [dependency], permit: JournalWritePermit())
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        let deferred = try #require(await reopened.incomingRecord(id: staged.id, account: "a", database: "private"))
+        #expect(deferred.dependencies == [dependency])
+        try await reopened.deferContentIncoming(deferred, dependencies: [dependency], permit: JournalWritePermit())
+        let fetches = try await reopened.operations(account: "a", database: "private").filter { $0.kind == .fetchContentVersion }
+        #expect(fetches.count == 1)
+        let request = try #require(ContentVersionFetch(dependency: dependency))
+        #expect(try request.operation(account: "b", owner: "owner").id != fetches.first?.id)
+        #expect(try request.operation(account: "a", owner: "other-owner").id != fetches.first?.id)
+    }
+}
+
+extension SyncJournalTests {
+    @Test func blockedContentHeadsCannotStarveAnotherVaultPublication() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let blockedVault = UUID(), readyVault = UUID(), recipients = policy()
+        for vault in [blockedVault, readyVault] {
+            try await repository.setContentRecipients(scope: VaultScope(account: "a", vaultID: vault), expected: nil,
+                policy: recipients, authorization: JournalWritePermit())
+        }
+        let prerequisite = SyncOperation(account: "a", vaultID: blockedVault, kind: .provision)
+        for _ in 0..<101 {
+            let scope = ItemScope(account: "a", vaultID: blockedVault, itemID: UUID())
+            _ = try await repository.commitContent(content(scope: scope, policy: recipients), grants: [], expectedPolicy: recipients,
+                prerequisites: [prerequisite], authorization: JournalWritePermit())
+        }
+        let ready = content(scope: ItemScope(account: "a", vaultID: readyVault, itemID: UUID()), policy: recipients)
+        _ = try await repository.commitContent(ready, grants: [], expectedPolicy: recipients, authorization: JournalWritePermit())
+        let candidates = try await repository.contentPublications(account: "a")
+        #expect(candidates.count == 1)
+        #expect(candidates.first?.content == ready)
+    }
+}
+
+extension SyncJournalTests {
+    @Test func identicalAcceptedHeadRefreshesChangeTagWithoutConfirmingLaterEdit() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let recipients = policy(), scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID())
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: recipients, authorization: JournalWritePermit())
+        let first = content(scope: scope, policy: recipients)
+        let firstReceipt = try await repository.commitContent(first, grants: [], expectedPolicy: recipients, authorization: JournalWritePermit())
+        try await repository.acknowledge(mutationID: firstReceipt.id, account: "a", serverSystemFields: Data([1]))
+        let second = content(scope: scope, policy: recipients, base: first)
+        let secondReceipt = try await repository.commitContent(second, grants: [], expectedPolicy: recipients, authorization: JournalWritePermit())
+        let event = IncomingRecord(id: "same-head-new-change-tag", account: "a", database: "private",
+            zoneName: SyncStoreLayout.contentZone(vault: scope.vaultID), zoneOwner: scope.zoneOwner,
+            recordName: scope.itemID.uuidString, recordType: ContentRecordKind.head.rawValue, bytes: first.version.ciphertext,
+            systemFields: Data([2]), vaultID: scope.vaultID)
+        _ = try await repository.stageIncoming(event)
+        try await repository.receiveContent(first, from: event, action: .keepLocal, expectedHead: second.version.versionID,
+            expectedPolicy: recipients, permit: JournalWritePermit())
+        #expect(try await repository.serverSystemFields(scope) == Data([2]))
+        #expect(try await repository.item(scope) == second.version)
+        #expect(try await repository.mutationReceipt(id: firstReceipt.id, account: "a")?.status == .cloudConfirmed)
+        #expect(try await repository.mutationReceipt(id: secondReceipt.id, account: "a")?.status == .queued)
+    }
+}
+
+@Test func expiredHistoryConsumerRequiresFullProjectionRefresh() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+    try await repository.saveEngineState(Data([1]), account: "a", database: "test")
+    let history = try await repository.history(after: nil)
+    let token = try #require(history.token)
+    try await repository.checkpointHistory(token: token, consumer: "gui", account: "a")
+    #expect(try await repository.historyCheckpoint(consumer: "gui", account: "a") == token)
+    struct Permit: RepositoryWritePermit { func withWritePermission<T>(_ body: () throws -> T) throws -> T { try body() } }
+    try await repository.pruneHistory(permit: Permit(), now: Date().addingTimeInterval(31 * 86400))
+    #expect(try await repository.historyCheckpoint(consumer: "gui", account: "a") == nil)
+}
+
+
+extension SyncJournalTests {
+    @Test func ownerReleaseResetsBackoffWithoutResettingAttemptDiagnostics() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Mutex(Date(timeIntervalSince1970: 100))
+        var operation = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
+        for attempt in 1...20 {
+            operation = try await repository.transition(operation, to: .retryScheduled, failure: .transport,
+                nextAttempt: Date(timeIntervalSince1970: 400), retryAttempts: attempt, attempted: true)
+        }
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.enrollment],
+            clock: SyncClock(now: { now.withLock { $0 } }, sleep: { _ in try await Task.sleep(for: .seconds(3600)) }, jitter: { 0 }),
+            dependencyAvailable: { _ in false }, handler: { _ in .retry(.transport) })
+        await coordinator.start()
+        await coordinator.wake(reason: .ownerReleased); await coordinator.waitUntilIdle()
+        let first = try #require(await repository.operations(account: "a", database: "private").first)
+        #expect(first.nextAttempt == Date(timeIntervalSince1970: 102))
+        #expect(first.attempts == 21 && first.retryAttempts == 1)
+        now.withLock { $0 = Date(timeIntervalSince1970: 102) }
+        await coordinator.wake(reason: .retry); await coordinator.waitUntilIdle()
+        let second = try #require(await repository.operations(account: "a", database: "private").first)
+        #expect(second.nextAttempt == Date(timeIntervalSince1970: 106))
+        #expect(second.attempts == 22 && second.retryAttempts == 2)
+        await coordinator.stop()
+    }
+
+    @Test func unlockAndAuthenticatedArrivalResumeDependencyBackoffImmediately() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 100), calls = Mutex(0)
+        var operation = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
+        operation = try await repository.transition(operation, to: .retryScheduled, failure: .dependency,
+            nextAttempt: now.addingTimeInterval(300), retryAttempts: 20, attempted: true)
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.enrollment],
+            clock: SyncClock(now: { now }, sleep: { _ in try await Task.sleep(for: .seconds(3600)) }, jitter: { 0 }),
+            dependencyAvailable: { _ in false }, handler: { _ in
+                let count = calls.withLock { $0 += 1; return $0 }
+                return count == 1 ? .retry(.dependency) : .completed
+            })
+        await coordinator.start()
+        #expect(calls.withLock { $0 } == 0)
+        await coordinator.wake(reason: .unlocked); await coordinator.waitUntilIdle()
+        let pending = try #require(await repository.operations(account: "a", database: "private").first)
+        #expect(pending.nextAttempt == now.addingTimeInterval(2))
+        await coordinator.wake(reason: .dependenciesChanged); await coordinator.waitUntilIdle()
+        #expect(calls.withLock { $0 } == 2)
+        #expect(try await repository.operations(account: "a", database: "private").first?.state == .completed)
+        await coordinator.stop()
+    }
+
+    @Test func transportHandoffClearsExpiredTimerWithoutClaimingDelivery() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        var operation = try await repository.enqueue(SyncOperation(account: "a", kind: .publishCoordination))
+        for attempt in 1...5 {
+            operation = try await repository.transition(operation, to: .retryScheduled, failure: .transport,
+                nextAttempt: .distantPast, retryAttempts: attempt, attempted: true)
+        }
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.publishCoordination],
+            dependencyAvailable: { _ in false }, handler: { _ in .transportOwned })
+        await coordinator.start(); await coordinator.waitUntilIdle()
+        let retained = try #require(await repository.operations(account: "a", database: "private").first)
+        #expect(retained.state == .ready && retained.nextAttempt == nil && retained.failure == nil)
+        #expect(retained.retryAttempts == 5 && retained.deliveredAt == nil && retained.completedAt == nil)
+        await coordinator.stop()
+    }
+
+    @Test func preflightFailurePersistsThrottleAndLeavesOtherVaultsEligible() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let blocked = try PreparedCoordinationRecord(account: "a", vault: UUID(), kind: .discovery, identity: UUID(), bytes: Data([1]))
+        let other = try PreparedCoordinationRecord(account: "a", vault: UUID(), kind: .discovery, identity: UUID(), bytes: Data([2]))
+        _ = try await repository.enqueueCoordination(blocked, authorization: JournalWritePermit())
+        _ = try await repository.enqueueCoordination(other, authorization: JournalWritePermit())
+        let now = Date()
+        try await repository.deferContentUpload(blocked.operationID, account: "a", failure: .transport,
+            retryAfter: 900, now: now, permit: JournalWritePermit())
+        let pending = try #require(await repository.operations(account: "a", database: "private").first { $0.id == blocked.operationID })
+        #expect(pending.state == .retryScheduled && pending.failure == .transport)
+        #expect(pending.nextAttempt == now.addingTimeInterval(900) && pending.retryNotBefore == pending.nextAttempt)
+        #expect(try await repository.coordinationPublications(account: "a") == [other])
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(try await reopened.coordinationPublications(account: "a") == [other])
+        #expect(try await !reopened.operationIsDelivered(blocked.operationID, account: "a"))
+    }
+}
+
+
+extension SyncJournalTests {
+    @Test func serverReadbackPausesPublicationUntilAppliedAcrossRestart() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let recipients = policy(), scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID())
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: recipients, authorization: JournalWritePermit())
+        let prepared = content(scope: scope, policy: recipients)
+        let keyGrant = grant(prepared)
+        let receipt = try await repository.commitContent(prepared, grants: [keyGrant], expectedPolicy: recipients, authorization: JournalWritePermit())
+        let initial = try await repository.contentPublications(account: "a")
+        #expect(initial.count == 2)
+        for upload in initial {
+            let event = IncomingRecord(id: upload.recordID.recordName, account: "a", database: "private",
+                zoneName: upload.recordID.zoneID.zoneName, zoneOwner: upload.recordID.zoneID.ownerName,
+                recordName: upload.recordID.recordName, recordType: upload.kind.rawValue,
+                bytes: upload.grant?.bytes ?? prepared.version.ciphertext, systemFields: Data([1]), vaultID: scope.vaultID)
+            _ = try await repository.stageIncoming(event)
+        }
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(try await reopened.contentPublications(account: "a").isEmpty)
+        #expect(try await reopened.mutationReceipt(id: receipt.id, account: "a")?.status == .queued)
+        for event in try await reopened.incomingRecords(account: "a", database: "private") {
+            if event.recordType == ContentRecordKind.version.rawValue {
+                try await reopened.receiveContent(prepared, from: event, action: .archive, expectedHead: nil, expectedPolicy: recipients, permit: JournalWritePermit())
+            } else {
+                try await reopened.receiveContentGrant(keyGrant, from: event, expectedPolicy: recipients, permit: JournalWritePermit())
+            }
+        }
+        let next = try await reopened.contentPublications(account: "a")
+        #expect(next.count == 1 && next.first?.kind == .head)
+        #expect(try await reopened.mutationReceipt(id: receipt.id, account: "a")?.status == .queued)
+        let head = try #require(next.first)
+        let event = IncomingRecord(id: "head", account: "a", database: "private", zoneName: head.recordID.zoneID.zoneName,
+            zoneOwner: scope.zoneOwner, recordName: head.recordID.recordName, recordType: ContentRecordKind.head.rawValue,
+            bytes: prepared.version.ciphertext, systemFields: Data([2]), vaultID: scope.vaultID)
+        _ = try await reopened.stageIncoming(event)
+        #expect(try await reopened.contentPublications(account: "a").isEmpty)
+        try await reopened.receiveContent(prepared, from: event, action: .duplicate, expectedHead: prepared.version.versionID,
+            expectedPolicy: recipients, permit: JournalWritePermit())
+        #expect(try await reopened.mutationReceipt(id: receipt.id, account: "a")?.status == .cloudConfirmed)
+    }
+}
+
+
+extension SyncJournalTests {
+    @Test func coordinationReadbackDoesNotStarveOtherPublicationsOrClaimDelivery() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let blocked = try PreparedCoordinationRecord(account: "a", vault: UUID(), kind: .discovery, identity: UUID(), bytes: Data([1]))
+        let other = try PreparedCoordinationRecord(account: "a", vault: UUID(), kind: .discovery, identity: UUID(), bytes: Data([2]))
+        _ = try await repository.enqueueCoordination(blocked, authorization: JournalWritePermit())
+        _ = try await repository.enqueueCoordination(other, authorization: JournalWritePermit())
+        let record = try blocked.record(assetDirectory: root)
+        let event = try PreparedCoordinationRecord.materialize(record, account: "a")
+        _ = try await repository.stageIncoming(event)
+        #expect(try await repository.coordinationPublications(account: "a") == [other])
+        #expect(try await !repository.operationIsDelivered(blocked.operationID, account: "a"))
+        // Rejecting an unauthenticated incoming record must not lose the local publication.
+        try await repository.completeIncoming(event, failure: .invalidAuthority)
+        #expect(try await repository.coordinationPublications(account: "a").count == 2)
+        #expect(try await !repository.operationIsDelivered(blocked.operationID, account: "a"))
+    }
+}
+
+extension SyncJournalTests {
+    @Test(arguments: [false, true]) func enrollmentProceedsWhileBulkTransferWaits(stopBeforeCompletion: Bool) async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let entered = AsyncStream<Void>.makeStream(), release = AsyncStream<Void>.makeStream()
+        let admitted = AsyncStream<Void>.makeStream(), returned = AsyncStream<Void>.makeStream()
+        let transfer = try await repository.enqueue(SyncOperation(account: "a", kind: .reconcile))
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.reconcile, .enrollment],
+            allowsConcurrentReconciliation: true, dependencyAvailable: { _ in true }, handler: { operation in
+                if operation.kind == .reconcile {
+                    entered.continuation.yield(())
+                    for await _ in release.stream { break }
+                    returned.continuation.yield(())
+                } else { admitted.continuation.yield(()) }
+                return .completed
+            })
+        await coordinator.start()
+        for await _ in entered.stream { break }
+        let enrollment = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
+        await coordinator.wake(reason: .storeChanged)
+        for await _ in admitted.stream { break }
+        let operations = try await repository.operations(account: "a", database: "private")
+        #expect(operations.first { $0.id == enrollment.id }?.state == .completed)
+        #expect(operations.first { $0.id == transfer.id }?.state == .ready)
+        if stopBeforeCompletion { await coordinator.stop() }
+        release.continuation.yield(())
+        for await _ in returned.stream { break }
+        await coordinator.waitUntilIdle()
+        let final = try await repository.operations(account: "a", database: "private").first { $0.id == transfer.id }
+        #expect(final?.state == (stopBeforeCompletion ? .ready : .completed))
+        await coordinator.stop()
+    }
+}
+
+extension SyncJournalTests {
+    @Test func repeatedWakesReplaceOneIntentAndRejectLateCompletion() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let first = try await repository.requestSync(account: "a", database: "private")
+        let old = try #require(await repository.operations(account: "a", database: "private").first)
+        for _ in 0..<100 { _ = try await repository.requestSync(account: "a", database: "private") }
+        let latest = try await repository.operations(account: "a", database: "private")
+        #expect(latest.count == 1 && latest.first?.id == old.id && latest.first?.revision != old.revision)
+        try await repository.markSyncRequestHandled(first)
+        #expect(try await repository.pendingSyncRequests(account: "a", database: "private").first?.generation == 101)
+        await #expect(throws: SyncJournalError.staleOperation) {
+            try await repository.transition(old, to: .completed)
+        }
+    }
+
+    @Test func oldReconciliationBacklogCollapsesWithoutConfirmingPublication() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        for generation in 1...100 {
+            let request = DurableSyncRequest(account: "a", database: "private", generation: Int64(generation), reason: .localSave)
+            _ = try await repository.enqueue(SyncOperation(account: "a", kind: .reconcile, payload: JSONEncoder().encode(request)))
+        }
+        let publication = try await repository.enqueue(SyncOperation(account: "a", kind: .publishItem))
+        try await repository.coalesceReconciliationRequests(account: "a", database: "private")
+        let operations = try await repository.operations(account: "a", database: "private")
+        let live = operations.filter { $0.kind == .reconcile && $0.state != .completed }
+        #expect(live.count == 1)
+        #expect(try JSONDecoder().decode(DurableSyncRequest.self, from: #require(live.first).payload).generation == 100)
+        #expect(operations.first { $0.id == publication.id } == publication)
+        #expect(operations.allSatisfy { $0.deliveredAt == nil })
+    }
+
+    @Test func publicationRegistrationIsBatchedAndInboxRunsFirst() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        for _ in 0..<100 { _ = try await repository.enqueue(SyncOperation(account: "a", kind: .publishItem)) }
+        _ = try await repository.enqueue(SyncOperation(account: "a", kind: .applyIncoming))
+        let calls = Mutex<[SyncOperation.Kind]>([])
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.publishItem, .applyIncoming],
+            coalescesPublicationRegistration: true, dependencyAvailable: { _ in true }, handler: { operation in
+                calls.withLock { $0.append(operation.kind) }
+                return operation.kind == .applyIncoming ? .completed : .transportOwned
+            })
+        await coordinator.start(); await coordinator.waitUntilIdle(); await coordinator.stop()
+        let received = calls.withLock { $0 }
+        #expect(received.first == .applyIncoming)
+        #expect(received.filter { $0 == .publishItem }.count <= 3)
+        #expect(received.contains(.publishItem))
+    }
+
+    @Test(arguments: [true, false]) func batchedRegistrationAdvancesEveryEligibleRetry(succeeds: Bool) async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(), deadline = now.addingTimeInterval(900)
+        var ids = Set<UUID>()
+        for _ in 0..<32 {
+            let operation = try await repository.enqueue(SyncOperation(account: "a", kind: .publishItem))
+            ids.insert(operation.id)
+            _ = try await repository.transition(operation, to: .retryScheduled, failure: .storagePressure,
+                nextAttempt: now.addingTimeInterval(-60))
+        }
+        let throttled = try await repository.enqueue(SyncOperation(account: "a", kind: .grant))
+        _ = try await repository.transition(throttled, to: .retryScheduled, failure: .transport,
+            nextAttempt: deadline, retryNotBefore: deadline)
+        let calls = Mutex(0)
+        let clock = SyncClock(now: { now }, sleep: { _ in try await Task.sleep(for: .seconds(3600)) }, jitter: { 0 })
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.publishItem, .grant],
+            clock: clock, coalescesPublicationRegistration: true, dependencyAvailable: { _ in true }, handler: { _ in
+                calls.withLock { $0 += 1 }
+                return succeeds ? .transportOwned : .retry(.transport)
+            })
+        await coordinator.start(); await coordinator.waitUntilIdle(); await coordinator.stop()
+        let operations = try await repository.operations(account: "a", database: "private")
+        let retried = operations.filter { ids.contains($0.id) }
+        #expect(retried.count == 32)
+        #expect(retried.allSatisfy { $0.deliveredAt == nil && $0.state != .completed })
+        if succeeds {
+            #expect(retried.allSatisfy { $0.state == .ready && $0.failure == nil && $0.nextAttempt == nil })
+        } else {
+            #expect(retried.allSatisfy { $0.state == .retryScheduled && $0.failure == .transport && ($0.nextAttempt ?? .distantPast) > now })
+        }
+        let untouched = try #require(operations.first { $0.id == throttled.id })
+        #expect(untouched.state == .retryScheduled && untouched.retryNotBefore == deadline && untouched.nextAttempt == deadline)
+        #expect(calls.withLock { $0 } <= 3)
+    }
+}
+
+extension SyncJournalTests {
+    @Test func newerWakePreservesServerRetryAfter() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await repository.requestSync(account: "a", database: "private")
+        let old = try #require(await repository.operations(account: "a", database: "private").first)
+        let deadline = Date().addingTimeInterval(900)
+        _ = try await repository.transition(old, to: .retryScheduled, failure: .transport,
+            nextAttempt: deadline, retryNotBefore: deadline, attempted: true)
+        _ = try await repository.requestSync(account: "a", database: "private", reason: .localSave)
+        let pending = try #require(await repository.operations(account: "a", database: "private").first)
+        #expect(pending.state == .retryScheduled && pending.nextAttempt == deadline && pending.retryNotBefore == deadline)
+        #expect(try JSONDecoder().decode(DurableSyncRequest.self, from: pending.payload).generation == 2)
+    }
+}
+
+extension SyncJournalTests {
+    @Test func successfulPreparationClearsOldFailureWithoutConfirmingDelivery() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let record = try PreparedCoordinationRecord(account: "a", vault: UUID(), kind: .discovery, identity: UUID(), bytes: Data([1]))
+        _ = try await repository.enqueueCoordination(record, authorization: JournalWritePermit())
+        try await repository.deferContentUpload(record.operationID, account: "a", failure: .storagePressure,
+            now: Date().addingTimeInterval(-600), permit: JournalWritePermit())
+        #expect(try await repository.syncHealth(account: "a", database: "private").blockedReasons.contains(.storagePressure))
+        try await repository.setContentUploadBlocked(record.operationID, account: "a", blocked: false, permit: JournalWritePermit())
+        let operation = try #require(await repository.operations(account: "a", database: "private").first)
+        #expect(operation.state == .ready && operation.failure == nil && operation.nextAttempt == nil)
+        #expect(operation.retryAttempts == 1 && operation.deliveredAt == nil)
+        #expect(try await repository.syncHealth(account: "a", database: "private").blockedReasons.isEmpty)
+        #expect(try await !repository.operationIsDelivered(record.operationID, account: "a"))
+        let deadline = Date().addingTimeInterval(900)
+        try await repository.deferContentUpload(record.operationID, account: "a", failure: .transport,
+            retryAfter: 900, now: deadline.addingTimeInterval(-900), permit: JournalWritePermit())
+        try await repository.setContentUploadBlocked(record.operationID, account: "a", blocked: false, permit: JournalWritePermit())
+        let throttled = try #require(await repository.operations(account: "a", database: "private").first)
+        #expect(throttled.state == .retryScheduled && throttled.retryNotBefore == deadline)
+    }
+}

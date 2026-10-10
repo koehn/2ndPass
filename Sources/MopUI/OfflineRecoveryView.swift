@@ -30,8 +30,10 @@ struct OfflineRecoveryView: View {
     @State private var exporting = false
     @State private var importing = false
     @State private var recoveryAllowed = false
+    @State private var readingStatus = false
+    @State private var setupIncomplete = false
     private enum ProgressLocation: Equatable {
-        case generate, activate, coverage, resume, reset, revoke, eligibility, open
+        case generate, activate, coverage, resume, revoke, eligibility, open
         case catalog(UUID), complete(UUID), completeAll, read(UUID, String)
     }
     @State private var progressLocation: ProgressLocation?
@@ -52,7 +54,6 @@ struct OfflineRecoveryView: View {
     @State private var recoveredVaultIDs: Set<UUID> = []
     @State private var recoveryConfirmations: [UUID: String] = [:]
     @State private var revoke = false
-    @State private var resetForTesting = false
     @State private var task: Task<Void, Never>?
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -69,9 +70,7 @@ struct OfflineRecoveryView: View {
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                     }
                 } else {
-                    actionButton("Check Access Again", operation: .recoveryEligibility, location: .eligibility)
-                        .disabled(model.removalCleanupPending)
-                        .help("Check whether this device can open your iCloud vaults using its existing device key.")
+                    Text("Checking this device’s vault access…").foregroundStyle(.secondary)
                 }
                 if rows.count > 1 {
                     actionButton("Complete Recovery for All Vaults", operation: .recoveryCompleteAll(rows.compactMap { UUID(uuidString: $0.id) }), location: .completeAll)
@@ -133,12 +132,15 @@ struct OfflineRecoveryView: View {
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                     }
                 }
-                GroupBox("Check existing protection") {
+                GroupBox("Recovery protection") {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Check coverage to see which vaults are protected by your configured recovery key. This does not change your key or test your saved copy.").foregroundStyle(.secondary)
-                        actionButton("Check Coverage", operation: .recoveryStatus, location: .coverage)
-                        Text("If setup, replacement, or removal was interrupted, resume to finish applying the changes to your remaining vaults.").foregroundStyle(.secondary)
-                        actionButton("Resume Recovery Setup", operation: .recoveryResume, location: .resume)
+                        Text("Coverage updates automatically as encrypted changes and grants arrive.").foregroundStyle(.secondary)
+                        if setupIncomplete {
+                            Text("Setup continues automatically. Unlock to authorize any remaining key changes.").foregroundStyle(.secondary)
+                            if !model.authenticated {
+                                actionButton("Unlock to Finish Setup", operation: .recoveryResume, location: .resume)
+                            }
+                        }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
                 }
                 DisclosureGroup("Remove offline recovery") {
@@ -158,8 +160,17 @@ struct OfflineRecoveryView: View {
                 else { run(.recoveryEligibility) }
             }
         }
+        .task {
+            // Subscribe before the initial read, so a completion cannot be missed.
+            let changes = await model.service.events()
+            await readStatus()
+            for await _ in changes {
+                guard !Task.isCancelled else { return }
+                await readStatus()
+            }
+        }
         .task(id: working) {
-            guard working else { return }
+            guard working else { await readStatus(); return }
             while !Task.isCancelled {
                 if let update = model.service.operationProgress {
                     progressMessage = update
@@ -172,11 +183,6 @@ struct OfflineRecoveryView: View {
             Button("OK", role: .cancel) {}
         } message: { Text(message) }
         .disabled(working || model.offline)
-        .confirmationDialog("Reset this device for recovery testing?", isPresented: $resetForTesting, titleVisibility: .visible) {
-            Button("Verify Copy and Reset This Device", role: .destructive) { run(.recoveryTestReset(copy: copy)) }
-        } message: {
-            Text("After verification, this device’s iCloud vault keys and cached iCloud data will be deleted. Local-only vaults and your vaults in iCloud stay intact. Keep your offline copy outside the app: you must enter it again to recover access. Other enrolled devices and accounts keep access when you complete recovery.")
-        }
         .confirmationDialog("Revoke the offline recovery key?", isPresented: $revoke, titleVisibility: .visible) {
             Button("Revoke and rotate encryption", role: .destructive) { run(.recoveryRevoke) }
         }
@@ -202,6 +208,40 @@ struct OfflineRecoveryView: View {
             else if phase == .active, recovering, rows.isEmpty { run(.recoveryEligibility) }
         }
         .onDisappear { clear(); model.service.endRecoverySession(); if completedVault { model.refresh() } }
+    }
+    private func readStatus() async {
+        guard !working, !readingStatus, scenePhase == .active else { return }
+        readingStatus = true
+        defer { readingStatus = false }
+        let generation = model.securityGeneration
+        do {
+            let result = try await model.service.execute(.manage(.recoveryStatus), vault: nil, offline: false)
+            guard !Task.isCancelled, !working, generation == model.securityGeneration else { return }
+            applyCoverage(result)
+        } catch {
+            guard !Task.isCancelled, !working, generation == model.securityGeneration else { return }
+            statuses = [ItemRecoveryFailure.message(for: error)]
+        }
+    }
+    private func applyCoverage(_ result: VaultResult) {
+        model.recoveryInProgress = result.recoveryInProgress
+        setupIncomplete = result.recoveryConfiguration?.incomplete ?? false
+        let coverage = result.recoveryVaults.isEmpty ? (result.recoveryConfiguration?.vaults ?? []) : result.recoveryVaults
+        statuses = coverage.map { status in
+            let name = rows.first(where: { $0.id == status.id.uuidString })?.name
+                ?? model.vaults.first(where: { $0.id == status.id.uuidString })?.name ?? "Unnamed vault"
+            let summary = status.complete ? (status.fingerprint == nil && !recovering ? "Offline recovery disabled" : "Complete") : "Pending"
+            return name + " · " + summary + (status.issue.map { " · " + $0 } ?? "")
+        }
+        if recovering {
+            for status in result.recoveryVaults where status.complete {
+                recoveredVaultIDs.insert(status.id)
+                completedVault = true
+                recoveryConfirmations[status.id] = "Vault recovered on this device. You can use it normally."
+                fields.removeAll { $0.0 == status.id }
+                model.deviceRemoved = false; model.removalCleanupPending = false
+            }
+        }
     }
     private var operationProgress: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -259,7 +299,6 @@ struct OfflineRecoveryView: View {
         case .recoveryActivate: progressLocation = .activate
         case .recoveryStatus: progressLocation = .coverage
         case .recoveryResume: progressLocation = .resume
-        case .recoveryTestReset: progressLocation = .reset
         case .recoveryRevoke: progressLocation = .revoke
         case .recoveryEligibility: progressLocation = .eligibility
         case .recoveryOpen: progressLocation = .open
@@ -270,7 +309,6 @@ struct OfflineRecoveryView: View {
         default: progressLocation = nil
         }
         switch operation {
-        case .recoveryTestReset: progressMessage = "Verifying your offline copy before resetting this device…"
         case .recoveryEligibility: progressMessage = "Checking this device’s vault access…"
         case .recoveryGenerate: progressMessage = "Generating your recovery code…"
         case .recoveryResume: progressMessage = "Resuming recovery setup… Keep this app open."
@@ -309,17 +347,7 @@ struct OfflineRecoveryView: View {
                 }
                 if let value = result.recoveredAttachment { attachment = SecretBytes(copying: value.data); attachmentName = value.fileName }
                 if let value = result.value { revealed = String(decoding: value, as: UTF8.self) }
-                let coverage = result.recoveryVaults.isEmpty ? (result.recoveryConfiguration?.vaults ?? []) : result.recoveryVaults
-                statuses = coverage.map { status in
-                    let name = rows.first(where: { $0.id == status.id.uuidString })?.name
-                        ?? model.vaults.first(where: { $0.id == status.id.uuidString })?.name
-                        ?? "Unnamed vault"
-                    let summary = status.complete
-                        ? (status.fingerprint == nil ? "Offline recovery disabled" : "Complete")
-                        : "Incomplete"
-                    let key = !status.complete ? status.fingerprint.map { " · Recovery key: " + $0 } ?? "" : ""
-                    return name + " · " + summary + (status.issue.map { " · " + $0 } ?? "") + key
-                }
+                applyCoverage(result)
                 message = result.message
                 switch operation {
                 case .recoveryEligibility:
@@ -343,11 +371,6 @@ struct OfflineRecoveryView: View {
                 default: break
                 }
             } catch {
-                if case .recoveryTestReset = operation,
-                   error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
-                    model.showRecoveryTestReset(pending: error as? MopError == .deviceRemovalPending)
-                    return
-                }
                 guard !Task.isCancelled, generation == model.securityGeneration else { return }
                 message = ItemRecoveryFailure.message(for: error)
                 showingError = true

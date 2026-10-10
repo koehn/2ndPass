@@ -7,8 +7,14 @@ import MopVaultNext
 /// ThisDeviceOnly, nonsynchronizing local trust. Cloud data cannot install or
 /// replace an enrollment pin. A duplicate add always rereads the existing winner.
 public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMembershipTrustStore {
+    public enum Namespace: Sendable { case legacy, contentPreview3 }
     private let accessGroup: String
-    public init() throws { accessGroup = try SigningIdentity.accessGroup() }
+    private let namespace: Namespace
+    private var setupService: String { namespace == .contentPreview3 ? "mop.content-vault-setup.v3" : "mop.item-vault-setup.v1" }
+    private var membershipService: String { namespace == .contentPreview3 ? "mop.content-vault-membership.v3" : "mop.item-vault-membership.v1" }
+    public init(namespace: Namespace = .legacy) throws {
+        accessGroup = try SigningIdentity.accessGroup(); self.namespace = namespace
+    }
 
     public func load(scope: ItemVaultSetupScope) throws -> ItemVaultSetupRecord? {
         var query = try baseQuery(scope)
@@ -43,7 +49,7 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
             kSecUseDataProtectionKeychain as String: true,
             kSecAttrSynchronizable as String: false,
             kSecAttrAccessGroup as String: accessGroup,
-            kSecAttrService as String: "mop.item-vault-setup.v1",
+            kSecAttrService as String: setupService,
             kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitAll
         ]
         var result: CFTypeRef?
@@ -68,7 +74,7 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
             kSecUseDataProtectionKeychain as String: true,
             kSecAttrSynchronizable as String: false,
             kSecAttrAccessGroup as String: accessGroup,
-            kSecAttrService as String: "mop.item-vault-membership.v1",
+            kSecAttrService as String: membershipService,
             kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitAll
         ]
         var result: CFTypeRef?
@@ -83,12 +89,12 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
         guard slots.count <= 4095, slots.enumerated().allSatisfy({ $0.element.generation == UInt64($0.offset + 2) }),
               let record = try load(scope: scope) else { throw ItemVaultBootstrapFailure.invalidTrust }
         let bytes = slots.map(\.bytes)
-        _ = try ItemVaultMembershipAuthority.history(record: record, successors: bytes)
+        _ = try ItemVaultMembershipAuthority.history(record: record, successors: bytes, allowingDeviceRemoval: namespace == .contentPreview3)
         return bytes
     }
     public func reserveMembership(scope: ItemVaultSetupScope, successors: [Data]) throws {
         guard let record = try load(scope: scope) else { throw ItemVaultBootstrapFailure.missingSetup }
-        _ = try ItemVaultMembershipAuthority.history(record: record, successors: successors)
+        _ = try ItemVaultMembershipAuthority.history(record: record, successors: successors, allowingDeviceRemoval: namespace == .contentPreview3)
         let existing = try membershipHistory(scope: scope)
         guard existing.count <= successors.count,
               Array(successors.prefix(existing.count)) == existing else { throw ItemVaultBootstrapFailure.invalidTrust }
@@ -97,7 +103,7 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
             let data = try setupEncode(slot)
             guard data.count <= 262_144 else { throw ItemVaultBootstrapFailure.invalidTrust }
             var query = try baseQuery(scope)
-            query[kSecAttrService as String] = "mop.item-vault-membership.v1"
+            query[kSecAttrService as String] = membershipService
             query[kSecAttrAccount as String] = try setupHash(setupEncode(scope)) + ":" + String(slot.generation)
             query[kSecValueData as String] = data
             query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
@@ -116,7 +122,7 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
         var query = try baseQuery(scope)
         let prefix = try setupHash(setupEncode(scope))
         for generation in 2...128 {
-            query[kSecAttrService as String] = "mop.item-vault-membership.v1"
+            query[kSecAttrService as String] = membershipService
             query[kSecAttrAccount as String] = prefix + ":" + String(generation)
             let status = SecItemDelete(query as CFDictionary)
             guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainItemVaultTrustFailure.status(status) }
@@ -131,7 +137,7 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
          kSecUseDataProtectionKeychain as String: true,
          kSecAttrSynchronizable as String: false,
          kSecAttrAccessGroup as String: accessGroup,
-         kSecAttrService as String: "mop.item-vault-setup.v1",
+         kSecAttrService as String: setupService,
          kSecAttrAccount as String: try setupHash(setupEncode(scope))]
     }
 }

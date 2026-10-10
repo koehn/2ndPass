@@ -55,15 +55,3 @@ private func recoveryEnrollmentFixture() throws -> (TestDevice, TestDevice, Offl
     let request = try DeviceEnrollmentRequest.create(scope: EnrollmentScope(container: "iCloud.test", environment: "Development", account: "account", vault: history.vault, member: owner.identity.member), device: joining)
     #expect(throws: (any Error).self) { try DeviceEnrollmentApproval.create(request: request, history: history, owner: foreign) }
 }
-
-@Test func envelopeRepairRequestIsBoundAndDeduplicatedWithoutGrantingAuthority() throws {
-    let (owner, joining, _, history, scope) = try recoveryEnrollmentFixture()
-    let record = UUID(), version = UUID()
-    let first = try EnvelopeRepairRequest.create(scope: scope, record: record, version: version, history: history, device: owner)
-    let retry = try EnvelopeRepairRequest.create(scope: scope, record: record, version: version, history: history, device: owner)
-    #expect(try first.identifier == retry.identifier)
-    try EnvelopeRepairRequest.decode(first.encoded()).verify(scope: scope, history: history)
-    #expect(throws: (any Error).self) { try EnvelopeRepairRequest.create(scope: scope, record: record, version: version, history: history, device: joining) }
-    let otherScope = EnrollmentScope(container: scope.container, environment: scope.environment, account: "other", vault: scope.vault, member: scope.member)
-    #expect(throws: (any Error).self) { try first.verify(scope: otherScope, history: history) }
-}

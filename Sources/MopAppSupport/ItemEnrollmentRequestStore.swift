@@ -49,6 +49,18 @@ struct ItemEnrollmentRequestStore: Sendable {
             }
         }
     }
+    func removeCompleted(_ id: UUID) throws {
+        let directory = try LocalDirectory(directory: location)
+        try directory.locked {
+            for name in ["request.json", id.uuidString + ".json"] {
+                let file = location.appendingPathComponent(name)
+                guard FileManager.default.fileExists(atPath: file.path) else { continue }
+                let request = try DeviceEnrollmentRequest.decode(LocalFile.read(file, privateFile: true, limit: 65_536))
+                guard request.scope == scope else { throw DeviceEnrollmentFailure.invalidRequest }
+                if request.id == id { try FileManager.default.removeItem(at: file) }
+            }
+        }
+    }
     func purge() throws {
         let directory = try LocalDirectory(directory: location)
         try directory.locked {

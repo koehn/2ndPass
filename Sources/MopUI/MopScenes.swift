@@ -66,7 +66,9 @@ private struct MopCommands: Commands {
                 }.keyboardShortcut("r", modifiers: [.command, .shift]).disabled(model.page != .recentlyDeleted || model.selectedDeletedItem == nil || model.busy || model.offline)
             }
             CommandMenu("Vault") {
-                Button("Refresh") { model.refresh() }.keyboardShortcut("r").disabled(model.busy)
+                #if DEBUG
+                Button("Force reconcile (diagnostic)") { model.refresh() }.keyboardShortcut("r").disabled(model.busy)
+                #endif
                 if model.authenticated {
                     Button("Lock") { model.lock() }.keyboardShortcut("l", modifiers: [.command, .shift])
                 } else {
@@ -216,10 +218,8 @@ struct SessionSettings: View {
                         }
                     }
                 }
-                if model.devices.isEmpty { Text(model.authenticated ? "Refresh to load enrolled devices." : "Unlock 2ndPass to view connected devices.").foregroundStyle(.secondary) }
-                if model.authenticated {
-                    Button("Refresh devices") { model.loadDevices() }.disabled(model.busy || model.offline)
-                } else {
+                if model.devices.isEmpty { Text(model.authenticated ? "Loading enrolled devices…" : "Unlock 2ndPass to view connected devices.").foregroundStyle(.secondary) }
+                if !model.authenticated {
                     Button("Unlock to view devices") { model.unlock() }.disabled(!model.canUnlock)
                 }
                 Text("Devices using the same Apple Account connect automatically while an existing device is unlocked.").font(.caption).foregroundStyle(.secondary)

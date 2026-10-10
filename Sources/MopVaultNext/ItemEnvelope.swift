@@ -595,7 +595,7 @@ public struct VaultEnvelopeMetadata: Codable, Equatable, Sendable {
     public init(name: String, security: VaultSecurityMetadata? = nil, exclusions: [String] = []) {
         self.name = name; self.security = security; self.exclusions = exclusions
     }
-    fileprivate func validate() throws {
+    public func validate() throws {
         try VaultName.validate(name)
         guard security?.histories.isEmpty ?? true,
               Set(security?.accounts.map(\.id) ?? []).count == (security?.accounts.count ?? 0),

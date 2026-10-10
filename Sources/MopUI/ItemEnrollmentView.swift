@@ -7,7 +7,6 @@ struct ItemEnrollmentView: View {
     let approving: Bool
     let target: VaultDescriptor?
     @State private var vaultID = ""
-    @Environment(\.scenePhase) private var scenePhase
     private var choices: [VaultDescriptor] { model.vaults.filter { $0.supported && !$0.enrolled } }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -23,15 +22,8 @@ struct ItemEnrollmentView: View {
                 if model.supports(.recovery) {
                     Button("Recover with an Offline Code…") { model.presentSheet(.recover) }
                 }
-                Button("Retry Connection") { refresh() }.disabled(vaultID.isEmpty || model.busy)
             }
         }
-        .onAppear { vaultID = target?.id ?? choices.first?.id ?? ""; refresh() }
-        .onChange(of: scenePhase) { _, phase in if phase == .active { refresh() } }
-        .onReceive(NotificationCenter.default.publisher(for: .mopCloudChanged)) { _ in refresh() }
-    }
-    private func refresh() {
-        guard !approving, !vaultID.isEmpty, !model.busy else { return }
-        model.enrollmentAction(.automaticEnrollment, vaultID: vaultID)
+        .onAppear { vaultID = target?.id ?? choices.first?.id ?? "" }
     }
 }

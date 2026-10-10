@@ -366,3 +366,25 @@ private struct NameCachePermit: RepositoryWritePermit {
         try await other.saveDisplayCatalogRows(scope: scope, rows: [], keyEnvelope: key, authorization: permit)
     }
 }
+
+@Test func displayCacheBatchValidationIsIndependentOfVaultSize() async throws {
+    let url = try repositoryLocation()
+    defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+    let repository = try EncryptedItemRepository(storeURL: url)
+    let scope = VaultScope(account: "display", vaultID: UUID()), key = Data([1])
+    var rows: [EncryptedDisplayCatalogRow] = []
+    for _ in 0..<1000 {
+        let item = ItemScope(account: scope.account, vaultID: scope.vaultID, itemID: UUID())
+        let version = EncryptedItemVersion(scope: item, baseVersionID: nil, ciphertext: Data([1]))
+        _ = try await repository.commitLocalMutation(version)
+        rows.append(EncryptedDisplayCatalogRow(itemID: item.itemID, versionID: version.versionID, keyID: UUID(), ciphertext: Data([2])))
+    }
+    _ = try await repository.reserveDisplayCatalogKey(scope: scope, candidate: key, replacing: nil, authorization: NameCachePermit())
+    let start = ContinuousClock.now
+    for offset in stride(from: 0, to: rows.count, by: 16) {
+        try await repository.saveDisplayCatalogRows(scope: scope, rows: Array(rows[offset..<min(offset + 16, rows.count)]), keyEnvelope: key, authorization: NameCachePermit())
+    }
+    #expect(await repository.displayValidationRows == 1000)
+    #expect(try await repository.displayCatalogRows(scope: scope).count == 1000)
+    print("Incremental display cache: 1000 rows in 16-item batches=\(start.duration(to: .now)); version rows validated=1000")
+}
