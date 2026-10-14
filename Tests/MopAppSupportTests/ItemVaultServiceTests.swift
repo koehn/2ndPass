@@ -47,6 +47,16 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
         }
         return result
     }
+    func replaceSession(_ id: UUID, preservingDisplay: Bool = false) async throws -> ItemVaultSession {
+        let scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development",
+            binding: ItemVaultBinding(account: "service", database: "private", zoneOwner: "__defaultOwner__", vaultID: id))
+        let device = owner.withLock { SessionDevice(copying: $0, unwrapCounter: unwraps) }
+        let replacement = try await ItemVaultBootstrap(repository: repository, trustStore: inventoryStore, scope: scope, device: device).open()
+        let prior = sessions.withLock { $0.updateValue(replacement, forKey: id) }
+        if preservingDisplay, let prior { replacement.inheritDisplayContinuity(from: prior) }
+        prior?.invalidate()
+        return replacement
+    }
     func inventory() async throws -> [VaultDescriptor] {
         names.withLock { values in values.map { VaultDescriptor(id: $0.key.uuidString, name: $0.value, format: "mop-content-v3", enrolled: true) } }
     }
@@ -816,6 +826,21 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
         try await service.execute(.savePasswordChecks(checks, revision: "stale"), vault: id.uuidString, offline: true)
     }
     #expect(try await repository.pendingMutations(account: session.binding.account).allSatisfy { $0.version.healthItemID == nil })
+    // A new item changes the aggregate revision without invalidating this evidence.
+    _ = try await service.execute(.save(ItemEdit(revision: saved.revision,
+        item: VaultItem(name: "unrelated", fields: [ItemField(path: "note", value: "note")]), create: true)),
+        vault: id.uuidString, offline: true)
+    let changed = try await service.execute(.catalog, vault: id.uuidString, offline: true).requireCatalog()
+    #expect(changed.revision != before.revision)
+    _ = try await service.execute(.savePasswordChecks(checks, revision: before.revision), vault: id.uuidString, offline: true)
+    #expect(try await session.healthChecks().first?.breachResult == newer.breachResult)
+    // A real password edit allocates a new record ID: old evidence must be rejected.
+    _ = try await session.replaceField(itemID: itemID, expectedBase: original.versionID,
+        path: "password", value: SecretBytes(utf8: "changed password"))
+    await #expect(throws: MopError.vaultConflict) {
+        try await service.execute(.savePasswordChecks(checks, revision: before.revision), vault: id.uuidString, offline: true)
+    }
+
 
 }
 private struct UnusedHealthBreach: BreachChecking {
@@ -878,7 +903,8 @@ func waitForDisplay(_ service: ItemVaultService, vault: UUID,
     #expect(await publisher.itemCounts == [3])
 }
 
-@Test func projectionFailurePreservesCauseAndRefreshRetriesWithoutRelocking() async throws {
+@Test(arguments: [false, true])
+func projectionFailurePreservesCauseAndRefreshRetriesWithoutRelocking(replaceSession: Bool) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
     let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
@@ -905,11 +931,18 @@ func waitForDisplay(_ service: ItemVaultService, vault: UUID,
     let session = try await backend.open(id)
     let originalVersions = try await session.revisionIndex()
     backend.failUnwraps(nil)
-    service.invalidateDiscovery() // The ordinary Refresh action also resets the failure backoff.
+    let active: ItemVaultSession
+    if replaceSession {
+        active = try await backend.replaceSession(id)
+        #expect(!session.isUnlocked)
+    } else {
+        service.invalidateDiscovery()
+        active = session
+    }
     let ready = try await waitForDisplay(service, vault: id) { $0.catalogLoadedCount == nil }
     #expect(ready.catalog?.items.count == 2)
-    #expect(session.isUnlocked)
-    #expect(try await session.revisionIndex() == originalVersions)
+    #expect(active.isUnlocked)
+    #expect(try await active.revisionIndex() == originalVersions)
 }
 
 @Test(arguments: [17, 257, 1025])
@@ -1110,4 +1143,107 @@ private actor RestartHealthBreach: BreachChecking {
     let result = try await service.execute(.passwordQuality(item: "Login"), vault: id.uuidString, offline: true)
     #expect(!result.passwordQuality.isEmpty)
     #expect(backend.offlineOpens.withLock { $0 } == 0)
+}
+
+@Test func displayReplacementKeepsVerifiedRowsUntilProjectionIsReady() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 40))
+    let session = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let service = ItemVaultService(backend: backend, idleDelay: .zero, idleSpacing: .zero)
+    defer { service.lock() }
+    service.setMaintenanceActive(false)
+    let before = try await service.execute(.catalog, vault: id.uuidString).requireCatalog()
+    let target = try #require(before.items.first), itemID = try #require(target.storageID.flatMap(UUID.init(uuidString:)))
+    let old = try await session.catalog(itemID: itemID)
+    var changed = old.catalog; changed.item.metadata = ItemMetadata(favorite: true)
+    _ = try await session.edit(itemID: itemID, expectedBase: old.versionID, catalog: changed)
+    let pending = try await service.displayCatalog(vault: id.uuidString)
+    let visible = try pending.requireCatalog()
+    #expect(visible.items.map(\.storageID) == before.items.map(\.storageID))
+    #expect(visible.revision == before.revision)
+    #expect(pending.catalogLoadedCount == 39 && pending.catalogTotalCount == 40)
+    #expect(visible.items.first(where: { $0.storageID == target.storageID })?.metadata?.favorite != true)
+    // A retained display row must never allow an edit against the obsolete head.
+    await #expect(throws: (any Error).self) {
+        _ = try await session.edit(itemID: itemID, expectedBase: old.versionID, catalog: old.catalog)
+    }
+    service.setMaintenanceActive(true)
+    let ready = try await waitForDisplay(service, vault: id) { $0.catalogTotalCount == nil }.requireCatalog()
+    #expect(ready.items.map(\.storageID) == before.items.map(\.storageID))
+    #expect(ready.items.first(where: { $0.storageID == target.storageID })?.metadata?.favorite == true)
+    #expect(ready.revision != before.revision)
+    service.lock()
+    #expect(!session.isUnlocked)
+}
+
+@Test func rotationWaitsForGrantWithoutRemovingVerifiedDisplayRow() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: directory), layout: .contentPreview3)
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 1))
+    let session = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let service = ItemVaultService(backend: backend, idleDelay: .zero, idleSpacing: .zero)
+    defer { service.lock() }
+    let before = try await service.execute(.catalog, vault: id.uuidString).requireCatalog()
+    let itemID = try #require(before.items.first?.storageID.flatMap(UUID.init(uuidString:)))
+    let contentSession = try #require(session.contentSession)
+    let scope = session.binding.item(itemID)
+    let stored = try #require(await repository.item(scope))
+    let original = try ContentEnvelope.decode(stored.ciphertext, history: contentSession.history, item: itemID)
+    let grant = try await contentSession.grant(for: original)
+    let rotated = try contentSession.permit.withDevice {
+        try original.rotateKey(grant: grant, history: contentSession.history, decryptor: $0, signer: $0)
+    }
+    let policy = try GrantBackedContentStorage.recipientPolicy(history: contentSession.history)
+    let envelope = rotated.content
+    let prepared = try PreparedContentVersion(version: EncryptedItemVersion(scope: scope, versionID: envelope.header.version,
+        baseVersionID: envelope.header.base, ciphertext: envelope.encoded(), generation: envelope.header.generation),
+        keyGeneration: envelope.header.keyGeneration, contentRevision: envelope.header.contentRevision,
+        membership: envelope.header.membership, keyAuthority: policy.keyAuthority)
+    let incoming = IncomingRecord(id: UUID().uuidString, account: scope.account, database: scope.database,
+        zoneName: SyncStoreLayout.contentZone(vault: id), zoneOwner: scope.zoneOwner, recordName: itemID.uuidString,
+        recordType: ContentRecordKind.head.rawValue, bytes: prepared.version.ciphertext, systemFields: Data(), vaultID: id)
+    try await repository.stageIncoming(incoming, permit: ClosureRepositoryWritePermit {})
+    try await repository.receiveContent(prepared, from: incoming, action: .supersede, expectedHead: stored.versionID,
+        expectedPolicy: policy, permit: ClosureRepositoryWritePermit {})
+    let waiting = try await waitForDisplay(service, vault: id) { $0.catalogWaitingCount == 1 }
+    #expect(waiting.catalog?.items.map(\.storageID) == before.items.map(\.storageID))
+    #expect(waiting.catalog?.revision == before.revision)
+    #expect(waiting.catalogLoadedCount == 0)
+    let recipientGrant = try #require(rotated.grants.first { $0.recipient == contentSession.identity.fingerprint })
+    let preparedGrant = try PreparedContentGrant(scope: scope, keyGeneration: recipientGrant.keyGeneration,
+        recipient: recipientGrant.recipient, identifier: recipientGrant.identifier, bytes: recipientGrant.encoded())
+    let incomingGrant = IncomingRecord(id: UUID().uuidString, account: scope.account, database: scope.database,
+        zoneName: incoming.zoneName, zoneOwner: scope.zoneOwner, recordName: itemID.uuidString + ":" + preparedGrant.identifier,
+        recordType: ContentRecordKind.grant.rawValue, bytes: preparedGrant.bytes, systemFields: Data(), vaultID: id)
+    try await repository.stageIncoming(incomingGrant, permit: ClosureRepositoryWritePermit {})
+    try await repository.receiveContentGrant(preparedGrant, from: incomingGrant, expectedPolicy: policy, permit: ClosureRepositoryWritePermit {})
+    let ready = try await waitForDisplay(service, vault: id) { $0.catalogTotalCount == nil }.requireCatalog()
+    #expect(ready.items.map(\.storageID) == before.items.map(\.storageID))
+    #expect(ready.revision != before.revision)
+}
+
+@Test func authorizedSessionReplacementKeepsCompleteDisplayWithoutRehydratingRows() async throws {
+    let directory = try serviceLocation()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let backend = try SoftwareItemBackend(repository: repository), id = UUID()
+    let archive = try PortableArchive.seal(performanceDocument(itemCount: 40))
+    _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
+    let service = ItemVaultService(backend: backend, idleDelay: .zero, idleSpacing: .zero)
+    defer { service.lock() }
+    service.setMaintenanceActive(false)
+    let before = try await service.execute(.catalog, vault: id.uuidString).requireCatalog()
+    _ = try await backend.replaceSession(id, preservingDisplay: true)
+    let unwraps = backend.unwrapCount
+    let result = try await service.displayCatalog(vault: id.uuidString)
+    let after = try result.requireCatalog()
+    #expect(after.items.map(\.storageID) == before.items.map(\.storageID))
+    #expect(after.revision == before.revision)
+    #expect(result.catalogTotalCount == nil)
+    #expect(backend.unwrapCount == unwraps)
 }

@@ -40,7 +40,7 @@ private func localModel(localService: (any LocalVaultServing)? = nil,
 @MainActor
 private func finish(_ model: AppModel) async throws {
     for _ in 0..<500 {
-        if !model.busy && !model.refreshing && !model.loadingVaults { return }
+        if !model.busy && !model.refreshing && !model.loadingVaults && !model.hasPendingAutomaticUnlock { return }
         try await Task.sleep(for: .milliseconds(10))
     }
 }
@@ -218,7 +218,7 @@ extension LocalVaultModelTests {
         store.identities = [identity]
         func makeModel() -> AppModel {
             AppModel(breachClient: TestBreachClient(), service: CloudOnlyService(), defaults: defaults,
-                     automaticTimer: false, localService: store)
+                     automaticTimer: false, localService: store, authorizeApplication: {})
         }
         let first = makeModel()
         first.chooseVault(LocalVault.id)
@@ -232,6 +232,8 @@ extension LocalVaultModelTests {
         next.start()
         while next.localLoading { await Task.yield() }
         try await finish(next)
+        while next.localLoading { await Task.yield() }
+        #expect(next.rootPresentation == .ready)
         #expect(next.collection == .local && next.vault == LocalVault.id)
         #expect(next.selectedLocalIdentity?.id == identity.id)
         next.lock()
@@ -239,12 +241,14 @@ extension LocalVaultModelTests {
         afterLock.start()
         while afterLock.localLoading { await Task.yield() }
         try await finish(afterLock)
+        while afterLock.localLoading { await Task.yield() }
         #expect(afterLock.selectedLocalIdentity?.id == identity.id)
         store.identities = []
         let missing = makeModel()
         missing.start()
         while missing.localLoading { await Task.yield() }
         try await finish(missing)
+        while missing.localLoading { await Task.yield() }
         #expect(missing.collection == .local && missing.selectedLocalIdentityID == nil)
     }
 }

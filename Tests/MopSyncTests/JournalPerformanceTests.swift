@@ -6,6 +6,7 @@ import Testing
 private enum BenchmarkWait: Error { case metadataNotAvailable }
 
 private struct BenchmarkHealth: Decodable {
+    let kind: SyncOperation.Kind
     let id: UUID
     let state: SyncOperationState
     let createdAt: Date
@@ -14,7 +15,7 @@ private struct BenchmarkHealth: Decodable {
 }
 
 extension EncryptedItemRepository {
-    fileprivate func seedLargeJournal() throws {
+    fileprivate func seedLargeJournal(incomingCount: Int = 200, incomingBytes: Int = 32768) throws {
         try transaction {
             let encoder = JSONEncoder()
             func insert<T: Encodable>(_ value: T, entity: String, id: String) throws {
@@ -28,10 +29,10 @@ extension EncryptedItemRepository {
                 if index < 10_000 { operation.state = .completed; operation.completedAt = Date() }
                 try insert(operation, entity: "SyncOperation", id: operation.id.uuidString)
             }
-            for index in 0..<200 {
+            for index in 0..<incomingCount {
                 let record = IncomingRecord(id: "incoming-\(index)", account: "benchmark", database: "private",
                     zoneName: "zone", zoneOwner: "owner", recordName: "record-\(index)", recordType: "content",
-                    bytes: Data(repeating: 1, count: 32_768), systemFields: Data())
+                    bytes: Data(repeating: 1, count: incomingBytes), systemFields: Data())
                 try insert(record, entity: "IncomingRecord", id: record.id)
                 let operation = SyncOperation(id: record.operationID, account: "benchmark", kind: .applyIncoming,
                     payload: Data(record.id.utf8), now: record.receivedAt)
@@ -214,7 +215,7 @@ extension EncryptedItemRepository {
         let after = await reader.metrics()
         #expect(original.pendingCount == 1200)
         #expect(after.resultBuilds - before.resultBuilds == 100)
-        #expect(after.summaryUpdates - before.summaryUpdates == 100)
+        #expect(after.summaryUpdates - before.summaryUpdates == 200)
         #expect(after.fullFetches == before.fullFetches)
         #expect(after.decodedRows - before.decodedRows == 200)
         print("Incoming health benchmark: 100 commits + 1000 reads, 11200 retained operations=\(start.duration(to: .now)); builds=100, decoded rows=200")
@@ -366,7 +367,7 @@ extension EncryptedItemRepository {
         let after = await repository.metrics()
         #expect(after.fullFetches == before.fullFetches)
         #expect(after.decodedRows - before.decodedRows <= 50 * 4)
-        #expect(after.summaryUpdates - before.summaryUpdates == 50)
+        #expect(after.summaryUpdates - before.summaryUpdates == 100)
         #expect(try await repository.syncHealth(account: "benchmark", database: "private").pendingCount == 1251)
         let baselineStart = clock.now
         for index in 50..<100 {
@@ -398,5 +399,171 @@ extension EncryptedItemRepository {
         #expect(try await repository.operations(account: "a", database: "private").count == 1)
         try await repository.pruneCompletedOperations(account: "a", database: "private")
         #expect(try await repository.operations(account: "a", database: "private").isEmpty)
+    }
+}
+
+private struct BaselineOperationSummary {
+    var unfinished: [UUID: BenchmarkHealth] = [:]
+    var deliveries: [Date: Int] = [:]
+    var latest: Date?
+    mutating func update(_ row: BenchmarkHealth, added: Bool) {
+        if row.state != .completed { unfinished[row.id] = added ? row : nil }
+        if let date = row.deliveredAt {
+            let count = deliveries[date, default: 0] + (added ? 1 : -1)
+            deliveries[date] = count == 0 ? nil : count
+            if added { latest = max(latest ?? date, date) }
+            else if latest == date && count == 0 { latest = deliveries.keys.max() }
+        }
+    }
+}
+private struct BaselineIncomingHealth: Decodable {
+    let id: String
+    let receivedAt: Date
+    let failure: SyncFailure?
+}
+private struct BaselineIncomingSize: Decodable {
+    let bytes: Data
+    let systemFields: Data
+}
+extension EncryptedItemRepository {
+    fileprivate func previousHealthSnapshot() throws -> SyncHealthSnapshot {
+        try transaction {
+            let operations = try journalReadCache.summary(
+                prefix: "sync-journal-v1:SyncOperation:" + journalKey("benchmark", "private", ""),
+                in: context, initial: BaselineOperationSummary()) {
+                    (summary: inout BaselineOperationSummary, row: BenchmarkHealth, added: Bool) in summary.update(row, added: added)
+                }
+            let incoming: [BaselineIncomingHealth] = try journalValues("IncomingRecord", account: "benchmark", database: "private")
+            let unfinished = operations.unfinished.values
+            let ids = Set(incoming.map { IncomingRecord.operationID(for: $0.id) })
+            let pending = unfinished.filter { !ids.contains($0.id) }
+            let delivery: Date? = try journalValue("StateBlob", key: "sync-last-delivery:" + journalKey("benchmark", "private", ""))
+            return SyncHealthSnapshot(pendingCount: pending.count + incoming.count,
+                oldestPendingAt: (pending.map(\.createdAt) + incoming.map(\.receivedAt)).min(),
+                lastDeliveryAt: [operations.latest, delivery].compactMap { $0 }.max(),
+                blockedReasons: Set(unfinished.compactMap(\.failure) + incoming.compactMap(\.failure)),
+                pendingKinds: Set(unfinished.filter { $0.state != .needsAttention }.map(\.kind)))
+        }
+    }
+    fileprivate func previousCapacityRead() throws -> Bool {
+        try transaction {
+            let records: [BaselineIncomingSize] = try journalValues("IncomingRecord", account: "benchmark")
+            return records.reduce(0) { $0 + $1.bytes.count + $1.systemFields.count } <= Self.maximumInboxBytes / 2
+        }
+    }
+    fileprivate func capacityOverlayMustRollback(_ first: IncomingRecord, _ second: IncomingRecord) throws {
+        try transaction {
+            _ = try stageIncomingInTransaction(first, budget: 100)
+            _ = try stageIncomingInTransaction(first, budget: 100) // replay must not double count
+            _ = try stageIncomingInTransaction(second, budget: 100)
+        }
+    }
+}
+extension JournalPerformanceTests {
+    @Test func incrementalStatusAndCapacityBenchmark() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = SyncStoreLayout.contentPreviewURL(in: root)
+        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        try await writer.seedLargeJournal(incomingCount: 5000, incomingBytes: 1024)
+        _ = try await reader.syncHealth(account: "benchmark", database: "private")
+        _ = try await reader.inboxReadyToResume(account: "benchmark")
+        _ = try await reader.previousHealthSnapshot()
+        _ = try await reader.previousCapacityRead()
+        let before = await reader.metrics()
+        var statusTime = Duration.zero, oldStatusTime = Duration.zero
+        var capacityTime = Duration.zero, oldCapacityTime = Duration.zero
+        let clock = ContinuousClock()
+        for index in 0..<100 {
+            let record = IncomingRecord(id: "incremental-\(index)", account: "benchmark", database: "private",
+                zoneName: "zone", zoneOwner: "owner", recordName: "incremental-\(index)", recordType: "content",
+                bytes: Data(repeating: 1, count: 32768), systemFields: Data([1, 2, 3]))
+            _ = try await writer.stageIncoming(record)
+            // Charge history-refresh work equally: perform it before timing.
+            _ = try await reader.activeOperations(account: "benchmark", database: "private")
+            var start = clock.now
+            let status = try await reader.syncHealth(account: "benchmark", database: "private")
+            statusTime += start.duration(to: clock.now)
+            start = clock.now
+            let oldStatus = try await reader.previousHealthSnapshot()
+            oldStatusTime += start.duration(to: clock.now)
+            #expect(status == oldStatus)
+            start = clock.now
+            let capacity = try await reader.inboxReadyToResume(account: "benchmark")
+            capacityTime += start.duration(to: clock.now)
+            start = clock.now
+            let oldCapacity = try await reader.previousCapacityRead()
+            oldCapacityTime += start.duration(to: clock.now)
+            #expect(capacity == oldCapacity)
+        }
+        let after = await reader.metrics()
+        // Three aggregate updates per incoming+operation pair, independent of
+        // the 16,000 retained rows. Timing is reported, not a flaky assertion.
+        #expect(after.summaryUpdates - before.summaryUpdates == 400) // 300 optimized + 100 baseline
+        print("Incremental status/capacity: 100 changes over 16,000 operations + 5,000 inbox rows; health=\(statusTime), previous health=\(oldStatusTime); capacity=\(capacityTime), previous capacity=\(oldCapacityTime); aggregate updates=300")
+    }
+
+    @Test func capacityAggregateIncludesUnsavedRowsAndDiscardsRollback() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = SyncStoreLayout.contentPreviewURL(in: root)
+        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        func record(_ id: String) -> IncomingRecord {
+            IncomingRecord(id: id, account: "a", database: "private", zoneName: "z", zoneOwner: "o", recordName: id,
+                recordType: "test", bytes: Data(repeating: 1, count: 50), systemFields: Data([1]))
+        }
+        #expect(try await reader.inboxReadyToResume(account: "a", budget: 100))
+        await #expect(throws: SyncJournalError.inboxFull) {
+            try await reader.capacityOverlayMustRollback(record("one"), record("two"))
+        }
+        #expect(try await reader.incomingRecords(account: "a", database: "private").isEmpty)
+        #expect(try await reader.inboxReadyToResume(account: "a", budget: 100))
+        let first = record("one")
+        _ = try await writer.stageIncoming(first, budget: 100)
+        #expect(try await !reader.inboxReadyToResume(account: "a", budget: 100))
+        try await writer.completeIncoming(first)
+        #expect(try await reader.inboxReadyToResume(account: "a", budget: 100))
+        let reopened = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        #expect(try await reopened.inboxReadyToResume(account: "a", budget: 100))
+    }
+}
+
+extension JournalPerformanceTests {
+    @Test func joinedHealthMatchesReferenceAcrossPartialReceiptTransitions() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = SyncStoreLayout.contentPreviewURL(in: root)
+        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        func check() async throws {
+            #expect(try await reader.syncHealth(account: "benchmark", database: "private") == reader.previousHealthSnapshot())
+        }
+        try await check()
+        for index in 0..<12 {
+            let record = IncomingRecord(id: "joined-\(index)", account: "benchmark", database: "private",
+                zoneName: "zone", zoneOwner: "owner", recordName: "r-\(index)", recordType: "content",
+                bytes: Data([1]), systemFields: Data(), now: Date(timeIntervalSince1970: Double(index)))
+            _ = try await writer.stageIncoming(record)
+            try await check()
+            var operation = try #require(await writer.operations(account: "benchmark", database: "private").first { $0.id == record.operationID })
+            operation.state = .needsAttention; operation.failure = .invalidAuthority
+            try await writer.replaceHealthFixture(operation)
+            try await check()
+            // Completed receipt with a retained inbox row must still count once.
+            operation.state = .completed; operation.deliveredAt = Date(timeIntervalSince1970: 100)
+            try await writer.replaceHealthFixture(operation)
+            try await check()
+            await #expect(throws: SyncJournalError.invalidOperation) {
+                try await writer.replaceHealthFixture(operation, delete: true, rollback: true)
+            }
+            try await check()
+            try await writer.replaceHealthFixture(operation, delete: true)
+            try await check() // orphan inbox still counts, with its original date
+            try await writer.completeIncoming(record)
+            try await check()
+        }
+        #expect(try await reader.syncHealth(account: "benchmark", database: "private").pendingCount == 0)
     }
 }

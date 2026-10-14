@@ -18,6 +18,7 @@ public enum CloudSyncAdapterError: Error, Equatable, Sendable {
     case assetDirectoryRequired
     case unreadableRemoteRecord
     case operationInterrupted
+    case inboxFull
 }
 
 /// Keep the reason sync stopped separate from subsequent callback diagnostics.
@@ -25,11 +26,20 @@ struct CloudSyncSuspension {
     private(set) var failure: CloudSyncAdapterError?
 
     mutating func record(_ reason: CloudSyncAdapterError) {
-        if failure == nil || reason == .accountChanged { failure = reason }
+        if failure == nil || reason == .accountChanged
+            || (failure == .inboxFull && reason != .operationInterrupted) { failure = reason }
     }
 
     func check() throws {
         if let failure { throw failure }
+    }
+
+    // Capacity pauses transport/checkpoints, not the consumer that frees space.
+    // No other suspension is allowed to retain local processing authority.
+    var allowsLocalProcessing: Bool { failure == nil || failure == .inboxFull }
+
+    func checkLocalProcessing() throws {
+        if !allowsLocalProcessing { try check() }
     }
 }
 

@@ -1432,6 +1432,149 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     #expect(try await repository.item(scope) == item.version)
 }
 
+@MainActor @Test func contentGrantRequestWaitsForMembershipBeforeVerification() async throws {
+    let (root, repository, owner, original, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let joining = try SessionDevice(member: owner.identity.member)
+    let enrollment = EnrollmentScope(container: "iCloud.test", environment: "Development", account: scope.account,
+        vault: scope.vaultID, member: owner.identity.member)
+    let request = try DeviceEnrollmentRequest.create(scope: enrollment, device: joining)
+    let history = try DeviceEnrollmentApproval.create(request: request, history: original, owner: owner).verifiedHistory()
+    let payload = try JSONEncoder().encode(ContentGrantRequest(item: scope.itemID, keyGeneration: UUID(), recipient: joining.identity.fingerprint))
+    let envelope = try CoordinationEnvelope.sign(kind: .grantRequest, scope: enrollment, identity: UUID(),
+        payload: payload, history: history, device: joining)
+    let record = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID, kind: .grantRequest,
+        identity: envelope.identity, bytes: envelope.encoded())
+    let incoming = try PreparedCoordinationRecord.materialize(record.record(), account: scope.account)
+    try await repository.stageIncoming(incoming, permit: ContentStorageTestPermit())
+    let operation = try #require(await repository.operations(account: scope.account, database: "private").first { $0.id == incoming.operationID })
+    let inbox = GrantBackedCoordinationInbox(repository: repository, container: enrollment.container,
+        environment: enrollment.environment, account: enrollment.account, member: enrollment.member)
+    guard case .waiting(let dependencies) = await inbox.handle(operation, history: original, permit: ContentStorageTestPermit()) else {
+        Issue.record("A request arriving before membership must wait, not quarantine"); return
+    }
+    #expect(dependencies == [.init(.membership, identifier: scope.vaultID.uuidString + ":" + (try history.current.digest()))])
+    #expect(try await repository.operations(account: scope.account, database: "private").contains { $0.kind == .fetchMembership })
+    #expect(try await repository.coordinationRecords(account: scope.account, kind: .grantRequest).isEmpty)
+    #expect(try await repository.quarantineSummary(account: scope.account).records == 0)
+    guard case .completed = await inbox.handle(operation, history: history, permit: ContentStorageTestPermit()) else {
+        Issue.record("Request did not resume after trusted membership arrived"); return
+    }
+    #expect(try await repository.coordinationRecords(account: scope.account, kind: .grantRequest) == [record])
+    #expect(try await repository.incomingRecord(id: incoming.id, account: scope.account, database: "private") == nil)
+
+    var revoked = history
+    try revoked.append(MembershipEnvelope.successor(of: history.current,
+        membership: Membership(accounts: [.init(id: owner.identity.member, role: .owner, devices: [owner.identity])],
+            removedDevices: [joining.identity.device]), owner: owner))
+    try await repository.stageIncoming(incoming, permit: ContentStorageTestPermit())
+    // Strict verification must still reject the removed author for access.
+    #expect(throws: MopError.vaultUntrusted) { try inbox.verify(record, history: revoked) }
+    #expect(try inbox.obsoleteGrantRequest(record, history: revoked))
+    guard case .completed = await inbox.handle(operation, history: revoked, permit: ContentStorageTestPermit()) else {
+        Issue.record("Verified obsolete work must terminate without granting access"); return
+    }
+    #expect(try await repository.incomingRecord(id: incoming.id, account: scope.account, database: "private") == nil)
+    #expect(try await repository.quarantineSummary(account: scope.account).records == 0)
+    let wrongRecipient = try CoordinationEnvelope.sign(kind: .grantRequest, scope: enrollment, identity: UUID(),
+        payload: JSONEncoder().encode(ContentGrantRequest(item: scope.itemID, keyGeneration: UUID(), recipient: owner.identity.fingerprint)),
+        history: history, device: joining)
+    let mismatched = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID, kind: .grantRequest,
+        identity: wrongRecipient.identity, bytes: wrongRecipient.encoded())
+    #expect(throws: MopError.vaultUntrusted) { try inbox.obsoleteGrantRequest(mismatched, history: revoked) }
+    var corrupted = try #require(JSONSerialization.jsonObject(with: record.bytes) as? [String: Any])
+    corrupted["signature"] = Data(repeating: 0, count: 64).base64EncodedString()
+    let invalid = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID, kind: .grantRequest,
+        identity: record.identity, bytes: JSONSerialization.data(withJSONObject: corrupted, options: [.sortedKeys]))
+    #expect(throws: (any Error).self) { try inbox.obsoleteGrantRequest(invalid, history: revoked) }
+    // Previously terminal work is re-evaluated without rearming it or issuing grants.
+    for candidate in [record, mismatched, invalid] {
+        let queued = try await repository.enqueue(SyncOperation(account: scope.account, vaultID: scope.vaultID,
+            kind: .enrollment, payload: JSONEncoder().encode(candidate)))
+        let failed = try await repository.transition(queued, to: .needsAttention, failure: .invalidAuthority, attempted: true)
+        #expect(try await !inbox.retireObsoleteFailure(failed, history: nil, permit: ContentStorageTestPermit()))
+        #expect(try await !inbox.retireObsoleteFailure(failed, history: original, permit: ContentStorageTestPermit()))
+        #expect(try await !inbox.retireObsoleteFailure(failed, history: history, permit: ContentStorageTestPermit()))
+        let retired = try await inbox.retireObsoleteFailure(failed, history: revoked, permit: ContentStorageTestPermit())
+        #expect(retired == (candidate == record))
+        let saved = try #require(await repository.operations(account: scope.account, database: "private").first { $0.id == failed.id })
+        #expect(saved.state == (retired ? .completed : .needsAttention))
+        #expect(saved.failure == (retired ? nil : .invalidAuthority))
+        #expect(saved.attempts == 1 && saved.deliveredAt == nil)
+        if retired {
+            await #expect(throws: SyncJournalError.staleOperation) {
+                _ = try await inbox.retireObsoleteFailure(failed, history: revoked, permit: ContentStorageTestPermit())
+            }
+        }
+    }
+    let badIncoming = try PreparedCoordinationRecord.materialize(invalid.record(), account: scope.account)
+    try await repository.stageIncoming(badIncoming, permit: ContentStorageTestPermit())
+    let badOperation = try #require(await repository.operations(account: scope.account, database: "private").first { $0.id == badIncoming.operationID })
+    guard case .attention(.invalidAuthority) = await inbox.handle(badOperation, history: revoked, permit: ContentStorageTestPermit()) else {
+        Issue.record("Invalid signatures cannot be retired as obsolete"); return
+    }
+    #expect(try await repository.quarantineSummary(account: scope.account).records == 1)
+    let badCandidate = try #require(await repository.quarantinedRecords(account: scope.account).first)
+    #expect(try await !inbox.retireQuarantinedRequest(badCandidate, history: revoked, permit: ContentStorageTestPermit()))
+    // Exercise the old rejection path with a valid, now-obsolete signed request.
+    try await repository.stageIncoming(incoming, permit: ContentStorageTestPermit())
+    try await repository.quarantineIncoming(incoming, permit: ContentStorageTestPermit())
+    let candidate = try #require(await repository.quarantinedRecords(account: scope.account).first { $0.payload == record.bytes })
+    #expect(try await !inbox.retireQuarantinedRequest(candidate, history: nil, permit: ContentStorageTestPermit()))
+    #expect(try await !inbox.retireQuarantinedRequest(candidate, history: history, permit: ContentStorageTestPermit()))
+    var legacy = candidate; legacy.operations = nil
+    #expect(try await !inbox.retireQuarantinedRequest(legacy, history: revoked, permit: ContentStorageTestPermit()))
+    var evicted = candidate; evicted.payload = nil
+    #expect(try await !inbox.retireQuarantinedRequest(evicted, history: revoked, permit: ContentStorageTestPermit()))
+    #expect(try await inbox.retireQuarantinedRequest(candidate, history: revoked, permit: ContentStorageTestPermit()))
+    let retiredIncoming = try #require(await repository.operations(account: scope.account, database: "private").first { $0.id == incoming.operationID })
+    #expect(retiredIncoming.state == .completed && retiredIncoming.failure == nil && retiredIncoming.deliveredAt == nil)
+    #expect(try await repository.quarantinedRecords(account: scope.account) == [badCandidate])
+    #expect(try await repository.quarantineSummary(account: scope.account).records == 2) // evidence retained
+    await #expect(throws: SyncJournalError.staleOperation) {
+        _ = try await inbox.retireQuarantinedRequest(candidate, history: revoked, permit: ContentStorageTestPermit())
+    }
+
+    let legacyEnvelope = try CoordinationEnvelope.sign(kind: .grantRequest, scope: enrollment, identity: UUID(),
+        payload: payload, history: history, device: joining)
+    let legacyRecord = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID,
+        kind: .grantRequest, identity: legacyEnvelope.identity, bytes: legacyEnvelope.encoded())
+    let cloudRecord = try legacyRecord.record()
+    let legacyIncoming = try PreparedCoordinationRecord.materialize(cloudRecord, account: scope.account)
+    try await repository.stageIncoming(legacyIncoming, permit: ContentStorageTestPermit())
+    // Reproduce the old format: retained bytes, but no operation linkage.
+    try await repository.quarantine(legacyIncoming.bytes, account: scope.account, database: "private",
+        zone: legacyIncoming.zoneName, owner: legacyIncoming.zoneOwner, record: legacyIncoming.recordName)
+    try await repository.completeIncoming(legacyIncoming, failure: .invalidAuthority)
+    var old = try #require(await repository.quarantinedRecords(account: scope.account).first { $0.payload == legacyRecord.bytes })
+    #expect(old.operations == nil)
+    #expect(inbox.legacyObsoleteRecord(old, history: history) == nil)
+    #expect(inbox.legacyObsoleteRecord(old, history: revoked) == legacyRecord)
+    let differentRevision = IncomingRecord(id: "different-revision", account: scope.account, database: "private",
+        zoneName: legacyIncoming.zoneName, zoneOwner: legacyIncoming.zoneOwner, recordName: legacyIncoming.recordName,
+        recordType: legacyIncoming.recordType, bytes: legacyIncoming.bytes, systemFields: Data(), vaultID: scope.vaultID)
+    await #expect(throws: SyncJournalError.staleOperation) {
+        _ = try await repository.linkLegacyQuarantine(old, incoming: differentRevision, permit: ContentStorageTestPermit())
+    }
+    try await repository.retainUnmatchedQuarantine(old, account: scope.account, permit: ContentStorageTestPermit())
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    old = try #require(await reopened.quarantinedRecords(account: scope.account).first { $0.digest == old.digest })
+    #expect(old.legacyReadbackUnmatched == true)
+    #expect(inbox.legacyObsoleteRecord(old, history: revoked) == nil) // no further cloud readback
+    #expect(try await reopened.operations(account: scope.account, database: "private")
+        .first { $0.id == legacyIncoming.operationID }?.failure == .invalidAuthority)
+    #expect(try await reopened.quarantinedRecords(account: scope.account).contains(badCandidate))
+    // Independently obtained exact evidence can still repair the record later.
+    let linked = try await repository.linkLegacyQuarantine(old,
+        incoming: PreparedCoordinationRecord.materialize(cloudRecord, account: scope.account), permit: ContentStorageTestPermit())
+    #expect(linked.operations == [legacyIncoming.operationID])
+    #expect(try await inbox.retireQuarantinedRequest(linked, history: revoked, permit: ContentStorageTestPermit()))
+    #expect(try await repository.operations(account: scope.account, database: "private")
+        .first { $0.id == legacyIncoming.operationID }?.state == .completed)
+    #expect(try await repository.quarantinedRecords(account: scope.account).contains(badCandidate))
+
+}
+
 @MainActor @Test func contentDeletionCarriesAuthorityForReturningDevicesAndReusesPreparedBytes() async throws {
     let (root, repository, owner, original, scope) = try await previewInboxFixture()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1531,4 +1674,246 @@ func contentConflictChoiceSurvivesNonOwnerExitAndCommitsWhileLocked(keepLocal: B
         #expect(publications.filter { $0.grant?.keyGeneration == replacement.content.keyGeneration }.count == replacement.grants.count)
     }
     await #expect(throws: SyncJournalError.staleOperation) { try await reopened.contentConflictDecision(decision) }
+}
+
+@Test(arguments: [MopError.vaultUntrusted, .cloudPermission, .invalidVault, .signing, .notVaultMember, .invalidIdentity])
+func permanentCoordinationFailuresDoNotRetryOnWake(failure: MopError) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+    let operation = try await repository.enqueue(SyncOperation(account: "test", kind: .enrollment))
+    let coordinator = DurableSyncCoordinator(repository: repository, account: "test", kinds: [.enrollment],
+        dependencyAvailable: { _ in true }, handler: { _ in ItemVaultSyncRuntime.workFailureOutcome(failure) })
+    await coordinator.start()
+    await coordinator.wake(reason: .unlocked)
+    await coordinator.wake(reason: .dependenciesChanged)
+    await coordinator.wake(reason: .foreground)
+    await coordinator.waitUntilIdle()
+    await coordinator.stop()
+    let result = try #require(await repository.operations(account: "test", database: "private").first { $0.id == operation.id })
+    #expect(result.state == .needsAttention && result.failure == .invalidAuthority && result.attempts == 1)
+    guard case .retry(.dependency, _) = ItemVaultSyncRuntime.workFailureOutcome(CloudSyncAdapterError.membershipUnavailable) else {
+        Issue.record("Unknown membership must remain retryable"); return
+    }
+}
+
+@Test func permanentRuntimeFailuresRemainStoppedAcrossWakes() async throws {
+    let failures: [any Error] = [
+        DeviceEnrollmentFailure.invalidRequest, DeviceEnrollmentFailure.invalidApproval,
+        CloudSyncAdapterError.invalidBinding, CloudSyncAdapterError.malformedRecord,
+        CloudSyncAdapterError.untrustedRecord, ContentStoreError.invalidRecord,
+        ContentStoreError.identityCollision, SyncJournalError.invalidOperation,
+        SyncJournalError.identityCollision, ItemEnvelopeFailure.invalidRecordMutation,
+        ItemRepositoryError.invalidScope, ItemRepositoryError.invalidGeneration,
+        ItemRepositoryError.emptyCiphertext, ItemRepositoryError.oversizedCiphertext,
+        MopError.invalidRecovery, MopError.deviceRemoved,
+        DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "test"))
+    ]
+    for failure in failures {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        let operation = try await repository.enqueue(SyncOperation(account: "test", kind: .enrollment))
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "test", kinds: [.enrollment],
+            dependencyAvailable: { _ in true }, handler: { _ in ItemVaultSyncRuntime.workFailureOutcome(failure) })
+        await coordinator.start()
+        await coordinator.waitUntilIdle()
+        for reason: SyncWakeReason in [.unlocked, .dependenciesChanged, .foreground] {
+            await coordinator.wake(reason: reason)
+            await coordinator.waitUntilIdle()
+        }
+        await coordinator.stop()
+        let result = try #require(await repository.operations(account: "test", database: "private").first { $0.id == operation.id })
+        #expect(result.state == .needsAttention && result.failure == .invalidAuthority && result.attempts == 1)
+    }
+}
+
+@Test func runtimeTransientFailuresRetainTheirRetryReason() {
+    let dependencies: [any Error] = [CloudSyncAdapterError.membershipUnavailable,
+        ContentStoreError.staleAuthority, SyncJournalError.staleOperation, ItemRepositoryError.staleLocalVersion]
+    for failure in dependencies {
+        guard case .retry(.dependency, _) = ItemVaultSyncRuntime.workFailureOutcome(failure) else {
+            Issue.record("Temporary dependency incorrectly classified: \(failure)"); continue
+        }
+    }
+    guard case .attention(.processing) = ItemVaultSyncRuntime.workFailureOutcome(ContentStoreError.wrongLayout),
+          case .attention(.processing) = ItemVaultSyncRuntime.workFailureOutcome(ItemRepositoryError.corruptStore),
+          case .attention(.processing) = ItemVaultSyncRuntime.workFailureOutcome(MopError.cloudInvalidRequest),
+          case .attention(.accountChanged) = ItemVaultSyncRuntime.workFailureOutcome(CloudSyncAdapterError.accountChanged),
+          case .attention(.conflict) = ItemVaultSyncRuntime.workFailureOutcome(MopError.vaultConflict),
+          case .retry(.storagePressure, _) = ItemVaultSyncRuntime.workFailureOutcome(SyncJournalError.inboxFull),
+          case .retry(.storagePressure, _) = ItemVaultSyncRuntime.workFailureOutcome(CloudSyncAdapterError.inboxFull),
+          case .authorization = ItemVaultSyncRuntime.workFailureOutcome(MopError.authentication),
+          case .retry(.transport, _) = ItemVaultSyncRuntime.workFailureOutcome(MopError.cloudUnavailable),
+          case .retry(.processing, _) = ItemVaultSyncRuntime.workFailureOutcome(NSError(domain: "test", code: 1)) else {
+        Issue.record("Transient failures lost their retry classification"); return
+    }
+}
+
+@MainActor @Test func grantPrerequisitesFetchMissingHeadAndWakeOnlyForRelevantState() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let publication = try ContentEnvelope.seal(["password": "secret"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let request = ContentGrantRequest(item: scope.itemID, keyGeneration: publication.content.header.keyGeneration, recipient: owner.identity.fingerprint)
+    let worker = GrantRequestPrerequisites(repository: repository), permit = ContentStorageTestPermit()
+    guard case .waiting(let dependencies) = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit) else {
+        Issue.record("Missing head must wait"); return
+    }
+    let dependency = try #require(dependencies.first)
+    let wait = try #require(GrantRequestWait(dependency: dependency))
+    #expect(try await !wait.available(repository: repository, scope: scope, history: history))
+    _ = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit)
+    let fetches = try await repository.operations(account: "a", database: "private").filter { $0.kind == .fetchContentHead }
+    #expect(fetches.count == 1)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    #expect(try await reopened.operations(account: "a", database: "private").contains { $0.id == fetches.first?.id })
+    let otherScope = ItemScope(account: "a", vaultID: history.vault, itemID: UUID())
+    let other = try ContentEnvelope.seal(["password": "other"], vault: history.vault, item: otherScope.itemID, history: history, signer: owner)
+    let storage = GrantBackedContentStorage(repository: repository)
+    _ = try await storage.commit(other.content, grants: other.grants, scope: otherScope, history: history, authorization: permit)
+    #expect(try await !wait.available(repository: repository, scope: scope, history: history))
+    _ = try await storage.commit(publication.content, grants: publication.grants, scope: scope, history: history, authorization: permit)
+    #expect(try await wait.available(repository: repository, scope: scope, history: history))
+    guard case .completed = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit) else { Issue.record("Expected completion"); return }
+}
+
+@MainActor @Test func grantPrerequisiteWaitObservesMembershipAndPreservesUnknownGeneration() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try ContentEnvelope.seal(["password": "secret"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    _ = try await GrantBackedContentStorage(repository: repository).commit(first.content, grants: first.grants, scope: scope, history: history, authorization: ContentStorageTestPermit())
+    let request = ContentGrantRequest(item: scope.itemID, keyGeneration: UUID(), recipient: owner.identity.fingerprint)
+    guard case .waiting(let dependencies) = try await GrantRequestPrerequisites(repository: repository).reconcile(request: request, scope: scope, history: history, permit: ContentStorageTestPermit()) else {
+        Issue.record("Unrelated generation is not obsolete proof"); return
+    }
+    let dependency = try #require(dependencies.first)
+    let wait = try #require(GrantRequestWait(dependency: dependency))
+    #expect(try await !wait.available(repository: repository, scope: scope, history: history))
+    let joining = try SessionDevice(member: owner.identity.member)
+    var updated = history
+    try updated.append(MembershipEnvelope.successor(of: history.current, membership: Membership(accounts: [.init(id: owner.identity.member, role: .owner, devices: [owner.identity, joining.identity])]), owner: owner))
+    #expect(try await wait.available(repository: repository, scope: scope, history: updated))
+    #expect(GrantRequestWait(dependency: try wait.dependency()) == wait)
+}
+
+@MainActor @Test func grantPrerequisitesRetireOnlyVerifiedAncestorGeneration() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try ContentEnvelope.seal(["password": "secret"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let storage = GrantBackedContentStorage(repository: repository), permit = ContentStorageTestPermit()
+    _ = try await storage.commit(first.content, grants: first.grants, scope: scope, history: history, authorization: permit)
+    let rotated = try first.content.rotateKey(grant: #require(first.grants.first), history: history, decryptor: owner, signer: owner)
+    _ = try await storage.commit(rotated.content, grants: rotated.grants, scope: scope, history: history, authorization: permit)
+    let worker = GrantRequestPrerequisites(repository: repository)
+    let obsolete = ContentGrantRequest(item: scope.itemID, keyGeneration: first.content.header.keyGeneration, recipient: owner.identity.fingerprint)
+    guard case .completed = try await worker.reconcile(request: obsolete, scope: scope, history: history, permit: permit) else { Issue.record("Verified ancestor should retire"); return }
+    let unrelated = ContentGrantRequest(item: scope.itemID, keyGeneration: UUID(), recipient: owner.identity.fingerprint)
+    guard case .waiting = try await worker.reconcile(request: unrelated, scope: scope, history: history, permit: permit) else {
+        Issue.record("Unproven generation must remain waiting"); return
+    }
+    let wrongRecipient = ContentGrantRequest(item: scope.itemID, keyGeneration: first.content.header.keyGeneration, recipient: String(repeating: "f", count: 64))
+    await #expect(throws: ContentStoreError.staleAuthority) {
+        try await worker.reconcile(request: wrongRecipient, scope: scope, history: history, permit: permit)
+    }
+}
+
+@MainActor @Test func grantPrerequisiteHeadFetchStagesWithoutTrustOrCheckpointAndRejectsWrongRoute() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try ContentEnvelope.seal(["password": "secret"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let prepared = try preparedInboxContent(first.content, scope: scope, history: history)
+    let dependency = SyncDependency(.contentHead, identifier: scope.vaultID.uuidString + ":" + scope.itemID.uuidString)
+    let request = try #require(ContentHeadFetch(dependency: dependency))
+    let operation = try await repository.enqueuePrerequisite(request.operation(account: "a", owner: scope.zoneOwner), permit: ContentStorageTestPermit())
+    try await repository.saveEngineState(Data([7]), account: "a", database: "private")
+    let wrong = ContentHeadFetcher(repository: repository, account: "a") { _ in
+        try ContentRecordTransport.content(prepared, kind: .version)
+    }
+    guard case .attention(.invalidAuthority) = await wrong.handle(operation, permit: ContentStorageTestPermit()) else { Issue.record("Wrong route must fail"); return }
+    #expect(try await repository.incomingRecords(account: "a", database: "private").isEmpty)
+    let missing = ContentHeadFetcher(repository: repository, account: "a") { _ in throw CKError(.unknownItem) }
+    guard case .retry(.transport, _) = await missing.handle(operation, permit: ContentStorageTestPermit()) else {
+        Issue.record("Missing cloud record must not retire request"); return
+    }
+    let fetcher = ContentHeadFetcher(repository: repository, account: "a") { id in
+        #expect(id == request.recordID(owner: scope.zoneOwner))
+        return try ContentRecordTransport.content(prepared, kind: .head)
+    }
+    guard case .completed = await fetcher.handle(operation, permit: ContentStorageTestPermit()) else { Issue.record("Head fetch must complete"); return }
+    #expect(try await repository.item(scope) == nil)
+    #expect(try await repository.engineState(account: "a", database: "private") == Data([7]))
+    #expect(try await repository.incomingRecords(account: "a", database: "private").count == 1)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    #expect(try await reopened.operations(account: "a", database: "private").first { $0.id == operation.id }?.state == .completed)
+    let incoming = try #require(await reopened.incomingRecords(account: "a", database: "private").first)
+    _ = try await GrantBackedContentInbox(repository: reopened, account: "a").process(id: incoming.id, history: history, permit: ContentStorageTestPermit())
+    #expect(try await reopened.contentState(scope: scope)?.keyGeneration == first.content.header.keyGeneration)
+}
+
+@MainActor @Test func grantPrerequisitesFetchMissingAncestryBeforeRetirement() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try ContentEnvelope.seal(["password": "secret"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let rotated = try first.content.rotateKey(grant: #require(first.grants.first), history: history, decryptor: owner, signer: owner)
+    let current = try ContentRecordTransport.materialize(ContentRecordTransport.content(preparedInboxContent(rotated.content, scope: scope, history: history), kind: .head), account: "a")
+    let inbox = GrantBackedContentInbox(repository: repository, account: "a"), permit = ContentStorageTestPermit()
+    _ = try await repository.stageIncoming(current)
+    _ = try await inbox.process(id: current.id, history: history, permit: permit)
+    let request = ContentGrantRequest(item: scope.itemID, keyGeneration: first.content.header.keyGeneration, recipient: owner.identity.fingerprint)
+    let worker = GrantRequestPrerequisites(repository: repository)
+    guard case .waiting(let dependencies) = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit) else {
+        Issue.record("Missing ancestry cannot prove obsolescence"); return
+    }
+    let dependency = try #require(dependencies.first)
+    let wait = try #require(GrantRequestWait(dependency: dependency))
+    #expect(wait.missingVersion == first.content.header.version)
+    #expect(try await !wait.available(repository: repository, scope: scope, history: history))
+    let fetch = try #require(await repository.operations(account: "a", database: "private").first { $0.kind == .fetchContentVersion })
+    let decoded = try JSONDecoder().decode(ContentVersionFetch.self, from: fetch.payload)
+    #expect(decoded.version == first.content.header.version)
+    let ancestor = try ContentRecordTransport.materialize(ContentRecordTransport.content(preparedInboxContent(first.content, scope: scope, history: history), kind: .version), account: "a")
+    _ = try await repository.stageIncoming(ancestor)
+    _ = try await inbox.process(id: ancestor.id, history: history, permit: permit)
+    #expect(try await wait.available(repository: repository, scope: scope, history: history))
+    guard case .completed = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit) else {
+        Issue.record("Verified ancestor should retire"); return
+    }
+    #expect(try await repository.item(scope)?.versionID == rotated.content.header.version)
+}
+
+@MainActor @Test func grantPrerequisitesRefreshStaleHeadOnceAndResumeNewGeneration() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try ContentEnvelope.seal(["password": "secret"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let rotated = try first.content.rotateKey(grant: #require(first.grants.first), history: history, decryptor: owner, signer: owner)
+    let inbox = GrantBackedContentInbox(repository: repository, account: "a"), permit = ContentStorageTestPermit()
+    let head = try ContentRecordTransport.materialize(ContentRecordTransport.content(preparedInboxContent(first.content, scope: scope, history: history), kind: .head), account: "a")
+    _ = try await repository.stageIncoming(head)
+    _ = try await inbox.process(id: head.id, history: history, permit: permit)
+    let worker = GrantRequestPrerequisites(repository: repository)
+    let request = ContentGrantRequest(item: scope.itemID, keyGeneration: rotated.content.header.keyGeneration, recipient: owner.identity.fingerprint)
+    guard case .waiting(let dependencies) = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit) else {
+        Issue.record("Newer generation must fetch its head"); return
+    }
+    let dependency = try #require(dependencies.first)
+    let wait = try #require(GrantRequestWait(dependency: dependency))
+    let fetch = try #require(await repository.operations(account: "a", database: "private").first { $0.kind == .fetchContentHead })
+    let prepared = try preparedInboxContent(rotated.content, scope: scope, history: history)
+    let fetcher = ContentHeadFetcher(repository: repository, account: "a") { _ in try ContentRecordTransport.content(prepared, kind: .head) }
+    guard case .completed = await fetcher.handle(fetch, permit: permit) else { Issue.record("Fetch failed"); return }
+    // Reception alone is not readiness and duplicate work cannot re-fetch it.
+    #expect(try await !wait.available(repository: repository, scope: scope, history: history))
+    _ = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit)
+    let fetches = try await repository.operations(account: "a", database: "private").filter { $0.kind == .fetchContentHead }
+    #expect(fetches.count == 1)
+    #expect(fetches.first?.state == .completed)
+    let incoming = try #require(await repository.incomingRecords(account: "a", database: "private").first)
+    _ = try await inbox.process(id: incoming.id, history: history, permit: permit)
+    #expect(try await wait.available(repository: repository, scope: scope, history: history))
+    guard case .completed = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit) else {
+        Issue.record("Verified newer head should resolve request"); return
+    }
+    let oldFetch = ContentHeadFetch(vault: scope.vaultID, item: scope.itemID, observedVersion: first.content.header.version, membership: try history.current.digest())
+    let newFetch = ContentHeadFetch(vault: scope.vaultID, item: scope.itemID, observedVersion: rotated.content.header.version, membership: try history.current.digest())
+    #expect(try oldFetch.operation(account: "a", owner: scope.zoneOwner).id != newFetch.operation(account: "a", owner: scope.zoneOwner).id)
 }

@@ -8,7 +8,11 @@ public struct MopScenes: Scene {
     @MainActor private static func initialModel() -> AppModel {
         #if DEBUG && (os(macOS) || targetEnvironment(simulator))
         if ProcessInfo.processInfo.environment["MOP_UI_TESTING"] == "1" {
-            let model = AppModel(breachClient: UITestBreachClient(), service: UITestVaultService())
+            // Keep restoration tests durable across relaunches without inheriting
+            // selections from unrelated UI tests or the user's application.
+            let selection = ProcessInfo.processInfo.environment["MOP_UI_SELECTION_TEST"] ?? UUID().uuidString
+            let defaults = UserDefaults(suiteName: "mop-ui-testing-" + selection)!
+            let model = AppModel(breachClient: UITestBreachClient(), service: UITestVaultService(), defaults: defaults)
             if ProcessInfo.processInfo.environment["MOP_UI_SECURITY_TEST"] == "1" { model.securityVisible = true }
             return model
         }
@@ -69,7 +73,7 @@ private struct MopCommands: Commands {
                 #if DEBUG
                 Button("Force reconcile (diagnostic)") { model.refresh() }.keyboardShortcut("r").disabled(model.busy)
                 #endif
-                if model.authenticated {
+                if model.applicationUnlocked {
                     Button("Lock") { model.lock() }.keyboardShortcut("l", modifiers: [.command, .shift])
                 } else {
                     Button("Unlock 2ndPass") { model.unlock() }.disabled(!model.canUnlock)

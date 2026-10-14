@@ -22,6 +22,64 @@ public struct GrantBackedCoordinationInbox: Sendable {
         .init(container: container, environment: environment, account: account, vault: vault,
               database: "private", zone: SyncStoreLayout.contentZone(vault: vault), owner: "__defaultOwner__", genesis: genesis)
     }
+    /// Retiring work is not granting access. Require a valid historical author,
+    /// signature, scope and recipient before treating removal as obsolescence.
+    func obsoleteGrantRequest(_ record: PreparedCoordinationRecord, history: TrustedMembershipHistory?) throws -> Bool {
+        guard record.kind == .grantRequest else { return false }
+        guard record.account == account, record.zoneOwner == "__defaultOwner__" else { throw MopError.vaultUntrusted }
+        let value = try CoordinationEnvelope.decode(record.bytes, scope: scope(vault: record.vault))
+        guard value.kind == .grantRequest, value.identity == record.identity,
+              let membership = value.membership else { throw MopError.vaultUntrusted }
+        let request = try JSONDecoder().decode(ContentGrantRequest.self, from: value.payload)
+        guard request.recipient == value.author.fingerprint else { throw MopError.vaultUntrusted }
+        guard let history else { throw CloudSyncAdapterError.membershipUnavailable }
+        guard history.vault == record.vault else { throw MopError.vaultUntrusted }
+        guard let state = try? history.state(forDigest: membership) else { throw CloudSyncAdapterError.membershipUnavailable }
+        guard state.membership.accounts.count == 1, state.membership.accounts[0].id == member,
+              state.membership.devices.contains(value.author) else { throw MopError.vaultUntrusted }
+        try history.verifyAccountPath(from: membership, allowingDeviceRemoval: true)
+        return !history.current.membership.devices.contains(value.author)
+    }
+
+    /// Re-evaluate only retained grant-request work, never generic quarantines.
+    /// A missing history or failed verification leaves the original failure intact.
+    func retireObsoleteFailure(_ operation: SyncOperation, history: TrustedMembershipHistory?,
+                               permit: any RepositoryWritePermit) async throws -> Bool {
+        guard operation.account == account, operation.database == "private",
+              operation.zoneOwner == "__defaultOwner__", operation.kind == .enrollment,
+              operation.state == .needsAttention, operation.failure == .invalidAuthority,
+              let record = try? JSONDecoder().decode(PreparedCoordinationRecord.self, from: operation.payload),
+              record.vault == operation.vaultID,
+              (try? obsoleteGrantRequest(record, history: history)) == true else { return false }
+        try await repository.retireObsoleteCoordination(operation, permit: permit)
+        AccessSyncTrace.event("persisted obsolete grant request retired", operation: operation.id, record: record.recordName)
+        return true
+    }
+
+    func retireQuarantinedRequest(_ candidate: QuarantinedSyncRecord, history: TrustedMembershipHistory?,
+                                  permit: any RepositoryWritePermit) async throws -> Bool {
+        guard let bytes = candidate.payload,
+              let envelope = try? JSONDecoder().decode(CoordinationEnvelope.self, from: bytes),
+              envelope.kind == .grantRequest,
+              let record = try? PreparedCoordinationRecord(account: account, vault: envelope.scope.vault,
+                  kind: .grantRequest, identity: envelope.identity, bytes: bytes),
+              (try? obsoleteGrantRequest(record, history: history)) == true else { return false }
+        guard candidate.operations?.isEmpty == false else { return false }
+        try await repository.retireQuarantinedGrant(candidate, record: record, permit: permit)
+        AccessSyncTrace.event("quarantined obsolete grant request retired", record: record.recordName)
+        return true
+    }
+
+    func legacyObsoleteRecord(_ candidate: QuarantinedSyncRecord, history: TrustedMembershipHistory?) -> PreparedCoordinationRecord? {
+        guard candidate.operations == nil, candidate.legacyReadbackUnmatched != true, let bytes = candidate.payload,
+              let envelope = try? JSONDecoder().decode(CoordinationEnvelope.self, from: bytes),
+              envelope.kind == .grantRequest,
+              let record = try? PreparedCoordinationRecord(account: account, vault: envelope.scope.vault,
+                  kind: .grantRequest, identity: envelope.identity, bytes: bytes),
+              (try? obsoleteGrantRequest(record, history: history)) == true else { return nil }
+        return record
+    }
+
     public func verify(_ record: PreparedCoordinationRecord, history: TrustedMembershipHistory?) throws -> CoordinationEnvelope {
         guard record.account == account, record.zoneOwner == "__defaultOwner__" else { throw MopError.vaultUntrusted }
         let value = try CoordinationEnvelope.decode(record.bytes, scope: scope(vault: record.vault))
@@ -46,7 +104,15 @@ public struct GrantBackedCoordinationInbox: Sendable {
             guard value.identity == record.vault, value.author.fingerprint == notice.author,
                   value.membership == notice.membership else { throw MopError.vaultUntrusted }
             try value.verifyAuthority(history: certified)
-        } else if let history { try value.verifyAuthority(history: history) }
+        } else if let history {
+            // Coordination and membership arrive from different zones. A valid
+            // signature may refer to a committed membership we have not fetched
+            // yet; absence from the local pin is not a failed signature.
+            if let membership = value.membership, (try? history.state(forDigest: membership)) == nil {
+                throw CloudSyncAdapterError.membershipUnavailable
+            }
+            try value.verifyAuthority(history: history)
+        }
         else if value.kind != .discovery { throw CloudSyncAdapterError.membershipUnavailable }
         switch value.kind {
         case .discovery:
@@ -74,8 +140,22 @@ public struct GrantBackedCoordinationInbox: Sendable {
                 guard incoming.vaultID == address.vault else { throw MopError.vaultUntrusted }
                 let record = try PreparedCoordinationRecord(account: account, zoneOwner: incoming.zoneOwner, vault: address.vault,
                     kind: address.kind, identity: address.identity, bytes: incoming.bytes)
-                do { _ = try verify(record, history: history) }
-                catch CloudSyncAdapterError.membershipUnavailable { throw CloudSyncAdapterError.membershipUnavailable }
+                do {
+                    if try obsoleteGrantRequest(record, history: history) {
+                        try await repository.completeIncoming(incoming, failure: nil, permit: permit)
+                        return .completed
+                    }
+                    _ = try verify(record, history: history)
+                }
+                catch CloudSyncAdapterError.membershipUnavailable {
+                    let envelope = try CoordinationEnvelope.decode(record.bytes, scope: scope(vault: record.vault))
+                    if let membership = envelope.membership {
+                        let dependencies: Set<SyncDependency> = [.init(.membership, identifier: record.vault.uuidString + ":" + membership)]
+                        try await repository.deferContentIncoming(incoming, dependencies: dependencies, permit: permit)
+                        return .waiting(dependencies)
+                    }
+                    throw CloudSyncAdapterError.membershipUnavailable
+                }
                 catch { throw MopError.vaultUntrusted }
                 if [.enrollmentRequest, .enrollmentApproval, .enrollmentAcknowledgment].contains(record.kind),
                    try await repository.enrollmentReceipt(account: account, vault: record.vault, request: record.identity) != nil {

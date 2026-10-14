@@ -87,6 +87,8 @@ public final class GrantBackedContentSession: @unchecked Sendable {
         for prepared in grants where prepared.recipient == identity.fingerprint {
             return try ContentKeyGrant.decode(prepared.bytes, content: content, history: history)
         }
+        AccessSyncTrace.event("local access grant missing", item: content.header.item,
+            generation: content.header.keyGeneration, recipient: identity.fingerprint)
         throw CloudSyncAdapterError.membershipUnavailable
     }
 
@@ -102,6 +104,9 @@ public final class GrantBackedContentSession: @unchecked Sendable {
                 let missing = try JSONDecoder().decode(MissingContentGrant.self, from: operation.payload)
                 guard missing.operationID == operation.id, missing.scope == binding.item(missing.scope.itemID) else { return .attention(.invalidAuthority) }
                 guard let snapshot = try await repository.contentGrantPreparation(missing, sourceRecipient: identity.fingerprint) else { return .completed }
+                AccessSyncTrace.event("grant preparation", operation: operation.id, item: missing.scope.itemID,
+                    generation: missing.keyGeneration, recipient: missing.recipient,
+                    detail: "sourceGrantPresent=\(snapshot.sourceGrant != nil)")
                 guard let existing = snapshot.sourceGrant else {
                     if let grantRequestScope { _ = try await requestOwnGrant(for: operation, scope: grantRequestScope, owner: owner) }
                     return .retry(.dependency)
@@ -117,6 +122,8 @@ public final class GrantBackedContentSession: @unchecked Sendable {
                     try verified.extendingAccess(to: recipient, sourceGrantBytes: existing.bytes, decryptor: $0, signer: $0)
                 }
                 try await storage.commitGrant(prepared, scope: missing.scope, authorization: authorization)
+                AccessSyncTrace.event("grant committed locally", operation: operation.id, item: missing.scope.itemID,
+                    generation: missing.keyGeneration, recipient: missing.recipient)
                 return .completed
             }
             if operation.kind == .rotateContent {
@@ -154,13 +161,22 @@ public final class GrantBackedContentSession: @unchecked Sendable {
                 return .completed
             }
             return .attention(.invalidAuthority)
-        } catch MopError.authentication { return .authorization }
-        catch MopError.cloudPermission { return .authorization }
+        } catch MopError.authentication {
+            AccessSyncTrace.event("grant work blocked", operation: operation.id, detail: "reason=authentication")
+            return .authorization
+        }
+        catch MopError.cloudPermission {
+            AccessSyncTrace.event("grant work blocked", operation: operation.id, detail: "reason=cloudPermission")
+            return .authorization
+        }
         catch CloudSyncAdapterError.membershipUnavailable { return .retry(.dependency) }
         catch CloudSyncAdapterError.operationInterrupted { return .retry(.authorization) }
         catch ContentStoreError.staleAuthority { return .retry(.dependency) }
         catch ItemRepositoryError.staleLocalVersion { return .retry(.dependency) }
-        catch { return Authentication.requiresRenewal(error) ? .authorization : .attention(.invalidAuthority) }
+        catch {
+            AccessSyncTrace.failure("grant work failed", operation: operation.id, error: error)
+            return Authentication.requiresRenewal(error) ? .authorization : .attention(.invalidAuthority)
+        }
     }
 
     /// Additive admission signs only membership and an approval. Existing
@@ -316,8 +332,19 @@ extension GrantBackedContentSession {
         let request = ContentGrantRequest(item: content.header.item, keyGeneration: content.header.keyGeneration, recipient: identity.fingerprint)
         let digest = Array(SHA256.hash(data: try setupEncode(request)).prefix(16))
         let id = UUID(uuid: (digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7], digest[8], digest[9], digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]))
-        if try await repository.preparedCoordination(account: binding.account, vault: binding.vaultID, kind: .grantRequest, identity: id) == nil {
-            _ = try await coordination(kind: .grantRequest, scope: scope, identity: id, payload: setupEncode(request), owner: owner)
+        let existing = try await repository.preparedCoordination(account: binding.account, vault: binding.vaultID, kind: .grantRequest, identity: id)
+        AccessSyncTrace.event("access request", operation: operation.id, item: request.item,
+            generation: request.keyGeneration, recipient: request.recipient,
+            detail: "alreadyPrepared=\(existing != nil)")
+        if let existing {
+            AccessSyncTrace.event("access request already prepared", operation: existing.operationID,
+                item: request.item, generation: request.keyGeneration, recipient: request.recipient,
+                record: existing.recordName)
+        } else {
+            let prepared = try await coordination(kind: .grantRequest, scope: scope, identity: id, payload: setupEncode(request), owner: owner)
+            AccessSyncTrace.event("access request queued", operation: prepared.operationID,
+                item: request.item, generation: request.keyGeneration, recipient: request.recipient,
+                record: prepared.recordID.recordName)
         }
         return true
     }

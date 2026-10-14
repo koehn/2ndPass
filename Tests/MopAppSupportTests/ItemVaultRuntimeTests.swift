@@ -106,6 +106,24 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
     #expect(try await repository.operationIsDelivered(removal.id, account: scope.binding.account))
     let revoked = try ItemVaultMembershipAuthority.history(record: pin, trustStore: trust, allowingDeviceRemoval: true)
     #expect(revoked.current.membership.devices == [newcomer.identity])
+    // Reset recovery relies on authenticated readback, independent of receipts
+    // or the removed device's ability to reopen a secret-key session.
+    #expect(try DebugEnrollmentResetFailure.verifiesRemoval(history: revoked,
+        head: revoked.current.encoded(), removed: [owner.identity.device]))
+    #expect(try !DebugEnrollmentResetFailure.verifiesRemoval(history: revoked,
+        head: admitted.current.encoded(), removed: [owner.identity.device]))
+    #expect(try !DebugEnrollmentResetFailure.verifiesRemoval(history: admitted,
+        head: revoked.current.encoded(), removed: [owner.identity.device]))
+    #expect(try !DebugEnrollmentResetFailure.verifiesRemoval(history: revoked,
+        head: revoked.current.encoded(), removed: []))
+
+    let remainingBootstrap = try ItemVaultBootstrap(repository: repository, trustStore: trust, scope: scope,
+        device: SessionDevice(copying: newcomer))
+    let remaining = try await remainingBootstrap.open()
+    #expect(remaining.isUnlocked)
+    let removedBootstrap = try ItemVaultBootstrap(repository: repository, trustStore: trust, scope: scope,
+        device: SessionDevice(copying: owner))
+    await #expect(throws: MopError.notVaultMember) { try await removedBootstrap.open() }
     #expect(throws: MopError.notVaultMember) {
         try GrantBackedContentSession(repository: repository, binding: scope.binding,
             history: revoked, device: SessionDevice(copying: owner))
@@ -174,3 +192,49 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
     #expect(throws: (any Error).self) { try DebugEnrollmentResetFailure.removing(UUID(), from: membership) }
 }
 #endif
+
+@Test func concurrentSessionLoadsReuseAuthorityWithoutLockingForegroundSession() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let owner = try SessionDevice(), trust = MemoryItemInventory()
+    let scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development",
+        binding: ItemVaultBinding(account: "session-reuse", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
+    let first = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: scope,
+        device: SessionDevice(copying: owner)).create(name: "test")
+    let pin = try #require(try trust.load(scope: scope))
+    let history = try ItemVaultMembershipAuthority.history(record: pin, trustStore: trust)
+    let registry = ItemVaultSessionRegistry(), authority = try history.current.digest()
+    #expect(try registry.install(first, authority: authority) === first)
+    let duplicate = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: scope,
+        device: SessionDevice(copying: owner)).open()
+    #expect(try registry.install(duplicate, authority: authority) === first)
+    #expect(first.isUnlocked && !duplicate.isUnlocked)
+    #expect(try await first.vaultMetadata().value.name == "test")
+    registry.lock()
+    #expect(!first.isUnlocked && registry.get(scope.binding.vaultID) == nil)
+    #expect(throws: MopError.authentication) { try first.currentDeviceID }
+    let next = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: scope,
+        device: SessionDevice(copying: owner)).open()
+    #expect(try registry.install(next, authority: authority) === next)
+    #expect(next.isUnlocked)
+    #expect(next.displayContinuityID != first.displayContinuityID)
+    let added = try SessionDevice(member: owner.identity.member)
+    let successor = try MembershipEnvelope.successor(of: history.current,
+        membership: Membership(accounts: [.init(id: owner.identity.member, role: .owner,
+            devices: [owner.identity, added.identity])]), owner: owner)
+    var newer = history
+    try newer.append(successor)
+    let changed = try ItemVaultSession(repository: repository, binding: scope.binding, history: newer,
+        device: SessionDevice(copying: owner))
+    #expect(try registry.install(changed, authority: successor.digest()) === changed)
+    #expect(!next.isUnlocked && changed.isUnlocked)
+    #expect(changed.displayContinuityID == next.displayContinuityID)
+    #expect(changed.isAuthorized(by: newer))
+    #expect(try await changed.vaultMetadata().value.name == "test")
+    let stale = try ItemVaultSession(repository: repository, binding: scope.binding, history: history,
+        device: SessionDevice(copying: owner))
+    #expect(throws: CloudSyncAdapterError.untrustedRecord) { try registry.install(stale, authority: successor.digest()) }
+    #expect(registry.get(scope.binding.vaultID) === changed && changed.isUnlocked)
+    registry.lock()
+}

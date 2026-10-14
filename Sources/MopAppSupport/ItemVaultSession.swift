@@ -106,6 +106,21 @@ public final class ItemVaultSession: @unchecked Sendable {
         contentSession = repository.layout == .contentPreview3 ? try GrantBackedContentSession(repository: repository, binding: binding, history: history, permit: permit) : nil
     }
 
+    private let displayContinuity = Mutex(UUID())
+    var displayContinuityID: UUID { displayContinuity.withLock { $0 } }
+
+    /// Display-only continuity across an authenticated successor. Old keys and
+    /// readers are still invalidated; this does not authorize reads or writes.
+    func inheritDisplayContinuity(from previous: ItemVaultSession) {
+        guard isUnlocked, previous.isUnlocked, binding == previous.binding, identity == previous.identity,
+              previous.isAuthorized(by: history), history.count >= previous.history.count,
+              Array(history.orderedStates.prefix(previous.history.count)) == previous.history.orderedStates,
+              history.orderedStates.dropFirst(previous.history.count).allSatisfy({ $0.membership.role(of: identity) == .owner }),
+              (try? history.verifyAccountPath(from: previous.currentDigest, allowingDeviceRemoval: true)) != nil else { return }
+        let identifier = previous.displayContinuityID
+        displayContinuity.withLock { $0 = identifier }
+    }
+
     public func lock() { permit.invalidate() }
     public var isUnlocked: Bool { permit.isValid }
     /// Account changes, membership replacement, and verified removal retire the
@@ -116,6 +131,9 @@ public final class ItemVaultSession: @unchecked Sendable {
     deinit { permit.invalidate() }
 
     var memberID: UUID { identity.member }
+    func isAuthorized(by history: TrustedMembershipHistory) -> Bool {
+        history.vault == binding.vaultID && history.current.membership.role(of: identity) == .owner
+    }
     public var currentDeviceID: UUID { get throws { try permit.check(); return identity.device } }
     public var enrolledDevices: [DevicePublicKey] { get throws { try permit.check(); return history.current.membership.devices } }
 

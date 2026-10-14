@@ -49,7 +49,9 @@ public struct ContentMembershipFetcher: Sendable {
             if try await available(request.dependency) { return .completed }
             var incoming: [IncomingRecord] = []
             for id in request.records(owner: operation.zoneOwner) {
+                AccessSyncTrace.event("membership fetch starting", operation: operation.id, record: id.recordName)
                 let record = try await fetch(id)
+                AccessSyncTrace.event("membership fetch returned", operation: operation.id, record: id.recordName)
                 try permit.withWritePermission {}
                 guard record.recordID == id else { return .attention(.invalidAuthority) }
                 incoming.append(try ContentMembershipTransport.materialize(record, account: account))
@@ -58,8 +60,14 @@ public struct ContentMembershipFetcher: Sendable {
             return .retry(.dependency)
         } catch SyncJournalError.inboxFull { return .retry(.storagePressure) }
         catch SyncJournalError.staleOperation { return .retry(.dependency) }
-        catch let error as CKError { return .retry(.transport, retryAfter: (error.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue) }
+        catch let error as CKError {
+            AccessSyncTrace.failure("membership fetch cloud failure", operation: operation.id, error: error)
+            return .retry(.transport, retryAfter: (error.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue)
+        }
         catch CloudSyncAdapterError.malformedRecord { return .attention(.invalidAuthority) }
-        catch { return .retry(.transport) }
+        catch {
+            AccessSyncTrace.failure("membership fetch failed", operation: operation.id, error: error)
+            return .retry(.transport)
+        }
     }
 }

@@ -177,6 +177,15 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         return Dictionary(uniqueKeysWithValues: try await context.repository.deletions(account: context.account.accountNamespace).map { ($0.scope.vaultID, $0.phase) })
     }
     public func discover() async throws -> ItemVaultDiscovery {
+        #if DEBUG
+        // A timed-out reset may have committed removal after the UI returned.
+        // Resume before inventory can try opening the now-revoked identity.
+        let pendingResetContext = try await serialized { try await self.connected() }
+        if FileManager.default.fileExists(atPath: pendingResetContext.account.directory
+            .appendingPathComponent("ContentPreview3/debug-enrollment-reset.json").path) {
+            try await debugResetEnrollment()
+        }
+        #endif
         let local = try await inventory(offline: false)
         let context = try await serialized { try await self.connected() }
         // Discovery is also invoked for repository notifications. It must remain
@@ -211,6 +220,10 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                     do { name = try await existing.vaultMetadata().value.name }
                     catch ItemVaultSessionFailure.missingVaultMetadata { }
                     catch CloudSyncAdapterError.membershipUnavailable { }
+                    catch MopError.authentication where !existing.isUnlocked {
+                        // Membership replacement can retire a name read in flight.
+                        // The independently pinned name remains a valid discovery label.
+                    }
                 } else if let session = try await loadWithoutPrompt(record, account: context.account, repository: context.repository) {
                     do { name = try await session.vaultMetadata().value.name }
                     catch ItemVaultSessionFailure.missingVaultMetadata { }
@@ -237,8 +250,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                 else {
                     let device = try await device(context, vaultID: id, create: false)
                     let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: record.scope, device: device)
-                    session = try await bootstrap.open()
-                    try await context.runtime.register(session: session, synchronize: !offline)
+                    session = try await context.runtime.register(session: bootstrap.open(), synchronize: !offline)
                 }
                 if try await session.vaultMetadata().value.name == name { matches.append(id) }
             }
@@ -310,10 +322,10 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             let provider = try await device(context, vaultID: vault, create: false, allowPrompt: allowPrompt)
             let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3),
                 scope: context.account.setupScope(vaultID: vault), device: provider)
-            let session = try await bootstrap.acceptContentEnrollment(approval: approval, request: request)
+            var session = try await bootstrap.acceptContentEnrollment(approval: approval, request: request)
             do {
                 try checkEnrollment(context, generation: generation, requireAuthorization: true)
-                try await context.runtime.register(session: session, synchronize: true)
+                session = try await context.runtime.register(session: session, synchronize: true)
                 let acknowledgment = EnrollmentAcknowledgment(request: request.id, approvalDigest: setupHash(record.bytes))
                 _ = try await session.contentSession!.coordination(kind: .enrollmentAcknowledgment, scope: scope, identity: request.id,
                     payload: setupEncode(acknowledgment), owner: permit)
@@ -397,8 +409,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             let device = try await device(context, vaultID: vaultID, create: false)
             let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: trust, scope: scope, device: device)
             let session = try await bootstrap.open()
-            try await context.runtime.register(session: session, synchronize: !offline)
-            return session
+            return try await context.runtime.register(session: session, synchronize: !offline)
         }
     }
     public func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession {
@@ -410,12 +421,12 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             guard try await context.repository.deletion(scope.repositoryScope) == nil else { throw VaultDeletionFailure.deleted }
             let device = try await device(context, vaultID: id, create: true)
             let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: scope, device: device, recovery: recoveryConfiguration.active)
-            let session: ItemVaultSession
+            var session: ItemVaultSession
             if let archiveData, let recoveryKey { session = try await bootstrap.restore(archiveData: archiveData, recoveryKey: recoveryKey, name: name) }
             else if archiveData == nil, recoveryKey == nil { session = try await bootstrap.create(name: name) }
             else { throw PortableArchiveFailure.invalid }
             do {
-                try await context.runtime.register(session: session, synchronize: true)
+                session = try await context.runtime.register(session: session, synchronize: true)
                 _ = try await session.contentSession!.coordination(kind: .discovery, scope: enrollmentScope(context.account, vaultID: id),
                     identity: id, payload: Data(id.uuidString.utf8), owner: context.account)
             }
@@ -560,23 +571,23 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             try await context.runtime.wake(reason: .unlocked)
             let deadline = ContinuousClock.now.advanced(by: .seconds(30))
             while true {
-                var delivered = true
-                for operation in reset.removals {
-                    if try await !context.repository.operationIsDelivered(operation.id, account: reset.account) { delivered = false; break }
+                // The signed cloud head, verified against pinned history, is the
+                // completion evidence. A receipt can be lost after self-removal
+                // invalidates the session; do not require it before readback.
+                var verified = true
+                for scope in reset.scopes {
+                    guard let operation = reset.removals.first(where: { $0.vaultID == scope.binding.vaultID }) else {
+                        throw MopError.invalidVault
+                    }
+                    let proposal = try JSONDecoder().decode(ContentMembershipCommit.self, from: operation.payload)
+                    let head = try await NativeVaultMembershipTransport(database: context.account.container.privateCloudDatabase)
+                        .readHead(binding: NativeContentHistoryReader(account: context.account).binding(scope.binding.vaultID))
+                    if try await !context.runtime.debugVerifyRemoval(vault: scope.binding.vaultID, head: head.bytes,
+                        removed: Set(proposal.successor.membership.removedDevices ?? [])) { verified = false; break }
                 }
-                if delivered { break }
+                if verified { break }
                 guard ContinuousClock.now < deadline else { throw DebugEnrollmentResetFailure.waiting }
-                try await Task.sleep(for: .milliseconds(250))
-            }
-            // Completed journal operations are not sufficient evidence by themselves.
-            for scope in reset.scopes {
-                let operation = reset.removals.first { $0.vaultID == scope.binding.vaultID }!
-                let proposal = try JSONDecoder().decode(ContentMembershipCommit.self, from: operation.payload)
-                let head = try await NativeVaultMembershipTransport(database: context.account.container.privateCloudDatabase).readHead(binding: NativeContentHistoryReader(account: context.account).binding(scope.binding.vaultID))
-                guard try await context.runtime.debugVerifyRemoval(vault: scope.binding.vaultID, head: head.bytes,
-                    removed: Set(proposal.successor.membership.removedDevices ?? [])) else {
-                    throw DebugEnrollmentResetFailure.waiting
-                }
+                try await Task.sleep(for: .seconds(2))
             }
             reset.revoked = true
             try LocalFile.write(JSONEncoder().encode(reset), to: location, replace: true)
@@ -658,6 +669,12 @@ private final class SharedAuthorizationDevice: DeviceOperations {
 #if DEBUG
 public enum DebugEnrollmentResetFailure: Error, LocalizedError {
     case pendingWork, noVaults, lastOwner, waiting
+    static func verifiesRemoval(history: TrustedMembershipHistory, head: Data, removed: Set<UUID>) throws -> Bool {
+        guard !removed.isEmpty else { return false }
+        let envelope = try MembershipEnvelope.decode(head)
+        guard let pinned = try? history.state(forDigest: envelope.digest()), pinned == envelope else { return false }
+        return removed.isSubset(of: Set(envelope.membership.removedDevices ?? []))
+    }
     static func removing(_ device: UUID, from current: Membership) throws -> Membership {
         guard current.accounts.count == 1, let member = current.accounts.first,
               member.role == .owner, member.devices.contains(where: { $0.device == device }),

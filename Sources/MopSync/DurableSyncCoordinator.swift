@@ -107,18 +107,19 @@ public actor DurableSyncCoordinator {
             do {
                 let resetRetry = reasons.contains { [.foreground, .networkRestored, .ownerReleased].contains($0) }
                 let authorization = reasons.contains { [.unlocked, .startup].contains($0) }
-                let operations = try await repository.activeOperations(account: account, database: database)
+                let candidates = try await repository.activeOperations(account: account, database: database)
                     .sorted { priority($0) < priority($1) }
-                var publicationRegistration: SyncOperationOutcome?
-                for operation in operations where kinds.contains(operation.kind) {
+                var eligible: [SyncOperation] = []
+                for operation in candidates where kinds.contains(operation.kind) {
                     guard running, generation == token, !Task.isCancelled else { return }
-                    if allowsConcurrentReconciliation, operation.kind == .reconcile, reconciliationTask != nil { continue }
-                    let publication = [.publishItem, .grant, .publishCoordination, .removeCoordination].contains(operation.kind)
                     let resetOperationRetry = resetRetry || (reasons.contains(.unlocked)
                         && (operation.failure == .authorization || operation.failure == .dependency))
                     switch operation.state {
                     case .completed, .needsAttention: continue
-                    case .waitingForAuthorization: if !authorization { continue }
+                    case .waitingForAuthorization:
+                        AccessSyncTrace.event("authorization gate", operation: operation.id,
+                            detail: "kind=\(operation.kind.rawValue) eligible=\(authorization) wakes=\(reasons.map { String(describing: $0) }.joined(separator: ","))")
+                        if !authorization { continue }
                     case .retryScheduled:
                         if let earliest = operation.retryNotBefore, earliest > clock.now() { continue }
                         let dependencyArrived = operation.failure == .dependency && reasons.contains(.dependenciesChanged)
@@ -131,6 +132,16 @@ public actor DurableSyncCoordinator {
                         if !ready { continue }
                     case .ready: break
                     }
+                    eligible.append(operation)
+                }
+                let operations = interleavingInbox(eligible)
+                var publicationRegistration: SyncOperationOutcome?
+                var completedBulk = 0
+                for operation in operations {
+                    if allowsConcurrentReconciliation, operation.kind == .reconcile, reconciliationTask != nil { continue }
+                    let publication = [.publishItem, .grant, .publishCoordination, .removeCoordination].contains(operation.kind)
+                    let resetOperationRetry = resetRetry || (reasons.contains(.unlocked)
+                        && (operation.failure == .authorization || operation.failure == .dependency))
                     guard running, generation == token, !Task.isCancelled else { return }
                     if allowsConcurrentReconciliation, operation.kind == .reconcile {
                         // One network wait may run alongside local inbox/authority
@@ -156,6 +167,19 @@ public actor DurableSyncCoordinator {
                     guard running, generation == token, !Task.isCancelled else { return }
                     do { try await commit(outcome, operation: operation, resetRetry: resetOperationRetry) }
                     catch SyncJournalError.staleOperation { /* another authorized worker advanced it */ }
+                    if [.rotateContent, .applyIncoming].contains(operation.kind), case .completed = outcome { completedBulk += 1 }
+                    if wakes.contains(.unlocked) || (completedBulk >= 16 && !wakes.isEmpty) {
+                        // Unlock can arrive while a handler or its commit awaits.
+                        // Re-read and prioritize durable work now, so enrollment
+                        // blocked earlier in this batch does not wait behind bulk
+                        // rotations. Also reconsider newly arrived access work
+                        // after a bounded slice of completed bulk operations. Counting
+                        // completions avoids endlessly replaying a blocked prefix.
+                        // Finish the current operation before yielding,
+                        // and preserve this batch's retry/authorization hints.
+                        for reason in reasons where !wakes.contains(reason) { wakes.append(reason) }
+                        break
+                    }
                 }
                 storageFailure = false
                 try await scheduleNext(token: token)
@@ -187,11 +211,32 @@ public actor DurableSyncCoordinator {
         }
     }
 
+    /// Recovery and membership dependencies retain priority. Access requests and
+    /// inbox application take bounded turns, including failed requests: a retry
+    /// must not keep the very records it depends on at the back of the queue.
+    private func interleavingInbox(_ operations: [SyncOperation]) -> [SyncOperation] {
+        let urgent = operations.filter { priority($0) < 1 }
+        let access = operations.filter { priority($0) == 1 }
+        let inbox = operations.filter { $0.kind == .applyIncoming }
+        var result = urgent
+        var a = 0, i = 0
+        while a < access.count || i < inbox.count {
+            let endA = min(a + 16, access.count), endI = min(i + 16, inbox.count)
+            result.append(contentsOf: access[a..<endA]); a = endA
+            result.append(contentsOf: inbox[i..<endI]); i = endI
+        }
+        result.append(contentsOf: operations.filter { priority($0) > 2 })
+        return result
+    }
+
     private func priority(_ operation: SyncOperation) -> Int {
         switch operation.kind {
-        case .applyIncoming, .fetchMembership: 0
-        case .enrollment, .membership, .provision, .resolveConflict, .deletion, .recovery: 1
-        case .reconcile, .recoverTransport: 2
+        case .recoverTransport: -2
+        case .reconcile: -1
+        case .fetchMembership: 0
+        case .enrollment, .membership, .provision, .resolveConflict, .deletion, .recovery, .prepareGrant,
+             .grant, .publishCoordination, .fetchContentHead, .fetchContentVersion: 1
+        case .applyIncoming: 2
         default: 3
         }
     }
@@ -219,6 +264,17 @@ public actor DurableSyncCoordinator {
 
     private func commit(_ outcome: SyncOperationOutcome, operation: SyncOperation, resetRetry: Bool) async throws {
         let now = clock.now()
+        let summary: String
+        switch outcome {
+        case .completed: summary = "completed"
+        case .transportOwned: summary = "transportOwned"
+        case .authorization: summary = "authorization"
+        case .waiting(let dependencies): summary = "waiting dependencies=\(dependencies.count)"
+        case .retry(let failure, _): summary = "retry failure=\(failure.rawValue)"
+        case .attention(let failure): summary = "attention failure=\(failure.rawValue)"
+        }
+        AccessSyncTrace.event("operation outcome", operation: operation.id,
+            detail: "kind=\(operation.kind.rawValue) priorState=\(operation.state.rawValue) attempts=\(operation.attempts) outcome=\(summary)")
         switch outcome {
         case .transportOwned:
             // A successful lease handoff must retire application backoff. Leaving

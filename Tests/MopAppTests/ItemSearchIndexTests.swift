@@ -37,4 +37,37 @@ import MopCore
         index = nil
         #expect(discarded == nil)
     }
+    @Test func reusePreservesFreshRowsAndInvalidatesChangedText() async throws {
+        let original = ItemSearchIndex(rows: [row])
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while original.isPreparing && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(!original.isPreparing)
+        var latest = row
+        latest.recentDate = Date()
+        let reused = ItemSearchIndex(rows: [latest], reusing: original)
+        while reused.isPreparing && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(reused.reusableEntryCount == 1)
+        #expect(reused.search("alice").rows.first?.recentDate == latest.recentDate)
+        var changed = row.item
+        changed.fields = [ItemField(path: "username", type: .username, value: "bob")]
+        let replacement = ItemRow(id: row.id, vaultName: row.vaultName, item: changed)
+        let updated = ItemSearchIndex(rows: [replacement], reusing: original)
+        while updated.isPreparing && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(!updated.isPreparing)
+        #expect(updated.reusableEntryCount == 0)
+        #expect(updated.search("alice").rows.isEmpty)
+        #expect(updated.search("bob").rows.count == 1)
+        let renamed = ItemSearchIndex(rows: [ItemRow(id: row.id, vaultName: "Work", item: row.item)], reusing: original)
+        #expect(renamed.reusableEntryCount == 0)
+        #expect(renamed.search("personal").rows.isEmpty)
+        #expect(ItemSearchIndex(rows: [row], deleted: true, reusing: original).reusableEntryCount == 0)
+        #expect(ItemSearchIndex(rows: [], reusing: original).search("alice").rows.isEmpty)
+    }
+
 }

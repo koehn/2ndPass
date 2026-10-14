@@ -27,7 +27,7 @@ actor ItemVaultSyncRuntime {
     private var startupRequested = false
     private var enabled = true
     private var retired = false
-    nonisolated private let sessions = Mutex<[UUID: ItemVaultSession]>([:])
+    nonisolated private let sessions = ItemVaultSessionRegistry()
 
     init(account: NativeItemCloudAccount, repository: EncryptedItemRepository) throws {
         guard repository.layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
@@ -61,31 +61,26 @@ actor ItemVaultSyncRuntime {
         try pin(id).map { try ItemVaultMembershipAuthority.history(record: $0, trustStore: trust, allowingDeviceRemoval: true) }
     }
     private func address(_ id: UUID) -> VaultCloudAddress { VaultCloudAddress(vaultID: id, zoneName: SyncStoreLayout.contentZone(vault: id), ownerName: CKCurrentUserDefaultName) }
-    func register(session: ItemVaultSession, synchronize: Bool = false) async throws {
+    @discardableResult
+    func register(session: ItemVaultSession, synchronize: Bool = false) async throws -> ItemVaultSession {
         guard let history = try history(session.binding.vaultID), session.contentSession != nil else { throw MopError.vaultUntrusted }
-        try session.validateMembershipAuthority(digest: history.current.digest())
-        let old = sessions.withLock { $0.updateValue(session, forKey: session.binding.vaultID) }
-        if let old, old !== session { old.invalidate() }
+        let session = try sessions.install(session, authority: history.current.digest())
         if let adapter { try await adapter.addContentAddresses([address(session.binding.vaultID)]) }
         if synchronize { try await wake(reason: .unlocked) }
+        return session
     }
     func session(vaultID: UUID) throws -> ItemVaultSession {
         try account.withWritePermission {}
-        guard !retired, let value = sessions.withLock({ $0[vaultID] }), value.isUnlocked else { throw MopError.authentication }
+        guard !retired, let value = sessions.get(vaultID), value.isUnlocked else { throw MopError.authentication }
         return value
     }
     private func unlocked(_ id: UUID) async throws -> ItemVaultSession {
         if let session = try? session(vaultID: id) { return session }
         guard let record = try pin(id), let loader, let loaded = try await loader(record) else { throw MopError.authentication }
-        try await register(session: loaded)
-        return loaded
+        return try await register(session: loaded)
     }
     nonisolated func lock(vaultID: UUID? = nil) {
-        let selected = sessions.withLock { values -> [ItemVaultSession] in
-            if let vaultID { return values.removeValue(forKey: vaultID).map { [$0] } ?? [] }
-            let result = Array(values.values); values.removeAll(); return result
-        }
-        selected.forEach { $0.lock() }
+        sessions.lock(vaultID: vaultID)
     }
     nonisolated func invalidate() { lock(); Task { await self.stop() } }
     func pauseNetwork() async {
@@ -109,7 +104,7 @@ actor ItemVaultSyncRuntime {
             Task { await self?.automaticWake(reason) }
         }, retire: { [weak self] in self?.invalidate() })
         let value = DurableSyncCoordinator(repository: repository, account: account.accountNamespace,
-            kinds: [.publishItem, .grant, .publishCoordination, .removeCoordination, .reconcile, .recoverTransport, .applyIncoming, .fetchContentVersion, .fetchMembership, .provision, .membership, .enrollment, .deletion, .recovery, .prepareGrant, .rotateContent, .resolveConflict],
+            kinds: [.publishItem, .grant, .publishCoordination, .removeCoordination, .reconcile, .recoverTransport, .applyIncoming, .fetchContentVersion, .fetchContentHead, .fetchMembership, .provision, .membership, .enrollment, .deletion, .recovery, .prepareGrant, .rotateContent, .resolveConflict],
             allowsConcurrentReconciliation: true, coalescesPublicationRegistration: true,
             dependencyAvailable: { [weak self] dependency in try await self?.dependency(dependency) ?? false }) { [weak self] operation in
                 guard let self else { return .retry(.accountChanged) }
@@ -126,7 +121,25 @@ actor ItemVaultSyncRuntime {
         guard !startupRequested else { return }
         startupRequested = true
         Self.logger.notice("Sync trace: starting account coordinator for online discovery")
-        do { try await wake(reason: .startup) }
+        do {
+            // Terminal journal entries intentionally do not execute again, so
+            // report them on startup as well as when they first fail.
+            let operations = try await repository.operations(account: account.accountNamespace, database: "private")
+            let blocked = operations.filter { $0.state != .completed && $0.failure != nil }
+            let quarantine = try await repository.quarantineSummary(account: account.accountNamespace)
+            Self.logger.notice("Sync trace: persisted failures; operations=\(blocked.count) quarantined=\(quarantine.records)")
+            let groups = Dictionary(grouping: blocked) { "kind=\($0.kind.rawValue) state=\($0.state.rawValue) failure=\($0.failure!.rawValue)" }
+            for key in groups.keys.sorted() {
+                AccessSyncTrace.event("persisted failure summary", detail: "\(key) count=\(groups[key]!.count)")
+            }
+            // Diagnostics must not perform one database transaction per failure
+            // or delay startup by emitting an unbounded backlog of log lines.
+            for operation in blocked.prefix(20) {
+                AccessSyncTrace.event("persisted operation failure", operation: operation.id,
+                    detail: "kind=\(operation.kind.rawValue) state=\(operation.state.rawValue) attempts=\(operation.attempts) failure=\(operation.failure!.rawValue)")
+            }
+            try await wake(reason: .startup)
+        }
         catch { startupRequested = false; throw error }
     }
     /// A bounded OS-granted execution opportunity can move public, prepared work
@@ -212,16 +225,88 @@ actor ItemVaultSyncRuntime {
             if [.reconcile, .recoverTransport].contains(operation.kind) {
                 if operation.kind == .recoverTransport { try await engine.resumeAutomaticSync() }
                 else { try await engine.requestSync() }
+                AccessSyncTrace.event("quarantine repair loading", operation: operation.id)
+                let quarantined = try await repository.quarantinedRecords(account: account.accountNamespace)
+                AccessSyncTrace.event("quarantine repair starting", operation: operation.id, detail: "records=\(quarantined.count)")
+                var repaired = 0, skipped = 0
+                for candidate in quarantined {
+                    guard let bytes = candidate.payload,
+                          let envelope = try? JSONDecoder().decode(CoordinationEnvelope.self, from: bytes),
+                          envelope.kind == .grantRequest else { skipped += 1; continue }
+                    if candidate.legacyReadbackUnmatched == true { skipped += 1; continue }
+                    do {
+                        var evidence = candidate
+                        if let record = coordinationInbox.legacyObsoleteRecord(candidate, history: try? history(envelope.scope.vault)) {
+                            AccessSyncTrace.event("quarantine readback starting", operation: operation.id, record: record.recordName)
+                            let remote = try await account.container.privateCloudDatabase.record(for: record.recordID)
+                            AccessSyncTrace.event("quarantine readback returned", operation: operation.id, record: record.recordName)
+                            let incoming = try PreparedCoordinationRecord.materialize(remote, account: account.accountNamespace)
+                            evidence = try await repository.linkLegacyQuarantine(candidate, incoming: incoming, permit: account)
+                        }
+                        if try await coordinationInbox.retireQuarantinedRequest(evidence,
+                            history: try? history(envelope.scope.vault), permit: account) { repaired += 1 }
+                        else { skipped += 1 }
+                    }
+                    catch SyncJournalError.staleOperation {
+                        skipped += 1
+                        AccessSyncTrace.event("quarantine repair retained", operation: operation.id, detail: "reason=revisionMismatch")
+                        if candidate.operations == nil {
+                            do { try await repository.retainUnmatchedQuarantine(candidate, account: account.accountNamespace, permit: account) }
+                            catch SyncJournalError.staleOperation { }
+                        }
+                    }
+                    catch SyncJournalError.invalidOperation {
+                        skipped += 1
+                        AccessSyncTrace.event("quarantine repair retained", operation: operation.id, detail: "reason=evidenceMismatch")
+                        if candidate.operations == nil {
+                            do { try await repository.retainUnmatchedQuarantine(candidate, account: account.accountNamespace, permit: account) }
+                            catch SyncJournalError.staleOperation { }
+                        }
+                    }
+                    catch let error as CKError where error.code == .unknownItem {
+                        skipped += 1
+                        AccessSyncTrace.event("quarantine repair retained", operation: operation.id, detail: "reason=remoteRecordMissing")
+                        if candidate.operations == nil {
+                            do { try await repository.retainUnmatchedQuarantine(candidate, account: account.accountNamespace, permit: account) }
+                            catch SyncJournalError.staleOperation { }
+                        }
+                    }
+                }
+                AccessSyncTrace.event("quarantine repair finished", operation: operation.id,
+                    detail: "retired=\(repaired) retained=\(skipped)")
+                for failed in try await repository.operations(account: account.accountNamespace, database: "private")
+                    where failed.kind == .enrollment && failed.state == .needsAttention && failed.failure == .invalidAuthority {
+                    guard let vault = failed.vaultID else { continue }
+                    // History can be unavailable until a later fetch; never clear
+                    // failures merely because verification could not be performed.
+                    let trusted = try? history(vault)
+                    do { _ = try await coordinationInbox.retireObsoleteFailure(failed, history: trusted, permit: account) }
+                    catch SyncJournalError.staleOperation { continue }
+                }
                 if let request = try? JSONDecoder().decode(DurableSyncRequest.self, from: operation.payload) { try await repository.markSyncRequestHandled(request) }
                 return .completed
             }
             return await engine.processIncomingOperation(operation)
         } catch CloudSyncAdapterError.accountChanged { await stop(); return .attention(.accountChanged) }
         catch MopError.cloudAccount { await stop(); return .attention(.accountChanged) }
-        catch let error as CKError { return .retry(.transport, retryAfter: error.retryAfterSeconds) }
-        catch { return .retry(.transport) }
+        catch let error as CKError {
+            AccessSyncTrace.failure("reconciliation transport failed", operation: operation.id, error: error)
+            return .retry(.transport, retryAfter: error.retryAfterSeconds)
+        }
+        catch {
+            AccessSyncTrace.failure("runtime dispatch failed", operation: operation.id, error: error)
+            return Self.workFailureOutcome(error)
+        }
     }
     private func dependency(_ dependency: SyncDependency) async throws -> Bool {
+        // Legacy waits lacked an observed membership/head. Re-evaluate once to
+        // verify and migrate them into the precise durable snapshot below.
+        if dependency.kind == .contentKeyState { return true }
+        if let wait = GrantRequestWait(dependency: dependency) {
+            guard let trusted = try history(wait.vault) else { return false }
+            return try await wait.available(repository: repository,
+                scope: account.setupScope(vaultID: wait.vault).binding.item(wait.item), history: trusted)
+        }
         if dependency.kind == .operation, let id = UUID(uuidString: dependency.identifier) {
             return try await repository.operationIsDelivered(id, account: account.accountNamespace)
         }
@@ -279,26 +364,38 @@ actor ItemVaultSyncRuntime {
     #if DEBUG
     func debugVerifyRemoval(vault: UUID, head: Data, removed: Set<UUID>) throws -> Bool {
         guard let trusted = try history(vault) else { return false }
-        let envelope = try MembershipEnvelope.decode(head)
-        guard try trusted.state(forDigest: envelope.digest()) == envelope else { return false }
-        return removed.isSubset(of: Set(envelope.membership.removedDevices ?? []))
+        return try DebugEnrollmentResetFailure.verifiesRemoval(history: trusted, head: head, removed: removed)
     }
     #endif
 
     private func changedMembership(_ history: TrustedMembershipHistory) async throws {
         let coordinator = coordinator
         Task { await coordinator?.wake(reason: .dependenciesChanged) }
-        if let existing = sessions.withLock({ $0[history.vault] }),
+        if let existing = sessions.get(history.vault),
            (try? existing.validateMembershipAuthority(digest: history.current.digest())) != nil { return }
-        lock(vaultID: history.vault)
+        if let existing = sessions.get(history.vault), !existing.isAuthorized(by: history) {
+            lock(vaultID: history.vault)
+            return
+        }
         do {
             if let pin = try pin(history.vault), let loader, let loaded = try await loader(pin) {
+                // Keep the still-authorized reader until its replacement is ready.
+                // Registration atomically swaps authority and retires the old keys.
                 try await register(session: loaded)
                 let coordinator = coordinator; Task { await coordinator?.wake(reason: .unlocked) }
-            }
+            } else { lock(vaultID: history.vault) }
         } catch MopError.notVaultMember {
-            // Revocation is successfully applied even though this device can no
-            // longer open a session under the newly pinned membership.
+            lock(vaultID: history.vault)
+            // Public commitment succeeds even when the local device was removed.
+        } catch MopError.authentication {
+            lock(vaultID: history.vault)
+            // Reopening keys is optional; public membership work also completes locked.
+        } catch where Authentication.requiresRenewal(error) {
+            lock(vaultID: history.vault)
+            // A later explicit unlock reloads the already committed authority.
+        } catch {
+            lock(vaultID: history.vault)
+            throw error
         }
     }
     private func apply(_ operation: SyncOperation, permit: any RepositoryWritePermit) async -> SyncOperationOutcome {
@@ -306,6 +403,8 @@ actor ItemVaultSyncRuntime {
             guard let id = String(data: operation.payload, encoding: .utf8),
                   let incoming = try await repository.incomingRecord(id: id, account: account.accountNamespace, database: "private"),
                   let vault = incoming.vaultID else { return .completed }
+            AccessSyncTrace.event("incoming application", operation: operation.id, record: incoming.recordName,
+                detail: "type=\(incoming.recordType)")
             if incoming.zoneName == SyncStoreLayout.contentCoordinationZone {
                 return didApply(await coordinationInbox.handle(operation, history: try history(vault), permit: permit))
             }
@@ -317,7 +416,10 @@ actor ItemVaultSyncRuntime {
             let comparison = (try? await unlocked(vault))?.contentSession?.comparison()
             return didApply(await GrantBackedContentInbox(repository: repository, account: account.accountNamespace)
                 .handle(operation, history: history, permit: permit, comparison: comparison))
-        } catch { return .retry(.dependency) }
+        } catch {
+            AccessSyncTrace.failure("incoming application failed", operation: operation.id, error: error)
+            return Self.workFailureOutcome(error)
+        }
     }
     private func didApply(_ outcome: SyncOperationOutcome) -> SyncOperationOutcome {
         // Unlike arbitrary store events, an authenticated inbox application is
@@ -359,6 +461,12 @@ actor ItemVaultSyncRuntime {
                     return .retry(.dependency)
                 } else {
                     let record = try JSONDecoder().decode(PreparedCoordinationRecord.self, from: operation.payload)
+                    AccessSyncTrace.event("coordination work starting", operation: operation.id, record: record.recordName,
+                        detail: "kind=\(record.kind.rawValue)")
+                    if try coordinationInbox.obsoleteGrantRequest(record, history: history(vault)) {
+                        AccessSyncTrace.event("obsolete grant request retired", operation: operation.id, record: record.recordName)
+                        return .completed
+                    }
                     let envelope = try coordinationInbox.verify(record, history: history(vault))
                     if [.enrollmentRequest, .enrollmentApproval, .enrollmentAcknowledgment].contains(record.kind),
                        try await repository.enrollmentReceipt(account: account.accountNamespace, vault: vault, request: record.identity) != nil { return .completed }
@@ -366,11 +474,14 @@ actor ItemVaultSyncRuntime {
                     case .enrollmentRequest:
                         guard try pin(vault) != nil else { return .completed }
                         let session = try await unlocked(vault)
-                        _ = try await session.contentSession!.prepareEnrollment(DeviceEnrollmentRequest.decode(envelope.payload),
+                        let approval = try await session.contentSession!.prepareEnrollment(DeviceEnrollmentRequest.decode(envelope.payload),
                             scope: coordinationInbox.scope(vault: vault), owner: permit)
+                        AccessSyncTrace.event("enrollment approval prepared", operation: approval.operationID, record: approval.recordName)
                     case .enrollmentApproval:
                         guard let enrollment else { return .authorization }
                         try await enrollment(vault, record, permit)
+                        AccessSyncTrace.event("enrollment approval handled", operation: operation.id, record: record.recordName,
+                            detail: "trusted=\(try pin(vault) != nil)")
                         if try pin(vault) != nil { try await adapter?.addContentAddresses([address(vault)]) }
                     case .enrollmentAcknowledgment:
                         let acknowledgment = try JSONDecoder().decode(EnrollmentAcknowledgment.self, from: envelope.payload)
@@ -387,10 +498,11 @@ actor ItemVaultSyncRuntime {
                         // Grant requirements are indexed against the current
                         // policy whenever content arrives or authority advances.
                         guard let history = try history(vault) else { return .retry(.dependency) }
-                        let policy = try GrantBackedContentStorage.recipientPolicy(history: history)
                         let request = try JSONDecoder().decode(ContentGrantRequest.self, from: envelope.payload)
-                        try await repository.reconcileContentGrantRequest(scope: account.setupScope(vaultID: vault).binding.item(request.item),
-                            keyGeneration: request.keyGeneration, recipient: request.recipient, policy: policy, permit: permit)
+                        AccessSyncTrace.event("access request verified", operation: operation.id, item: request.item,
+                            generation: request.keyGeneration, recipient: request.recipient, record: record.recordID.recordName)
+                        return try await GrantRequestPrerequisites(repository: repository).reconcile(request: request,
+                            scope: account.setupScope(vaultID: vault).binding.item(request.item), history: history, permit: permit)
                     default: break
                     }
                 }
@@ -459,10 +571,58 @@ actor ItemVaultSyncRuntime {
                 return await session.handle(operation, owner: permit, grantRequestScope: coordinationInbox.scope(vault: vault))
             default: return .attention(.invalidAuthority)
             }
-        } catch MopError.authentication { return .authorization }
+        } catch MopError.authentication {
+            AccessSyncTrace.event("runtime work blocked", operation: operation.id, detail: "kind=\(operation.kind.rawValue) reason=authentication")
+            return .authorization
+        }
         catch DeviceEnrollmentFailure.expired { return .completed }
-        catch { return Authentication.requiresRenewal(error) ? .authorization : .retry(.dependency) }
+        catch {
+            AccessSyncTrace.failure("runtime work failed", operation: operation.id, error: error)
+            return Self.workFailureOutcome(error)
+        }
     }
+    static func workFailureOutcome(_ error: any Error) -> SyncOperationOutcome {
+        if Authentication.requiresRenewal(error) { return .authorization }
+        switch error {
+        case let failure as MopError:
+            switch failure {
+            case .vaultUntrusted, .cloudPermission, .invalidVault, .signing, .notVaultMember,
+                 .invalidIdentity, .invalidRecovery, .deviceRemoved:
+                return .attention(.invalidAuthority)
+            case .authentication: return .authorization
+            case .cloudInvalidRequest: return .attention(.processing)
+            case .cloudAccount: return .attention(.accountChanged)
+            case .vaultConflict: return .attention(.conflict)
+            case .cloudUnavailable, .cloudThrottled, .cloudUncertain: return .retry(.transport)
+            case .cloudQuota, .inputOutput: return .retry(.storagePressure)
+            default: break
+            }
+        case DeviceEnrollmentFailure.invalidRequest, DeviceEnrollmentFailure.invalidApproval,
+             CloudSyncAdapterError.invalidBinding, CloudSyncAdapterError.malformedRecord,
+             CloudSyncAdapterError.untrustedRecord, ContentStoreError.invalidRecord,
+             ContentStoreError.identityCollision, SyncJournalError.invalidOperation,
+             SyncJournalError.identityCollision, ItemEnvelopeFailure.invalidRecordMutation,
+             ItemRepositoryError.invalidScope, ItemRepositoryError.invalidGeneration,
+             ItemRepositoryError.emptyCiphertext, ItemRepositoryError.oversizedCiphertext:
+            return .attention(.invalidAuthority)
+        case ContentStoreError.wrongLayout, ItemRepositoryError.corruptStore:
+            return .attention(.processing)
+        case CloudSyncAdapterError.accountChanged: return .attention(.accountChanged)
+        case CloudSyncAdapterError.operationInterrupted: return .retry(.authorization)
+        case CloudSyncAdapterError.membershipUnavailable, ContentStoreError.staleAuthority,
+             SyncJournalError.staleOperation, ItemRepositoryError.staleLocalVersion:
+            return .retry(.dependency)
+        case SyncJournalError.inboxFull, CloudSyncAdapterError.inboxFull, CloudSyncAdapterError.storageFailure:
+            return .retry(.storagePressure)
+        case let failure as CKError: return .retry(.transport, retryAfter: failure.retryAfterSeconds)
+        case is DecodingError: return .attention(.invalidAuthority)
+        default: break
+        }
+        // Unknown failures may be transient, but are not evidence of missing
+        // membership/content. Preserve retries without misreporting a dependency.
+        return .retry(.processing)
+    }
+
     func reconcileDeletions() async throws { try await wake(reason: .foreground) }
     func deleteVault(_ vault: UUID) async throws -> VaultDeletionPhase {
         let scope = try account.setupScope(vaultID: vault).repositoryScope
@@ -478,5 +638,34 @@ actor ItemVaultSyncRuntime {
         let record = try await session.contentSession!.prepareEnrollment(request, scope: coordinationInbox.scope(vault: request.scope.vault), owner: account)
         try await wake(reason: .unlocked)
         return try DeviceEnrollmentApproval.decode(coordinationInbox.verify(record, history: history(record.vault)).payload)
+    }
+}
+
+/// Concurrent foreground/background loads of the same authority share one live
+/// session. Installing a redundant load must not lock the session serving the UI.
+final class ItemVaultSessionRegistry: Sendable {
+    private let values = Mutex<[UUID: ItemVaultSession]>([:])
+    func get(_ vault: UUID) -> ItemVaultSession? { values.withLock { $0[vault] } }
+    func install(_ candidate: ItemVaultSession, authority: String) throws -> ItemVaultSession {
+        try candidate.validateMembershipAuthority(digest: authority)
+        let device = try candidate.currentDeviceID
+        return values.withLock { values in
+            let vault = candidate.binding.vaultID
+            if let existing = values[vault], existing !== candidate, existing.isUnlocked,
+               existing.binding == candidate.binding, (try? existing.currentDeviceID) == device,
+               (try? existing.validateMembershipAuthority(digest: authority)) != nil {
+                candidate.invalidate()
+                return existing
+            }
+            if let old = values[vault], old !== candidate { candidate.inheritDisplayContinuity(from: old) }
+            if let old = values.updateValue(candidate, forKey: vault), old !== candidate { old.invalidate() }
+            return candidate
+        }
+    }
+    func lock(vaultID: UUID? = nil) {
+        values.withLock { values in
+            if let vaultID { values.removeValue(forKey: vaultID)?.invalidate() }
+            else { values.values.forEach { $0.invalidate() }; values.removeAll() }
+        }
     }
 }

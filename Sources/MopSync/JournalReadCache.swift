@@ -150,14 +150,52 @@ final class JournalReadCache: @unchecked Sendable {
     func summary<T: Decodable, R>(prefix: String, in context: NSManagedObjectContext, initial: R,
                                  update: @escaping (inout R, T, Bool) -> Void) throws -> R {
         let key = Query(prefix: prefix, type: ObjectIdentifier(T.self)), type = ObjectIdentifier(R.self)
-        if !context.hasChanges, let summary = projections[key]?.summaries[type] as? TypedSummary<T, R> { return summary.value }
-        let rows: [T] = try values(prefix: prefix, in: context)
-        var result = initial
-        for row in rows { update(&result, row, true); metrics.summaryUpdates += 1 }
-        if !context.hasChanges {
-            projections[key]?.summaries[type] = TypedSummary(value: result, update: update)
+        if projections[key] == nil { let _: [T] = try values(prefix: prefix, in: context) }
+        let projection = projections[key]!
+        if projection.summaries[type] == nil {
+            var base = initial
+            for row in projection.values.values { update(&base, row as! T, true); metrics.summaryUpdates += 1 }
+            projection.summaries[type] = TypedSummary(value: base, update: update)
+        }
+        // R must have value semantics. Overlay only changed rows; do not scan
+        // the backlog just because a transaction has an unrelated boundary write.
+        var result = (projection.summaries[type] as! TypedSummary<T, R>).value
+        for row in context.insertedObjects.union(context.updatedObjects).union(context.deletedObjects)
+            where row.entity.name == "StateBlob" {
+            if let old = projection.values[row.objectID] as? T { update(&result, old, false); metrics.summaryUpdates += 1 }
+            if !row.isDeleted, let name = row.value(forKey: "key") as? String, name.hasPrefix(prefix) {
+                guard let bytes = row.value(forKey: "value") as? Data else { throw ItemRepositoryError.corruptStore }
+                let value = try JSONDecoder().decode(T.self, from: bytes)
+                metrics.decodedRows += 1
+                if (value as? any JournalProjectionValue)?.includeInJournalProjection != false {
+                    update(&result, value, true); metrics.summaryUpdates += 1
+                }
+            }
         }
         return result
+    }
+
+    /// Two projections share one queue-confined aggregate. Updates to either
+    /// side maintain the join; only an immutable snapshot leaves the cache.
+    func joinedSummary<A: Decodable, B: Decodable, R: AnyObject, S>(
+        first: String, second: String, in context: NSManagedObjectContext,
+        make: () -> R, updateFirst: @escaping (R, A, Bool) -> Void,
+        updateSecond: @escaping (R, B, Bool) -> Void, snapshot: (R) -> S) throws -> S {
+        let a = Query(prefix: first, type: ObjectIdentifier(A.self))
+        let b = Query(prefix: second, type: ObjectIdentifier(B.self))
+        let type = ObjectIdentifier(R.self)
+        if !context.hasChanges, let cached = projections[a]?.summaries[type] as? TypedSummary<A, R>,
+           projections[b]?.summaries[type] != nil { return snapshot(cached.value) }
+        let rowsA: [A] = try values(prefix: first, in: context)
+        let rowsB: [B] = try values(prefix: second, in: context)
+        let result = make()
+        for row in rowsA { updateFirst(result, row, true); metrics.summaryUpdates += 1 }
+        for row in rowsB { updateSecond(result, row, true); metrics.summaryUpdates += 1 }
+        if !context.hasChanges {
+            projections[a]?.summaries[type] = TypedSummary(value: result, update: { updateFirst($0, $1, $2) })
+            projections[b]?.summaries[type] = TypedSummary(value: result, update: { updateSecond($0, $1, $2) })
+        }
+        return snapshot(result)
     }
 
     /// Complete read-only results share the same history checkpoint as projections.

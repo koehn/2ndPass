@@ -23,13 +23,24 @@ func cloudFailureSummary(_ errors: [CKError]) -> String {
     return "CKError codes(counts)=\(codes) retryAfterSeconds=\(retryAfter)"
 }
 
+/// An authority barrier interrupts preparation without failing durable work.
+/// Call before any retry bookkeeping or removal from CKSyncEngine's pending set.
+func checkUploadPreparation(_ error: (any Error)? = nil) throws {
+    try Task.checkCancellation()
+    if let error, error is CancellationError
+        || (error as? CKError)?.code == .operationCancelled
+        || error as? CloudSyncAdapterError == .operationInterrupted {
+        throw CancellationError()
+    }
+}
+
 func publicationFailure(_ error: any Error) -> SyncFailure {
     switch error {
     case CloudSyncAdapterError.accountChanged, MopError.cloudAccount: return .accountChanged
     case CloudSyncAdapterError.membershipUnavailable, ContentStoreError.staleAuthority: return .dependency
     case MopError.authentication, MopError.vaultUntrusted, MopError.cloudPermission: return .authorization
     case is CKError, MopError.cloudUnavailable, MopError.cloudThrottled, is CancellationError: return .transport
-    case SyncJournalError.inboxFull: return .storagePressure
+    case SyncJournalError.inboxFull, CloudSyncAdapterError.inboxFull: return .storagePressure
     default:
         let native = error as NSError
         if (native.domain == NSCocoaErrorDomain && native.code == NSFileWriteOutOfSpaceError)
@@ -89,6 +100,7 @@ public struct CloudContentReception: Sendable {
 // Cancellation is transport interruption, not evidence of invalid ciphertext or
 // a failed disk write. Keep both Swift and CloudKit cancellation paths equivalent.
 func cloudSyncFailure(_ error: any Error, fallback: CloudSyncAdapterError) -> CloudSyncAdapterError {
+    if error as? SyncJournalError == .inboxFull { return .inboxFull }
     if error is CancellationError || (error as? CKError)?.code == .operationCancelled {
         return .operationInterrupted
     }
@@ -164,6 +176,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     private var engine: CKSyncEngine?
     private var lease: SynchronizationLease?
     private var uploadsAllowed = false
+    private var lastIncomingBlockDiagnostic: String?
     private var suspension = CloudSyncSuspension()
     private var suspended: Bool { suspension.failure != nil }
     private var stopping = false
@@ -223,7 +236,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         try Task.checkCancellation()
         guard !stopping else { throw CloudSyncAdapterError.operationInterrupted }
         try checkSuspension()
-        guard engine == nil else { return }
+        guard engine == nil else {
+            Self.logger.notice("Sync trace: engine startup skipped; existing engine reused")
+            return
+        }
         let expectedGeneration = identityGeneration
         let acquired = try SynchronizationLease(url: leaseURL)
         guard try await accountValidator() else { throw CloudSyncAdapterError.accountChanged }
@@ -231,8 +247,24 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         try await repository.pruneCompletedOperations(account: account, database: databaseName)
         try await repository.pruneHistory(permit: ConflictPublicationPermit(lease: acquired, authorization: accountAuthorization))
         lastRetentionPrune = Date()
-        let data = try await repository.engineState(account: account, database: stateNamespace)
-        let state = try data.map { try JSONDecoder().decode(CKSyncEngine.State.Serialization.self, from: $0) }
+        // Log checkpoint availability, never its contents or account/vault identifiers.
+        let data: Data?
+        do {
+            data = try await repository.engineState(account: account, database: stateNamespace)
+        } catch {
+            let native = error as NSError
+            Self.logger.error("Sync trace: startup checkpoint read failed; domain=\(native.domain, privacy: .public) code=\(native.code)")
+            throw error
+        }
+        Self.logger.notice("Sync trace: startup checkpoint loaded; present=\(data != nil) bytes=\(data?.count ?? 0)")
+        let state: CKSyncEngine.State.Serialization?
+        do {
+            state = try data.map { try JSONDecoder().decode(CKSyncEngine.State.Serialization.self, from: $0) }
+        } catch {
+            let native = error as NSError
+            Self.logger.error("Sync trace: startup checkpoint decode failed; domain=\(native.domain, privacy: .public) code=\(native.code); startup aborted")
+            throw error
+        }
         try Task.checkCancellation()
         guard expectedGeneration == identityGeneration, !suspended, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
         var configuration = CKSyncEngine.Configuration(database: database, stateSerialization: state, delegate: self)
@@ -242,6 +274,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         if contentReception != nil { contentPermit = ConflictPublicationPermit(lease: acquired, authorization: accountAuthorization) }
         let startedEngine = CKSyncEngine(configuration)
         engine = startedEngine
+        Self.logger.notice("Sync trace: engine created; checkpointRestored=\(state != nil) zones=\(self.addresses.count) automaticallySync=\(automaticallySync)")
         if contentReception?.coordination != nil { startedEngine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: coordinationZoneID))]) }
         do {
             if let coordination = contentReception?.coordination,
@@ -253,10 +286,15 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 try await repository.saveEngineState(Data([1]), account: account, database: stateNamespace + ":inventory")
             }
             try await registerPendingChanges()
-            guard expectedGeneration == identityGeneration, engine === startedEngine, !suspended, !stopping else {
+            guard expectedGeneration == identityGeneration, engine === startedEngine, suspension.allowsLocalProcessing, !stopping else {
                 throw CloudSyncAdapterError.operationInterrupted
             }
         } catch {
+            // Automatic reception may fill the inbox before registration returns.
+            // Retain this adapter/lease so startup can hand off to the consumer.
+            if error as? CloudSyncAdapterError == .inboxFull,
+               suspension.failure == .inboxFull, expectedGeneration == identityGeneration,
+               engine === startedEngine, !stopping { return }
             if engine === startedEngine { await stop() }
             throw error
         }
@@ -379,6 +417,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             let registered = Set(engine.state.pendingRecordZoneChanges.compactMap { change -> CKRecord.ID? in
                 if case .saveRecord(let id) = change { return id }; return nil
             })
+            if ids != registered {
+                Self.logger.notice("Sync trace: upload registration; contentCandidates=\(candidates.count) coordinationCandidates=\(coordination.count) untrustedZoneCandidates=\(candidates.filter { address(for: $0.scope) == nil }.count) added=\(ids.subtracting(registered).count) removed=\(registered.subtracting(ids).count)")
+            }
             engine.state.add(pendingRecordZoneChanges: ids.subtracting(registered).map { .saveRecord($0) })
             engine.state.remove(pendingRecordZoneChanges: registered.subtracting(ids).map { .saveRecord($0) })
 
@@ -387,6 +428,15 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     /// The account coordinator retries this same durable operation until lease
     /// reacquisition and upload restoration both succeed. No nested wake/pump.
     public func resumeAutomaticSync() async throws {
+        if suspension.failure == .inboxFull {
+            // Return to the durable scheduler so applyIncoming can drain. Never
+            // wait here for the consumer running on that same scheduler.
+            let expected = identityGeneration
+            let ready = try await repository.inboxReadyToResume(account: account)
+            guard expected == identityGeneration, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
+            guard ready else { throw CloudSyncAdapterError.inboxFull }
+            Self.logger.notice("Sync trace: inbox capacity available; resuming from durable checkpoint")
+        }
         if suspended {
             guard try await accountValidator() else { throw CloudSyncAdapterError.accountChanged }
             await stop()
@@ -406,7 +456,12 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     }
 
     private func processEvent(_ event: CKSyncEngine.Event, syncEngine: CKSyncEngine) async {
-        guard !suspended, engine === syncEngine else { return }
+        guard engine === syncEngine else { return }
+        if suspended {
+            // Capacity suspension retains the local permit. Account revocation
+            // must still invalidate it even while transport callbacks are ignored.
+            guard case .accountChange = event else { return }
+        }
         let expectedGeneration = identityGeneration
         let dataEvent: Bool
         switch event {
@@ -470,13 +525,18 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                     let summary = cloudFailureSummary(changes.failedRecordSaves.map(\.error))
                     Self.logger.error("Cloud record saves failed: \(summary, privacy: .public)")
                 }
-                for saved in changes.savedRecords { try await acknowledge(saved) }
+                for saved in changes.savedRecords {
+                    AccessSyncTrace.event("record saved by cloud", record: saved.recordID.recordName, detail: "type=\(saved.recordType)")
+                    try await acknowledge(saved)
+                }
                 if contentReception != nil, let contentPermit {
                     for id in changes.deletedRecordIDs where id.zoneID == coordinationZoneID {
                         try await repository.acknowledgeCoordinationRemoval(account: account, record: id.recordName, permit: contentPermit)
                     }
                 }
                 for failure in changes.failedRecordSaves {
+                    AccessSyncTrace.event("record save failed", record: failure.record.recordID.recordName,
+                        detail: "type=\(failure.record.recordType) code=\(failure.error.code.rawValue)")
                     if failure.error.code == .serverRecordChanged {
                         // A conflict response is not an asset download. Fetch the
                         // complete current record before validating its ciphertext;
@@ -538,6 +598,8 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             }
         }
         catch {
+            let native = error as NSError
+            Self.logger.error("Sync trace: checkpoint save failed; domain=\(native.domain, privacy: .public) code=\(native.code)")
             if expectedGeneration == identityGeneration, engine === syncEngine {
                 suspend(.storageFailure)
             }
@@ -554,7 +616,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     public func nextRecordZoneChangeBatch(_ context: CKSyncEngine.SendChangesContext,
                                          syncEngine: CKSyncEngine) async -> CKSyncEngine.RecordZoneChangeBatch? {
-        guard uploadsAllowed, !suspended, !resolutionInProgress, engine === syncEngine else { return nil }
+        guard uploadsAllowed, !suspended, !resolutionInProgress, engine === syncEngine else {
+            Self.logger.notice("Sync trace: send batch blocked; uploadsAllowed=\(self.uploadsAllowed) suspended=\(self.suspended) resolutionInProgress=\(self.resolutionInProgress) currentEngine=\(self.engine === syncEngine)")
+            return nil
+        }
         return await nextContentBatch(context, syncEngine: syncEngine)
     }
 
@@ -563,8 +628,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         let expected = identityGeneration, expectedUploads = generation
         var pending: [(UUID, CKRecord.ID)] = []
         do {
+            try checkUploadPreparation()
             let candidates = try await repository.contentPublications(account: account)
             let controls = try await repository.coordinationPublications(account: account)
+            Self.logger.notice("Sync trace: send batch candidates; content=\(candidates.count) coordination=\(controls.count)")
             pending = candidates.map { ($0.operationID, $0.recordID) } + controls.map { ($0.operationID, $0.recordID) }
             try await validateAccount(generation: expected)
             var records: [CKRecord] = [], selected: [ContentUpload] = [], bytes = 0
@@ -572,6 +639,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             let preparationAuthority = PublicationAuthorityChecks()
             if let coordination = contentReception?.coordination {
                 for candidate in controls {
+                    try checkUploadPreparation()
                     guard records.count < 100, context.options.scope.contains(.saveRecord(candidate.recordID)) else { continue }
                     if !records.isEmpty, candidate.bytes.count > Self.assetChunkBytes - min(bytes, Self.assetChunkBytes) { break }
                     do {
@@ -586,6 +654,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 }
             }
             for candidate in candidates {
+                try checkUploadPreparation()
                 guard records.count < 100 else { break }
                 guard address(for: candidate.scope) != nil, context.options.scope.contains(.saveRecord(candidate.recordID)) else { continue }
                 // Authority failures are scoped to this operation, not the engine.
@@ -610,6 +679,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             // this phase, sharing only within this batch and exact pinned head.
             let submissionAuthority = PublicationAuthorityChecks()
             for candidate in selected {
+                try checkUploadPreparation()
                 do {
                     try await validate(candidate, submissionAuthority)
                     try await repository.setContentUploadBlocked(candidate.operationID, account: account, blocked: false, permit: contentPermit)
@@ -621,6 +691,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             }
             if let coordination = contentReception?.coordination {
                 for candidate in selectedCoordination {
+                    try checkUploadPreparation()
                     do {
                         try await coordination.validate(candidate, submissionAuthority)
                         try await repository.setContentUploadBlocked(candidate.operationID, account: account, blocked: false, permit: contentPermit)
@@ -634,9 +705,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             records.removeAll { rejected.contains($0.recordID) }
             selected.removeAll { rejected.contains($0.recordID) }
             selectedCoordination.removeAll { rejected.contains($0.recordID) }
+            try checkUploadPreparation()
             try contentPermit.withWritePermission {}
             guard expected == identityGeneration, expectedUploads == generation, engine === syncEngine,
-                  !suspended, uploadsAllowed, (!records.isEmpty || !removals.isEmpty) else { return nil }
+                  !suspended, uploadsAllowed, (!records.isEmpty || !removals.isEmpty) else {
+                Self.logger.notice("Sync trace: send batch withheld; records=\(records.count) removals=\(removals.count) rejected=\(rejected.count) identityChanged=\(expected != self.identityGeneration) uploadsChanged=\(expectedUploads != self.generation) suspended=\(self.suspended) uploadsAllowed=\(self.uploadsAllowed)")
+                return nil
+            }
             for candidate in selectedCoordination {
                 activeAssetVersions.insert(candidate.operationID)
                 activeContentAssets[candidate.recordName + ":" + SHA256.hash(data: candidate.bytes).map { String(format: "%02x", $0) }.joined()] = candidate.operationID
@@ -646,24 +721,39 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 activeContentAssets[key] = candidate.content.version.versionID
                 activeAssetVersions.insert(candidate.content.version.versionID)
             }
+            for candidate in selectedCoordination where !rejected.contains(candidate.recordID) {
+                AccessSyncTrace.event("coordination submitted", operation: candidate.operationID,
+                    record: candidate.recordName, detail: "kind=\(candidate.kind.rawValue)")
+            }
+            for candidate in selected where !rejected.contains(candidate.recordID) {
+                AccessSyncTrace.event("content submitted", operation: candidate.operationID, item: candidate.scope.itemID,
+                    record: candidate.recordID.recordName, detail: "kind=\(candidate.kind.rawValue)")
+            }
             return CKSyncEngine.RecordZoneChangeBatch(recordsToSave: records, recordIDsToDelete: removals, atomicByZone: false)
         } catch {
+            do { try checkUploadPreparation(error) } catch { return nil }
             lastFailure = cloudSyncFailure(error, fallback: .storageFailure)
             do {
                 for (id, recordID) in pending {
                     try await deferUpload(id, recordID: recordID, error: error, permit: contentPermit, engine: syncEngine)
                 }
-            } catch { suspend(.storageFailure) }
+            } catch {
+                do { try checkUploadPreparation(error) } catch { return nil }
+                suspend(.storageFailure)
+            }
             return nil
         }
     }
 
     private func deferUpload(_ id: UUID, recordID: CKRecord.ID, error: any Error,
                              permit: ConflictPublicationPermit, engine owner: CKSyncEngine) async throws {
+        try checkUploadPreparation(error)
         if error as? CloudSyncAdapterError == .accountChanged || error as? MopError == .cloudAccount {
             suspend(.accountChanged); throw CloudSyncAdapterError.accountChanged
         }
         let failure = publicationFailure(error)
+        AccessSyncTrace.failure("upload deferred", operation: id, error: error)
+        AccessSyncTrace.event("upload deferred", operation: id, record: recordID.recordName, detail: "failure=\(failure.rawValue)")
         let retryAfter = (error as? CKError)?.retryAfterSeconds
         let native = error as NSError
         // Only error type and numeric code; never descriptions, payloads or IDs.
@@ -705,18 +795,37 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     private func commitIncomingChunk(_ chunk: [IncomingRecord], token: Int, owner: CKSyncEngine?, permit: ConflictPublicationPermit) async throws {
         guard token == identityGeneration, engine === owner, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
         try await repository.stageIncomingRecords(chunk, permit: permit)
+        for incoming in chunk {
+            AccessSyncTrace.event("record staged locally", record: incoming.recordName, detail: "type=\(incoming.recordType)")
+        }
     }
 
     public func processIncomingOperation(_ operation: SyncOperation) async -> SyncOperationOutcome {
         if let contentReception {
+            AccessSyncTrace.event("incoming operation", operation: operation.id, detail: "kind=\(operation.kind.rawValue)")
             guard operation.account == account, operation.database == databaseName,
                   operation.vaultID != nil, operation.zoneOwner == CKCurrentUserDefaultName else { return .attention(.invalidAuthority) }
-            guard engine != nil, !suspended, !stopping, let contentPermit else { return .retry(.transport) }
+            guard engine != nil, suspension.allowsLocalProcessing, !stopping, let contentPermit else {
+                let reason = "engine=\(engine != nil) suspended=\(suspended) stopping=\(stopping) permit=\(contentPermit != nil) cause=\(suspension.failure.map { String(describing: $0) } ?? "none") recoveryQueued=\(recoveryOperation != nil)"
+                if lastIncomingBlockDiagnostic != reason {
+                    lastIncomingBlockDiagnostic = reason
+                    AccessSyncTrace.event("incoming application blocked", operation: operation.id, detail: reason)
+                }
+                return .retry(.transport)
+            }
+            lastIncomingBlockDiagnostic = nil
             let expected = identityGeneration
-            do { try await validateAccount(generation: expected) }
+            do { try await validateAccount(generation: expected, allowingInboxDrain: true) }
             catch { return .retry(.authorization) }
             if operation.kind == .fetchContentVersion {
                 let fetcher = ContentVersionFetcher(repository: repository, account: account) { [weak self] id in
+                    guard let self else { throw CloudSyncAdapterError.operationInterrupted }
+                    return try await self.fetchContentVersionRecord(id)
+                }
+                return await fetcher.handle(operation, permit: contentPermit)
+            }
+            if operation.kind == .fetchContentHead {
+                let fetcher = ContentHeadFetcher(repository: repository, account: account) { [weak self] id in
                     guard let self else { throw CloudSyncAdapterError.operationInterrupted }
                     return try await self.fetchContentVersionRecord(id)
                 }
@@ -762,6 +871,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
               let scope = try? JSONDecoder().decode(ItemScope.self, from: operation.payload),
               scope.account == account, scope.database == databaseName, scope.vaultID == operation.vaultID,
               scope.zoneOwner == operation.zoneOwner, address(for: scope) != nil else { return .retry(.dependency) }
+        do {
+            if try await repository.contentRotationSatisfied(scope: scope) {
+                AccessSyncTrace.event("rotation already satisfied", operation: operation.id, item: scope.itemID)
+                return .completed
+            }
+        } catch { return .retry(.storagePressure) }
+        guard engine === owner, !stopping, !suspended else { return .retry(.authorization) }
         resolutionInProgress = true; generation += 1
         let expected = identityGeneration
         let outcome: SyncOperationOutcome
@@ -823,11 +939,17 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     private func fetchContentVersionRecord(_ id: CKRecord.ID) async throws -> CKRecord {
         let expected = identityGeneration
-        try await validateAccount(generation: expected)
+        // Targeted dependencies can unblock staged records while bulk fetching
+        // is paused. Their normal scope, signature, and inbox bounds still apply.
+        try await validateAccount(generation: expected, allowingInboxDrain: true)
         guard engine != nil, !stopping, contentReception != nil,
-              addresses.values.contains(where: { $0.zoneID == id.zoneID }) else { throw CloudSyncAdapterError.invalidBinding }
+              addresses.values.contains(where: { $0.zoneID == id.zoneID }) else {
+            AccessSyncTrace.event("direct fetch blocked", record: id.recordName,
+                detail: "enginePresent=\(engine != nil) stopping=\(stopping) trustedZone=\(addresses.values.contains { $0.zoneID == id.zoneID })")
+            throw CloudSyncAdapterError.invalidBinding
+        }
         let record = try await database.record(for: id)
-        try await validateAccount(generation: expected)
+        try await validateAccount(generation: expected, allowingInboxDrain: true)
         return record
     }
 
@@ -842,11 +964,23 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     private func suspend(_ failure: CloudSyncAdapterError) {
         // Preserve the first cause even if subsequent callbacks fail because the
         // engine is suspended. A confirmed account change always takes priority.
+        let newlyFull = failure == .inboxFull && suspension.failure == nil
         suspension.record(failure)
-        contentPermit?.invalidate()
+        if !suspension.allowsLocalProcessing { contentPermit?.invalidate() }
         resolutionPermit?.invalidate()
         uploadsAllowed = false
         lastFailure = suspension.failure
+        if newlyFull, let owner = engine {
+            let expected = identityGeneration
+            Self.logger.notice("Sync trace: inbox full; pausing transfers while local records drain")
+            // Do not await cancellation inside the callback being cancelled.
+            // Keep the lease and local permit until recovery restarts the engine
+            // from its last durable (pre-overflow) checkpoint.
+            Task {
+                guard identityGeneration == expected, engine === owner, suspension.failure == .inboxFull else { return }
+                await owner.cancelOperations()
+            }
+        }
         if failure != .accountChanged, recoveryOperation == nil {
             let operation = SyncOperation(account: account, database: databaseName, kind: .recoverTransport)
             recoveryOperation = operation.id
@@ -855,7 +989,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         }
     }
 
-    private func validateAccount(generation expected: Int) async throws {
+    private func validateAccount(generation expected: Int, allowingInboxDrain: Bool = false) async throws {
         guard expected == identityGeneration else { throw CloudSyncAdapterError.operationInterrupted }
         let authorized = try await accountValidator()
         guard expected == identityGeneration else { throw CloudSyncAdapterError.operationInterrupted }
@@ -865,7 +999,8 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         }
         // A callback can suspend the engine while account validation awaits.
         // A valid account must not turn that failure into an account mismatch.
-        try checkSuspension()
+        if allowingInboxDrain { try suspension.checkLocalProcessing() }
+        else { try checkSuspension() }
     }
 
     private func blockZone(_ zone: CKRecordZone.ID) async throws {

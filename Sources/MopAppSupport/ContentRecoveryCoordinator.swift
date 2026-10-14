@@ -66,7 +66,7 @@ final class ContentRecoveryCoordinator: @unchecked Sendable {
             _ = try await repository.enqueue(signed)
             return .retry(.dependency)
         } catch MopError.authentication { return .authorization }
-        catch { return .retry(.dependency) }
+        catch { return ItemVaultSyncRuntime.workFailureOutcome(error) }
     }
     func grant(_ operation: SyncOperation, session: GrantBackedContentSession, permit: any RepositoryWritePermit) async -> SyncOperationOutcome? {
         guard let recovery = key.withLock({ $0 }), session.history.current.membership.offlineRecovery == recovery.identity else { return nil }

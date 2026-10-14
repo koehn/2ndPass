@@ -88,19 +88,16 @@ import XCTest
         add(screenshot)
         app.buttons["Cancel"].tap()
     }
-    func testEnrollmentWaitsWithoutSpinnerAndCanClose() {
+    func testEnrollmentWaitsOnEntryScreen() {
         let app = XCUIApplication()
         app.launchEnvironment["MOP_UI_TESTING"] = "1"
         app.launchEnvironment["MOP_UI_ENROLLMENT"] = "1"
         app.launch()
-        XCTAssertTrue(app.buttons["Connect"].waitForExistence(timeout: 10))
-        app.buttons["Connect"].tap()
-        let waiting = app.staticTexts["Open and unlock 2ndPass on another connected device."]
-        XCTAssertTrue(waiting.waitForExistence(timeout: 5))
-        XCTAssertFalse(app.activityIndicators.firstMatch.exists)
-        app.buttons["Close"].tap()
-        XCTAssertFalse(waiting.exists)
+        XCTAssertTrue(app.staticTexts["Connecting securely…"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["Unlock to Connect"].exists)
+        XCTAssertFalse(app.textFields["Item search"].exists)
     }
+
     private func typeReliably(_ text: String, into field: XCUIElement) {
         // Synchronize key events with SwiftUI relayout; batched simulator input
         // can drop characters in both the title editor and secure fields.
@@ -188,6 +185,17 @@ import XCTest
         legacyActions.tap()
         XCTAssertTrue(app.buttons["Reveal"].exists)
         XCTAssertFalse(app.buttons["Use as OTP"].exists)
+    }
+
+    func testLockedMobileReturnUnlocksAutomatically() {
+        let app = launch()
+        openItems(app)
+        app.buttons["Lock"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Unlock 2ndPass"].waitForExistence(timeout: 5))
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        openItems(app)
+        XCTAssertFalse(app.buttons["Unlock 2ndPass"].exists)
     }
 
     func testRestoresSelectedItemAfterRelaunch() {
@@ -518,6 +526,22 @@ extension MopUITests {
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Example Login,")).firstMatch.waitForExistence(timeout: 10), app.debugDescription)
         return app
     }
+    func testStartupAndLocalSelectionStayBehindUnlock() {
+        let app = XCUIApplication()
+        app.launchEnvironment["MOP_UI_TESTING"] = "1"
+        app.launchEnvironment["MOP_UI_SELECTION_TEST"] = UUID().uuidString
+        app.launch()
+        let local = app.buttons["local"].firstMatch
+        XCTAssertTrue(local.waitForExistence(timeout: 10))
+        local.click()
+        XCTAssertTrue(app.staticTexts["Device-only vault"].waitForExistence(timeout: 5))
+        app.typeKey("l", modifierFlags: [.command, .shift])
+        XCTAssertTrue(app.buttons["Unlock 2ndPass"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts["Device-only vault"].exists)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Device-only vault"].waitForExistence(timeout: 5))
+    }
     func testLocalVaultSelectionReplacesCloudItems() {
         let app = launch()
         let local = app.buttons["local"].firstMatch
@@ -541,19 +565,16 @@ extension MopUITests {
         name.typeKey("a", modifierFlags: .command)
         name.typeText("Changed Login")
     }
-    func testEnrollmentWaitsWithoutSpinnerAndCanClose() {
+    func testEnrollmentWaitsOnEntryScreen() {
         let app = XCUIApplication()
         app.launchEnvironment["MOP_UI_TESTING"] = "1"
         app.launchEnvironment["MOP_UI_ENROLLMENT"] = "1"
         app.launch()
-        XCTAssertTrue(app.buttons["Connect"].waitForExistence(timeout: 10))
-        app.buttons["Connect"].click()
-        let waiting = app.staticTexts["Open and unlock 2ndPass on another connected device."]
-        XCTAssertTrue(waiting.waitForExistence(timeout: 5))
-        XCTAssertFalse(app.progressIndicators.firstMatch.exists)
-        app.buttons["Close"].click()
-        XCTAssertFalse(waiting.exists)
+        XCTAssertTrue(app.staticTexts["Connecting securely…"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["Unlock to Connect"].exists)
+        XCTAssertFalse(app.textFields["Item search"].exists)
     }
+
     func testAutoFillMappingControlsAndSettings() {
         let app = launch()
         edit(app)

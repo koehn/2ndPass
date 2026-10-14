@@ -4,6 +4,57 @@ import Synchronization
 @testable import MopSync
 
 @Suite struct SyncJournalTests: Sendable {
+    @Test func retryingGrantBacklogCannotStarveInbox() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date()
+        for _ in 0..<830 { _ = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment)) }
+        for _ in 0..<40 { _ = try await repository.enqueue(SyncOperation(account: "a", kind: .applyIncoming)) }
+        let order = Mutex<[SyncOperation.Kind]>([])
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
+            kinds: [.enrollment, .applyIncoming],
+            clock: SyncClock(now: { now }, sleep: { _ in try await Task.sleep(for: .seconds(60)) }, jitter: { 0 }),
+            dependencyAvailable: { _ in true }, handler: { operation in
+                order.withLock { $0.append(operation.kind) }
+                return operation.kind == .enrollment ? .retry(.dependency) : .completed
+            })
+        await coordinator.start(); await coordinator.waitUntilIdle(); await coordinator.stop()
+        let calls = order.withLock { $0 }
+        #expect(calls.firstIndex(of: .applyIncoming) == 16)
+        #expect(calls.filter { $0 == .applyIncoming }.count == 40)
+        #expect(calls.filter { $0 == .enrollment }.count == 830)
+        var consecutiveRequests = 0, applied = 0
+        for kind in calls {
+            if kind == .applyIncoming { consecutiveRequests = 0; applied += 1 }
+            else if applied < 40 { consecutiveRequests += 1; #expect(consecutiveRequests <= 16) }
+        }
+    }
+
+    @Test func grantRequestDiagnosticsDistinguishAuthorityFailures() {
+        let requested = UUID(), other = UUID()
+        #expect(ContentGrantRequestBlockReason.assess(policyMatches: false, recipientIncluded: true, currentGeneration: requested, requestedGeneration: requested) == .policyMismatch)
+        #expect(ContentGrantRequestBlockReason.assess(policyMatches: true, recipientIncluded: false, currentGeneration: requested, requestedGeneration: requested) == .recipientExcluded)
+        #expect(ContentGrantRequestBlockReason.assess(policyMatches: true, recipientIncluded: true, currentGeneration: nil, requestedGeneration: requested) == .missingKeyState)
+        #expect(ContentGrantRequestBlockReason.assess(policyMatches: true, recipientIncluded: true, currentGeneration: other, requestedGeneration: requested) == .generationMismatch)
+        #expect(ContentGrantRequestBlockReason.assess(policyMatches: true, recipientIncluded: true, currentGeneration: requested, requestedGeneration: requested) == nil)
+    }
+
+    @Test func recoveryAndEnrollmentPrecedePersistedInboxBacklog() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        for _ in 0..<64 { _ = try await repository.enqueue(SyncOperation(account: "a", kind: .applyIncoming)) }
+        for kind: SyncOperation.Kind in [.recoverTransport, .reconcile, .enrollment] {
+            _ = try await repository.enqueue(SyncOperation(account: "a", kind: kind))
+        }
+        let order = Mutex<[SyncOperation.Kind]>([])
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
+            kinds: [.applyIncoming, .recoverTransport, .reconcile, .enrollment], dependencyAvailable: { _ in true },
+            handler: { operation in order.withLock { $0.append(operation.kind) }; return .completed })
+        await coordinator.start(); await coordinator.waitUntilIdle(); await coordinator.stop()
+        #expect(Array(order.withLock { $0 }.prefix(3)) == [.recoverTransport, .reconcile, .enrollment])
+        #expect(order.withLock { $0.count } == 67)
+    }
+
     #if DEBUG
     @Test func debugEnrollmentResetClearsOnlyPreviewStoreAndRequiresPermit() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -266,6 +317,61 @@ import Synchronization
 }
 
 extension SyncJournalTests {
+    @Test func grantRequestWaitsForItsKeyStateAcrossUnrelatedProgressAndRestart() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID()), policy = policy()
+        let key = UUID(), recipient = try #require(policy.recipients.first)
+        let permit = JournalWritePermit()
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil, policy: policy, authorization: permit)
+        let request = SyncOperation(account: "a", vaultID: scope.vaultID, kind: .enrollment)
+        _ = try await repository.enqueue(request)
+        let attempts = Mutex(0)
+        let expected = SyncDependency(.contentKeyState, identifier: scope.vaultID.uuidString + ":" + scope.itemID.uuidString + ":" + key.uuidString)
+        func coordinator(_ store: EncryptedItemRepository) -> DurableSyncCoordinator {
+            DurableSyncCoordinator(repository: store, account: "a", kinds: [.enrollment], dependencyAvailable: { dependency in
+                guard dependency == expected else { return false }
+                return try await store.contentKeyStateAvailable(scope: scope, keyGeneration: key)
+            }, handler: { _ in
+                attempts.withLock { $0 += 1 }
+                do {
+                    if let missing = try await store.reconcileContentGrantRequest(scope: scope, keyGeneration: key,
+                        recipient: recipient, policy: policy, permit: permit) { return .waiting([missing]) }
+                    return .completed
+                } catch { Issue.record("Unexpected request failure: \(error)"); return .attention(.invalidAuthority) }
+            })
+        }
+        let first = coordinator(repository)
+        await first.start(); await first.waitUntilIdle(); await first.stop()
+        let waiting = try #require(await repository.operations(account: "a", database: "private").first { $0.id == request.id })
+        #expect(waiting.state == .waitingForDependency && waiting.dependencies == [expected])
+        #expect(waiting.nextAttempt == nil)
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        let resumed = coordinator(reopened)
+        await resumed.start(); await resumed.waitUntilIdle()
+        let other = ItemScope(account: "a", vaultID: scope.vaultID, itemID: UUID())
+        _ = try await repository.commitContent(content(scope: other, policy: policy, key: key), grants: [], expectedPolicy: policy, authorization: permit)
+        for _ in 0..<50 {
+            await resumed.wake(reason: .dependenciesChanged)
+            await resumed.wake(reason: .foreground)
+        }
+        #expect(attempts.withLock { $0 } == 1)
+        #expect(try await !reopened.contentKeyStateAvailable(scope: scope, keyGeneration: key))
+        _ = try await repository.commitContent(content(scope: scope, policy: policy, key: key), grants: [], expectedPolicy: policy, authorization: permit)
+        #expect(try await !reopened.contentKeyStateAvailable(scope: scope, keyGeneration: UUID()))
+        await resumed.wake(reason: .dependenciesChanged); await resumed.waitUntilIdle(); await resumed.stop()
+        #expect(attempts.withLock { $0 } == 2)
+        #expect(try await reopened.operations(account: "a", database: "private").first { $0.id == request.id }?.state == .completed)
+        // Readiness is not authorization: a different policy or recipient still fails.
+        await #expect(throws: ContentStoreError.staleAuthority) {
+            try await reopened.reconcileContentGrantRequest(scope: scope, keyGeneration: key,
+                recipient: "excluded", policy: policy, permit: permit)
+        }
+        await #expect(throws: ContentStoreError.staleAuthority) {
+            try await reopened.reconcileContentGrantRequest(scope: scope, keyGeneration: UUID(),
+                recipient: recipient, policy: policy, permit: permit)
+        }
+    }
+
     private func previewStore() throws -> (URL, EncryptedItemRepository) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-content-" + UUID().uuidString)
         return (root, try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3))
@@ -496,6 +602,77 @@ extension SyncJournalTests {
 }
 
 extension SyncJournalTests {
+    @Test func inboxCapacityReadRefreshesAcrossRepositoryInstances() async throws {
+        let (root, reader) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let writer = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(try await reader.inboxReadyToResume(account: "a", budget: 100))
+        let record = incoming("external-capacity", bytes: 60)
+        try await writer.stageIncomingRecords([record], permit: JournalWritePermit(), budget: 100)
+        #expect(try await !reader.inboxReadyToResume(account: "a", budget: 100))
+        try await writer.completeIncoming(record, failure: nil, permit: JournalWritePermit())
+        #expect(try await reader.inboxReadyToResume(account: "a", budget: 100))
+    }
+
+    @Test func fullInboxDrainsWhileTransportRecoveryWaitsAndReplaysCheckpoint() async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let permit = JournalWritePermit()
+        let first = incoming("capacity-first", bytes: 60)
+        let next = incoming("capacity-next", bytes: 60)
+        try await repository.saveEngineState(Data([1]), account: "a", database: "private")
+        try await repository.stageIncomingRecords([first], permit: permit, budget: 100)
+        let state = Mutex(CloudSyncSuspension())
+        do {
+            try await repository.stageIncomingBatch([next], checkpoint: Data([2]), account: "a",
+                database: "private", budget: 100, permit: permit)
+            Issue.record("The batch must exceed capacity")
+        } catch {
+            state.withLock { $0.record(cloudSyncFailure(error, fallback: .storageFailure)) }
+        }
+        #expect(try await repository.engineState(account: "a", database: "private") == Data([1]))
+        #expect(try await !repository.inboxReadyToResume(account: "a", budget: 100))
+        // An unrelated account cannot hold this account's recovery closed.
+        _ = try await repository.stageIncoming(incoming("other-account", account: "b", bytes: 80), budget: 100)
+        let recovery = SyncOperation(account: "a", kind: .recoverTransport)
+        _ = try await repository.enqueue(recovery)
+        let deferred = Mutex(0)
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
+            kinds: [.applyIncoming, .recoverTransport], dependencyAvailable: { _ in true }, handler: { operation in
+                do {
+                    if operation.kind == .recoverTransport {
+                        guard try await repository.inboxReadyToResume(account: "a", budget: 100) else {
+                            deferred.withLock { $0 += 1 }
+                            return .retry(.storagePressure)
+                        }
+                        // Replay the failed batch only after draining. The old
+                        // checkpoint must have survived the entire pause.
+                        #expect(try await repository.engineState(account: "a", database: "private") == Data([1]))
+                        try await repository.stageIncomingBatch([next], checkpoint: Data([2]), account: "a",
+                            database: "private", budget: 100, permit: permit)
+                        state.withLock { $0 = CloudSyncSuspension() }
+                    } else {
+                        try state.withLock { try $0.checkLocalProcessing() }
+                        if let id = String(data: operation.payload, encoding: .utf8),
+                           let record = try await repository.incomingRecord(id: id, account: "a", database: "private") {
+                            try await repository.completeIncoming(record, failure: nil, permit: permit)
+                        }
+                    }
+                    return .completed
+                } catch { Issue.record("Capacity recovery failed: \(error)"); return .attention(.processing) }
+            })
+        await coordinator.start(); await coordinator.waitUntilIdle()
+        #expect(deferred.withLock { $0 } >= 1)
+        #expect(try await repository.inboxReadyToResume(account: "a", budget: 100))
+        await coordinator.wake(reason: .foreground); await coordinator.waitUntilIdle()
+        // The replay creates a fresh inbox operation; explicitly deliver its
+        // store wake rather than racing the asynchronous change observer.
+        await coordinator.wake(reason: .storeChanged); await coordinator.waitUntilIdle(); await coordinator.stop()
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        #expect(try await reopened.engineState(account: "a", database: "private") == Data([2]))
+        #expect(try await reopened.incomingRecords(account: "a", database: "private").isEmpty)
+        #expect(try await reopened.activeOperations(account: "a", database: "private").isEmpty)
+        #expect(try await reopened.incomingRecords(account: "b", database: "private").count == 1)
+    }
+
     @Test func interruptedChunksReplayWithoutAdvancingCheckpoint() async throws {
         let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
         try await repository.saveEngineState(Data([9]), account: "a", database: "private")
@@ -782,9 +959,16 @@ extension SyncJournalTests {
             })
         await coordinator.start()
         for await _ in entered.stream { break }
+        let changes = await repository.changes()
         let enrollment = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
         await coordinator.wake(reason: .storeChanged)
         for await _ in admitted.stream { break }
+        // Handler entry precedes the coordinator's durable outcome commit.
+        // A store-observer wake may already own the drain when our wake returns.
+        for await _ in changes {
+            if try await repository.operations(account: "a", database: "private")
+                .first(where: { $0.id == enrollment.id })?.state == .completed { break }
+        }
         let operations = try await repository.operations(account: "a", database: "private")
         #expect(operations.first { $0.id == enrollment.id }?.state == .completed)
         #expect(operations.first { $0.id == transfer.id }?.state == .ready)
@@ -917,5 +1101,153 @@ extension SyncJournalTests {
         try await repository.setContentUploadBlocked(record.operationID, account: "a", blocked: false, permit: JournalWritePermit())
         let throttled = try #require(await repository.operations(account: "a", database: "private").first)
         #expect(throttled.state == .retryScheduled && throttled.retryNotBefore == deadline)
+    }
+}
+
+extension SyncJournalTests {
+    @Test(arguments: [SyncOperation.Kind.enrollment, .prepareGrant])
+    func unlockReconsidersAccessWorkBeforeRemainingBulkWork(kind: SyncOperation.Kind) async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let enrollment = try await repository.enqueue(SyncOperation(account: "a", kind: kind))
+        var bulk: [SyncOperation] = []
+        for _ in 0..<8 {
+            bulk.append(try await repository.enqueue(SyncOperation(account: "a", kind: .rotateContent)))
+        }
+        let authorized = Mutex(false)
+        let calls = Mutex<[UUID]>([])
+        let bulkCalls = Mutex(0)
+        let barrier = JournalBarrier()
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
+            kinds: [kind, .rotateContent], dependencyAvailable: { _ in true }, handler: { operation in
+                calls.withLock { $0.append(operation.id) }
+                if operation.kind == kind {
+                    return authorized.withLock { $0 } ? .completed : .authorization
+                }
+                let first = bulkCalls.withLock { $0 += 1; return $0 == 1 }
+                if first { await barrier.wait() }
+                return .completed
+            })
+        let startup = Task { await coordinator.start() }
+        await barrier.waitForEntry()
+        // Enrollment has failed authentication and the first bulk handler is live.
+        authorized.withLock { $0 = true }
+        await coordinator.wake(reason: .unlocked)
+        await barrier.release()
+        await startup.value
+        await coordinator.waitUntilIdle()
+        await coordinator.stop()
+
+        let order = calls.withLock { $0 }
+        #expect(order.count == bulk.count + 2)
+        #expect(order.first == enrollment.id)
+        // Finish and commit the current bulk operation, then retry enrollment
+        // before starting any of the seven remaining bulk operations.
+        #expect(order.dropFirst(2).first == enrollment.id)
+        for operation in bulk { #expect(order.filter { $0 == operation.id }.count == 1) }
+        let persisted = try await repository.operations(account: "a", database: "private")
+        #expect(persisted.count == bulk.count + 1)
+        #expect(persisted.allSatisfy { $0.state == .completed })
+    }
+}
+
+extension SyncJournalTests {
+    @Test func accessWorkArrivingDuringRotationsDoesNotWaitForWholeBatch() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        var bulk: [SyncOperation] = []
+        for _ in 0..<40 {
+            bulk.append(try await repository.enqueue(SyncOperation(account: "a", kind: .rotateContent)))
+        }
+        let calls = Mutex<[UUID]>([])
+        let first = Mutex(true)
+        let barrier = JournalBarrier()
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
+            kinds: [.rotateContent, .prepareGrant, .grant, .publishCoordination],
+            dependencyAvailable: { _ in true }, handler: { operation in
+                calls.withLock { $0.append(operation.id) }
+                if operation.kind == .rotateContent, first.withLock({ value in
+                    let wasFirst = value; value = false; return wasFirst
+                }) { await barrier.wait() }
+                return .completed
+            })
+        let startup = Task { await coordinator.start() }
+        await barrier.waitForEntry()
+        var access: [SyncOperation] = []
+        for kind in [SyncOperation.Kind.prepareGrant, .grant, .publishCoordination] {
+            access.append(try await repository.enqueue(SyncOperation(account: "a", kind: kind)))
+        }
+        await coordinator.wake(reason: .storeChanged)
+        await barrier.release()
+        await startup.value
+        await coordinator.waitUntilIdle()
+        await coordinator.stop()
+        let order = calls.withLock { $0 }
+        let bulkIDs = Set(bulk.map(\.id))
+        for operation in access {
+            let index = try #require(order.firstIndex(of: operation.id))
+            // A bounded slice must yield to newly arrived access work even
+            // without another unlock; no wall-clock sleeps or ordering ties.
+            #expect(order[..<index].filter { bulkIDs.contains($0) }.count <= 16)
+        }
+        for operation in bulk + access { #expect(order.filter { $0 == operation.id }.count == 1) }
+        let persisted = try await repository.operations(account: "a", database: "private")
+        #expect(persisted.count == bulk.count + access.count)
+        #expect(persisted.allSatisfy { $0.state == .completed })
+    }
+}
+
+extension SyncJournalTests {
+    @Test(arguments: [true, false]) func remoteRotationRetiresWorkOnlyWhenInstalled(installed: Bool) async throws {
+        let (root, repository) = try previewStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let scope = ItemScope(account: "a", vaultID: UUID(), itemID: UUID())
+        let original = policy(), removed = policy("d", authority: "d")
+        #expect(try await !repository.contentRotationSatisfied(scope: scope))
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: nil,
+            policy: original, authorization: JournalWritePermit())
+        let first = content(scope: scope, policy: original)
+        _ = try await repository.commitContent(first, grants: [], expectedPolicy: original, authorization: JournalWritePermit())
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: original,
+            policy: removed, authorization: JournalWritePermit())
+        let rotation = try #require(await repository.operations(account: "a", database: "private")
+            .first { $0.kind == .rotateContent })
+        #expect(try await !repository.contentRotationSatisfied(scope: scope))
+        let remote = content(scope: scope, policy: removed, base: first, key: UUID())
+        let incoming = IncomingRecord(id: UUID().uuidString, account: "a", database: "private",
+            zoneName: SyncStoreLayout.contentZone(vault: scope.vaultID), zoneOwner: scope.zoneOwner,
+            recordName: scope.itemID.uuidString + (installed ? "" : ":" + remote.version.versionID.uuidString),
+            recordType: (installed ? ContentRecordKind.head : .version).rawValue,
+            bytes: remote.version.ciphertext, systemFields: Data(), vaultID: scope.vaultID)
+        try await repository.stageIncoming(incoming, permit: JournalWritePermit())
+        try await repository.receiveContent(remote, from: incoming, action: installed ? .supersede : .archive,
+            expectedHead: first.version.versionID, expectedPolicy: removed, permit: JournalWritePermit())
+        let result = try #require(await repository.operations(account: "a", database: "private").first { $0.id == rotation.id })
+        #expect(result.state == (installed ? .completed : .ready))
+        #expect(result.deliveredAt == nil)
+        #expect(try await repository.contentRotationSatisfied(scope: scope) == installed)
+        // Re-admission adds grant recipients but does not undo removal's key authority.
+        let readmitted = policy("e", recipients: removed.recipients.union([String(repeating: "f", count: 64)]), authority: "d")
+        try await repository.setContentRecipients(scope: vaultScope(scope), expected: removed,
+            policy: readmitted, authorization: JournalWritePermit())
+        #expect(try await repository.contentRotationSatisfied(scope: scope) == installed)
+        #expect(try await repository.operations(account: "a", database: "private")
+            .filter { $0.kind == .rotateContent && $0.state != .completed }.count == (installed ? 0 : 1))
+    }
+}
+
+extension SyncJournalTests {
+    @Test func prerequisiteFetchesRunBeforeBulkInboxButCannotStarveIt() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        for _ in 0..<40 { _ = try await repository.enqueue(SyncOperation(account: "a", kind: .applyIncoming)) }
+        for _ in 0..<40 { _ = try await repository.enqueue(SyncOperation(account: "a", kind: .fetchContentHead)) }
+        let order = Mutex<[SyncOperation.Kind]>([])
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.fetchContentHead, .applyIncoming],
+            dependencyAvailable: { _ in true }, handler: { operation in
+                order.withLock { $0.append(operation.kind) }; return .completed
+            })
+        await coordinator.start(); await coordinator.waitUntilIdle(); await coordinator.stop()
+        let calls = order.withLock { $0 }
+        #expect(calls.first == .fetchContentHead)
+        #expect(calls.firstIndex(of: .applyIncoming) == 16)
+        #expect(calls.filter { $0 == .fetchContentHead }.count == 40)
+        #expect(calls.filter { $0 == .applyIncoming }.count == 40)
     }
 }

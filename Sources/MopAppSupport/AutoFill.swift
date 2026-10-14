@@ -171,10 +171,17 @@ public struct AutoFillIndex: Sendable {
     private let directory: URL
     public init(directory: URL) { self.directory = directory }
     private var file: URL { directory.appendingPathComponent("identities.json") }
-    private func read(rebuildingInvalidCache: Bool = false) throws -> [AutoFillIdentity] {
+    // Cache decoded values, never filesystem authority. Every hit still performs
+    // the private-file read under the directory lock, and compares exact bytes.
+    struct ReadCache: Sendable {
+        let data: Data
+        let entries: [AutoFillIdentity]
+    }
+    private func read(rebuildingInvalidCache: Bool = false, cache: inout ReadCache?) throws -> [AutoFillIdentity] {
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
         // Filesystem security failures must never be treated as an empty cache.
         let data = try LocalFile.read(file, privateFile: true)
+        if let cache, cache.data == data { return cache.entries }
         let entries: [AutoFillIdentity]
         do { entries = try JSONDecoder().decode([AutoFillIdentity].self, from: data) }
         catch {
@@ -186,11 +193,19 @@ public struct AutoFillIndex: Sendable {
             if rebuildingInvalidCache { return [] }
             throw MopError.invalidVault
         }
+        cache = ReadCache(data: data, entries: entries)
         return entries
     }
     public func load() throws -> [AutoFillIdentity] {
         let cache = try LocalDirectory(directory: directory)
-        return try cache.locked { try read() }
+        return try cache.locked {
+            var decoded: ReadCache?
+            return try read(cache: &decoded)
+        }
+    }
+    func load(cache decoded: inout ReadCache?) throws -> [AutoFillIdentity] {
+        let directory = try LocalDirectory(directory: directory)
+        return try directory.locked { try read(cache: &decoded) }
     }
     @discardableResult
     func update(_ transform: ([AutoFillIdentity]) -> [AutoFillIdentity]) throws -> [AutoFillIdentity] {
@@ -198,7 +213,8 @@ public struct AutoFillIndex: Sendable {
         return try cache.locked {
             // This is derived metadata, not vault data. Rebuild an unusable
             // index from authenticated catalogs instead of preserving a refresh loop.
-            let entries = transform(try read(rebuildingInvalidCache: true)).sorted { $0.recordIdentifier < $1.recordIdentifier }
+            var decoded: ReadCache?
+            let entries = transform(try read(rebuildingInvalidCache: true, cache: &decoded)).sorted { $0.recordIdentifier < $1.recordIdentifier }
             let data = try JSONEncoder().encode(entries)
             guard data.count <= 16 * 1024 * 1024 else { throw MopError.invalidVault }
             try LocalFile.write(data, to: file, replace: FileManager.default.fileExists(atPath: file.path))
@@ -264,6 +280,8 @@ public actor AutoFillPublisher: AutoFillPublishing {
     private let removeIdentities: @Sendable ([AutoFillIdentity]) async throws -> Void
     private let localIdentities: @Sendable () throws -> [AutoFillIdentity]
     private var health: AutoFillPublicationStatus?
+    private var projectionCache: (data: Data, state: AutoFillPublicationState)?
+    private var indexCache: AutoFillIndex.ReadCache?
     init(directory: URL? = nil, publish: (@Sendable ([AutoFillIdentity]) async throws -> Void)? = nil,
          enabled: (@Sendable () async -> Bool)? = nil,
          incremental: (@Sendable () async -> Bool)? = nil,
@@ -322,8 +340,10 @@ public actor AutoFillPublisher: AutoFillPublishing {
         guard FileManager.default.fileExists(atPath: file.path) else { return AutoFillPublicationState() }
         // Read/permission failures are not cache corruption and must fail closed.
         let data = try LocalFile.read(file, privateFile: true)
+        if let projectionCache, projectionCache.data == data { return projectionCache.state }
         guard let state = try? JSONDecoder().decode(AutoFillPublicationState.self, from: data),
               state.schema == AutoFillPublicationState.currentSchema else { return AutoFillPublicationState() }
+        projectionCache = (data, state)
         return state
     }
     private func saveProjection(_ state: AutoFillPublicationState, directory: URL) throws {
@@ -360,7 +380,7 @@ public actor AutoFillPublisher: AutoFillPublishing {
             let index = AutoFillIndex(directory: directory)
             let indexedRows: [AutoFillIdentity]
             var repairIndex = false
-            do { indexedRows = try index.load() }
+            do { indexedRows = try index.load(cache: &indexCache) }
             catch MopError.invalidVault { projection.requiresReconciliation = true; indexedRows = []; repairIndex = true }
             let recovered = projection.items.values.flatMap { $0.values.flatMap(\.identities) }
             let previousDesired = projection.desiredCloud ?? AutoFillPublicationState.unique(indexedRows + recovered)

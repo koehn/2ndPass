@@ -21,20 +21,26 @@ struct LockedView: View {
         return Image(systemName: "lock.shield")
     }()
 
-    private func connectionThermometer(title: String) -> some View {
-        VStack(spacing: 8) {
-            Text(title)
-            ProgressView(value: model.connectionProgress?.fraction, total: 1)
-                .progressViewStyle(.linear)
-                .accessibilityLabel("Vault connection progress")
-                .accessibilityValue(model.connectionProgress.map { "\($0.ready) of \($0.total) vault records ready" } ?? "Waiting for approval")
-            if let progress = model.connectionProgress {
-                Text("\(progress.ready) of \(progress.total) vault records ready")
+    private var connectionStatus: some View {
+        VStack(spacing: 16) {
+            Text(model.connectionTitle).font(.title2)
+            if !model.connectionNeedsUnlock {
+                ProgressView().accessibilityLabel("Waiting for vault connection")
+            }
+            Text(model.connectionExplanation)
+                .font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 420)
+            if model.connectionNeedsUnlock {
+                Button(model.unlockQueued ? "Waiting to unlock…" : model.unlockStarting ? "Unlocking…" : "Unlock this device") {
+                    model.authorizeVaultConnection()
+                }.disabled(!model.canUnlock)
+            }
+            if let date = model.connectionLastProgress {
+                HStack { Text("Last progress"); Text(date, style: .relative); Text("ago") }
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }
-        .frame(maxWidth: 320)
-        .accessibilityIdentifier("Enrollment progress")
+            Button("Check Again") { model.discover(autoUnlock: false) }.disabled(model.busy)
+        }.accessibilityIdentifier("Enrollment progress")
     }
 
     var body: some View {
@@ -42,31 +48,27 @@ struct LockedView: View {
             Self.icon
                 .resizable().scaledToFit().frame(width: 128, height: 128)
                 .accessibilityLabel("2ndPass")
-            if model.waitingForVaultMetadata {
-                connectionThermometer(title: "Downloading vault…")
-                Text("This device is connected. Waiting for vault details and secure access to finish downloading. Your vault will open automatically.")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center).frame(maxWidth: 420)
-            } else if model.isConnectingVaults {
-                connectionThermometer(title: "Connecting securely…")
-                if !model.authenticated {
-                    Button("Unlock to Connect") { model.authorizeVaultConnection() }.disabled(model.busy)
-                }
-                Text("Open and unlock 2ndPass on another device to finish connecting.")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+            if model.rootPresentation == .starting {
+                ProgressView("Opening 2ndPass…")
+            } else if model.rootPresentation == .setup {
+                Text("Welcome to 2ndPass").font(.title2)
+                Button("Create a vault…") { model.presentSheet(.createVault) }
+                    .buttonStyle(.borderedProminent).disabled(model.busy)
+                Button("Restore a backup…") { model.presentSheet(.restoreBackup) }.disabled(model.busy)
+                Button("Unlock device-local vault") { model.unlock() }.disabled(!model.canUnlock)
+            } else if model.waitingForVaultMetadata || model.isConnectingVaults {
+                connectionStatus
+            } else if model.rootPresentation == .unlocking {
+                ProgressView("Unlocking and opening your vault…")
+                    .accessibilityIdentifier("Unlock in progress")
             } else {
-                Button(model.unlocking ? "Unlocking…" : "Unlock 2ndPass") {
-                    if model.vaults.contains(where: { $0.supported }) { model.unlock() }
-                    else { model.presentSheet(model.canPresent(.enrollDevice) ? .enrollDevice : .restoreBackup) }
+                Button(model.unlockQueued ? "Waiting to unlock…" : model.unlockStarting ? "Unlocking…" : "Unlock 2ndPass") {
+                    model.unlock()
                 }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                .disabled(model.hasConnectedVaults ? !model.canUnlock : model.busy || model.deviceRemoved)
+                .disabled(!model.canUnlock)
             }
             if !model.waitingForVaultMetadata, model.vaults.contains(where: { $0.supported && !$0.enrolled }) {
-                Text("Connecting your iCloud vaults").font(.headline)
-                Text("Open and unlock 2ndPass on an existing device. Key access syncs automatically.")
-                    .multilineTextAlignment(.center).frame(maxWidth: 420)
                 ForEach(model.vaults.filter { $0.supported && !$0.enrolled }) { vault in
                     Label(vault.name ?? "Vault \(vault.id.prefix(8))", systemImage: "icloud")
                 }

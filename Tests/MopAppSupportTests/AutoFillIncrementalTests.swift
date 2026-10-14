@@ -319,3 +319,20 @@ private actor PublicationBarrier {
     try await p.refresh()
     #expect(try AutoFillIndex(directory: root).load().isEmpty)
 }
+
+@Test func warmPruningObservesAnotherPublisherAndRepairsChangedIndex() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), first = publisher(root, store), second = publisher(root, store)
+    let kept = UUID().uuidString, removed = UUID().uuidString
+    try await first.publish(catalog: suggestionCatalog([(suggestionItem(UUID(), user: "kept"), UUID())]), vaultID: kept)
+    try await first.prune(keeping: [kept])
+    try await first.prune(keeping: [kept])
+    try await second.publish(catalog: suggestionCatalog([(suggestionItem(UUID(), user: "removed"), UUID())]), vaultID: removed)
+    try await first.prune(keeping: [kept])
+    #expect(Set(await store.rows.values.map(\.username)) == ["kept"])
+    #expect(Set(try AutoFillIndex(directory: root).load().map(\.username)) == ["kept"])
+    try AutoFillIndex(directory: root).update { _ in [] }
+    try await first.prune(keeping: [kept])
+    #expect(Set(try AutoFillIndex(directory: root).load().map(\.username)) == ["kept"])
+}

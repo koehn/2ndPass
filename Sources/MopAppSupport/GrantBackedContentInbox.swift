@@ -76,9 +76,10 @@ public struct GrantBackedContentInbox: Sendable {
         if dependency.kind == .membership, parts.count == 2 {
             return (try? history.state(forDigest: String(parts[1]))) != nil
         }
-        if [.content, .contentKeyGeneration].contains(dependency.kind), parts.count == 3,
+        if [.content, .contentKeyGeneration, .contentKeyState].contains(dependency.kind), parts.count == 3,
            let item = UUID(uuidString: String(parts[1])), let identity = UUID(uuidString: String(parts[2])) {
             let scope = ItemScope(account: account, vaultID: history.vault, itemID: item, zoneOwner: zoneOwner)
+            if dependency.kind == .contentKeyState { return try await repository.contentKeyStateAvailable(scope: scope, keyGeneration: identity) }
             if dependency.kind == .content { return try await repository.contentVersion(scope: scope, version: identity) != nil }
             return try await repository.contentVersion(scope: scope, keyGeneration: identity) != nil
         }
@@ -111,6 +112,8 @@ public struct GrantBackedContentInbox: Sendable {
                 let prepared = try PreparedContentGrant(scope: scope, keyGeneration: grant.keyGeneration,
                     recipient: grant.recipient, identifier: grant.identifier, bytes: incoming.bytes)
                 try await repository.receiveContentGrant(prepared, from: incoming, expectedPolicy: policy, permit: permit)
+                AccessSyncTrace.event("grant applied", item: scope.itemID, generation: grant.keyGeneration,
+                    recipient: grant.recipient, record: incoming.recordName)
                 return .completed
             }
             let parsed = try authenticate { try JSONDecoder().decode(ContentEnvelope.self, from: incoming.bytes) }
@@ -144,6 +147,8 @@ public struct GrantBackedContentInbox: Sendable {
             case .preserveBranches: action = .branch
             case .compareContents:
                 guard let comparison else {
+                    AccessSyncTrace.event("incoming authorization blocked", item: scope.itemID,
+                        record: incoming.recordName, detail: "reason=comparisonSessionUnavailable")
                     try await repository.deferIncoming(incoming, dependencies: [SyncDependency(.authorization, identifier: scope.vaultID.uuidString)], failure: .authorization, permit: permit)
                     return .authorization
                 }

@@ -12,6 +12,7 @@ import MopCore
     #expect(publicationFailure(CocoaError(.fileWriteOutOfSpace)) == .storagePressure)
     #expect(publicationFailure(NSError(domain: NSPOSIXErrorDomain, code: 28)) == .storagePressure)
     #expect(publicationFailure(SyncJournalError.inboxFull) == .storagePressure)
+    #expect(publicationFailure(CloudSyncAdapterError.inboxFull) == .storagePressure)
     #expect(publicationFailure(CocoaError(.fileReadCorruptFile)) == .processing)
 }
 
@@ -51,6 +52,34 @@ import MopCore
     entered.continuation.finish(); resume.continuation.finish()
 }
 
+@Test func interruptedUploadPreparationStopsBeforeRetryBookkeeping() async throws {
+    for error: any Error in [CancellationError(), CKError(.operationCancelled), CloudSyncAdapterError.operationInterrupted] {
+        var deferred = 0
+        do {
+            for _ in 0..<1_000 {
+                try checkUploadPreparation(error)
+                deferred += 1
+            }
+            Issue.record("Interrupted batch must exit")
+        } catch is CancellationError { }
+        #expect(deferred == 0)
+    }
+    try checkUploadPreparation(CKError(.networkUnavailable))
+    try checkUploadPreparation(MopError.cloudPermission)
+    let entered = AsyncStream<Void>.makeStream()
+    let resume = AsyncStream<Void>.makeStream()
+    let task = Task {
+        entered.continuation.yield(())
+        for await _ in resume.stream { break }
+        #expect(throws: CancellationError.self) { try checkUploadPreparation() }
+    }
+    for await _ in entered.stream { break }
+    task.cancel()
+    resume.continuation.finish()
+    await task.value
+    entered.continuation.finish()
+}
+
 @Test func cancelledSyncWorkIsNeitherStorageFailureNorUntrustedData() {
     for error: any Error in [CancellationError(), CKError(.operationCancelled)] {
         #expect(cloudSyncFailure(error, fallback: .storageFailure) == .operationInterrupted)
@@ -59,6 +88,27 @@ import MopCore
     #expect(cloudSyncFailure(CloudSyncAdapterError.untrustedRecord, fallback: .storageFailure) == .untrustedRecord)
     #expect(cloudSyncFailure(CloudSyncAdapterError.accountChanged, fallback: .storageFailure) == .accountChanged)
     #expect(cloudSyncFailure(CocoaError(.fileReadCorruptFile), fallback: .storageFailure) == .storageFailure)
+}
+
+@Test func inboxCapacitySuspendsTransportButPreservesLocalProcessing() throws {
+    var suspension = CloudSyncSuspension()
+    suspension.record(cloudSyncFailure(SyncJournalError.inboxFull, fallback: .storageFailure))
+    #expect(throws: CloudSyncAdapterError.inboxFull) { try suspension.check() }
+    try suspension.checkLocalProcessing()
+    suspension.record(.operationInterrupted)
+    try suspension.checkLocalProcessing()
+    #expect(suspension.failure == .inboxFull)
+}
+
+@Test(arguments: [CloudSyncAdapterError.accountChanged, .storageFailure, .untrustedRecord])
+func inboxCapacityCannotMaskRealFailures(_ failure: CloudSyncAdapterError) {
+    var suspension = CloudSyncSuspension()
+    suspension.record(.inboxFull)
+    suspension.record(failure)
+    suspension.record(.inboxFull)
+    #expect(!suspension.allowsLocalProcessing)
+    #expect(throws: failure) { try suspension.checkLocalProcessing() }
+    #expect(throws: failure) { try suspension.check() }
 }
 
 @Test(arguments: [CloudSyncAdapterError.membershipUnavailable, .storageFailure, .unreadableRemoteRecord])

@@ -11,7 +11,7 @@ public enum SyncOperationState: String, Codable, Sendable {
 }
 
 public struct SyncDependency: Hashable, Codable, Sendable {
-    public enum Kind: String, Codable, Sendable { case membership, grant, content, contentKeyGeneration, operation, authorization }
+    public enum Kind: String, Codable, Sendable { case membership, grant, content, contentKeyGeneration, contentKeyState, contentHead, grantRequestState, operation, authorization }
     public let kind: Kind
     public let identifier: String
     public init(_ kind: Kind, identifier: String) { self.kind = kind; self.identifier = identifier }
@@ -19,7 +19,7 @@ public struct SyncDependency: Hashable, Codable, Sendable {
 
 public struct SyncOperation: Equatable, Codable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable {
-        case publishItem, provision, membership, enrollment, grant, deletion, reconcile, applyIncoming, recoverTransport, prepareGrant, rotateContent, fetchContentVersion, publishCoordination, fetchMembership, recovery, removeCoordination, resolveConflict
+        case publishItem, provision, membership, enrollment, grant, deletion, reconcile, applyIncoming, recoverTransport, prepareGrant, rotateContent, fetchContentVersion, fetchContentHead, publishCoordination, fetchMembership, recovery, removeCoordination, resolveConflict
     }
     public let id: UUID
     public let account: String
@@ -87,10 +87,11 @@ public struct SyncHealthSnapshot: Equatable, Sendable {
     public let pendingCount: Int
     public let oldestPendingAt: Date?
     public let lastDeliveryAt: Date?
+    public let pendingKinds: Set<SyncOperation.Kind>
     public let blockedReasons: Set<SyncFailure>
-    public init(pendingCount: Int, oldestPendingAt: Date?, lastDeliveryAt: Date?, blockedReasons: Set<SyncFailure>) {
+    public init(pendingCount: Int, oldestPendingAt: Date?, lastDeliveryAt: Date?, blockedReasons: Set<SyncFailure>, pendingKinds: Set<SyncOperation.Kind> = []) {
         self.pendingCount = pendingCount; self.oldestPendingAt = oldestPendingAt
-        self.lastDeliveryAt = lastDeliveryAt; self.blockedReasons = blockedReasons
+        self.lastDeliveryAt = lastDeliveryAt; self.blockedReasons = blockedReasons; self.pendingKinds = pendingKinds
     }
 }
 

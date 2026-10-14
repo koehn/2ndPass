@@ -11,6 +11,20 @@ These observations cover the previous protocol preview and those scenarios only.
 
 ## Automated checks
 
+October 10 enrollment-reset unlock follow-up: Mac logs showed repeated
+`MopError.authentication` after receipt of a membership change. Bootstrap now
+reports an authenticated non-member distinctly from invalid trust, allowing
+self-removal publication to finish. Concurrent loads reuse the current authorized
+session; membership replacement retains a still-authorized reader until the new
+session is installed, and removed devices are invalidated immediately. Catalog
+workers and failures are scoped to their session, with one bounded retry for an
+authorized replacement. The full Swift suite passed 670 tests. Final focused tests
+also passed for remaining-device bootstrap, removed-device rejection, duplicate
+session installation, authority replacement/stale-session rejection, and catalog
+failure recovery after session replacement. macOS and iOS Simulator Debug
+app/AutoFill builds passed. These are software checks; the user's interrupted
+phone reset and Mac unlock still need verification with updated signed clients.
+
 October 10 debug enrollment reset: added coverage for V3-only store clearing,
 write-permit rejection, durable inbox/checkpoint removal, legacy-store preservation,
 last-owner refusal, revoked-device tombstone preservation, fresh-enrollment UI
@@ -171,3 +185,29 @@ The roadmap tracks these requirements. No automated result substitutes for an un
 Automated recovery tests cover recovery-signed additive enrollment with embedded proof of possession, preservation of existing devices, rejection of recovery-authority changes, fresh-device bootstrap without the old device, recipient replacement/revocation across item/metadata/health envelopes, account-scoped progress, and interruption after committed cloud writes. Injected transports exercise restart without a retained recovery code and re-entry when a late record was not staged.
 
 These tests do not validate live CloudKit or Secure Enclave recovery. Physical acceptance remains: activate and verify coverage; make every original device unavailable; recover on a fresh same-account device; then reconnect an original device and verify reading, editing, and synchronization. Exercise interruption, deferred grant delivery and key rotation on both platforms before release. Do not use a destructive local reset as a substitute.
+
+## Rotation interruption and password-health cache (2026-10-10)
+
+Upload preparation now exits on Swift/CloudKit cancellation before retry bookkeeping or removal from the engine pending set. Authority barriers, final authority validation, and delivered-event checkpoint persistence remain intact. Password-health saves use live immutable password record identities for evidence freshness while retaining per-item parent-version checks; unrelated aggregate revision changes no longer discard valid evidence.
+
+Focused tests passed for interrupted preparation (including a cancelled task), delivered-event persistence, and health-cache saves across unrelated edits versus real password replacement. The full elevated Swift suite passed all 671 tests (`/tmp/mop-interruption-full.log`); `git diff --check` passed. Signed-device rotation/enrollment confirmation remains a physical acceptance check.
+
+## Interrupted DEBUG enrollment reset (2026-10-10)
+
+Discovery resumes an existing reset manifest before inventory opens the revoked identity. Reset completion uses cloud-head readback authenticated against pinned membership history, without requiring a local operation delivery receipt first. Unknown heads and empty removal sets do not authorize cleanup; pending-edit checks and the cleanup lease remain in force. Focused reset/membership tests passed, including accepted removal readback, rejection of pre-removal or unpinned heads, and rejection of the removed device on unlock. Physical phone relaunch and fresh enrollment still require signed-device verification.
+
+## Incremental sync status and inbox capacity (2026-10-14)
+
+Sync health maintains a joined operation/inbox aggregate refreshed by persistent history, including incomplete receipts, orphan inbox rows, failure/kind counts, and oldest/latest dates. Only immutable snapshots leave the queue-confined cache. Capacity maintains an account-wide byte/count summary and overlays unsaved changes without scanning all retained records. The cross-process capacity boundary, rollback invalidation, authorization permits, and checkpoint transactions are unchanged.
+
+Validation: all 106 sync tests passed; after reducing retained health-summary memory, 17 focused performance/capacity/checkpoint tests passed. Regressions cover external repository writes, deletion, duplicate staging, rollback, partial receipts, and checkpoint replay. `incrementalStatusAndCapacityBenchmark` compares the previous query shapes on the same store with warm projections: 100 changes, 16,000 operations and 5,000 inbox rows. The final local run measured health reads at 0.0275 s versus 1.1692 s, and capacity reads at 0.0150 s versus 0.1065 s. Persistent-history refresh is performed before timing either query; equality and bounded aggregate-update counts are asserted, while timing ratios are reported rather than asserted. Run with `swift test --disable-sandbox --filter JournalPerformanceTests` using the cache paths and permissions described in AGENTS.md.
+
+These are local query benchmarks, not end-to-end iPad or iCloud speedups. Reprofile the signed iPad build against its existing backlog to measure the actual drain-rate improvement.
+
+## Grant-request prerequisite recovery (2026-10-14)
+
+Waiting grant requests now persist their observed item head and membership digest, plus any exact missing ancestor. Relevant changes re-enter normal signed-request verification; unrelated inbox progress does not retry them. Legacy key-state waits re-enter verification once to adopt this dependency representation. Missing or potentially stale heads get a durable targeted fetch, deduplicated per observed state. Missing ancestors use immutable version fetches. Both use bounded access scheduling alongside inbox processing. Fetched heads are atomically staged with fetch completion, without advancing engine checkpoints or treating reception as verification.
+
+A generation mismatch alone never retires a request. Retirement requires the existing verified removed-device path or a signed successor chain from the current publishable head, followed by a transactional state/policy check and reconciliation of current recipient grants. Unknown cloud records and unproven generations remain pending; genuine verification failures remain failures.
+
+Validation: 108 MopSync tests and 215 MopAppSupport tests passed with `swift test --disable-sandbox --filter 'MopSyncTests|MopAppSupportTests'` and the cache/permission settings above (`/tmp/mop-prereq-broad-final.log`). New regressions cover relevant versus unrelated changes, restart persistence, stale-head refresh, deduplicated fetches, missing ancestry, verified retirement versus unknown generations, excluded recipients, wrong record routes, unknown cloud records, checkpoint preservation, and bounded fetch/inbox scheduling. Live iCloud convergence of the iPad's existing backlog still requires a signed-device run.

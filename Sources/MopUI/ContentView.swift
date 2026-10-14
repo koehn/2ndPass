@@ -209,6 +209,14 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     Spacer()
                 }.padding(12)
+                if let activity = model.outgoingAccessStatus {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(activity).font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                    }.padding(.horizontal, 12).padding(.bottom, 8)
+                        .accessibilityIdentifier("secure-access-progress")
+                }
                 if let issue = model.syncIssue {
                     HStack {
                         Label(issue, systemImage: "exclamationmark.icloud")
@@ -272,7 +280,7 @@ struct ContentView: View {
     }
     private var sessionContent: some View {
         Group {
-            if !model.authenticated && model.cloudVaultsPresent && !model.isLocalVaultSelected {
+            if model.rootPresentation != .ready {
                 LockedView(model: model)
             } else {
                 navigation

@@ -135,11 +135,53 @@ private actor Barrier {
 @MainActor struct AppModelTests {
     private func model(_ service: FakeService, clock: Clock = Clock()) -> AppModel {
         let defaults = UserDefaults(suiteName: "mop-session-test-" + UUID().uuidString)!
-        let model = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, now: { clock.time }, automaticTimer: false)
+        let model = AppModel(breachClient: TestBreachClient(), service: service, defaults: defaults, now: { clock.time }, automaticTimer: false, unlockOnActivation: false)
         model.vault = UUID().uuidString
         model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)]
         return model
     }
+    @Test func startupDiscoveryShowsConnectedWaitingWithoutReactivation() async throws {
+        let id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            if case .discover = operation {
+                var result = VaultResult()
+                result.vaults = [.init(id: id, name: "vault", format: "mop-content-v3", enrolled: true)]
+                result.enrollmentProgress = [id: .init(ready: 0, total: 100)]
+                return result
+            }
+            throw ItemVaultSessionFailure.missingVaultMetadata
+        }
+        service.authenticate()
+        let app = model(service); app.vault = id
+        app.discover(); try await finish(app)
+        #expect(app.waitingForVaultMetadata)
+        #expect(app.connectionTitle == "Device connected")
+        #expect(!app.connectionNeedsUnlock)
+        #expect(!app.unlocking && !app.busy)
+    }
+
+    @Test func connectionUnlockReflectsServiceAuthorizationBeforeVaultOpens() {
+        let service = FakeService()
+        let app = model(service)
+        #expect(app.connectionNeedsUnlock)
+        service.authenticate()
+        #expect(!app.authenticated)
+        #expect(!app.connectionNeedsUnlock)
+        #expect(app.connectionTitle == "Waiting for secure access")
+        service.lock()
+        #expect(app.connectionNeedsUnlock)
+    }
+
+    @Test func connectionProgressTimestampOnlyChangesWithObservedProgress() {
+        let app = model(FakeService())
+        #expect(app.connectionLastProgress == nil)
+        app.enrollmentProgress = ["vault": .init(ready: 1, total: 10)]
+        let first = app.connectionLastProgress
+        #expect(first != nil)
+        app.enrollmentProgress = ["vault": .init(ready: 1, total: 10)]
+        #expect(app.connectionLastProgress == first)
+    }
+
     #if DEBUG
     @Test func debugResetReturnsToFreshEnrollmentWithoutCancellingDiscovery() async throws {
         let service = FakeService { operation, _, _ in
@@ -333,6 +375,29 @@ private actor Barrier {
         #expect(app.conflictItems.isEmpty && !app.conflictReviewPresented)
     }
 
+    @Test func replacementCatalogPreservesSelectionAndSearch() async throws {
+        let service = FakeService { _, _, _ in VaultResult() }
+        let app = model(service)
+        app.discover(); try await finish(app)
+        var item = VaultItem(name: "login", fields: [ItemField(path: "username", type: .username, value: "alice")])
+        item.storageID = UUID().uuidString
+        let before = ItemCatalog(vault: "personal", revision: "old", items: [item])
+        try app.applyCatalog(before)
+        service.authenticate(); app.authenticated = true
+        app.search = "alice"
+        app.selectedRow = try #require(app.displayedItems.first).id
+        let selected = app.selectedRow
+        // While replacement is pending, the verified projection stays identical.
+        try app.applyCatalog(before)
+        #expect(app.selectedRow == selected && app.search == "alice")
+        #expect(app.displayedItems.count == 1)
+        try app.applyCatalog(ItemCatalog(vault: "personal", revision: "rotated", items: [item]))
+        #expect(app.selectedRow == selected && app.search == "alice")
+        #expect(app.displayedItems.count == 1)
+        app.lock(clearClipboard: false)
+        #expect(!app.authenticated && app.selectedRow == nil)
+    }
+
     @Test func editWithExpiredNativeAuthorizationLocksAndOffersFreshUnlock() async throws {
         let service = FakeService { operation, _, _ in
             if case .read = operation {
@@ -341,6 +406,7 @@ private actor Barrier {
             return VaultResult()
         }
         let app = model(service)
+        app.discover(); try await finish(app)
         let item = VaultItem(name: "login", fields: [ItemField(path: "password", type: .password)])
         try app.applyCatalog(ItemCatalog(vault: "personal", revision: "r", items: [item]))
         service.authenticate(); app.authenticated = true; app.selectedItem = item.name
@@ -349,6 +415,36 @@ private actor Barrier {
         #expect(app.error == "Unlock 2ndPass again to continue. Your device requires authentication.")
         #expect(service.state.withLock { $0.locks } > 0)
         #expect(app.canUnlock)
+    }
+
+    @Test func backgroundRefreshWithExpiredNativeAuthorizationRequiresUnlock() async throws {
+        let id = UUID().uuidString, expired = Mutex(false)
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            switch operation {
+            case .discover:
+                result.vaults = [VaultDescriptor(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
+            case .catalog:
+                if expired.withLock({ $0 }) { throw NSError(domain: "com.apple.LocalAuthentication", code: -1004) }
+                result.catalog = Self.catalog
+            default: break
+            }
+            return result
+        }
+        service.authenticate()
+        let app = model(service); app.vault = id; app.start()
+        try await finish(app)
+        #expect(app.authenticated)
+        expired.withLock { $0 = true }
+        app.cloudChanged()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while app.authenticated && ContinuousClock.now < deadline { await Task.yield() }
+        try await finish(app)
+        #expect(!app.authenticated)
+        #expect(app.error == "Unlock 2ndPass again to continue. Your device requires authentication.")
+        #expect(!app.catalogUpdatePaused)
+        #expect(app.canUnlock)
+        #expect(service.state.withLock { $0.locks } > 0)
     }
 
     @Test func cloudWakeIsIndependentOfCatalogRefreshAndReportsFailuresWithoutLocking() async throws {
@@ -390,7 +486,7 @@ private actor Barrier {
         let empty = model(FakeService())
         empty.vault = ""; empty.vaults = []
         empty.discover(); try await finish(empty)
-        #expect(empty.sheet == .createVault)
+        #expect(empty.sheet == nil && empty.rootPresentation == .setup)
         let service = FakeService { operation, _, _ in
             var result = VaultResult()
             if case .discover = operation { result.vaults = [VaultDescriptor(id: "cloud-vault", name: "iCloud vault", format: "mop-content-v3", enrolled: false)] }
@@ -419,7 +515,7 @@ private actor Barrier {
             return result
         }
         let app = model(service); app.vault = ""; app.vaults = []; app.start()
-        try await finish(app)
+        try await finish(app); app.authorizeVaultConnection(); try await finish(app)
         #expect(app.isConnectingVaults && !app.authenticated)
         app.discover(autoUnlock: true); try await finish(app)
         #expect(app.isConnectingVaults && !app.authenticated)
@@ -453,6 +549,8 @@ private actor Barrier {
     @Test func cancelledFirstVaultPromptStaysDismissedDuringDiscovery() async throws {
         let app = model(FakeService()); app.vault = ""; app.vaults = []
         app.discover(); try await finish(app)
+        #expect(app.sheet == nil && app.rootPresentation == .setup)
+        app.presentSheet(.createVault)
         #expect(app.sheet == .createVault)
         app.sheet = nil
         app.discover(); try await finish(app)
@@ -480,9 +578,10 @@ private actor Barrier {
         app.discover(); try await finish(app)
         #expect(app.sheet == nil && app.vaults.isEmpty && !app.authenticated)
         #expect(!service.state.withLock { $0.operations.contains { if case .create = $0 { return true }; return false } })
+        #expect(app.rootPresentation == .locked)
         complete.withLock { $0 = true }
         app.discover(); try await finish(app)
-        #expect(app.sheet == .createVault)
+        #expect(app.sheet == nil && app.rootPresentation == .setup)
     }
 
     @Test func failedDiscoveryDoesNotOfferAnEmptyAccountSetup() async throws {
@@ -542,7 +641,7 @@ private actor Barrier {
     }
     private func finish(_ model: AppModel) async throws {
         for _ in 0..<500 {
-            if !model.busy && !model.refreshing && !model.loadingVaults { return }
+            if !model.busy && !model.refreshing && !model.loadingVaults && !model.hasPendingAutomaticUnlock { return }
             try await Task.sleep(for: .milliseconds(10))
         }
         Issue.record("Operation did not finish")
@@ -602,6 +701,40 @@ private actor Barrier {
         model.activate()
         #expect(model.authenticated && model.isActive)
     }
+    @Test func advancingBacklogRenewsIdleTimerButStalledWorkExpires() {
+        let clock = Clock(), service = FakeService(); service.authenticate()
+        let app = model(service, clock: clock)
+        app.checkExpiration()
+        app.applySyncHealth(.init(pendingCount: 10, oldestPendingAt: nil, lastDeliveryAt: nil,
+            blockedReasons: [], pendingKinds: [.rotateContent]))
+        clock.time = 299
+        app.applySyncHealth(.init(pendingCount: 9, oldestPendingAt: nil, lastDeliveryAt: nil,
+            blockedReasons: [], pendingKinds: [.rotateContent]))
+        clock.time = 301; app.checkExpiration()
+        #expect(service.isAuthenticated)
+        clock.time = 598
+        app.applySyncHealth(.init(pendingCount: 9, oldestPendingAt: nil, lastDeliveryAt: nil,
+            blockedReasons: [], pendingKinds: [.rotateContent]))
+        clock.time = 599; app.checkExpiration()
+        #expect(!service.isAuthenticated)
+    }
+
+    @Test func backlogProgressCannotOverrideBackgroundOrExplicitLock() {
+        let clock = Clock(), service = FakeService(); service.authenticate()
+        let app = model(service, clock: clock)
+        app.checkExpiration()
+        app.applySyncHealth(.init(pendingCount: 10, oldestPendingAt: nil, lastDeliveryAt: nil,
+            blockedReasons: [], pendingKinds: [.prepareGrant]))
+        app.deactivate(); clock.time = 299
+        app.applySyncHealth(.init(pendingCount: 9, oldestPendingAt: nil, lastDeliveryAt: nil,
+            blockedReasons: [], pendingKinds: [.prepareGrant]))
+        clock.time = 300; app.checkExpiration()
+        #expect(!service.isAuthenticated)
+        app.lock()
+        app.applySyncHealth(.init(pendingCount: 0, oldestPendingAt: nil, lastDeliveryAt: Date(), blockedReasons: []))
+        #expect(!service.isAuthenticated)
+    }
+
     @Test func timeoutUsesOnlyGUIActivityAndExpiresInBackground() {
         let clock = Clock(), service = FakeService(); service.authenticate()
         let model = model(service, clock: clock)
@@ -897,7 +1030,7 @@ extension AppModelTests {
 }
 
 extension AppModelTests {
-    @Test func launchUnlocksOnceAndAllVaultsKeepDuplicateNamesSeparate() async throws {
+    @Test func automaticLaunchUnlockAndAllVaultsKeepDuplicateNamesSeparate() async throws {
         let first = UUID().uuidString, second = UUID().uuidString
         let service = FakeService { operation, id, _ in
             var result = VaultResult()
@@ -925,7 +1058,7 @@ extension AppModelTests {
         #expect(service.state.withLock { $0.operations.count } == count)
         #expect(model.catalogs.isEmpty && model.displayedItems.isEmpty)
     }
-    @Test func cancelledLaunchAuthenticationDoesNotPromptAgain() async throws {
+    @Test func cancelledAuthenticationDoesNotPromptAgain() async throws {
         let id = UUID().uuidString
         let service = FakeService { operation, _, _ in
             if case .discover = operation {
@@ -1401,7 +1534,7 @@ extension AppModelTests {
         model.shutdown()
     }
 
-    @Test func cancelledAutomaticAuthenticationRequiresExplicitUnlock() async throws {
+    @Test func cancelledAuthenticationRequiresExplicitRetry() async throws {
         let id = UUID().uuidString
         let service = FakeService { operation, _, _ in
             if case .discover = operation {
@@ -2644,8 +2777,7 @@ extension AppModelTests {
             #expect(isolated.selectedItem == nil && isolated.selectedDeleted == nil)
             source.items = []
             let (missing, _) = selectionModel([vault: source], defaults: defaults)
-            missing.unlock(); try await finish(missing)
-            #expect(missing.selectedItem == nil && missing.selectedDeleted == nil)
+                #expect(missing.selectedItem == nil && missing.selectedDeleted == nil)
         }
     }
 }
@@ -2703,7 +2835,7 @@ extension AppModelTests {
         #expect(app.vaults.map(\.id) == [retained])
         #expect(app.catalogs[gone] == nil && app.catalogs[retained] != nil)
     }
-    @Test func unlockAfterLastVaultDeletionOffersCreation() async throws {
+    @Test func unlockAfterLastVaultDeletionDoesNotPresentAnUnexpectedSheet() async throws {
         let service = FakeService { operation, _, _ in
             if case .discover = operation { return VaultResult() }
             throw MopError.vaultMissing
@@ -2712,7 +2844,7 @@ extension AppModelTests {
         app.unlock(); try await finish(app)
         #expect(app.error == nil)
         #expect(!app.authenticated && app.vaults.isEmpty && app.vault.isEmpty)
-        #expect(app.sheet == .createVault)
+        #expect(app.sheet == nil)
     }
 }
 
@@ -2844,7 +2976,7 @@ extension AppModelTests {
         service.authenticate()
         let app = model(service); app.unlock(); try await finish(app)
         #expect(!app.authenticated && app.catalogs.isEmpty && app.vaults.isEmpty)
-        #expect(app.sheet == .createVault)
+        #expect(app.sheet == nil)
     }
 }
 
@@ -3471,4 +3603,154 @@ extension AppModelTests {
         #expect(!changed.withLock { $0 })
         model.lock()
     }
+}
+
+
+extension AppModelTests {
+    @Test func startupKeepsNavigationHiddenThroughAutomaticAuthentication() async throws {
+        let barrier = Barrier(), authentication = Barrier(), id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                await barrier.wait()
+                result.vaults = [.init(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
+            } else {
+                await authentication.wait()
+                throw MopError.authentication
+            }
+            return result
+        }
+        let app = model(service); app.vault = ""; app.vaults = []
+        #expect(app.rootPresentation == .starting)
+        app.start(); try await entered(barrier)
+        #expect(app.rootPresentation == .starting && !app.canUnlock)
+        await barrier.release(); try await entered(authentication)
+        #expect(app.rootPresentation == .unlocking && !app.canUnlock && app.catalogs.isEmpty)
+        await authentication.release(); try await finish(app)
+        #expect(app.rootPresentation == .locked && app.canUnlock)
+        app.error = nil
+        app.chooseVault(LocalVault.id)
+        #expect(app.rootPresentation == .locked)
+        app.chooseAllVaults(); app.activate(); app.activity()
+        try await Task.sleep(for: .milliseconds(20)); try await finish(app)
+        #expect(app.rootPresentation == .locked && app.catalogs.isEmpty)
+        #expect(service.state.withLock { $0.operations.count } == 2)
+    }
+
+    @Test func localApplicationUnlockExpiresAndRejectsLateAuthentication() async throws {
+        let clock = Clock(), barrier = Barrier(), block = Mutex(false)
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let app = AppModel(breachClient: TestBreachClient(), service: FakeService(), defaults: defaults,
+                           now: { clock.time }, automaticTimer: false, localService: SelectionLocalService(),
+                           authorizeApplication: { if block.withLock({ $0 }) { await barrier.wait() } })
+        #expect(app.rootPresentation == .starting)
+        app.start(); try await finish(app)
+        #expect(app.rootPresentation == .setup)
+        app.unlock(); try await finish(app)
+        #expect(app.rootPresentation == .ready && !app.authenticated)
+        #expect(app.sessionState == .unlocked)
+        clock.time = 100; app.activity()
+        app.background(); clock.time = 200; app.activate()
+        #expect(app.rootPresentation == .ready)
+        clock.time = 501; app.checkExpiration()
+        #expect(app.rootPresentation == .locked && app.sessionState == .locked(.timeout))
+        block.withLock { $0 = true }
+        app.unlock(); try await entered(barrier)
+        #expect(app.rootPresentation == .unlocking)
+        app.lock()
+        await barrier.release(); try await finish(app)
+        #expect(app.rootPresentation == .locked && !app.applicationUnlocked)
+    }
+
+    @Test func cancelledLocalUnlockStaysLockedUntilExplicitRetry() async throws {
+        let attempts = Mutex(0)
+        let app = AppModel(breachClient: TestBreachClient(), service: FakeService(),
+                           defaults: UserDefaults(suiteName: UUID().uuidString)!, automaticTimer: false,
+                           localService: SelectionLocalService(), authorizeApplication: {
+            attempts.withLock { $0 += 1 }
+            throw MopError.authentication
+        })
+        app.start(); try await finish(app)
+        app.unlock(); try await finish(app)
+        #expect(!app.applicationUnlocked && app.error != nil)
+        app.error = nil; app.activate(); app.activity(); app.chooseAllVaults()
+        try await Task.sleep(for: .milliseconds(20)); try await finish(app)
+        #expect(attempts.withLock { $0 } == 1)
+        app.unlock(); try await finish(app)
+        #expect(attempts.withLock { $0 } == 2)
+    }
+}
+
+
+extension AppModelTests {
+    @Test func mobileReturnUnlocksButBiometricDismissalDoesNotRetry() async throws {
+        let barrier = Barrier(), attempts = Mutex(0), id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [.init(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
+            } else {
+                let attempt = attempts.withLock { $0 += 1; return $0 }
+                if attempt == 1 { await barrier.wait() }
+                throw MopError.authentication
+            }
+            return result
+        }
+        let app = AppModel(breachClient: TestBreachClient(), service: service,
+                           defaults: UserDefaults(suiteName: UUID().uuidString)!,
+                           automaticTimer: false, unlockOnActivation: true)
+        app.start(); try await entered(barrier)
+        app.deactivate() // The system authentication dialog takes focus.
+        await barrier.release(); try await finish(app)
+        app.activate(); try await finish(app)
+        #expect(attempts.withLock { $0 } == 1 && app.rootPresentation == .locked)
+        app.background(); app.activate(); try await finish(app)
+        #expect(attempts.withLock { $0 } == 2 && app.rootPresentation == .locked)
+        app.activate(); app.activity(); try await finish(app)
+        #expect(attempts.withLock { $0 } == 2)
+        app.lock(); app.activity(); try await finish(app)
+        #expect(attempts.withLock { $0 } == 2)
+    }
+
+    @Test(arguments: [false, true])
+    func unlockAvailabilityDoesNotFlickerDuringDiscoveryAndClicksAreQueued(discoveryFails: Bool) async throws {
+        let barrier = Barrier(), block = Mutex(false), attempts = Mutex(0), id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                if block.withLock({ $0 }) {
+                    await barrier.wait()
+                    if discoveryFails { throw MopError.cloudUnavailable }
+                }
+                result.vaults = [.init(id: id, name: "personal", format: "mop-content-v3", enrolled: true)]
+            } else {
+                attempts.withLock { $0 += 1 }
+                throw MopError.authentication
+            }
+            return result
+        }
+        let app = model(service); app.vault = ""; app.vaults = []
+        app.start(); try await finish(app)
+        #expect(app.canUnlock && attempts.withLock { $0 } == 1)
+        block.withLock { $0 = true }
+        app.discover(); try await entered(barrier)
+        #expect(app.busy && app.canUnlock)
+        app.unlock(); app.unlock()
+        #expect(app.unlockQueued && !app.canUnlock)
+        await barrier.release(); try await finish(app)
+        #expect(attempts.withLock { $0 } == (discoveryFails ? 1 : 2))
+        #expect(!app.unlockQueued && app.canUnlock)
+    }
+}
+
+@Test func syncHealthReportsOutstandingAccessWorkWithoutCountingItems() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("sync.sqlite"))
+    let operation = try await repository.enqueue(SyncOperation(account: "test", kind: .prepareGrant))
+    #expect(try await repository.syncHealth(account: "test", database: "private").pendingKinds == [.prepareGrant])
+    _ = try await repository.transition(operation, to: .needsAttention, failure: .invalidAuthority)
+    let health = try await repository.syncHealth(account: "test", database: "private")
+    #expect(health.pendingKinds.isEmpty)
+    #expect(health.blockedReasons.contains(.invalidAuthority))
 }

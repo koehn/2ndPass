@@ -5,24 +5,91 @@ import CryptoKit
 
 // Health reads never need encrypted payloads, dependencies, or system fields.
 private struct OperationHealthFields: Decodable {
+    let kind: SyncOperation.Kind
     let id: UUID
     let state: SyncOperationState
     let createdAt: Date
     let deliveredAt: Date?
     let failure: SyncFailure?
 }
-private struct OperationHealthSummary {
-    var unfinished: [UUID: OperationHealthFields] = [:]
-    var deliveries: [Date: Int] = [:]
-    var latest: Date?
-    mutating func update(_ row: OperationHealthFields, added: Bool) {
-        if row.state != .completed { unfinished[row.id] = added ? row : nil }
-        if let date = row.deliveredAt {
-            let count = (deliveries[date] ?? 0) + (added ? 1 : -1)
-            deliveries[date] = count == 0 ? nil : count
-            if added { latest = max(latest ?? date, date) }
-            else if date == latest && count == 0 { latest = deliveries.keys.max() }
+// Lazy-deletion heap: removing the oldest pending row does not scan the backlog.
+private struct HealthDates {
+    var counts: [Date: Int] = [:]
+    var heap: [Date] = []
+    mutating func update(_ date: Date, added: Bool) {
+        let count = counts[date, default: 0] + (added ? 1 : -1)
+        precondition(count >= 0)
+        counts[date] = count == 0 ? nil : count
+        if added && count == 1 {
+            heap.append(date)
+            var i = heap.count - 1
+            while i > 0 {
+                let parent = (i - 1) / 2
+                if heap[parent] <= heap[i] { break }
+                heap.swapAt(parent, i); i = parent
+            }
         }
+        while let first = heap.first, counts[first] == nil {
+            let last = heap.removeLast()
+            if heap.isEmpty { break }
+            heap[0] = last
+            var i = 0
+            while i * 2 + 1 < heap.count {
+                var child = i * 2 + 1
+                if child + 1 < heap.count && heap[child + 1] < heap[child] { child += 1 }
+                if heap[i] <= heap[child] { break }
+                heap.swapAt(i, child); i = child
+            }
+        }
+        if heap.count > counts.count * 2 + 64 { heap = counts.keys.sorted() }
+    }
+    var first: Date? { heap.first }
+}
+
+private final class SyncHealthAggregate {
+    private var operations: [UUID: OperationHealthFields] = [:]
+    private var incoming: [UUID: IncomingHealthFields] = [:]
+    private var pending = 0
+    private var dates = HealthDates()
+    private var deliveries = HealthDates()
+    private var failures: [SyncFailure: Int] = [:]
+    private var kinds: [SyncOperation.Kind: Int] = [:]
+
+    private func count<K>(_ key: K, in counts: inout [K: Int], added: Bool) {
+        let value = counts[key, default: 0] + (added ? 1 : -1)
+        precondition(value >= 0)
+        counts[key] = value == 0 ? nil : value
+    }
+    private func pendingDate(_ id: UUID) -> Date? {
+        if let record = incoming[id] { return record.receivedAt }
+        if let operation = operations[id], operation.state != .completed { return operation.createdAt }
+        return nil
+    }
+    private func changePending(_ date: Date?, added: Bool) {
+        guard let date else { return }
+        pending += added ? 1 : -1; dates.update(date, added: added)
+    }
+    func update(_ row: OperationHealthFields, added: Bool) {
+        changePending(pendingDate(row.id), added: false)
+        operations[row.id] = added && row.state != .completed ? row : nil
+        changePending(pendingDate(row.id), added: true)
+        if row.state != .completed {
+            if let failure = row.failure { count(failure, in: &failures, added: added) }
+            if row.state != .needsAttention { count(row.kind, in: &kinds, added: added) }
+        }
+        // Negating the timestamp turns a minimum heap into latest delivery.
+        if let date = row.deliveredAt { deliveries.update(Date(timeIntervalSinceReferenceDate: -date.timeIntervalSinceReferenceDate), added: added) }
+    }
+    func update(_ row: IncomingHealthFields, added: Bool) {
+        changePending(pendingDate(row.operationID), added: false)
+        incoming[row.operationID] = added ? row : nil
+        changePending(pendingDate(row.operationID), added: true)
+        if let failure = row.failure { count(failure, in: &failures, added: added) }
+    }
+    func snapshot() -> SyncHealthSnapshot {
+        SyncHealthSnapshot(pendingCount: pending, oldestPendingAt: dates.first,
+            lastDeliveryAt: deliveries.first.map { Date(timeIntervalSinceReferenceDate: -$0.timeIntervalSinceReferenceDate) },
+            blockedReasons: Set(failures.keys), pendingKinds: Set(kinds.keys))
     }
 }
 private struct IncomingHealthFields: Decodable {
@@ -78,10 +145,13 @@ private struct IncomingBudgetFields: Decodable {
     }
 }
 
-private struct QuarantinedSyncRecord: Codable {
-    let digest: String
+public struct QuarantinedSyncRecord: Codable, Equatable, Sendable {
+    public let digest: String
     let receivedAt: Date
-    var payload: Data?
+    public var payload: Data?
+    public var operations: [UUID]?
+    var retired: Bool?
+    public var legacyReadbackUnmatched: Bool?
 }
 
 extension EncryptedItemRepository {
@@ -180,23 +250,30 @@ extension EncryptedItemRepository {
                 try requireIncomingInTransaction(incoming)
                 try quarantineInTransaction(incoming.bytes, account: incoming.account, database: incoming.database,
                     zone: incoming.zoneName, owner: incoming.zoneOwner, record: incoming.recordName,
-                    now: Date(), budget: Self.maximumQuarantineBytes)
+                    now: Date(), budget: Self.maximumQuarantineBytes, operation: incoming.operationID)
                 try completeIncomingInTransaction(incoming, failure: .invalidAuthority)
             }
         }
     }
 
     private func quarantineInTransaction(_ bytes: Data, account: String, database: String, zone: String, owner: String,
-                                         record: String, now: Date, budget: Int) throws {
+                                         record: String, now: Date, budget: Int, operation: UUID? = nil) throws {
         guard budget >= 0, !account.isEmpty, ["private", "shared"].contains(database) else { throw SyncJournalError.invalidOperation }
         let scope = try JSONEncoder().encode([database, zone, owner, record])
         let digest = SHA256.hash(data: scope + bytes).map { String(format: "%02x", $0) }.joined()
         let prefix = "sync-quarantine:" + Data(account.utf8).base64EncodedString() + ":"
         let key = prefix + digest
-        guard try fetchOne("StateBlob", key: key) == nil else { return }
+        if var existing: QuarantinedSyncRecord = try journalValue("StateBlob", key: key) {
+            if let operation, !(existing.operations ?? []).contains(operation) {
+                existing.operations = (existing.operations ?? []) + [operation]
+                existing.retired = nil
+                try writeJournal(existing, entity: "StateBlob", key: key)
+            }
+            return
+        }
         try writeJournal(UUID(), entity: "StateBlob", key: prefix + "boundary")
         var rows = try quarantineRows(account: account)
-        let candidate = QuarantinedSyncRecord(digest: digest, receivedAt: now, payload: bytes.count <= budget ? bytes : nil)
+        let candidate = QuarantinedSyncRecord(digest: digest, receivedAt: now, payload: bytes.count <= budget ? bytes : nil, operations: operation.map { [$0] })
         try writeJournal(candidate, entity: "StateBlob", key: key)
         if let row = try fetchOne("StateBlob", key: key) { rows.append((row, candidate)) }
         var total = rows.reduce(0) { $0 + ($1.1.payload?.count ?? 0) }
@@ -204,6 +281,82 @@ extension EncryptedItemRepository {
             var value = value
             total -= value.payload?.count ?? 0; value.payload = nil
             row.setValue(try JSONEncoder().encode(value), forKey: "value")
+        }
+    }
+
+    public func quarantinedRecords(account: String) throws -> [QuarantinedSyncRecord] {
+        try transaction { try quarantineRows(account: account).map(\.1).filter { $0.retired != true } }
+    }
+
+    /// Remember a conclusive readback mismatch without clearing any failure.
+    /// Transport errors must not call this: they remain retryable.
+    public func retainUnmatchedQuarantine(_ expected: QuarantinedSyncRecord, account: String,
+                                          permit: any RepositoryWritePermit) throws {
+        try permit.withWritePermission {
+            try transaction {
+                let key = "sync-quarantine:" + Data(account.utf8).base64EncodedString() + ":" + expected.digest
+                guard let current: QuarantinedSyncRecord = try journalValue("StateBlob", key: key), current == expected,
+                      current.operations == nil, current.retired != true else { throw SyncJournalError.staleOperation }
+                var retained = current; retained.legacyReadbackUnmatched = true
+                try writeJournal(retained, entity: "StateBlob", key: key)
+            }
+        }
+    }
+
+    /// Recover legacy linkage only from the exact materialized cloud revision.
+    /// Its inbox hash includes routing, system fields and bytes; no fuzzy match.
+    public func linkLegacyQuarantine(_ expected: QuarantinedSyncRecord, incoming: IncomingRecord,
+                                     permit: any RepositoryWritePermit) throws -> QuarantinedSyncRecord {
+        try permit.withWritePermission {
+            try transaction {
+                guard expected.operations == nil, expected.payload == incoming.bytes,
+                      incoming.database == "private", incoming.zoneName == SyncStoreLayout.contentCoordinationZone,
+                      incoming.recordType == CoordinationRecordKind.grantRequest.recordType else { throw SyncJournalError.invalidOperation }
+                let scope = try JSONEncoder().encode([incoming.database, incoming.zoneName, incoming.zoneOwner, incoming.recordName])
+                let digest = SHA256.hash(data: scope + incoming.bytes).map { String(format: "%02x", $0) }.joined()
+                guard digest == expected.digest else { throw SyncJournalError.invalidOperation }
+                let key = "sync-quarantine:" + Data(incoming.account.utf8).base64EncodedString() + ":" + digest
+                guard let current: QuarantinedSyncRecord = try journalValue("StateBlob", key: key), current == expected,
+                      current.retired != true,
+                      let operation: SyncOperation = try journalValue("SyncOperation", key: journalKey(incoming.account, incoming.database, incoming.operationID.uuidString)),
+                      operation.kind == .applyIncoming, operation.state == .needsAttention,
+                      operation.failure == .invalidAuthority, operation.payload == Data(incoming.id.utf8),
+                      operation.vaultID == incoming.vaultID, operation.zoneOwner == incoming.zoneOwner else { throw SyncJournalError.staleOperation }
+                var linked = current; linked.operations = [incoming.operationID]
+                try writeJournal(linked, entity: "StateBlob", key: key)
+                return linked
+            }
+        }
+    }
+
+    /// Caller verifies the signed request; storage independently checks routing
+    /// digest, exact retained evidence, and every linked operation before commit.
+    public func retireQuarantinedGrant(_ expected: QuarantinedSyncRecord, record: PreparedCoordinationRecord,
+                                      permit: any RepositoryWritePermit) throws {
+        try permit.withWritePermission {
+            try transaction {
+                guard record.kind == .grantRequest, expected.payload == record.bytes,
+                      let ids = expected.operations, !ids.isEmpty else { throw SyncJournalError.invalidOperation }
+                let scope = try JSONEncoder().encode(["private", SyncStoreLayout.contentCoordinationZone, record.zoneOwner, record.recordName])
+                let digest = SHA256.hash(data: scope + record.bytes).map { String(format: "%02x", $0) }.joined()
+                guard digest == expected.digest else { throw SyncJournalError.invalidOperation }
+                let key = "sync-quarantine:" + Data(record.account.utf8).base64EncodedString() + ":" + digest
+                guard let current: QuarantinedSyncRecord = try journalValue("StateBlob", key: key), current == expected,
+                      current.retired != true else { throw SyncJournalError.staleOperation }
+                for id in ids {
+                    guard let operation: SyncOperation = try journalValue("SyncOperation", key: journalKey(record.account, "private", id.uuidString)),
+                          operation.kind == .applyIncoming, operation.state == .needsAttention,
+                          operation.failure == .invalidAuthority, operation.vaultID == record.vault else { throw SyncJournalError.staleOperation }
+                    var completed = operation
+                    completed.state = .completed; completed.failure = nil; completed.dependencies = []
+                    completed.nextAttempt = nil; completed.retryNotBefore = nil; completed.retryAttempts = nil
+                    completed.completedAt = Date(); completed.revision = UUID()
+                    try writeJournal(completed, entity: "SyncOperation",
+                        key: journalKey(record.account, "private", completed.id.uuidString), account: record.account, database: "private")
+                }
+                var retired = current; retired.retired = true
+                try writeJournal(retired, entity: "StateBlob", key: key)
+            }
         }
     }
 
@@ -300,6 +453,16 @@ extension EncryptedItemRepository {
         return values.compactMap(\.operation)
     }
 
+    /// Verification is performed by the caller; CAS protects the exact bytes
+    /// inspected, and the permit protects account ownership at commit time.
+    public func retireObsoleteCoordination(_ expected: SyncOperation, permit: any RepositoryWritePermit) throws {
+        try permit.withWritePermission {
+            guard expected.kind == .enrollment, expected.state == .needsAttention,
+                  expected.failure == .invalidAuthority else { throw SyncJournalError.invalidOperation }
+            _ = try transition(expected, to: .completed)
+        }
+    }
+
     /// CAS prevents a late worker from completing newly updated or retired work.
     @discardableResult
     public func transition(_ expected: SyncOperation, to state: SyncOperationState,
@@ -336,7 +499,23 @@ extension EncryptedItemRepository {
         }
     }
 
-    private struct InboxUsage { var count: Int; var bytes: Int }
+    private struct InboxUsage { var count = 0; var bytes = 0 }
+    private func inboxUsage(account: String) throws -> InboxUsage {
+        try journalReadCache.summary(prefix: journalPrefix("IncomingRecord", account: account, database: nil),
+            in: context, initial: InboxUsage()) { (usage: inout InboxUsage, row: IncomingBudgetFields, added: Bool) in
+                usage.count += added ? 1 : -1
+                usage.bytes += added ? row.size : -row.size
+            }
+    }
+
+    /// Use the same account-wide budget as reception. Hysteresis leaves room
+    /// for replay of the uncheckpointed batch instead of restarting per record.
+    func inboxReadyToResume(account: String, budget: Int = maximumInboxBytes) throws -> Bool {
+        guard budget > 0 else { throw SyncJournalError.invalidOperation }
+        return try transaction {
+            return try inboxUsage(account: account).bytes <= budget / 2
+        }
+    }
     func stageIncomingInTransaction(_ record: IncomingRecord, budget: Int) throws -> IncomingRecord {
         var usage: InboxUsage?
         return try stageIncomingInTransaction(record, budget: budget, usage: &usage)
@@ -360,8 +539,7 @@ extension EncryptedItemRepository {
             let boundaryKey = journalKey(record.account, "inbox-boundary", "")
             try writeJournal(UUID(), entity: "StateBlob", key: boundaryKey)
             try journalReadCache.begin(in: context, persistent: context.persistentStoreCoordinator?.persistentStores.first?.type == NSSQLiteStoreType)
-            let all: [IncomingBudgetFields] = try journalValues("IncomingRecord", account: record.account)
-            usage = InboxUsage(count: all.count, bytes: all.reduce(0) { $0 + $1.size })
+            usage = try inboxUsage(account: record.account)
         }
         let added = record.bytes.count + record.systemFields.count
         guard usage!.count == 0 || (added <= budget && usage!.bytes <= budget - added) else { throw SyncJournalError.inboxFull }
@@ -507,6 +685,35 @@ extension EncryptedItemRepository {
         }
     }
 
+    /// Deduplicate targeted prerequisite work under the account/lease permit.
+    public func enqueuePrerequisite(_ operation: SyncOperation, permit: any RepositoryWritePermit) throws -> SyncOperation {
+        try permit.withWritePermission { try transaction { try enqueueInTransaction(operation) } }
+    }
+
+    public func finishContentHeadFetch(_ expected: SyncOperation, incoming: IncomingRecord,
+                                          permit: any RepositoryWritePermit) throws {
+        guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+        try permit.withWritePermission {
+            try transaction {
+                let key = journalKey(expected.account, expected.database, expected.id.uuidString)
+                guard var current: SyncOperation = try journalValue("SyncOperation", key: key), current == expected,
+                      current.state != .completed else { throw SyncJournalError.staleOperation }
+                guard expected.kind == .fetchContentHead, current.attempts < Int.max,
+                      let fetch = try? JSONDecoder().decode(ContentHeadFetch.self, from: expected.payload),
+                      expected.vaultID == fetch.vault, incoming.vaultID == fetch.vault,
+                      incoming.account == expected.account, incoming.database == "private", expected.database == "private",
+                      incoming.zoneOwner == expected.zoneOwner,
+                      incoming.zoneName == SyncStoreLayout.contentZone(vault: fetch.vault),
+                      incoming.recordName == fetch.item.uuidString,
+                      incoming.recordType == ContentRecordKind.head.rawValue else { throw SyncJournalError.invalidOperation }
+                _ = try stageIncomingInTransaction(incoming, budget: Self.maximumInboxBytes)
+                current.state = .completed; current.completedAt = Date(); current.revision = UUID()
+                current.failure = nil; current.nextAttempt = nil; current.retryNotBefore = nil; current.attempts += 1
+                try writeJournal(current, entity: "SyncOperation", key: key, account: current.account, database: current.database)
+            }
+        }
+    }
+
     public func deferIncoming(_ expected: IncomingRecord, dependencies: Set<SyncDependency>, failure: SyncFailure,
                               permit: any RepositoryWritePermit) throws {
         try permit.withWritePermission { try deferIncoming(expected, dependencies: dependencies, failure: failure) }
@@ -556,19 +763,17 @@ extension EncryptedItemRepository {
     public func syncHealth(account: String, database: String) throws -> SyncHealthSnapshot {
         try transaction {
             try journalReadCache.result(key: "health:" + journalKey(account, database, ""), in: context) {
-                let operations = try journalReadCache.summary(prefix: journalPrefix("SyncOperation", account: account, database: database), in: context,
-                    initial: OperationHealthSummary()) { (summary: inout OperationHealthSummary, row: OperationHealthFields, added: Bool) in
-                        summary.update(row, added: added)
-                    }
-                let incoming: [IncomingHealthFields] = try journalValues("IncomingRecord", account: account, database: database)
-                let unfinished = operations.unfinished.values
-                let incomingOperations = Set(incoming.map(\.operationID))
-                let pending = unfinished.filter { !incomingOperations.contains($0.id) }
+                let summary = try journalReadCache.joinedSummary(
+                    first: journalPrefix("SyncOperation", account: account, database: database),
+                    second: journalPrefix("IncomingRecord", account: account, database: database), in: context,
+                    make: { SyncHealthAggregate() },
+                    updateFirst: { (summary: SyncHealthAggregate, row: OperationHealthFields, added: Bool) in summary.update(row, added: added) },
+                    updateSecond: { (summary: SyncHealthAggregate, row: IncomingHealthFields, added: Bool) in summary.update(row, added: added) },
+                    snapshot: { $0.snapshot() })
                 let lastDelivery: Date? = try journalValue("StateBlob", key: "sync-last-delivery:" + journalKey(account, database, ""))
-                return SyncHealthSnapshot(pendingCount: pending.count + incoming.count,
-                    oldestPendingAt: (pending.map(\.createdAt) + incoming.map(\.receivedAt)).min(),
-                    lastDeliveryAt: [operations.latest, lastDelivery].compactMap { $0 }.max(),
-                    blockedReasons: Set(unfinished.compactMap(\.failure) + incoming.compactMap(\.failure)))
+                return SyncHealthSnapshot(pendingCount: summary.pendingCount, oldestPendingAt: summary.oldestPendingAt,
+                    lastDeliveryAt: [summary.lastDeliveryAt, lastDelivery].compactMap { $0 }.max(),
+                    blockedReasons: summary.blockedReasons, pendingKinds: summary.pendingKinds)
             }
         }
     }

@@ -236,6 +236,29 @@ final class AppModel {
     var isConnectingVaults: Bool {
         connectionUnlockPending || (authenticated && vaults.contains { $0.supported && !$0.enrolled })
     }
+    var connectionNeedsUnlock: Bool { !service.isAuthenticated && !authenticated }
+    var connectionTitle: String {
+        if connectionNeedsUnlock { return "Unlock this device to connect" }
+        if waitingForVaultMetadata { return "Device connected" }
+        return "Waiting for secure access"
+    }
+    var connectionExplanation: String {
+        if connectionNeedsUnlock { return "Unlock this device to continue connecting. Your progress is saved." }
+        if waitingForVaultMetadata { return "Receiving encrypted vault data and secure access through iCloud. Your vault will open automatically when ready." }
+        return "Keep 2ndPass open and unlocked on an existing device. This device will continue automatically when secure access arrives through iCloud."
+    }
+    var outgoingAccessStatus: String? {
+        guard let health = synchronizationHealth else { return nil }
+        let kinds = health.pendingKinds
+        if !kinds.isDisjoint(with: [.prepareGrant, .grant, .enrollment, .membership]) {
+            return health.blockedReasons.contains(.authorization)
+                ? "Unlock to continue preparing secure access"
+                : "Preparing and syncing secure access through iCloud"
+        }
+        if kinds.contains(.rotateContent) { return "Updating item security · Your vault remains available" }
+        return nil
+    }
+    private(set) var connectionLastProgress: Date?
     private(set) var syncIssue: String?
     private(set) var synchronizationHealth: SyncHealthSnapshot?
     private var syncIssueDetails: String?
@@ -288,7 +311,19 @@ final class AppModel {
             } while self.syncWakeAgain && self.isActive && self.authenticated && self.generation == token && !Task.isCancelled
         }
     }
-    private func applySyncHealth(_ health: SyncHealthSnapshot) {
+    func applySyncHealth(_ health: SyncHealthSnapshot) {
+        // Pending work alone is not activity: only advancing an existing backlog
+        // may renew a live foreground session. A stalled queue still times out.
+        let keyWork: Set<SyncOperation.Kind> = [.prepareGrant, .rotateContent, .enrollment, .membership, .recovery, .grant]
+        if isActive, service.isAuthenticated, let previous = synchronizationHealth,
+           !previous.pendingKinds.isDisjoint(with: keyWork),
+           health.pendingCount < previous.pendingCount ||
+            (health.lastDeliveryAt != nil && health.lastDeliveryAt! > (previous.lastDeliveryAt ?? .distantPast)) {
+            lastActivity = now()
+        }
+        if let delivered = health.lastDeliveryAt, delivered != synchronizationHealth?.lastDeliveryAt {
+            connectionLastProgress = delivered
+        }
         synchronizationHealth = health
         if health.blockedReasons.contains(.accountChanged) { syncIssue = "Sign in to your iCloud account to resume synchronization." }
         else if health.blockedReasons.contains(.invalidAuthority) { syncIssue = "Some cloud changes could not be verified. Your local changes are saved." }
@@ -299,7 +334,9 @@ final class AppModel {
         else { syncIssue = nil }
         syncIssueDetails = nil
     }
-    var enrollmentProgress: [String: VaultEnrollmentProgress] = [:]
+    var enrollmentProgress: [String: VaultEnrollmentProgress] = [:] {
+        didSet { if enrollmentProgress != oldValue && !enrollmentProgress.isEmpty { connectionLastProgress = Date() } }
+    }
     var connectionProgress: VaultEnrollmentProgress? {
         let values = vault.isEmpty ? Array(enrollmentProgress.values) : enrollmentProgress[vault].map { [$0] } ?? []
         guard !values.isEmpty else { return nil }
@@ -407,7 +444,7 @@ final class AppModel {
     // Discovery runs on repository and lifecycle events. Offer setup once per
     // app session, without reopening a dismissed sheet or replacing a restore.
     private func offerVaultCreationIfNeeded() {
-        guard !hasOfferedVaultCreation, sheet == nil, !isLocalVaultSelected else { return }
+        guard startupFinished, applicationUnlocked, !hasOfferedVaultCreation, sheet == nil, !isLocalVaultSelected else { return }
         sheet = .createVault
     }
     var sheet: AppSheet? {
@@ -470,6 +507,7 @@ final class AppModel {
         }
     }
     private func restoreSelection() {
+        if restoreLocalSelection() { return }
         guard restoreLastSelection,
               let account = catalogs[vault]?.usageScope ?? catalogs.sorted(by: { $0.key < $1.key }).first?.value.usageScope,
               let bytes = defaults.data(forKey: "lastSelection." + account),
@@ -513,28 +551,59 @@ final class AppModel {
         guard recoveryIdleLockHolds.remove(token) != nil else { return }
         if recoveryIdleLockHolds.isEmpty, service.isAuthenticated { lastActivity = now() }
     }
-    private var launchUnlockAvailable = true
+    private var launchUnlockAvailable = false
+    private var activationUnlockPending = false
+    private let unlockOnActivation: Bool
+    static var defaultUnlockOnActivation: Bool {
+        #if os(iOS)
+        true
+        #else
+        false
+        #endif
+    }
     private var accessNeedsRepair = false
     private var connectionRepairMessage: String {
         "This device could not verify its saved vault connection. Use your offline recovery copy to verify access. Saved local data remains intact."
     }
+    enum RootPresentation: Equatable { case starting, setup, locked, unlocking, ready, recovery }
+    private(set) var startupFinished = false
+    private var discoveryComplete = false
+    private var localSessionStarted: TimeInterval?
+    var applicationUnlocked: Bool { authenticated || localSessionStarted != nil }
+    var rootPresentation: RootPresentation {
+        if unlocking { return .unlocking }
+        if applicationUnlocked { return .ready }
+        if !startupFinished { return .starting }
+        if accessNeedsRepair || recoveryInProgress { return .recovery }
+        if lockReason == .initial && discoveryComplete && vaults.isEmpty && localIdentities.isEmpty && !defaults.bool(forKey: "lastSelectionWasLocal") { return .setup }
+        return .locked
+    }
+    @ObservationIgnored private let authorizeApplication: () async throws -> Void
     enum LockReason: Equatable { case initial, manual, timeout, system, accessFailure }
     enum SessionState: Equatable { case locked(LockReason), unlocking, unlocked, needsRepair }
     private var lockReason = LockReason.initial
     private(set) var unlocking = false
+    private(set) var unlockQueued = false
+    var hasPendingAutomaticUnlock: Bool { automaticUnlockTask != nil }
     var sessionState: SessionState {
         if unlocking { return .unlocking }
-        if authenticated { return .unlocked }
+        if applicationUnlocked { return .unlocked }
         if accessNeedsRepair { return .needsRepair }
         return .locked(lockReason)
     }
     var sessionStatus: String {
         if unlocking { return "Unlocking 2ndPass…" }
-        if authenticated || !hasConnectedVaults { return status }
+        if applicationUnlocked { return status }
         if accessNeedsRepair { return "Vault access needs repair. Connect again using another authorized device or your offline recovery copy." }
         return lockReason == .timeout ? "Locked after inactivity" : "Locked"
     }
-    var canUnlock: Bool { !authenticated && !busy && hasConnectedVaults && !deviceRemoved }
+    var unlockStarting: Bool {
+        unlocking || unlockQueued || (launchUnlockAvailable && startupFinished && rootPresentation == .locked
+            && error == nil && sheet == nil && !deviceRemoved)
+    }
+    // Read-only work must not toggle the button. unlock() queues the request
+    // behind a foreground operation and disables it only while that request waits.
+    var canUnlock: Bool { !authenticated && (!applicationUnlocked || hasConnectedVaults) && startupFinished && !unlockStarting && !deviceRemoved }
     private(set) var pendingTransition: PendingTransition?
     var showsUnsavedChanges = false
     private(set) var selectionGeneration = 0
@@ -575,9 +644,15 @@ final class AppModel {
          documents: any DocumentAccessing = SystemDocumentAccess(),
          usageStore: any ItemUsageStoring = ItemUsageStore(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         automaticTimer: Bool = true, wallNow: @escaping () -> Date = Date.init,
+         automaticTimer: Bool = true, unlockOnActivation: Bool = AppModel.defaultUnlockOnActivation, wallNow: @escaping () -> Date = Date.init,
          localService: (any LocalVaultServing)? = nil,
+         authorizeApplication: @escaping () async throws -> Void = {
+             let context = try await Authentication.authorizeAsync(reason: "unlock 2ndPass")
+             context.invalidate()
+         },
          authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { try await LocalAuthorization.authorizeAsync(reason: $0, ids: $1, purposes: $2, operations: $3) }) {
+        self.unlockOnActivation = unlockOnActivation
+        self.authorizeApplication = authorizeApplication
         self.breachClient = breachClient
         self.localService = localService
         self.authorizeLocal = authorizeLocal
@@ -628,7 +703,7 @@ final class AppModel {
     }
     deinit { conflictRefreshTask?.cancel(); syncWakeTask?.cancel(); catalogLoadTask?.cancel(); usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); storeChangesTask?.cancel() }
     func checkExpiration() {
-        if let started = service.authenticatedAt {
+        if let started = service.authenticatedAt ?? localSessionStarted {
             if lastActivity == nil { lastActivity = started }
             if recoveryIdleLockHolds.isEmpty, now() - (lastActivity ?? started) >= Double(autoLockMinutes * 60) {
                 lock(reason: .timeout)
@@ -649,24 +724,30 @@ final class AppModel {
             Task { [weak self] in self?.discover() }
             return
         }
-        guard launchAttempted, isActive, !isLocalVaultSelected, !authenticated, !busy, launchUnlockAvailable, !accessNeedsRepair,
-              error == nil, sheet == nil, !requestedVaultIDs.isEmpty,
+        guard launchAttempted || unlockQueued, startupFinished, isActive, !authenticated, !busy, !unlocking,
+              (!applicationUnlocked && launchUnlockAvailable) || unlockQueued,
+              !accessNeedsRepair, !deviceRemoved,
+              unlockQueued || rootPresentation == .locked, error == nil, sheet == nil,
               automaticUnlockTask == nil else { return }
         automaticUnlockTask = Task { [weak self] in
             await Task.yield()
             guard let self else { return }
             self.automaticUnlockTask = nil
-            guard !Task.isCancelled, self.isActive, !self.isLocalVaultSelected, !self.authenticated, !self.busy,
-                  self.launchUnlockAvailable, !self.accessNeedsRepair, self.error == nil,
-                  self.sheet == nil, !self.requestedVaultIDs.isEmpty else { return }
+            guard !Task.isCancelled, self.isActive, !self.authenticated, !self.busy, !self.unlocking,
+                  (!self.applicationUnlocked && self.launchUnlockAvailable) || self.unlockQueued,
+                  !self.accessNeedsRepair, !self.deviceRemoved,
+                  self.unlockQueued || self.rootPresentation == .locked,
+                  self.error == nil, self.sheet == nil else { return }
+            // Consume this request before authentication can send lifecycle events.
             self.unlock()
         }
     }
+
     func activity() {
         service.userActivity()
         checkExpiration()
         guard isActive else { return }
-        if service.isAuthenticated { lastActivity = now() }
+        if service.isAuthenticated || localSessionStarted != nil { lastActivity = now() }
     }
     private let usageStore: any ItemUsageStoring
     private(set) var lastUsed: [ItemUsageIdentity: Date] = [:] {
@@ -721,11 +802,15 @@ final class AppModel {
     private var deletedSearchRevision = 0
     @ObservationIgnored private var itemSearchIndex: ItemSearchIndex?
     @ObservationIgnored private var deletedSearchIndex: ItemSearchIndex?
+    @ObservationIgnored private var previousItemSearchIndex: ItemSearchIndex?
+    @ObservationIgnored private var previousDeletedSearchIndex: ItemSearchIndex?
     private func invalidateItemSearch() {
+        previousItemSearchIndex = catalog != nil || !catalogs.isEmpty ? itemSearchIndex ?? previousItemSearchIndex : nil
         itemSearchIndex = nil
         itemSearchRevision &+= 1
     }
     private func invalidateDeletedSearch() {
+        previousDeletedSearchIndex = deletedCatalogs.isEmpty ? nil : deletedSearchIndex ?? previousDeletedSearchIndex
         deletedSearchIndex = nil
         deletedSearchRevision &+= 1
     }
@@ -759,7 +844,8 @@ final class AppModel {
                 return ($0.id.vault, $0.item.storageID ?? "", $0.item.name) < ($1.id.vault, $1.item.storageID ?? "", $1.item.name)
             }
         }
-        let index = ItemSearchIndex(rows: rows)
+        let index = ItemSearchIndex(rows: rows, reusing: previousItemSearchIndex)
+        previousItemSearchIndex = nil
         itemSearchIndex = index
         return index
     }
@@ -772,7 +858,8 @@ final class AppModel {
                 return ItemRow(id: .init(vault: id, name: item.name), vaultName: catalog.vault, item: item)
             }
         }.sorted { ($0.item.deletion?.deletedAt ?? .distantPast) > ($1.item.deletion?.deletedAt ?? .distantPast) }
-        let index = ItemSearchIndex(rows: rows, deleted: true)
+        let index = ItemSearchIndex(rows: rows, deleted: true, reusing: previousDeletedSearchIndex)
+        previousDeletedSearchIndex = nil
         deletedSearchIndex = index
         return index
     }
@@ -1268,18 +1355,31 @@ final class AppModel {
     func shutdown() { isActive = false; lock(); inactivityTask?.cancel(); lifecycle.stop() }
     func background() {
         deactivate()
+        activationUnlockPending = true
         // A temporary app switch preserves the authenticated vault session.
         // Pending authentication cannot continue in the background.
         if busy && !authenticated { lock(clearClipboard: false) }
         checkExpiration()
     }
-    func deactivate() { service.setMaintenanceActive(false); isActive = false; visibilityGeneration += 1; conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil }
+    func deactivate() {
+        // Biometric dialogs temporarily deactivate the app. Their dismissal is
+        // not a new user visit and must not retry cancelled authentication.
+        if !unlocking { activationUnlockPending = true }
+        service.setMaintenanceActive(false); isActive = false; visibilityGeneration += 1
+        conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil
+    }
     func activate() {
         service.setMaintenanceActive(true)
         Task { try? await AutoFillPublisher.shared.reconcile() }
         checkExpiration(); isActive = true
+        let shouldUnlock = unlockOnActivation && activationUnlockPending
+        activationUnlockPending = false
+        if shouldUnlock, !applicationUnlocked, !unlocking, !accessNeedsRepair, !deviceRemoved {
+            error = nil
+            launchUnlockAvailable = true
+        }
         reloadUsage()
-        if service.isAuthenticated, !busy { lastActivity = now() }
+        if service.isAuthenticated || localSessionStarted != nil, !busy { lastActivity = now() }
         scheduleAutomaticUnlock(); checkRetention()
         if launchAttempted {
             requestBackgroundSynchronization()
@@ -1311,6 +1411,7 @@ final class AppModel {
         DistributedNotificationCenter.default().postNotificationName(LocalAuthorization.appLockNotification, object: nil, userInfo: nil, deliverImmediately: true)
         #endif
         keyCreationPresented = false
+        localSessionStarted = nil
         localAuthorization?.revoke(); localAuthorization = nil
         rememberSelection(); restoreLastSelection = true
         securityGeneration += 1
@@ -1320,8 +1421,8 @@ final class AppModel {
         syncWakeTask?.cancel(); syncWakeTask = nil; syncWakeID = nil
         syncWakeAgain = false; requestingSynchronization = false; syncIssue = nil; syncIssueDetails = nil
         synchronizationHealth = nil
-        connectionUnlockPending = false; waitingForVaultMetadata = false
-        lockReason = reason; unlocking = false; launchUnlockAvailable = false
+        connectionUnlockPending = false; waitingForVaultMetadata = false; connectionLastProgress = nil
+        lockReason = reason; unlocking = false; unlockQueued = false; launchUnlockAvailable = false
         cancelPendingTransition()
         copyFeedback = nil; exchangeOutput = ""
         automaticUnlockTask?.cancel(); automaticUnlockTask = nil
@@ -1430,6 +1531,7 @@ final class AppModel {
                         self.showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending); return
                     }
                     self.launchUnlockAvailable = false
+                    self.unlockQueued = false
                     self.connectionUnlockPending = false
                     self.waitingForVaultMetadata = false
                     self.cancelPendingTransition()
@@ -1460,26 +1562,40 @@ final class AppModel {
     func start() {
         guard !launchAttempted else { return }
         launchAttempted = true
-        if defaults.bool(forKey: "lastSelectionWasLocal"),
-           let bytes = defaults.data(forKey: "lastSelection.local"),
-           let saved = try? JSONDecoder().decode(SavedSelection.self, from: bytes) {
-            restoringSelection = true
-            vault = LocalVault.id
-            collection = .local
-            pendingLocalSelection = saved.localItem
-            restoringSelection = false
-            restoreLastSelection = false
-            openLocalVault()
-            discover(autoUnlock: false)
-        } else {
-            discover(autoUnlock: true)
-        }
+        allVaults = true
+        launchUnlockAvailable = true
+        // Keep the entry screen mounted throughout discovery and authentication.
+        // The scheduler consumes one launch request once discovery finishes.
+        discover(autoUnlock: false)
     }
+    private func restoreLocalSelection() -> Bool {
+        guard restoreLastSelection, defaults.bool(forKey: "lastSelectionWasLocal"),
+              let bytes = defaults.data(forKey: "lastSelection.local"),
+              let saved = try? JSONDecoder().decode(SavedSelection.self, from: bytes) else { return false }
+        restoringSelection = true
+        vault = LocalVault.id; collection = .local; catalog = nil
+        pendingLocalSelection = saved.localItem
+        restoringSelection = false
+        restoreLastSelection = false
+        openLocalVault()
+        return true
+    }
+
     func discover(autoUnlock: Bool = false, selectedOnly: Bool = false) {
         guard !busy, allowTransition(.refresh) else { return }
         let refreshContents = authenticated
+        if autoUnlock && !authenticated { unlocking = true }
         perform { token in
+            defer {
+                self.startupFinished = true
+                if autoUnlock { self.unlocking = false }
+            }
             let result = try await self.service.execute(.discover, vault: nil, offline: false)
+            guard self.current(token) else { return }
+            self.discoveryComplete = result.discoveryComplete
+            if !self.startupFinished {
+                self.localIdentities = (try? self.localStore().list()) ?? []
+            }
             if result.recoveryNeeded {
                 self.recoveryInProgress = true
                 self.lock(reason: .accessFailure)
@@ -1497,6 +1613,11 @@ final class AppModel {
                 row.enrolled && self.vaults.contains { $0.id == row.id && !$0.enrolled }
             }
             self.enrollmentProgress = result.enrollmentProgress
+            if !self.authenticated, rows.contains(where: { $0.supported && $0.enrolled }),
+               result.enrollmentProgress.values.contains(where: { $0.total > 0 && $0.ready < $0.total }) {
+                self.waitingForVaultMetadata = true
+                self.connectionUnlockPending = true
+            }
             self.hasPendingVaultDeletion = !result.pendingVaultDeletions.isEmpty
             self.vaults = rows
             self.catalogLoadProgress = self.catalogLoadProgress.filter { ids.contains($0.key) }
@@ -1529,15 +1650,47 @@ final class AppModel {
         }
     }
     func authorizeVaultConnection() {
-        guard !busy, isActive, !authenticated else { return }
+        guard isActive, !authenticated, !unlocking, !deviceRemoved else { return }
+        launchUnlockAvailable = false; accessNeedsRepair = false; error = nil
+        if busy { unlockQueued = true; return }
+        unlockQueued = false
         discover(autoUnlock: true)
     }
     func unlock() {
-        guard !busy, !authenticated, isActive, !deviceRemoved else { return }
-        launchUnlockAvailable = false; accessNeedsRepair = false
+        guard !authenticated, !unlocking, isActive, !deviceRemoved else { return }
+        launchUnlockAvailable = false; accessNeedsRepair = false; error = nil
+        if busy { unlockQueued = true; return }
+        unlockQueued = false
+        if !hasConnectedVaults, vaults.contains(where: { $0.supported && !$0.enrolled }) {
+            authorizeVaultConnection()
+            return
+        }
+        if !hasConnectedVaults {
+            unlocking = true
+            perform(local: true) { token in
+                self.unlocking = true
+                defer { self.unlocking = false }
+                try await self.authorizeApplication()
+                guard self.current(token), !Task.isCancelled, self.isActive else { return }
+                self.localSessionStarted = self.now()
+                self.lastActivity = self.now()
+                if !self.restoreLocalSelection() {
+                    self.collection = .local; self.vault = LocalVault.id
+                    self.openLocalVault()
+                }
+                self.status = "Unlocked"
+            }
+            return
+        }
+        localSessionStarted = nil; lastActivity = nil
+        if collection == .vault("") { allVaults = true }
         cancelItemEditing(); conceal(); catalog = nil; catalogs = [:]; deletedCatalogs = [:]
         passwordQualities = [:]; passwordQualitySource = nil; authenticated = false
-        perform { token in try await self.unlockContents(token) }
+        unlocking = true
+        perform { token in
+            defer { self.unlocking = false }
+            try await self.unlockContents(token)
+        }
     }
     private func connectDiscoveredVaults(_ token: Int) async throws {
         waitingForVaultMetadata = false
@@ -2050,6 +2203,12 @@ final class AppModel {
                 if selectedItem == nil && selectedDeleted == nil { restoreSelection() }
             } catch {
                 guard current(token), !Task.isCancelled else { return }
+                if Authentication.requiresRenewal(error) {
+                    lock(reason: .accessFailure)
+                    self.error = "Unlock 2ndPass again to continue. Your device requires authentication."
+                    recordError(error, operation: "Local catalog refresh")
+                    return
+                }
                 if let failure = error as? MopError,
                    [.authentication, .signing, .invalidIdentity, .invalidVault, .vaultUntrusted, .notVaultMember, .cloudAccount].contains(failure) {
                     if failure != .authentication { accessNeedsRepair = true }
@@ -2129,6 +2288,12 @@ final class AppModel {
                 reconcileAgain = false
                 if isUpdatingCatalog { catalogUpdatePaused = true }
                 guard token == generation, !Task.isCancelled else { return }
+                if Authentication.requiresRenewal(error) {
+                    lock(reason: .accessFailure)
+                    self.error = "Unlock 2ndPass again to continue. Your device requires authentication."
+                    recordError(error, operation: "Background cloud refresh")
+                    return
+                }
                 if error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
                     showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending); return
                 }

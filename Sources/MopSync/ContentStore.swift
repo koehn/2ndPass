@@ -780,6 +780,18 @@ extension EncryptedItemRepository {
         }
     }
 
+    /// Only independently accepted local metadata can skip the rotation barrier.
+    /// Missing state is not evidence that another device finished the work.
+    public func contentRotationSatisfied(scope: ItemScope) throws -> Bool {
+        try requireContentLayout()
+        return try transaction {
+            guard let row = try fetchOne("ContentKeyState", key: scope.storageKey),
+                  let policy = try contentPolicy(VaultScope(scope)) else { return false }
+            let state: ContentKeyState = try contentValue(row)
+            return state.keyAuthority == policy.keyAuthority
+        }
+    }
+
     private func reconcileGrantRequirements(_ content: ContentKeyState, policy: ContentRecipientPolicy) throws {
         let scope = content.scope
         let existing = try contentRows("ContentGrant", field: "scopeKey", equals: scope.storageKey)
@@ -811,6 +823,11 @@ extension EncryptedItemRepository {
             _ = try enqueueInTransaction(operation)
             return
         }
+        // An authenticated remote head can satisfy a queued rotation too.
+        // Its newly installed state no longer carries rotationOperationID, so
+        // retire the deterministic operation for this authority explicitly.
+        let rotation = contentOperationID("rotate:" + scope.storageKey + ":" + policy.keyAuthority)
+        try finishPublicationInTransaction(rotation, account: scope.account, database: scope.database, confirmed: false)
         for recipient in policy.recipients.subtracting(covered) {
             let key = contentGrantKey(scope: scope, keyGeneration: content.keyGeneration, suffix: recipient)
             guard try fetchOne("MissingContentGrant", key: key) == nil else { continue }
@@ -975,16 +992,60 @@ extension EncryptedItemRepository {
     }
 }
 
+enum ContentGrantRequestBlockReason: String {
+    case policyMismatch, recipientExcluded, missingKeyState, generationMismatch
+
+    static func assess(policyMatches: Bool, recipientIncluded: Bool, currentGeneration: UUID?, requestedGeneration: UUID) -> Self? {
+        if !policyMatches { return .policyMismatch }
+        if !recipientIncluded { return .recipientExcluded }
+        guard let currentGeneration else { return .missingKeyState }
+        return currentGeneration == requestedGeneration ? nil : .generationMismatch
+    }
+}
+
 extension EncryptedItemRepository {
-    public func reconcileContentGrantRequest(scope: ItemScope, keyGeneration: UUID, recipient: String,
-                                            policy: ContentRecipientPolicy, permit: any RepositoryWritePermit) throws {
+    /// Scheduling hint only. A resumed request must repeat signature, membership,
+    /// recipient policy and generation verification before producing any grants.
+    public func contentKeyStateAvailable(scope: ItemScope, keyGeneration: UUID) throws -> Bool {
+        try transaction {
+            guard let row = try fetchOne("ContentKeyState", key: scope.storageKey) else { return false }
+            let value: ContentKeyState = try contentValue(row)
+            return value.keyGeneration == keyGeneration
+        }
+    }
+
+    public func reconcileSupersededGrantRequest(scope: ItemScope, expected: ContentKeyState, recipient: String,
+                                               policy: ContentRecipientPolicy, permit: any RepositoryWritePermit) throws {
         try permit.withWritePermission {
             try transaction {
-                guard try contentPolicy(VaultScope(scope)) == policy, policy.recipients.contains(recipient),
-                      let row = try fetchOne("ContentKeyState", key: scope.storageKey) else { throw ContentStoreError.staleAuthority }
-                let value: ContentKeyState = try contentValue(row)
-                guard value.keyGeneration == keyGeneration else { throw ContentStoreError.staleAuthority }
+                guard expected.scope == scope, try contentPolicy(VaultScope(scope)) == policy,
+                      policy.recipients.contains(recipient), let row = try fetchOne("ContentKeyState", key: scope.storageKey),
+                      try contentValue(row) as ContentKeyState == expected else { throw ContentStoreError.staleAuthority }
+                try reconcileGrantRequirements(expected, policy: policy)
+            }
+        }
+    }
+
+    public func reconcileContentGrantRequest(scope: ItemScope, keyGeneration: UUID, recipient: String,
+                                            policy: ContentRecipientPolicy, permit: any RepositoryWritePermit) throws -> SyncDependency? {
+        try permit.withWritePermission {
+            try transaction {
+                let value: ContentKeyState? = try fetchOne("ContentKeyState", key: scope.storageKey).map { try contentValue($0) }
+                if let reason = ContentGrantRequestBlockReason.assess(
+                    policyMatches: try contentPolicy(VaultScope(scope)) == policy,
+                    recipientIncluded: policy.recipients.contains(recipient),
+                    currentGeneration: value?.keyGeneration, requestedGeneration: keyGeneration) {
+                    AccessSyncTrace.event("grant request blocked", item: scope.itemID, generation: keyGeneration,
+                        recipient: recipient, detail: "reason=\(reason.rawValue) currentGeneration=\(value.map { AccessSyncTrace.token($0.keyGeneration.uuidString) } ?? "-")")
+                    if reason == .missingKeyState {
+                        return SyncDependency(.contentKeyState,
+                            identifier: scope.vaultID.uuidString + ":" + scope.itemID.uuidString + ":" + keyGeneration.uuidString)
+                    }
+                    throw ContentStoreError.staleAuthority
+                }
+                guard let value else { throw ContentStoreError.staleAuthority }
                 try reconcileGrantRequirements(value, policy: policy)
+                return nil
             }
         }
     }

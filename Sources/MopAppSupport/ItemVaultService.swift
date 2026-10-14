@@ -113,9 +113,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let complete: Bool
     }
     private let publishedCatalogs = Mutex<[UUID: PublishedCatalog]>([:])
-    private struct CatalogUpdate: Sendable { let id: UUID; let task: Task<Void, Never> }
+    private struct CatalogUpdate: Sendable { let id: UUID; let session: ObjectIdentifier; let task: Task<Void, Never> }
     private let catalogUpdates = Mutex<[UUID: CatalogUpdate]>([:])
     private struct CatalogFailure: Sendable {
+        let session: ObjectIdentifier
         let error: any Error
         let retryAfter: ContinuousClock.Instant
     }
@@ -124,6 +125,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private let state = Mutex<(generation: Int, authenticated: TimeInterval?)>((0, nil))
     private struct CachedCatalog: Sendable {
         let session: ObjectIdentifier
+        let continuity: UUID
         let projection: ItemCatalogProjection
         let sourceVersions: [UUID: UUID]
         let pending: ArraySlice<UUID>
@@ -367,11 +369,18 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         guard authenticatedAt != nil else { return nil }
         let token = sessionGeneration, id = try await select(vault, offline: true, authenticate: false)
         guard let session = await backend.existing(id), session.isUnlocked else { return nil }
-        if let failure = catalogUpdateFailures.withLock({ $0[id] }) { throw failure.error }
+        if let failure = catalogUpdateFailures.withLock({ $0[id] }), failure.session == ObjectIdentifier(session) { throw failure.error }
         guard let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) else { return nil }
-        let index = try await session.revisionIndex()
-        try checked(token)
-        return try await displayResult(cached, index: index, session: session)
+        do {
+            let index = try await session.revisionIndex()
+            try checked(token)
+            return try await displayResult(cached, index: index, session: session)
+        } catch MopError.authentication {
+            guard sessionGeneration == token,
+                  let replacement = await backend.existing(id), replacement !== session,
+                  replacement.isUnlocked else { throw MopError.authentication }
+            return nil // A fresh projection will use the replacement session.
+        }
     }
     public func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult {
         try CloudVaultBoundary.requireCloud(vault)
@@ -387,32 +396,44 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     /// rows need bounded background preparation; partial views are never AutoFill
     /// inventories or authoritative complete command results.
     public func displayCatalog(vault: String) async throws -> VaultResult {
+        try await displayCatalog(vault: vault, retryingReplacement: false)
+    }
+    private func displayCatalog(vault: String, retryingReplacement: Bool) async throws -> VaultResult {
         try CloudVaultBoundary.requireCloud(vault)
         let token = sessionGeneration, id = try await select(vault, offline: false)
         let session = try await opened(id, token: token, offline: false)
-        let index = try await session.revisionIndex()
-        if let failure = catalogUpdateFailures.withLock({ $0[id] }), ContinuousClock.now < failure.retryAfter {
-            throw failure.error
-        }
-        catalogUpdateFailures.withLock { $0[id] = nil }
-        if catalogUpdates.withLock({ $0[id] != nil }),
-           let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) {
+        do {
+            let index = try await session.revisionIndex()
+            if let failure = catalogUpdateFailures.withLock({ $0[id] }), failure.session == ObjectIdentifier(session), ContinuousClock.now < failure.retryAfter {
+                throw failure.error
+            }
+            catalogUpdateFailures.withLock { $0[id] = nil }
+            if catalogUpdates.withLock({ $0[id] != nil }),
+               let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) {
+                try checked(token)
+                return try await displayResult(cached, index: index, session: session)
+            }
+            if let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session), cached.versions == index {
+                try checked(token)
+                startCatalogUpdater(session, token: token)
+                return try await displayResult(cached, index: index, session: session)
+            }
+            _ = try await prepareCatalog(session, limit: 0)
             try checked(token)
-            return try await displayResult(cached, index: index, session: session)
-        }
-        if let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session), cached.versions == index {
-            try checked(token)
+            let current = try await session.revisionIndex()
+            guard let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
+            let result = try await displayResult(cached, index: current, session: session)
             startCatalogUpdater(session, token: token)
-            return try await displayResult(cached, index: index, session: session)
+            try checked(token)
+            return result
+        } catch MopError.authentication {
+            // A verified membership change may replace the session during a read.
+            // Retry once only with a live replacement under the same authorization.
+            guard !retryingReplacement, sessionGeneration == token,
+                  let replacement = await backend.existing(id), replacement !== session,
+                  replacement.isUnlocked else { throw MopError.authentication }
+            return try await displayCatalog(vault: vault, retryingReplacement: true)
         }
-        _ = try await prepareCatalog(session, limit: 0)
-        try checked(token)
-        let current = try await session.revisionIndex()
-        guard let cached = catalogCache.withLock({ $0[id] }), cached.session == ObjectIdentifier(session) else { throw MopError.authentication }
-        let result = try await displayResult(cached, index: current, session: session)
-        startCatalogUpdater(session, token: token)
-        try checked(token)
-        return result
     }
 
     /// Priority reveal from a displayed storage identity. It cannot trigger a
@@ -435,7 +456,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
 
     private func displaySettled(_ cached: CachedCatalog, index: [UUID: UUID]) -> Bool {
-        cached.versions.merging(cached.waiting, uniquingKeysWith: { first, _ in first }) == index
+        cached.versions.merging(cached.waiting, uniquingKeysWith: { _, waiting in waiting }) == index
     }
     private func displayResult(_ cached: CachedCatalog, index: [UUID: UUID], session: ItemVaultSession) async throws -> VaultResult {
         var result = VaultResult(); assignCatalog(try cached.projection.catalog(), to: &result)
@@ -454,7 +475,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private func startCatalogUpdater(_ session: ItemVaultSession, token: Int) {
         let vault = session.binding.vaultID, identifier = UUID()
         catalogUpdates.withLock { values in
-            guard values[vault] == nil else { return }
+            if let existing = values[vault] {
+                guard existing.session != ObjectIdentifier(session) else { return }
+                existing.task.cancel()
+            }
             let task = Task(priority: .utility) { [weak self] in
                 var delay = 2.0
                 var preparedBatches = 0
@@ -479,7 +503,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                         guard !Task.isCancelled, session.isUnlocked, self?.sessionGeneration == token else { break }
                         if let self {
                             self.catalogUpdateFailures.withLock {
-                                $0[vault] = CatalogFailure(error: error, retryAfter: .now.advanced(by: .seconds(delay)))
+                                $0[vault] = CatalogFailure(session: ObjectIdentifier(session), error: error, retryAfter: .now.advanced(by: .seconds(delay)))
                             }
                             self.displayChanged(vault)
                         }
@@ -493,7 +517,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                     if current[vault]?.id == identifier { current[vault] = nil }
                 }
             }
-            values[vault] = CatalogUpdate(id: identifier, task: task)
+            values[vault] = CatalogUpdate(id: identifier, session: ObjectIdentifier(session), task: task)
         }
     }
     private func advanceCatalogProjection(_ session: ItemVaultSession, token: Int, publishPartial: Bool) async throws -> Bool {
@@ -715,7 +739,13 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             }
         case .savePasswordChecks(let checks, let expectedRevision):
             let entries = try await metadataEntries(session)
-            guard try revision(entries) == expectedRevision else { throw MopError.vaultConflict }
+            // Storage revisions also change for rotations and unrelated edits.
+            // Immutable password record IDs below establish evidence freshness;
+            // saveHealthChecks still CAS-checks each current parent version.
+            guard let revisionData = Data(base64Encoded: expectedRevision),
+                  let versions = try? JSONDecoder().decode([String: String].self, from: revisionData),
+                  versions.allSatisfy({ UUID(uuidString: $0.key) != nil && UUID(uuidString: $0.value) != nil })
+            else { throw MopError.vaultConflict }
             let live = Set(entries.filter { !$0.catalog.item.isArchived && $0.catalog.item.deletion == nil }.flatMap { entry in
                 entry.catalog.item.fields.filter { $0.type == .password || ($0.path == entry.catalog.item.autoFill?.password && [.concealed, .text, .username, .email].contains($0.type)) }
                     .compactMap { entry.catalog.references[SecretReference.encode(entry.catalog.item.name) + "/" + $0.path] }
@@ -930,9 +960,9 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let token = sessionGeneration
         let index = try await session.revisionIndex()
         let previous = catalogCache.withLock { $0[session.binding.vaultID] }.flatMap {
-            $0.session == ObjectIdentifier(session) ? $0 : nil
+            $0.continuity == session.displayContinuityID ? $0 : nil
         }
-        if let previous, previous.versions == index {
+        if let previous, previous.session == ObjectIdentifier(session), previous.versions == index {
             try checked(token)
             guard session.isUnlocked else { throw MopError.authentication }
             return previous
@@ -944,7 +974,10 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         var visible = previous?.projection.items ?? [:]
         if !sameSource {
             waiting = waiting.filter { itemIDs.contains($0.key) && index[$0.key] == $0.value }
-            entries = entries.filter { itemIDs.contains($0.key) && $0.value.versionID == index[$0.key] }
+            // Keep the last verified display until its replacement is decrypted.
+            // Entries retain their OLD versions: reads/edits still validate them,
+            // and session replacement/lock still discards this plaintext cache.
+            entries = entries.filter { itemIDs.contains($0.key) }
             visible = visible.filter { entries[$0.key] != nil }
         }
         var changedIDs: Set<UUID> = []
@@ -961,9 +994,16 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             }
         }
         let pending: ArraySlice<UUID>
-        if sameSource, limit != nil, let previous { pending = previous.pending }
+        if sameSource, limit != nil, let previous {
+            // A new display refresh can follow a grant-only commit: the item
+            // version is unchanged, but a previously waiting replacement may
+            // now be readable. Retry once per refresh, not on every idle batch.
+            if limit == 0, previous.pending.isEmpty, !waiting.isEmpty {
+                pending = waiting.keys.filter { index[$0] == waiting[$0] }.sorted { $0.uuidString < $1.uuidString }[...]
+            } else { pending = previous.pending }
+        }
         else {
-            pending = itemIDs.filter { entries[$0] == nil && (limit == nil || waiting[$0] != index[$0]) }
+            pending = itemIDs.filter { entries[$0]?.versionID != index[$0] && (limit == nil || waiting[$0] != index[$0]) }
                 .sorted { $0.uuidString < $1.uuidString }[...]
         }
         let changed = Set(limit.map { pending.prefix($0) } ?? pending)
@@ -1023,7 +1063,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         if projection.versions == index && !rows.isEmpty {
             try? await session.seedNameIndex(projection.orderedIDs.compactMap { entries[$0] }, versions: projection.versions)
         }
-        let prepared = CachedCatalog(session: ObjectIdentifier(session), projection: projection, sourceVersions: index,
+        let prepared = CachedCatalog(session: ObjectIdentifier(session), continuity: session.displayContinuityID, projection: projection, sourceVersions: index,
             pending: remaining, waiting: waiting)
         try state.withLock { current in
             guard current.generation == token, session.isUnlocked else { throw MopError.authentication }

@@ -18,7 +18,7 @@ final class ItemSearchIndex {
         let ids: Set<ItemRow.ID>
     }
     private struct Entry: Sendable {
-        let row: ItemRow
+        var row: ItemRow
         let name: String
         let vault: String
         let tags: [(text: String, normalized: String)]
@@ -26,7 +26,8 @@ final class ItemSearchIndex {
     }
     let rows: [ItemRow]
     private var entries: [Entry]?
-    @ObservationIgnored private var preparation: Task<[Entry]?, Never>?
+    @ObservationIgnored private var preparation: Task<([Entry], Int)?, Never>?
+    private(set) var reusableEntryCount = 0
     private let deleted: Bool
     var isPreparing: Bool { entries == nil }
     private let locale: Locale
@@ -34,26 +35,39 @@ final class ItemSearchIndex {
     @ObservationIgnored private var lastSnapshot: Snapshot?
     @ObservationIgnored private var cachedAlphabetTargets: [AlphabetTarget<ItemRow.ID>]?
 
-    init(rows: [ItemRow], deleted: Bool = false) {
+    init(rows: [ItemRow], deleted: Bool = false, reusing previous: ItemSearchIndex? = nil) {
         self.rows = rows
         self.deleted = deleted
         let locale = Locale.current
         self.locale = locale
         if rows.isEmpty { entries = []; return }
+        // Reuse only completed, same-locale snapshots. Duplicate IDs are tolerated
+        // here; the full item comparison below still validates every reused row.
+        let previousEntries = previous?.locale == locale && previous?.deleted == deleted ? previous?.entries ?? [] : []
         let task = Task.detached(priority: .userInitiated) {
+            let reusable = Dictionary(previousEntries.map { ($0.row.id, $0) }, uniquingKeysWith: { _, last in last })
             let interval = Self.signposter.beginInterval("Build search index")
             defer { Self.signposter.endInterval("Build search index", interval) }
             var entries: [Entry] = []
             entries.reserveCapacity(rows.count)
+            var reused = 0
             for row in rows {
-                guard !Task.isCancelled else { return nil as [Entry]? }
-                entries.append(Self.entry(row, deleted: deleted, locale: locale))
+                guard !Task.isCancelled else { return nil as ([Entry], Int)? }
+                if var entry = reusable[row.id], entry.row.item == row.item, entry.row.vaultName == row.vaultName {
+                    // Presentation-only changes must use the newest row too.
+                    reused += 1
+                    entry.row = row
+                    entries.append(entry)
+                } else {
+                    entries.append(Self.entry(row, deleted: deleted, locale: locale))
+                }
             }
-            return entries as [Entry]?
+            return (entries, reused) as ([Entry], Int)?
         }
         preparation = task
         Task { [weak self] in
-            guard let entries = await task.value, let self else { return }
+            guard let (entries, reused) = await task.value, let self else { return }
+            self.reusableEntryCount = reused
             self.entries = entries
             self.preparation = nil
         }

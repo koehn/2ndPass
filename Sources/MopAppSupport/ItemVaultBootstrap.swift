@@ -156,9 +156,11 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
         try permit.withDevice { device in
             guard genesis.membership.accounts.count == 1,
                   genesis.membership.accounts[0].role == .owner,
-                  genesis.membership.accounts[0].id == device.identity.member,
-                  history.current.membership.role(of: device.identity) == .owner else {
+                  genesis.membership.accounts[0].id == device.identity.member else {
                 throw ItemVaultBootstrapFailure.invalidTrust
+            }
+            guard history.current.membership.role(of: device.identity) == .owner else {
+                throw MopError.notVaultMember
             }
         }
         return history
