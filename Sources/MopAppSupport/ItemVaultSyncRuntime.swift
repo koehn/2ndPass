@@ -106,7 +106,11 @@ actor ItemVaultSyncRuntime {
         let value = DurableSyncCoordinator(repository: repository, account: account.accountNamespace,
             kinds: [.publishItem, .grant, .publishCoordination, .removeCoordination, .reconcile, .recoverTransport, .applyIncoming, .fetchContentVersion, .fetchContentHead, .fetchMembership, .provision, .membership, .enrollment, .deletion, .recovery, .prepareGrant, .rotateContent, .resolveConflict],
             allowsConcurrentReconciliation: true, coalescesPublicationRegistration: true,
-            dependencyAvailable: { [weak self] dependency in try await self?.dependency(dependency) ?? false }) { [weak self] operation in
+            dependencyAvailable: { [weak self] dependency in try await self?.dependency(dependency) ?? false },
+            rotationBatchHandler: { [weak self] operations in
+                guard let self else { return operations.map { _ in .retry(.accountChanged) } }
+                return await self.handleRotations(operations)
+            }) { [weak self] operation in
                 guard let self else { return .retry(.accountChanged) }
                 return await self.handle(operation)
             }
@@ -152,9 +156,13 @@ actor ItemVaultSyncRuntime {
         await coordinator.waitUntilIdle()
     }
 
-    @discardableResult func requestSync() async throws -> DurableSyncRequest {
+    @discardableResult func requestSync(refreshPrerequisites: Bool = false) async throws -> DurableSyncRequest {
         guard !retired else { throw CloudSyncAdapterError.accountChanged }
         enabled = true
+        if refreshPrerequisites {
+            try await GrantRequestPrerequisites(repository: repository).refreshWaitingHeads(
+                account: account.accountNamespace, owner: CKCurrentUserDefaultName, permit: account)
+        }
         let request = try await repository.requestSync(account: account.accountNamespace, database: "private", reason: .manual)
         await ensureCoordinator()
         let coordinator = coordinator
@@ -213,6 +221,23 @@ actor ItemVaultSyncRuntime {
             await value.stop(); if adapter === value { adapter = nil }; throw error
         }
     }
+    private func handleRotations(_ operations: [SyncOperation]) async -> [SyncOperationOutcome] {
+        guard enabled, !retired else { return operations.map { _ in .retry(.authorization) } }
+        do {
+            try account.withWritePermission {}
+            let engine = try await ensureAdapter()
+            return await engine.processContentRotations(operations)
+        } catch CloudSyncAdapterError.accountChanged {
+            await stop(); return operations.map { _ in .attention(.accountChanged) }
+        } catch MopError.cloudAccount {
+            await stop(); return operations.map { _ in .attention(.accountChanged) }
+        } catch let error as CKError {
+            return operations.map { _ in .retry(.transport, retryAfter: error.retryAfterSeconds) }
+        } catch {
+            return operations.map { _ in Self.workFailureOutcome(error) }
+        }
+    }
+
     private func handle(_ operation: SyncOperation) async -> SyncOperationOutcome {
         guard enabled, !retired else { return .retry(.authorization) }
         do {
@@ -299,6 +324,14 @@ actor ItemVaultSyncRuntime {
         }
     }
     private func dependency(_ dependency: SyncDependency) async throws -> Bool {
+        if dependency.kind == .prerequisiteInboxCapacity {
+            guard let kind = SyncOperation.Kind(rawValue: dependency.identifier) else { return false }
+            return try await repository.prerequisiteInboxReadyToResume(account: account.accountNamespace, kind: kind)
+        }
+        if dependency.kind == .inboxCapacity {
+            guard dependency.identifier == account.accountNamespace else { return false }
+            return try await repository.inboxReadyToResume(account: account.accountNamespace)
+        }
         // Legacy waits lacked an observed membership/head. Re-evaluate once to
         // verify and migrate them into the precise durable snapshot below.
         if dependency.kind == .contentKeyState { return true }
@@ -502,7 +535,8 @@ actor ItemVaultSyncRuntime {
                         AccessSyncTrace.event("access request verified", operation: operation.id, item: request.item,
                             generation: request.keyGeneration, recipient: request.recipient, record: record.recordID.recordName)
                         return try await GrantRequestPrerequisites(repository: repository).reconcile(request: request,
-                            scope: account.setupScope(vaultID: vault).binding.item(request.item), history: history, permit: permit)
+                            scope: account.setupScope(vaultID: vault).binding.item(request.item), history: history, permit: permit,
+                            localRecipient: (try? session(vaultID: vault))?.contentSession?.identity.fingerprint)
                     default: break
                     }
                 }
@@ -612,8 +646,8 @@ actor ItemVaultSyncRuntime {
         case CloudSyncAdapterError.membershipUnavailable, ContentStoreError.staleAuthority,
              SyncJournalError.staleOperation, ItemRepositoryError.staleLocalVersion:
             return .retry(.dependency)
-        case SyncJournalError.inboxFull, CloudSyncAdapterError.inboxFull, CloudSyncAdapterError.storageFailure:
-            return .retry(.storagePressure)
+        case SyncJournalError.inboxFull, CloudSyncAdapterError.inboxFull: return .retry(.inboxFull)
+        case CloudSyncAdapterError.storageFailure: return .retry(.storagePressure)
         case let failure as CKError: return .retry(.transport, retryAfter: failure.retryAfterSeconds)
         case is DecodingError: return .attention(.invalidAuthority)
         default: break

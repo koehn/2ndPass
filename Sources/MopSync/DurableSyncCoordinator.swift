@@ -9,6 +9,8 @@ public enum SyncOperationOutcome: Sendable {
     /// The engine owns transport retries; retain this undelivered operation.
     case transportOwned
     case waiting(Set<SyncDependency>)
+    /// Resume on verified dependency changes, or once at a durable deadline.
+    case waitingUntil(Set<SyncDependency>, Date)
     case authorization
     case retry(SyncFailure, retryAfter: TimeInterval? = nil)
     case attention(SyncFailure)
@@ -40,6 +42,9 @@ public actor DurableSyncCoordinator {
     private var reconciliationTask: Task<Void, Never>?
     private var reconciliationID: UUID?
     private let clock: SyncClock
+    public typealias RotationBatchHandler = @Sendable ([SyncOperation]) async -> [SyncOperationOutcome]
+    public static let rotationBatchLimit = 16
+    private let rotationBatchHandler: RotationBatchHandler?
     private let handler: Handler
     private let dependencyAvailable: @Sendable (SyncDependency) async throws -> Bool
     private var observer: Task<Void, Never>?
@@ -51,13 +56,15 @@ public actor DurableSyncCoordinator {
     private var draining = false
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private var wakes: [SyncWakeReason] = []
+    private var legacyCapacityRetries: Set<UUID> = []
     public private(set) var storageFailure = false
 
     public init(repository: EncryptedItemRepository, account: String, database: String = "private",
                 kinds: Set<SyncOperation.Kind>, clock: SyncClock = SyncClock(),
                 allowsConcurrentReconciliation: Bool = false, coalescesPublicationRegistration: Bool = false,
                 dependencyAvailable: @escaping @Sendable (SyncDependency) async throws -> Bool,
-                handler: @escaping Handler) {
+                rotationBatchHandler: RotationBatchHandler? = nil, handler: @escaping Handler) {
+        self.rotationBatchHandler = rotationBatchHandler
         self.repository = repository; self.account = account; self.database = database
         self.coalescesPublicationRegistration = coalescesPublicationRegistration
         self.allowsConcurrentReconciliation = allowsConcurrentReconciliation
@@ -101,6 +108,7 @@ public actor DurableSyncCoordinator {
             draining = false
             finishIdleWaiters()
         }
+        var retriedBulkThisDrain: Set<UUID> = []
         while running, !wakes.isEmpty {
             let reasons = wakes; wakes = []
             let token = generation
@@ -112,8 +120,8 @@ public actor DurableSyncCoordinator {
                 var eligible: [SyncOperation] = []
                 for operation in candidates where kinds.contains(operation.kind) {
                     guard running, generation == token, !Task.isCancelled else { return }
-                    let resetOperationRetry = resetRetry || (reasons.contains(.unlocked)
-                        && (operation.failure == .authorization || operation.failure == .dependency))
+                    let resetOperationRetry = !retriedBulkThisDrain.contains(operation.id) && (resetRetry || (reasons.contains(.unlocked)
+                        && (operation.failure == .authorization || operation.failure == .dependency)))
                     switch operation.state {
                     case .completed, .needsAttention: continue
                     case .waitingForAuthorization:
@@ -122,9 +130,16 @@ public actor DurableSyncCoordinator {
                         if !authorization { continue }
                     case .retryScheduled:
                         if let earliest = operation.retryNotBefore, earliest > clock.now() { continue }
-                        let dependencyArrived = operation.failure == .dependency && reasons.contains(.dependenciesChanged)
+                        // Older versions recorded inbox suspension as storage pressure.
+                        // A drained inbox must release those recovery jobs without a
+                        // foreground event or their accumulated exponential delay.
+                        let capacityArrived = operation.kind == .recoverTransport && operation.failure == .storagePressure
+                            && !legacyCapacityRetries.contains(operation.id)
+                            ? try await dependencyAvailable(.init(.inboxCapacity, identifier: account)) : false
+                        let dependencyArrived = capacityArrived || (operation.failure == .dependency && reasons.contains(.dependenciesChanged))
                         if !resetOperationRetry, !dependencyArrived, let date = operation.nextAttempt, date > clock.now() { continue }
                     case .waitingForDependency:
+                        if let deadline = operation.nextAttempt, deadline <= clock.now() { break }
                         var ready = true
                         for dependency in operation.dependencies {
                             if try await !dependencyAvailable(dependency) { ready = false; break }
@@ -136,12 +151,13 @@ public actor DurableSyncCoordinator {
                 }
                 let operations = interleavingInbox(eligible)
                 var publicationRegistration: SyncOperationOutcome?
-                var completedBulk = 0
-                for operation in operations {
+                var attemptedBulk = 0
+                var batchOutcomes: [UUID: SyncOperationOutcome] = [:]
+                for (index, operation) in operations.enumerated() {
                     if allowsConcurrentReconciliation, operation.kind == .reconcile, reconciliationTask != nil { continue }
                     let publication = [.publishItem, .grant, .publishCoordination, .removeCoordination].contains(operation.kind)
-                    let resetOperationRetry = resetRetry || (reasons.contains(.unlocked)
-                        && (operation.failure == .authorization || operation.failure == .dependency))
+                    let resetOperationRetry = !retriedBulkThisDrain.contains(operation.id) && (resetRetry || (reasons.contains(.unlocked)
+                        && (operation.failure == .authorization || operation.failure == .dependency)))
                     guard running, generation == token, !Task.isCancelled else { return }
                     if allowsConcurrentReconciliation, operation.kind == .reconcile {
                         // One network wait may run alongside local inbox/authority
@@ -158,28 +174,51 @@ public actor DurableSyncCoordinator {
                     // operations strands their old failure/deadline and spins
                     // the timer on an already-expired application retry.
                     let outcome: SyncOperationOutcome
-                    if coalescesPublicationRegistration, publication, let registered = publicationRegistration {
+                    if operation.kind == .rotateContent, let rotationBatchHandler {
+                        if batchOutcomes.isEmpty {
+                            // Only already-eligible consecutive rotations share a barrier.
+                            // Finish and journal the bounded batch before yielding to a wake.
+                            let budget = max(1, Self.rotationBatchLimit - attemptedBulk)
+                            let batch = Array(operations[index...].prefix(budget).prefix { $0.kind == .rotateContent })
+                            let results = await rotationBatchHandler(batch)
+                            for (offset, member) in batch.enumerated() {
+                                batchOutcomes[member.id] = results.count == batch.count ? results[offset] : .retry(.processing)
+                            }
+                        }
+                        outcome = batchOutcomes.removeValue(forKey: operation.id) ?? .retry(.processing)
+                    } else if coalescesPublicationRegistration, publication, let registered = publicationRegistration {
                         outcome = registered
                     } else {
+                        // Old journals cannot distinguish inbox capacity from
+                        // real I/O failures. Probe once per coordinator lifetime;
+                        // if storage really fails, retain its normal backoff.
+                        if operation.kind == .recoverTransport, operation.failure == .storagePressure {
+                            legacyCapacityRetries.insert(operation.id)
+                        }
                         outcome = await handler(operation)
                         if coalescesPublicationRegistration, publication { publicationRegistration = outcome }
                     }
                     guard running, generation == token, !Task.isCancelled else { return }
                     do { try await commit(outcome, operation: operation, resetRetry: resetOperationRetry) }
                     catch SyncJournalError.staleOperation { /* another authorized worker advanced it */ }
-                    if [.rotateContent, .applyIncoming].contains(operation.kind), case .completed = outcome { completedBulk += 1 }
-                    if wakes.contains(.unlocked) || (completedBulk >= 16 && !wakes.isEmpty) {
+                    if [.rotateContent, .applyIncoming].contains(operation.kind) {
+                        attemptedBulk += 1
+                        if case .retry = outcome { retriedBulkThisDrain.insert(operation.id) }
+                    }
+                    if batchOutcomes.isEmpty && (wakes.contains(.unlocked) || (attemptedBulk >= 16 && !wakes.isEmpty)) {
                         // Unlock can arrive while a handler or its commit awaits.
                         // Re-read and prioritize durable work now, so enrollment
                         // blocked earlier in this batch does not wait behind bulk
                         // rotations. Also reconsider newly arrived access work
-                        // after a bounded slice of completed bulk operations. Counting
-                        // completions avoids endlessly replaying a blocked prefix.
+                        // after a bounded slice of completed or retrying bulk work.
+                        // A carried wake hint may reset each operation only once
+                        // per drain, so a failed prefix retains its new backoff.
                         // Finish the current operation before yielding,
                         // and preserve this batch's retry/authorization hints.
                         for reason in reasons where !wakes.contains(reason) { wakes.append(reason) }
                         break
                     }
+                    if attemptedBulk >= Self.rotationBatchLimit && batchOutcomes.isEmpty { attemptedBulk = 0 }
                 }
                 storageFailure = false
                 try await scheduleNext(token: token)
@@ -270,6 +309,7 @@ public actor DurableSyncCoordinator {
         case .transportOwned: summary = "transportOwned"
         case .authorization: summary = "authorization"
         case .waiting(let dependencies): summary = "waiting dependencies=\(dependencies.count)"
+        case .waitingUntil(let dependencies, _): summary = "waitingUntil dependencies=\(dependencies.count)"
         case .retry(let failure, _): summary = "retry failure=\(failure.rawValue)"
         case .attention(let failure): summary = "attention failure=\(failure.rawValue)"
         }
@@ -287,10 +327,23 @@ public actor DurableSyncCoordinator {
         case .waiting(let dependencies):
             _ = try await repository.transition(operation, to: .waitingForDependency, dependencies: dependencies,
                 failure: .dependency, attempted: true, now: now)
+        case .waitingUntil(let dependencies, let deadline):
+            _ = try await repository.transition(operation, to: .waitingForDependency, dependencies: dependencies,
+                failure: .dependency, nextAttempt: deadline, attempted: true, now: now)
         case .authorization:
             _ = try await repository.transition(operation, to: .waitingForAuthorization, failure: .authorization, attempted: true, now: now)
         case .attention(let failure):
             _ = try await repository.transition(operation, to: .needsAttention, failure: failure, attempted: true, now: now)
+        case .retry(.inboxFull, nil):
+            // Local capacity is a durable dependency, not a transport failure.
+            // Store commits wake this wait as soon as draining crosses the low
+            // watermark; no polling, exponential backoff, or user action is needed.
+            _ = try await repository.transition(operation, to: .waitingForDependency,
+                dependencies: [.init([.fetchMembership, .fetchContentHead, .fetchContentVersion].contains(operation.kind)
+                    ? .prerequisiteInboxCapacity : .inboxCapacity,
+                    identifier: [.fetchMembership, .fetchContentHead, .fetchContentVersion].contains(operation.kind)
+                        ? operation.kind.rawValue : account)], failure: .inboxFull,
+                attempted: true, now: now)
         case .retry(let failure, let after):
             let attempt = resetRetry ? 1 : min(operation.retryAttempts ?? operation.attempts, Int.max - 1) + 1
             let delay = SyncRetryPolicy.delay(attempt: attempt, jitter: clock.jitter(), retryAfter: after)
@@ -305,7 +358,7 @@ public actor DurableSyncCoordinator {
         timer?.cancel(); timer = nil; timerID = UUID()
         if let next = operations.filter({ kinds.contains($0.kind)
             && !(allowsConcurrentReconciliation && $0.kind == .reconcile && reconciliationTask != nil)
-            && $0.state == .retryScheduled }).compactMap({ operation -> Date? in
+            && ($0.state == .retryScheduled || ($0.state == .waitingForDependency && $0.nextAttempt != nil)) }).compactMap({ operation -> Date? in
                 guard let next = operation.nextAttempt else { return operation.retryNotBefore }
                 return max(next, operation.retryNotBefore ?? next)
             }).min() {

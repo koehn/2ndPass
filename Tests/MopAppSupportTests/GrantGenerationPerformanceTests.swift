@@ -206,3 +206,110 @@ extension EncryptedItemRepository {
         #expect(try await reopened.enrollmentDownloadProgress(scope: scope, recipient: joining.identity.fingerprint, metadata: metadata) == nil)
     }
 }
+
+extension GrantGenerationPerformanceTests {
+    /// Local crypto/journal benchmark, deliberately without CloudKit or Keychain.
+    /// 895 user records; production metadata is an additional encrypted record.
+    @Test func removeReadd895ItemsWithRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("ContentPreview3/Content3.sqlite")
+        var repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let mac = try SessionDevice(), ipad = try SessionDevice(member: mac.identity.member)
+        let oldPhone = try SessionDevice(member: mac.identity.member), newPhone = try SessionDevice(member: mac.identity.member)
+        let vault = UUID(), permit = GrantBenchmarkPermit()
+        let scope = VaultScope(account: "audit", vaultID: vault)
+        let binding = ItemVaultBinding(account: scope.account, database: scope.database, zoneOwner: scope.zoneOwner, vaultID: vault)
+        let genesis = try MembershipEnvelope.genesis(vault: vault,
+            membership: Membership(accounts: [.init(id: mac.identity.member, role: .owner,
+                devices: [mac.identity, ipad.identity, oldPhone.identity])]), owner: mac)
+        let original = try TrustedMembershipHistory(genesis: genesis, vault: vault, pinnedDigest: genesis.digest())
+        var storage = GrantBackedContentStorage(repository: repository)
+        try await storage.setAuthority(scope: scope, expected: nil, history: original, authorization: permit)
+        var session = try GrantBackedContentSession(repository: repository, binding: binding, history: original, device: SessionDevice(copying: mac))
+        for _ in 0..<895 {
+            _ = try await session.create(item: UUID(), components: ["password": SecretBytes(copying: Data(repeating: 42, count: 1024))])
+        }
+        var removed = original
+        try removed.append(MembershipEnvelope.successor(of: genesis,
+            membership: Membership(accounts: [.init(id: mac.identity.member, role: .owner, devices: [mac.identity, ipad.identity])],
+                removedDevices: [oldPhone.identity.device]), owner: mac))
+        try await storage.setAuthority(scope: scope, expected: original, history: removed, authorization: permit)
+        let rotations = try await repository.activeOperations(account: scope.account, database: scope.database).filter { $0.kind == .rotateContent }
+        #expect(rotations.count == 895)
+        session = try GrantBackedContentSession(repository: repository, binding: binding, history: removed, device: SessionDevice(copying: mac))
+        let start = ContinuousClock.now
+        for (index, operation) in rotations.enumerated() {
+            if index == 447 {
+                // Reopen durable storage mid-cycle; never reset its journal.
+                session.lock()
+                repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+                storage = GrantBackedContentStorage(repository: repository)
+                session = try GrantBackedContentSession(repository: repository, binding: binding, history: removed, device: SessionDevice(copying: mac))
+                #expect(try await repository.activeOperations(account: scope.account, database: scope.database).filter { $0.kind == .rotateContent }.count == 448)
+            }
+            guard case .completed = await session.handle(operation, owner: permit) else { Issue.record("Rotation failed"); return }
+        }
+        let rotationDuration = start.duration(to: .now)
+        let revisions = try await repository.itemRevisionIndex(account: scope.account, vaultID: vault)
+        let firstBatch = try await repository.contentPublications(account: scope.account)
+        #expect(firstBatch.count == 100)
+        #expect(firstBatch.filter { $0.kind == .grant }.count == 16)
+        // Enumerate current publication payloads, not the bounded 100-record selector.
+        func projectedUploads(_ repository: EncryptedItemRepository) async throws -> [ContentUpload] {
+            var result: [ContentUpload] = []
+            for (item, version) in revisions {
+                let itemScope = binding.item(item)
+                let content = try #require(await repository.contentVersion(scope: itemScope, version: version))
+                for kind in [ContentRecordKind.version, .head] {
+                    result.append(ContentUpload(operationID: UUID(), content: content, grant: nil, kind: kind, systemFields: nil))
+                }
+                for grant in try await repository.contentGrants(scope: itemScope, keyGeneration: content.keyGeneration) {
+                    result.append(ContentUpload(operationID: UUID(), content: content, grant: grant, kind: .grant, systemFields: nil))
+                }
+            }
+            return result
+        }
+        let rotatedUploads = try await projectedUploads(repository)
+        let rotationBytes = rotatedUploads.reduce(0) { $0 + $1.byteCount }
+        #expect(rotatedUploads.filter { $0.kind == .head }.count == 895)
+        #expect(rotatedUploads.filter { $0.kind == .grant }.count == 1790)
+        for operation in rotations { _ = await session.handle(operation, owner: permit) }
+        #expect(try await repository.itemRevisionIndex(account: scope.account, vaultID: vault) == revisions)
+        var admitted = removed
+        try admitted.append(MembershipEnvelope.successor(of: removed.current,
+            membership: Membership(accounts: [.init(id: mac.identity.member, role: .owner, devices: [mac.identity, ipad.identity, newPhone.identity])],
+                removedDevices: [oldPhone.identity.device]), owner: mac))
+        #expect(try GrantBackedContentStorage.recipientPolicy(history: admitted).keyAuthority == GrantBackedContentStorage.recipientPolicy(history: removed).keyAuthority)
+        try await storage.setAuthority(scope: scope, expected: removed, history: admitted, authorization: permit)
+        let work = try await repository.activeOperations(account: scope.account, database: scope.database)
+        #expect(work.filter { $0.kind == .rotateContent }.isEmpty)
+        let grants = work.filter { $0.kind == .prepareGrant }
+        #expect(grants.count == 895)
+        let device = GrantBenchmarkDevice(mac)
+        session = try GrantBackedContentSession(repository: repository, binding: binding, history: admitted, device: device)
+        let grantStart = ContinuousClock.now
+        for operation in grants {
+            guard case .completed = await session.handle(operation, owner: permit) else { Issue.record("Grant failed"); return }
+        }
+        let grantDuration = grantStart.duration(to: .now)
+        let uploads = try await projectedUploads(repository)
+        let newGrants = uploads.filter { $0.grant?.recipient == newPhone.identity.fingerprint }
+        #expect(newGrants.count == 895)
+        #expect(device.signatures.withLock { $0 } == 895)
+        #expect(try await repository.itemRevisionIndex(account: scope.account, vaultID: vault) == revisions)
+        // A second issuer can generate a distinct, valid record for identical access.
+        let first = try #require(newGrants.first)
+        let prepared = try ContentGrantPreparation(bytes: first.content.version.ciphertext, item: first.scope.itemID, history: admitted)
+        let ipadGrant = try #require(await repository.contentGrants(scope: first.scope, keyGeneration: first.content.keyGeneration, recipient: ipad.identity.fingerprint).first)
+        let duplicate = try prepared.extendingAccess(to: newPhone.identity, sourceGrantBytes: ipadGrant.bytes, decryptor: ipad, signer: ipad)
+        #expect(try duplicate.grant.identifier != first.grant?.identifier)
+        let phone = try GrantBackedContentSession(repository: repository, binding: binding, history: admitted, device: SessionDevice(copying: newPhone))
+        for (item, version) in revisions {
+            #expect(try await phone.open(item: item, component: "password", expected: version).count == 1024)
+        }
+        for operation in grants { _ = await session.handle(operation, owner: permit) }
+        #expect(device.signatures.withLock { $0 } == 895)
+        print("AUDIT895 rotation=\(rotationDuration) rotationUploadRecords=\(rotatedUploads.count) rotationPayloadBytes=\(rotationBytes) grants=\(grantDuration) newGrantRecords=\(newGrants.count) newGrantPayloadBytes=\(newGrants.reduce(0) { $0 + $1.byteCount }) replaySignatures=0 reEnrollmentRotations=0")
+    }
+}

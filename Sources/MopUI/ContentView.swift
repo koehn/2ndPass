@@ -326,6 +326,9 @@ struct ContentView: View {
         .sheet(item: $model.vaultDetailsTarget) { target in
             VaultDetailsDialog(model: model, target: target)
         }
+        .alert("Enrollment reset — force quit now", isPresented: Binding(get: { !model.settingsVisible && model.enrollmentResetAlertPresented }, set: { if !$0 { model.enrollmentResetAlertPresented = false } })) {
+            Button("OK") { model.enrollmentResetAlertPresented = false }
+        } message: { Text(AppModel.enrollmentResetInstructions) }
         .alert("Operation not completed", isPresented: Binding(get: { !model.settingsVisible && model.vaultDetailsTarget == nil && model.sheetRequest == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
             if model.developerDiagnosticsEnabled { Button("Copy Details") { model.copyErrorDetails() } }
             Button("OK") { model.error = nil }

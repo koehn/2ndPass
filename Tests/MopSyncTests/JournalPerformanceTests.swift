@@ -538,7 +538,15 @@ extension JournalPerformanceTests {
         let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
         let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
         func check() async throws {
-            #expect(try await reader.syncHealth(account: "benchmark", database: "private") == reader.previousHealthSnapshot())
+            let actual = try await reader.syncHealth(account: "benchmark", database: "private")
+            let previous = try await reader.previousHealthSnapshot()
+            // The old query has no dependency-specific diagnostics; compare its
+            // original fields while dedicated tests exercise the new groups.
+            #expect(actual.pendingCount == previous.pendingCount)
+            #expect(actual.oldestPendingAt == previous.oldestPendingAt)
+            #expect(actual.lastDeliveryAt == previous.lastDeliveryAt)
+            #expect(actual.blockedReasons == previous.blockedReasons)
+            #expect(actual.pendingKinds == previous.pendingKinds)
         }
         try await check()
         for index in 0..<12 {

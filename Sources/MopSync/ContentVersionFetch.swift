@@ -67,7 +67,7 @@ public struct ContentVersionFetcher: Sendable {
             try await repository.finishContentVersionFetch(operation, incoming: incoming, permit: permit)
             return .completed
         } catch SyncJournalError.staleOperation { return .retry(.dependency) }
-        catch SyncJournalError.inboxFull { return .retry(.storagePressure) }
+        catch SyncJournalError.inboxFull { return .retry(.inboxFull) }
         catch CloudSyncAdapterError.operationInterrupted { return .retry(.authorization) }
         catch let error as CKError {
             // unknownItem can be publication ordering, never proof of deletion.

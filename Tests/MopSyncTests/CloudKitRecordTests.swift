@@ -11,8 +11,8 @@ import MopCore
     #expect(publicationFailure(CKError(.networkFailure)) == .transport)
     #expect(publicationFailure(CocoaError(.fileWriteOutOfSpace)) == .storagePressure)
     #expect(publicationFailure(NSError(domain: NSPOSIXErrorDomain, code: 28)) == .storagePressure)
-    #expect(publicationFailure(SyncJournalError.inboxFull) == .storagePressure)
-    #expect(publicationFailure(CloudSyncAdapterError.inboxFull) == .storagePressure)
+    #expect(publicationFailure(SyncJournalError.inboxFull) == .inboxFull)
+    #expect(publicationFailure(CloudSyncAdapterError.inboxFull) == .inboxFull)
     #expect(publicationFailure(CocoaError(.fileReadCorruptFile)) == .processing)
 }
 

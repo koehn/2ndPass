@@ -4,6 +4,45 @@ import Synchronization
 @testable import MopSync
 
 @Suite struct SyncJournalTests: Sendable {
+    @Test(arguments: [false, true], [895, 1_000])
+    func rotationBatchesBoundWorkAndYieldToEnrollment(retry: Bool, itemCount: Int) async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date()
+        let held = try await repository.enqueue(SyncOperation(account: "a", kind: .rotateContent))
+        let throttled = try await repository.transition(held, to: .retryScheduled, failure: .transport,
+            nextAttempt: now.addingTimeInterval(600), retryNotBefore: now.addingTimeInterval(600))
+        for _ in 0..<itemCount { _ = try await repository.enqueue(SyncOperation(account: "a", kind: .rotateContent)) }
+        let batches = Mutex<[Int]>([]), calls = Mutex<[UUID]>([])
+        let enrollment = SyncOperation(account: "a", kind: .enrollment)
+        let enrollmentAt = Mutex<Int?>(nil)
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
+            kinds: [.rotateContent, .enrollment],
+            clock: SyncClock(now: { now }, sleep: { _ in try await Task.sleep(for: .seconds(60)) }, jitter: { 0 }),
+            dependencyAvailable: { _ in true }, rotationBatchHandler: { operations in
+                let first = batches.withLock { $0.append(operations.count); return $0.count == 1 }
+                calls.withLock { $0.append(contentsOf: operations.map(\.id)) }
+                if first { _ = try? await repository.enqueue(enrollment) }
+                return operations.map { _ in retry ? .retry(.transport, retryAfter: 600) : .completed }
+            }, handler: { operation in
+                #expect(operation.kind == .enrollment)
+                enrollmentAt.withLock { $0 = calls.withLock { $0.count } }
+                return .completed
+            })
+        await coordinator.start(); await coordinator.waitUntilIdle()
+        await coordinator.wake(reason: .foreground); await coordinator.waitUntilIdle()
+        await coordinator.stop()
+        #expect(batches.withLock { $0.allSatisfy { $0 <= 16 } })
+        #expect(batches.withLock { $0.count } == (itemCount + 15) / 16)
+        #expect(enrollmentAt.withLock { $0 } == 16)
+        #expect(calls.withLock { $0.count } == itemCount)
+        #expect(calls.withLock { Set($0).count } == itemCount)
+        #expect(!calls.withLock { $0.contains(held.id) })
+        let operations = try await repository.operations(account: "a", database: "private")
+        #expect(operations.first { $0.id == held.id }?.retryNotBefore == throttled.retryNotBefore)
+        #expect(operations.filter { $0.id != held.id && $0.kind == .rotateContent }
+            .allSatisfy { $0.state == (retry ? .retryScheduled : .completed) })
+    }
+
     @Test func retryingGrantBacklogCannotStarveInbox() async throws {
         let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
         let now = Date()
@@ -221,6 +260,44 @@ import Synchronization
         #expect(calls.withLock { $0 } == 0)
         await coordinator.stop()
         await timer.release()
+    }
+
+    @Test(arguments: [false, true])
+    func timedDependencyWaitResumesOnEvidenceOrDeadline(evidenceArrives: Bool) async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Mutex(Date(timeIntervalSince1970: 100)), available = Mutex(false)
+        let deadline = Date(timeIntervalSince1970: 220)
+        let dependency = SyncDependency(.grant, identifier: "verified-grant")
+        let work = try await repository.enqueue(SyncOperation(account: "a", kind: .prepareGrant))
+        let calls = Mutex(0), timer = JournalBarrier(), scheduled = Mutex<Date?>(nil)
+        let coordinator = DurableSyncCoordinator(repository: repository, account: "a", kinds: [.prepareGrant],
+            clock: SyncClock(now: { now.withLock { $0 } }, sleep: { date in
+                scheduled.withLock { $0 = date }
+                if date > now.withLock({ $0 }) { await timer.wait() }
+            }), dependencyAvailable: { _ in available.withLock { $0 } }, handler: { _ in
+                calls.withLock { $0 += 1; return $0 } == 1 ? .waitingUntil([dependency], deadline) : .completed
+            })
+        let changes = await repository.changes()
+        await coordinator.start(); await timer.waitForEntry()
+        for reason: SyncWakeReason in [.foreground, .unlocked, .storeChanged] { await coordinator.wake(reason: reason) }
+        #expect(calls.withLock { $0 } == 1)
+        #expect(scheduled.withLock { $0 } == deadline)
+        let waiting = try #require(await repository.operations(account: "a", database: "private").first { $0.id == work.id })
+        #expect(waiting.state == .waitingForDependency && waiting.nextAttempt == deadline)
+        let reopened = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        #expect(try await reopened.operations(account: "a", database: "private").first { $0.id == work.id } == waiting)
+        if evidenceArrives {
+            available.withLock { $0 = true }
+            await coordinator.wake(reason: .storeChanged)
+        } else {
+            now.withLock { $0 = deadline }
+            await timer.release()
+        }
+        for await _ in changes {
+            if try await repository.operations(account: "a", database: "private").first { $0.id == work.id }?.state == .completed { break }
+        }
+        await coordinator.stop(); await timer.release()
+        #expect(calls.withLock { $0 } == 2)
     }
 
     @Test func coordinatorRetriesAutomaticallyAtPersistedDeadline() async throws {
@@ -636,12 +713,16 @@ extension SyncJournalTests {
         _ = try await repository.enqueue(recovery)
         let deferred = Mutex(0)
         let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
-            kinds: [.applyIncoming, .recoverTransport], dependencyAvailable: { _ in true }, handler: { operation in
+            kinds: [.applyIncoming, .recoverTransport],
+            clock: SyncClock(sleep: { _ in try await Task.sleep(for: .seconds(600)) }), dependencyAvailable: { dependency in
+                #expect(dependency.kind == .inboxCapacity)
+                return try await repository.inboxReadyToResume(account: "a", budget: 100)
+            }, handler: { operation in
                 do {
                     if operation.kind == .recoverTransport {
                         guard try await repository.inboxReadyToResume(account: "a", budget: 100) else {
                             deferred.withLock { $0 += 1 }
-                            return .retry(.storagePressure)
+                            return .retry(.inboxFull)
                         }
                         // Replay the failed batch only after draining. The old
                         // checkpoint must have survived the entire pause.
@@ -662,7 +743,8 @@ extension SyncJournalTests {
         await coordinator.start(); await coordinator.waitUntilIdle()
         #expect(deferred.withLock { $0 } >= 1)
         #expect(try await repository.inboxReadyToResume(account: "a", budget: 100))
-        await coordinator.wake(reason: .foreground); await coordinator.waitUntilIdle()
+        // Only store events may release recovery; no user/lifecycle wake.
+        await coordinator.wake(reason: .storeChanged); await coordinator.waitUntilIdle()
         // The replay creates a fresh inbox operation; explicitly deliver its
         // store wake rather than racing the asynchronous change observer.
         await coordinator.wake(reason: .storeChanged); await coordinator.waitUntilIdle(); await coordinator.stop()
@@ -1151,7 +1233,7 @@ extension SyncJournalTests {
 }
 
 extension SyncJournalTests {
-    @Test func accessWorkArrivingDuringRotationsDoesNotWaitForWholeBatch() async throws {
+    @Test(arguments: [false, true]) func accessWorkArrivingDuringRotationsDoesNotWaitForWholeBatch(retry: Bool) async throws {
         let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
         var bulk: [SyncOperation] = []
         for _ in 0..<40 {
@@ -1160,14 +1242,16 @@ extension SyncJournalTests {
         let calls = Mutex<[UUID]>([])
         let first = Mutex(true)
         let barrier = JournalBarrier()
+        let now = Date()
         let coordinator = DurableSyncCoordinator(repository: repository, account: "a",
             kinds: [.rotateContent, .prepareGrant, .grant, .publishCoordination],
+            clock: SyncClock(now: { now }, sleep: { _ in try await Task.sleep(for: .seconds(3600)) }, jitter: { 0 }),
             dependencyAvailable: { _ in true }, handler: { operation in
                 calls.withLock { $0.append(operation.id) }
                 if operation.kind == .rotateContent, first.withLock({ value in
                     let wasFirst = value; value = false; return wasFirst
                 }) { await barrier.wait() }
-                return .completed
+                return retry && operation.kind == .rotateContent ? .retry(.transport) : .completed
             })
         let startup = Task { await coordinator.start() }
         await barrier.waitForEntry()
@@ -1175,7 +1259,7 @@ extension SyncJournalTests {
         for kind in [SyncOperation.Kind.prepareGrant, .grant, .publishCoordination] {
             access.append(try await repository.enqueue(SyncOperation(account: "a", kind: kind)))
         }
-        await coordinator.wake(reason: .storeChanged)
+        await coordinator.wake(reason: .foreground)
         await barrier.release()
         await startup.value
         await coordinator.waitUntilIdle()
@@ -1191,7 +1275,7 @@ extension SyncJournalTests {
         for operation in bulk + access { #expect(order.filter { $0 == operation.id }.count == 1) }
         let persisted = try await repository.operations(account: "a", database: "private")
         #expect(persisted.count == bulk.count + access.count)
-        #expect(persisted.allSatisfy { $0.state == .completed })
+        #expect(persisted.allSatisfy { $0.state == (retry && $0.kind == .rotateContent ? .retryScheduled : .completed) })
     }
 }
 
@@ -1249,5 +1333,27 @@ extension SyncJournalTests {
         #expect(calls.firstIndex(of: .applyIncoming) == 16)
         #expect(calls.filter { $0 == .fetchContentHead }.count == 40)
         #expect(calls.filter { $0 == .applyIncoming }.count == 40)
+    }
+}
+
+extension SyncJournalTests {
+    @Test func blockedHealthPersistsReasonsAndRetryFloorsWithoutPayloads() async throws {
+        let (root, repository) = try journalStore(); defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 100), next = now.addingTimeInterval(10), floor = now.addingTimeInterval(60)
+        let waiting = try await repository.enqueue(SyncOperation(account: "a", kind: .rotateContent,
+            payload: Data("secret must never appear in health".utf8), dependencies: [.init(.grant, identifier: "private routing")], now: now))
+        let retry = try await repository.enqueue(SyncOperation(account: "a", kind: .fetchContentVersion, now: now))
+        let scheduled = try await repository.transition(retry, to: .retryScheduled, failure: .transport, nextAttempt: next, retryNotBefore: floor)
+        let before = try await repository.syncHealth(account: "a", database: "private")
+        #expect(before.blockedWork.first { $0.reason == .missingGrant }?.count == 1)
+        #expect(before.blockedWork.first { $0.reason == .missingGrant }?.oldestOperationAt == now)
+        #expect(before.blockedWork.first { $0.reason == .transport }?.nextAttempt == floor)
+        #expect(!String(describing: before).contains("secret"))
+        #expect(!String(describing: before).contains("private routing"))
+        let reopened = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        #expect(try await reopened.syncHealth(account: "a", database: "private") == before)
+        _ = try await repository.transition(waiting, to: .completed)
+        _ = try await repository.transition(scheduled, to: .completed)
+        #expect(try await repository.syncHealth(account: "a", database: "private").blockedWork.isEmpty)
     }
 }

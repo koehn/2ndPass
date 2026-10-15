@@ -40,7 +40,7 @@ func publicationFailure(_ error: any Error) -> SyncFailure {
     case CloudSyncAdapterError.membershipUnavailable, ContentStoreError.staleAuthority: return .dependency
     case MopError.authentication, MopError.vaultUntrusted, MopError.cloudPermission: return .authorization
     case is CKError, MopError.cloudUnavailable, MopError.cloudThrottled, is CancellationError: return .transport
-    case SyncJournalError.inboxFull, CloudSyncAdapterError.inboxFull: return .storagePressure
+    case SyncJournalError.inboxFull, CloudSyncAdapterError.inboxFull: return .inboxFull
     default:
         let native = error as NSError
         if (native.domain == NSCocoaErrorDomain && native.code == NSFileWriteOutOfSpaceError)
@@ -186,6 +186,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     private var identityGeneration = 0
     private var activeAssetVersions: Set<UUID> = []
     private var activeContentAssets: [String: UUID] = [:]
+    // Diagnostic only, bounded and intentionally not persisted. Measures latest
+    // engine handoff to server acknowledgement, not end-to-end durable latency.
+    private var submissionTimes: [CKRecord.ID: ContinuousClock.Instant] = [:]
     private var lastRetentionPrune = Date.distantPast
     private var recoveryOperation: UUID?
     private var activeDataEvents = 0
@@ -319,7 +322,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             await oldEngine.cancelOperations()
         }
         lease = nil
-        activeAssetVersions = []; activeContentAssets = [:]
+        activeAssetVersions = []; activeContentAssets = [:]; submissionTimes = [:]
         stopping = false
     }
 
@@ -527,6 +530,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 }
                 for saved in changes.savedRecords {
                     AccessSyncTrace.event("record saved by cloud", record: saved.recordID.recordName, detail: "type=\(saved.recordType)")
+                    if let start = submissionTimes.removeValue(forKey: saved.recordID) {
+                        AccessSyncTrace.elapsed("publication acknowledgment latency", since: start,
+                            detail: "basis=latestSubmission type=\(saved.recordType)")
+                    }
                     try await acknowledge(saved)
                 }
                 if contentReception != nil, let contentPermit {
@@ -596,6 +603,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             } else {
                 try await repository.saveEngineState(state, account: account, database: stateNamespace)
             }
+            AccessSyncTrace.event("checkpoint persisted", detail: "bytes=\(state.count)")
         }
         catch {
             let native = error as NSError
@@ -723,12 +731,17 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             }
             for candidate in selectedCoordination where !rejected.contains(candidate.recordID) {
                 AccessSyncTrace.event("coordination submitted", operation: candidate.operationID,
-                    record: candidate.recordName, detail: "kind=\(candidate.kind.rawValue)")
+                    record: candidate.recordName, detail: "kind=\(candidate.kind.rawValue) payloadBytes=\(candidate.bytes.count)")
             }
             for candidate in selected where !rejected.contains(candidate.recordID) {
                 AccessSyncTrace.event("content submitted", operation: candidate.operationID, item: candidate.scope.itemID,
-                    record: candidate.recordID.recordName, detail: "kind=\(candidate.kind.rawValue)")
+                    generation: candidate.content.keyGeneration, recipient: candidate.grant?.recipient,
+                    record: candidate.recordID.recordName, detail: "kind=\(candidate.kind.rawValue) payloadBytes=\(candidate.byteCount)")
             }
+            if submissionTimes.count + records.count > 1_024 { submissionTimes.removeAll(keepingCapacity: true) }
+            for record in records { submissionTimes[record.recordID] = .now }
+            let submittedBytes = selected.reduce(0) { $0 + $1.byteCount } + selectedCoordination.reduce(0) { $0 + $1.bytes.count }
+            AccessSyncTrace.event("batch submitted", detail: "records=\(records.count) payloadBytes=\(submittedBytes) deletions=\(removals.count)")
             return CKSyncEngine.RecordZoneChangeBatch(recordsToSave: records, recordIDsToDelete: removals, atomicByZone: false)
         } catch {
             do { try checkUploadPreparation(error) } catch { return nil }
@@ -796,7 +809,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         guard token == identityGeneration, engine === owner, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
         try await repository.stageIncomingRecords(chunk, permit: permit)
         for incoming in chunk {
-            AccessSyncTrace.event("record staged locally", record: incoming.recordName, detail: "type=\(incoming.recordType)")
+            AccessSyncTrace.event("record staged locally", record: incoming.recordName, detail: "type=\(incoming.recordType) payloadBytes=\(incoming.bytes.count) systemFieldBytes=\(incoming.systemFields.count)")
         }
     }
 
@@ -841,7 +854,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             if [.prepareGrant, .rotateContent, .provision, .membership, .enrollment, .deletion, .recovery, .resolveConflict].contains(operation.kind) {
                 guard let work = contentReception.authorizedWork else { return .authorization }
                 if operation.kind == .rotateContent {
-                    return await performContentRotation(operation, permit: contentPermit, work: work)
+                    return await processContentRotations([operation]).first ?? .retry(.processing)
                 }
                 if operation.kind == .membership {
                     guard let owner = engine, !resolutionInProgress else { return .retry(.dependency) }
@@ -865,43 +878,73 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     /// A security transition needs a bounded send barrier, not an engine
     /// restart. Read back the head after cancellation before superseding an old
     /// outbox: a lost acknowledgment must not be mistaken for an unsent edit.
-    private func performContentRotation(_ operation: SyncOperation, permit: ConflictPublicationPermit,
-        work: @Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome) async -> SyncOperationOutcome {
+    /// Called only with a bounded group that the durable scheduler has already
+    /// checked for retry floors and dependencies. No speculative work is fetched.
+    public func processContentRotations(_ operations: [SyncOperation]) async -> [SyncOperationOutcome] {
+        func repeated(_ outcome: SyncOperationOutcome) -> [SyncOperationOutcome] { operations.map { _ in outcome } }
+        guard !operations.isEmpty, operations.count <= DurableSyncCoordinator.rotationBatchLimit,
+              Set(operations.map(\.id)).count == operations.count else { return repeated(.attention(.invalidAuthority)) }
         guard let owner = engine, !resolutionInProgress, let reception = contentReception,
-              let scope = try? JSONDecoder().decode(ItemScope.self, from: operation.payload),
-              scope.account == account, scope.database == databaseName, scope.vaultID == operation.vaultID,
-              scope.zoneOwner == operation.zoneOwner, address(for: scope) != nil else { return .retry(.dependency) }
-        do {
-            if try await repository.contentRotationSatisfied(scope: scope) {
-                AccessSyncTrace.event("rotation already satisfied", operation: operation.id, item: scope.itemID)
-                return .completed
-            }
-        } catch { return .retry(.storagePressure) }
-        guard engine === owner, !stopping, !suspended else { return .retry(.authorization) }
+              let work = reception.authorizedWork, let permit = contentPermit,
+              !stopping, !suspended else { return repeated(.retry(.authorization)) }
+        var pending: [(Int, SyncOperation, ItemScope)] = []
+        var outcomes = repeated(.completed)
+        for (index, operation) in operations.enumerated() {
+            guard operation.kind == .rotateContent, operation.account == account, operation.database == databaseName,
+                  let scope = try? JSONDecoder().decode(ItemScope.self, from: operation.payload),
+                  scope.account == account, scope.database == databaseName, scope.database == "private",
+                  scope.vaultID == operation.vaultID, scope.zoneOwner == operation.zoneOwner,
+                  address(for: scope) != nil else { return repeated(.attention(.invalidAuthority)) }
+            do {
+                if try await repository.contentRotationSatisfied(scope: scope) {
+                    AccessSyncTrace.event("rotation already satisfied", operation: operation.id, item: scope.itemID)
+                } else { pending.append((index, operation, scope)) }
+            } catch { outcomes[index] = .retry(.storagePressure) }
+        }
+        guard !pending.isEmpty else { return outcomes }
+        guard Set(pending.map { $0.2.storageKey }).count == pending.count else { return repeated(.attention(.invalidAuthority)) }
+        // Repository reads above can reenter this actor. Recheck before owning
+        // the publication barrier, including engine identity.
+        guard engine === owner, !resolutionInProgress, !stopping, !suspended else { return repeated(.retry(.authorization)) }
         resolutionInProgress = true; generation += 1
         let expected = identityGeneration
-        let outcome: SyncOperationOutcome
+        let batchStart = ContinuousClock.now
         do {
+            let cancelStart = ContinuousClock.now
             await owner.cancelOperations()
+            AccessSyncTrace.elapsed("rotation engine cancellation", since: cancelStart, detail: "items=\(pending.count)")
             try await validateAccount(generation: expected)
             guard engine === owner, !stopping else { throw CloudSyncAdapterError.operationInterrupted }
-            let readback = ContentRotationReadback(repository: repository, account: account) { [database] id in
-                try await database.record(for: id)
+            let readback = ContentRotationBatchReadback(repository: repository, account: account) { [database] ids in
+                try await database.records(for: ids)
             }
-            outcome = try await readback.perform(scope: scope, permit: permit, check: { [self] in
+            let byScope = Dictionary(uniqueKeysWithValues: pending.map { ($0.2.storageKey, $0.1) })
+            for (_, operation, scope) in pending {
+                AccessSyncTrace.event("rotation readback requested", operation: operation.id, item: scope.itemID)
+            }
+            let results = try await readback.perform(scopes: pending.map { $0.2 }, permit: permit, check: { [self] in
                 try await checkContentRotationOwner(owner, generation: expected)
-            }, apply: reception.apply, rotate: {
-                await work(operation, permit)
+            }, apply: reception.apply, rotate: { scope in
+                guard let operation = byScope[scope.storageKey] else { return .attention(.invalidAuthority) }
+                return await work(operation, permit)
             })
-        } catch let error as CKError { outcome = .retry(.transport, retryAfter: error.retryAfterSeconds) }
-        catch CloudSyncAdapterError.operationInterrupted { outcome = .retry(.authorization) }
-        catch { outcome = .retry(.transport) }
+            for (entry, outcome) in zip(pending, results) { outcomes[entry.0] = outcome }
+        } catch {
+            let outcome: SyncOperationOutcome
+            if let cloud = error as? CKError { outcome = .retry(.transport, retryAfter: cloud.retryAfterSeconds) }
+            else if case CloudSyncAdapterError.operationInterrupted = error { outcome = .retry(.authorization) }
+            else { outcome = .retry(.transport) }
+            for entry in pending { outcomes[entry.0] = outcome }
+        }
         if expected == identityGeneration, engine === owner {
             resolutionInProgress = false
+            let registrationStart = ContinuousClock.now
             do { try await registerPendingChanges() }
             catch { lastFailure = cloudSyncFailure(error, fallback: .storageFailure) }
+            AccessSyncTrace.elapsed("rotation upload registration", since: registrationStart)
         }
-        return outcome
+        AccessSyncTrace.elapsed("rotation batch total", since: batchStart, detail: "items=\(pending.count)")
+        return outcomes
     }
 
     public func resolveContentConflict<T: Sendable>(_ expected: EncryptedItemConflict, authorization: any RepositoryWritePermit,
@@ -948,7 +991,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 detail: "enginePresent=\(engine != nil) stopping=\(stopping) trustedZone=\(addresses.values.contains { $0.zoneID == id.zoneID })")
             throw CloudSyncAdapterError.invalidBinding
         }
+        AccessSyncTrace.event("direct fetch requested", record: id.recordName)
         let record = try await database.record(for: id)
+        AccessSyncTrace.event("direct fetch returned", record: id.recordName, detail: "type=\(record.recordType)")
         try await validateAccount(generation: expected, allowingInboxDrain: true)
         return record
     }
@@ -991,7 +1036,14 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
 
     private func validateAccount(generation expected: Int, allowingInboxDrain: Bool = false) async throws {
         guard expected == identityGeneration else { throw CloudSyncAdapterError.operationInterrupted }
-        let authorized = try await accountValidator()
+        let validationStart = ContinuousClock.now
+        let authorized: Bool
+        do { authorized = try await accountValidator() }
+        catch {
+            AccessSyncTrace.elapsed("account validation", since: validationStart, detail: "success=false")
+            throw error
+        }
+        AccessSyncTrace.elapsed("account validation", since: validationStart, detail: "success=\(authorized)")
         guard expected == identityGeneration else { throw CloudSyncAdapterError.operationInterrupted }
         guard authorized else {
             suspend(.accountChanged)

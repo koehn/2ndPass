@@ -26,6 +26,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         #endif
         var context: Context?
         var authorization: ContextInvalidator?
+        var enrollmentAuthorizedAt: TimeInterval?
         var pendingAuthorization: ContextInvalidator?
         var listeners: [UUID: AsyncStream<Void>.Continuation] = [:]
         var changePump: Task<Void, Never>?
@@ -35,10 +36,13 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     private let directory: URL?
     private let gate = OperationGate()
     public init(state: URL? = nil) { directory = state }
+    public var enrollmentAuthorizedAt: TimeInterval? {
+        state.withLock { $0.authorization == nil ? nil : $0.enrollmentAuthorizedAt }
+    }
     public func lock() {
         let resources = state.withLock { value in
             value.generation += 1
-            value.authorization?.invalidate(); value.authorization = nil
+            value.authorization?.invalidate(); value.authorization = nil; value.enrollmentAuthorizedAt = nil
             value.pendingAuthorization?.invalidate(); value.pendingAuthorization = nil
             let bootstraps = Array(value.provisionalBootstraps.values)
             value.provisionalBootstraps.removeAll()
@@ -73,7 +77,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                     let resources = (value.authorization, value.pendingAuthorization, value.changePump, Array(value.provisionalBootstraps.values))
                     value.provisionalBootstraps.removeAll()
                     value.generation += 1
-                            value.context = nil; value.authorization = nil
+                            value.context = nil; value.authorization = nil; value.enrollmentAuthorizedAt = nil
                     value.pendingAuthorization = nil; value.changePump = nil
                     return resources
                 }
@@ -441,7 +445,8 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             return session
         }
     }
-    public func requestSync() async throws {
+    public func requestSync() async throws { try await requestSync(refreshPrerequisites: false) }
+    public func requestSync(refreshPrerequisites: Bool) async throws {
         try Task.checkCancellation()
         let context = try await serialized { [self] in
             try Task.checkCancellation()
@@ -449,7 +454,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         }
         // Connection/authentication serialization protects local handles only.
         // A cloud request may outlive its caller and must not hold that gate.
-        _ = try await context.runtime.requestSync()
+        _ = try await context.runtime.requestSync(refreshPrerequisites: refreshPrerequisites)
     }
     public func enrollmentProgress() async throws -> [String: VaultEnrollmentProgress] {
         guard let context = state.withLock({ $0.context }) else { return [:] }
@@ -642,6 +647,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             guard current.generation == generation else { return false }
             // Only completed, interaction-disabled contexts are visible to the
             // no-prompt background loader. Pending authentication is separate.
+            if current.authorization == nil { current.enrollmentAuthorizedAt = ProcessInfo.processInfo.systemUptime }
             current.authorization = ContextInvalidator(authorization)
             current.pendingAuthorization = nil
             return true

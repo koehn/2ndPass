@@ -94,7 +94,7 @@ public final class GrantBackedContentSession: @unchecked Sendable {
 
     /// Passed only the public account/lease permit. The session adds its own
     /// secret-key gate and checks it again at the final durable commit.
-    public func handle(_ operation: SyncOperation, owner: any RepositoryWritePermit, recovery: (any DeviceOperations)? = nil, grantRequestScope: EnrollmentScope? = nil) async -> SyncOperationOutcome {
+    public func handle(_ operation: SyncOperation, owner: any RepositoryWritePermit, recovery: (any DeviceOperations)? = nil, grantRequestScope: EnrollmentScope? = nil, now: Date = Date()) async -> SyncOperationOutcome {
         guard operation.account == binding.account, operation.database == binding.database,
               operation.vaultID == binding.vaultID, operation.zoneOwner == binding.zoneOwner else { return .attention(.invalidAuthority) }
         do {
@@ -108,8 +108,7 @@ public final class GrantBackedContentSession: @unchecked Sendable {
                     generation: missing.keyGeneration, recipient: missing.recipient,
                     detail: "sourceGrantPresent=\(snapshot.sourceGrant != nil)")
                 guard let existing = snapshot.sourceGrant else {
-                    if let grantRequestScope { _ = try await requestOwnGrant(for: operation, scope: grantRequestScope, owner: owner) }
-                    return .retry(.dependency)
+                    return try await waitForOwnGrant(operation, item: missing.scope, requestScope: grantRequestScope, owner: owner, now: now)
                 }
                 let verified = try ContentGrantPreparation(bytes: snapshot.version.ciphertext, item: missing.scope.itemID, history: history)
                 guard verified.content.header.version == snapshot.version.versionID,
@@ -141,14 +140,21 @@ public final class GrantBackedContentSession: @unchecked Sendable {
                 catch CloudSyncAdapterError.membershipUnavailable {
                     guard let recovery, history.current.membership.offlineRecovery == recovery.identity,
                           let source = try await repository.contentGrants(scope: scope, keyGeneration: content.header.keyGeneration)
-                            .first(where: { $0.recipient == recovery.identity.fingerprint }) else { return .retry(.dependency) }
+                            .first(where: { $0.recipient == recovery.identity.fingerprint }) else {
+                        return try await waitForOwnGrant(operation, item: scope, requestScope: grantRequestScope, owner: owner, now: now)
+                    }
                     grant = try ContentKeyGrant.decode(source.bytes, content: content, history: history); decryptor = recovery
                 }
                 let acceptedVersion = try await repository.acceptedVersion(scope)
                 let accepted = try acceptedVersion.map { try ContentEnvelope.decode($0.ciphertext, history: history, item: scope.itemID) }
                 var ancestors: [ContentEnvelope] = [], cursor = content
                 while cursor.header.version != accepted?.header.version, let base = cursor.header.base {
-                    guard let stored = try await repository.contentVersion(scope: scope, version: base) else { return .retry(.dependency) }
+                    guard let stored = try await repository.contentVersion(scope: scope, version: base) else {
+                        let dependency = SyncDependency(.content, identifier: scope.vaultID.uuidString + ":" + scope.itemID.uuidString + ":" + base.uuidString)
+                        guard let fetch = ContentVersionFetch(dependency: dependency) else { return .attention(.invalidAuthority) }
+                        _ = try await repository.enqueuePrerequisite(fetch.operation(account: binding.account, owner: binding.zoneOwner), permit: authorization)
+                        return .waiting([dependency])
+                    }
                     let parent = try ContentEnvelope.decode(stored.version.ciphertext, history: history, item: scope.itemID)
                     guard parent.header.generation + 1 == cursor.header.generation else { return .attention(.invalidAuthority) }
                     ancestors.append(parent); cursor = parent
@@ -282,7 +288,18 @@ extension GrantBackedContentSession {
             payload: payload, history: history, device: $0) }
         let record = try PreparedCoordinationRecord(account: binding.account, vault: binding.vaultID, kind: recordKind,
             identity: identity, bytes: envelope.encoded())
-        _ = try await repository.enqueueCoordination(record, authorization: ContentWorkPermit(owner: owner, session: permit))
+        do { _ = try await repository.enqueueCoordination(record, authorization: ContentWorkPermit(owner: owner, session: permit)) }
+        catch SyncJournalError.identityCollision where kind == .grantRequest {
+            // Two app-group workers can sign the same deterministic request
+            // before either commits. Keep the authenticated durable winner.
+            guard let winner = try await repository.preparedCoordination(account: binding.account,
+                vault: binding.vaultID, kind: recordKind, identity: identity) else { throw SyncJournalError.identityCollision }
+            let decoded = try CoordinationEnvelope.decode(winner.bytes, scope: scope)
+            try decoded.verifyAuthority(history: history)
+            guard decoded.kind == kind, decoded.identity == identity, decoded.author == self.identity,
+                  decoded.payload == payload else { throw MopError.vaultUntrusted }
+            return winner
+        }
         return record
     }
 }
@@ -322,11 +339,42 @@ extension GrantBackedContentSession {
 }
 
 extension GrantBackedContentSession {
+    static let initialGrantRepairDelay: TimeInterval = 120
+
+    private func waitForOwnGrant(_ operation: SyncOperation, item: ItemScope, requestScope: EnrollmentScope?,
+                                 owner: any RepositoryWritePermit, now: Date) async throws -> SyncOperationOutcome {
+        guard let state = try await repository.contentState(scope: item) else { return .retry(.dependency) }
+        let dependency = try GrantRequestWait(vault: item.vaultID, item: item.itemID, version: state.versionID,
+            membership: history.current.digest(), recipient: identity.fingerprint, keyGeneration: state.keyGeneration).dependency()
+        let deadline = operation.createdAt.addingTimeInterval(Self.initialGrantRepairDelay)
+        if now < deadline,
+           try await repository.enrollmentProgressRecipient(scope: VaultScope(account: item.account, vaultID: item.vaultID, database: item.database, zoneOwner: item.zoneOwner)) == identity.fingerprint {
+            // Admission already queues grants on existing devices. Do not create
+            // per-item repair traffic or head fetches while those grants arrive.
+            // The operation's durable creation time prevents restart/foreground
+            // wakes from extending the wait indefinitely. This hint grants no access.
+            return .waitingUntil([dependency], deadline)
+        }
+        if let requestScope { _ = try await requestOwnGrant(for: operation, scope: requestScope, owner: owner) }
+        // Another survivor may already have rotated this head. Refresh once per
+        // observation as well as publishing the signed access request. Neither
+        // reception nor a completed fetch makes the wait ready: inbox verification does.
+        let fetch = ContentHeadFetch(vault: item.vaultID, item: item.itemID,
+            observedVersion: state.versionID, membership: try history.current.digest())
+        _ = try await repository.enqueuePrerequisite(fetch.operation(account: binding.account, owner: binding.zoneOwner),
+            permit: ContentWorkPermit(owner: owner, session: permit))
+        return .waiting([dependency])
+    }
+
     func requestOwnGrant(for operation: SyncOperation, scope: EnrollmentScope, owner: any RepositoryWritePermit) async throws -> Bool {
-        guard operation.kind == .prepareGrant else { return false }
-        let missing = try JSONDecoder().decode(MissingContentGrant.self, from: operation.payload)
-        guard missing.scope == binding.item(missing.scope.itemID), let stored = try await repository.item(missing.scope) else { return false }
-        let content = try ContentEnvelope.decode(stored.ciphertext, history: history, item: missing.scope.itemID)
+        let item: ItemScope
+        switch operation.kind {
+        case .prepareGrant: item = try JSONDecoder().decode(MissingContentGrant.self, from: operation.payload).scope
+        case .rotateContent: item = try JSONDecoder().decode(ItemScope.self, from: operation.payload)
+        default: return false
+        }
+        guard item == binding.item(item.itemID), let stored = try await repository.item(item) else { return false }
+        let content = try ContentEnvelope.decode(stored.ciphertext, history: history, item: item.itemID)
         do { _ = try await grant(for: content); return false }
         catch CloudSyncAdapterError.membershipUnavailable { }
         let request = ContentGrantRequest(item: content.header.item, keyGeneration: content.header.keyGeneration, recipient: identity.fingerprint)

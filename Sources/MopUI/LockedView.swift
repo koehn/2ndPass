@@ -25,21 +25,23 @@ struct LockedView: View {
         VStack(spacing: 16) {
             Text(model.connectionTitle).font(.title2)
             if !model.connectionNeedsUnlock {
-                ProgressView().accessibilityLabel("Waiting for vault connection")
+                ProgressView().accessibilityLabel(model.connectionTitle)
             }
             Text(model.connectionExplanation)
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 420)
             if model.connectionNeedsUnlock {
-                Button(model.unlockQueued ? "Waiting to unlock…" : model.unlockStarting ? "Unlocking…" : "Unlock this device") {
+                Button(model.unlockQueued ? "Waiting to unlock…" : model.unlockStarting ? "Unlocking…" : "Unlock 2ndPass") {
                     model.authorizeVaultConnection()
-                }.disabled(!model.canUnlock)
+                }.disabled(!model.canAuthorizeVaultConnection)
             }
-            if let date = model.connectionLastProgress {
-                HStack { Text("Last progress"); Text(date, style: .relative); Text("ago") }
-                    .font(.caption).foregroundStyle(.secondary)
+            if let progress = model.connectionProgressText {
+                Text(progress).font(.callout)
             }
-            Button("Check Again") { model.discover(autoUnlock: false) }.disabled(model.busy)
+            if let issue = model.syncIssue {
+                Text(issue).font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 420)
+            }
         }.accessibilityIdentifier("Enrollment progress")
     }
 

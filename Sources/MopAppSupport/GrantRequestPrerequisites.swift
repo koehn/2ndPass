@@ -11,16 +11,19 @@ struct GrantRequestWait: Codable, Equatable {
     let version: UUID?
     let membership: String
     let missingVersion: UUID?
+    let recipient: String?
+    let keyGeneration: UUID?
 
     func dependency() throws -> SyncDependency {
-        .init(.grantRequestState, identifier: vault.uuidString + ":" + (try JSONEncoder().encode(self)).base64EncodedString())
+        .init(recipient == nil ? .grantRequestState : .grant, identifier: vault.uuidString + ":" + (try JSONEncoder().encode(self)).base64EncodedString())
     }
-    init(vault: UUID, item: UUID, version: UUID?, membership: String, missingVersion: UUID? = nil) {
+    init(vault: UUID, item: UUID, version: UUID?, membership: String, missingVersion: UUID? = nil, recipient: String? = nil, keyGeneration: UUID? = nil) {
         self.vault = vault; self.item = item; self.version = version; self.membership = membership; self.missingVersion = missingVersion
+        self.recipient = recipient; self.keyGeneration = keyGeneration
     }
     init?(dependency: SyncDependency) {
         let parts = dependency.identifier.split(separator: ":", omittingEmptySubsequences: false)
-        guard dependency.kind == .grantRequestState, parts.count == 2,
+        guard [.grantRequestState, .grant].contains(dependency.kind), parts.count == 2,
               let data = Data(base64Encoded: String(parts[1])),
               let value = try? JSONDecoder().decode(Self.self, from: data),
               parts[0] == Substring(value.vault.uuidString) else { return nil }
@@ -30,6 +33,8 @@ struct GrantRequestWait: Codable, Equatable {
         guard scope.vaultID == vault, scope.itemID == item, history.vault == vault else { return false }
         if try history.current.digest() != membership { return true }
         if try await repository.contentState(scope: scope)?.versionID != version { return true }
+        if let recipient, let keyGeneration,
+           try await !repository.contentGrants(scope: scope, keyGeneration: keyGeneration, recipient: recipient).isEmpty { return true }
         if let missingVersion { return try await repository.contentVersion(scope: scope, version: missingVersion) != nil }
         return false
     }
@@ -38,10 +43,33 @@ struct GrantRequestWait: Codable, Equatable {
 struct GrantRequestPrerequisites {
     let repository: EncryptedItemRepository
 
+    /// Manual synchronization can refresh an unchanged observation once more.
+    /// Background wakes keep the ordinary deduplication and retry policy.
+    func refreshWaitingHeads(account: String, owner: String, permit: any RepositoryWritePermit) async throws {
+        var refreshed: Set<UUID> = []
+        var requests: [SyncOperation] = []
+        for operation in try await repository.activeOperations(account: account, database: "private")
+            where operation.state == .waitingForDependency && operation.zoneOwner == owner {
+            for dependency in operation.dependencies {
+                guard let wait = GrantRequestWait(dependency: dependency), wait.vault == operation.vaultID,
+                      wait.missingVersion == nil else { continue }
+                let fetch = try ContentHeadFetch(vault: wait.vault, item: wait.item, observedVersion: wait.version,
+                    membership: wait.membership).operation(account: account, owner: owner)
+                guard refreshed.insert(fetch.id).inserted else { continue }
+                requests.append(fetch)
+            }
+        }
+        try await repository.refreshCompletedContentHeadFetches(requests, permit: permit)
+    }
+
     /// Caller has strictly verified the signed request, including its recipient.
     func reconcile(request: ContentGrantRequest, scope: ItemScope, history: TrustedMembershipHistory,
-                   permit: any RepositoryWritePermit) async throws -> SyncOperationOutcome {
+                   permit: any RepositoryWritePermit, localRecipient: String? = nil) async throws -> SyncOperationOutcome {
         guard request.item == scope.itemID, scope.vaultID == history.vault, scope.database == "private" else { throw MopError.vaultUntrusted }
+        // An authenticated echo of this device's own request is a delivery
+        // acknowledgment, not work this same device can fulfill. Its original
+        // prepareGrant/rotation wait remains responsible for receiving access.
+        if request.recipient == localRecipient { return .completed }
         let policy = try GrantBackedContentStorage.recipientPolicy(history: history)
         let state = try await repository.contentState(scope: scope)
         func wait(missingVersion: UUID? = nil) async throws -> SyncOperationOutcome {

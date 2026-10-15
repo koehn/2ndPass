@@ -215,6 +215,10 @@ final class AppModel {
     var searchScope: String { collection.title ?? (vaultName.isEmpty ? "Items" : vaultName) }
     var members: [VaultMemberRecord] = []
     var settingsVisible = false
+    private(set) var enrollmentResetRequiresRestart = false
+    var enrollmentResetAlertPresented = false
+    static let enrollmentResetInstructions = "Force quit 2ndPass now. Do not restart it until your other devices have finished re-syncing. Keep those devices online and unlocked; on Mac, use Vault → Force reconcile. Reopen this app only when you are ready to begin re-enrollment."
+
     var devices: [VaultDeviceRecord] = []
     var recoveryInProgress = false
     var deviceRemoved = false
@@ -236,16 +240,29 @@ final class AppModel {
     var isConnectingVaults: Bool {
         connectionUnlockPending || (authenticated && vaults.contains { $0.supported && !$0.enrolled })
     }
-    var connectionNeedsUnlock: Bool { !service.isAuthenticated && !authenticated }
+    private(set) var enrollmentAuthorizedAt: TimeInterval?
+    private var hasConnectionAuthorization: Bool {
+        _ = enrollmentAuthorizedAt // Observe changes to the backend authorization snapshot.
+        return service.isAuthenticated || service.enrollmentAuthorizedAt != nil
+    }
+    var connectionNeedsUnlock: Bool { !hasConnectionAuthorization && !authenticated }
+    var canAuthorizeVaultConnection: Bool { connectionNeedsUnlock && canUnlock }
     var connectionTitle: String {
-        if connectionNeedsUnlock { return "Unlock this device to connect" }
-        if waitingForVaultMetadata { return "Device connected" }
-        return "Waiting for secure access"
+        if connectionNeedsUnlock { return "Unlock 2ndPass to continue" }
+        if waitingForVaultMetadata { return "Setting up your vault" }
+        return "Waiting for vault access"
     }
     var connectionExplanation: String {
-        if connectionNeedsUnlock { return "Unlock this device to continue connecting. Your progress is saved." }
-        if waitingForVaultMetadata { return "Receiving encrypted vault data and secure access through iCloud. Your vault will open automatically when ready." }
+        if connectionNeedsUnlock { return "Authenticate on this device to connect your vault. Your progress is saved." }
+        if waitingForVaultMetadata { return "This device has been approved. Waiting for encrypted items and secure access through iCloud. Your vault will open automatically when ready." }
         return "Keep 2ndPass open and unlocked on an existing device. This device will continue automatically when secure access arrives through iCloud."
+    }
+    var connectionProgressText: String? {
+        guard !connectionNeedsUnlock, let progress = connectionProgress, progress.total > 0 else { return nil }
+        // Counts include vault metadata and grant-covered records, not verified catalog rows.
+        // Discovery can increase the total; avoid presenting a misleading percentage.
+        return progress.ready == 1 ? "Secure access received for 1 record"
+            : "Secure access received for \(progress.ready) records"
     }
     var outgoingAccessStatus: String? {
         guard let health = synchronizationHealth else { return nil }
@@ -271,13 +288,15 @@ final class AppModel {
     @ObservationIgnored private var syncWakeTask: Task<Void, Never>?
     private var syncWakeID: UUID?
     private var syncWakeAgain = false
+    private var refreshPrerequisitesOnNextWake = false
 
     /// Only lifecycle, push, explicit refresh and unlock call this. Store changes
     /// update the view without generating another cloud request feedback loop.
-    func requestBackgroundSynchronization() {
+    func requestBackgroundSynchronization(refreshPrerequisites: Bool = false) {
         Self.logger.notice("Sync trace: UI wake; active=\(self.isActive) authenticated=\(self.authenticated) serviceAuthenticated=\(self.service.isAuthenticated)")
-        guard isActive, authenticated, service.isAuthenticated else { return }
+        guard isActive, hasConnectionAuthorization else { return }
         syncWakeAgain = true
+        refreshPrerequisitesOnNextWake = refreshPrerequisitesOnNextWake || refreshPrerequisites
         guard syncWakeTask == nil else { return }
         let id = UUID(), token = generation
         syncWakeID = id; requestingSynchronization = true
@@ -292,7 +311,9 @@ final class AppModel {
             repeat {
                 self.syncWakeAgain = false
                 do {
-                    try await self.service.requestSynchronization()
+                    let refreshPrerequisites = self.refreshPrerequisitesOnNextWake
+                    self.refreshPrerequisitesOnNextWake = false
+                    try await self.service.requestSynchronization(refreshPrerequisites: refreshPrerequisites)
                     guard self.generation == token, !Task.isCancelled else { return }
                     let health = try await self.service.synchronizationHealth()
                     guard self.generation == token, !Task.isCancelled else { return }
@@ -308,7 +329,7 @@ final class AppModel {
                     self.recordError(error, operation: "Resume iCloud synchronization")
                     self.syncIssueDetails = self.errorDetails
                 }
-            } while self.syncWakeAgain && self.isActive && self.authenticated && self.generation == token && !Task.isCancelled
+            } while self.syncWakeAgain && self.isActive && self.hasConnectionAuthorization && self.generation == token && !Task.isCancelled
         }
     }
     func applySyncHealth(_ health: SyncHealthSnapshot) {
@@ -331,8 +352,38 @@ final class AppModel {
         else if health.blockedReasons.contains(.processing) { syncIssue = "Synchronization encountered a processing error. Your local changes are saved." }
         else if health.blockedReasons.contains(.conflict) { syncIssue = "Review conflicting item edits to finish synchronization." }
         else if health.blockedReasons.contains(.authorization) { syncIssue = "Unlock an authorized device to finish sharing secure access." }
+        else if health.blockedReasons.contains(.inboxFull) { syncIssue = Self.blockedWorkExplanation(.inboxFull) }
+        else if let blocked = health.blockedWork.first { syncIssue = Self.blockedWorkExplanation(blocked.reason) }
+        else if health.blockedReasons.contains(.dependency) { syncIssue = Self.blockedWorkExplanation(.prerequisite) }
+        else if health.blockedReasons.contains(.transport) { syncIssue = Self.blockedWorkExplanation(.transport) }
         else { syncIssue = nil }
-        syncIssueDetails = nil
+        syncIssueDetails = health.blockedWork.isEmpty ? nil : health.blockedWork.map { blocked in
+            var text = "\(blocked.count) operation(s): " + Self.blockedWorkExplanation(blocked.reason)
+            if let oldest = blocked.oldestOperationAt { text += " Oldest operation created: \(oldest.formatted(.iso8601))." }
+            if let next = blocked.nextAttempt { text += " Next scheduled attempt in this group: \(next.formatted(.iso8601))." }
+            else if [.missingGrant, .missingContent, .missingMembership, .unprovenGeneration, .prerequisite].contains(blocked.reason) {
+                text += " Waiting for verified data or access; no timed retry is scheduled."
+            } else { text += " No timed retry is scheduled. Follow the action above." }
+            return text
+        }.joined(separator: "\n\n")
+    }
+
+    static func blockedWorkExplanation(_ reason: SyncBlockReason) -> String {
+        switch reason {
+        case .missingGrant: "Secure access is missing. Keep another authorized device open and unlocked, then synchronize both devices. If none has access, use your offline recovery copy."
+        case .missingContent: "An encrypted item version is missing. Reconnect and synchronize the device that last edited it; its verified version is required before this operation can continue."
+        case .missingMembership: "Verified device membership is missing. Keep an existing authorized device online and synchronize both devices."
+        case .unprovenGeneration: "An access request has no verified matching item history yet. Synchronize the requesting device and an existing authorized device. If it persists, review recovery with your offline recovery copy."
+        case .prerequisite: "Synchronization is waiting for required data or access. Keep an authorized device open and unlocked and synchronize both devices; review any verification or conflict errors."
+        case .authorization: "Unlock an authorized device to continue synchronization."
+        case .transport: "iCloud could not deliver required data. Check connectivity and iCloud availability; synchronization will retry automatically."
+        case .verification: "Cloud data could not be verified. Review the affected vault's recovery options using your offline recovery copy. Local data is preserved."
+        case .conflict: "Review conflicting item edits to finish synchronization."
+        case .inboxFull: "The sync inbox is full. Downloads will resume automatically after queued changes are processed."
+        case .storage: "Check available storage and retry synchronization. Local changes are saved."
+        case .processing: "Synchronization could not process an operation. Restart the app; if it persists, retain diagnostics for support."
+        case .account: "Sign in to the original iCloud account to resume synchronization."
+        }
     }
     var enrollmentProgress: [String: VaultEnrollmentProgress] = [:] {
         didSet { if enrollmentProgress != oldValue && !enrollmentProgress.isEmpty { connectionLastProgress = Date() } }
@@ -603,7 +654,7 @@ final class AppModel {
     }
     // Read-only work must not toggle the button. unlock() queues the request
     // behind a foreground operation and disables it only while that request waits.
-    var canUnlock: Bool { !authenticated && (!applicationUnlocked || hasConnectedVaults) && startupFinished && !unlockStarting && !deviceRemoved }
+    var canUnlock: Bool { !enrollmentResetRequiresRestart && !authenticated && (!applicationUnlocked || hasConnectedVaults) && startupFinished && !unlockStarting && !deviceRemoved }
     private(set) var pendingTransition: PendingTransition?
     var showsUnsavedChanges = false
     private(set) var selectionGeneration = 0
@@ -703,7 +754,8 @@ final class AppModel {
     }
     deinit { conflictRefreshTask?.cancel(); syncWakeTask?.cancel(); catalogLoadTask?.cancel(); usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); storeChangesTask?.cancel() }
     func checkExpiration() {
-        if let started = service.authenticatedAt ?? localSessionStarted {
+        enrollmentAuthorizedAt = service.enrollmentAuthorizedAt
+        if let started = service.authenticatedAt ?? enrollmentAuthorizedAt ?? localSessionStarted {
             if lastActivity == nil { lastActivity = started }
             if recoveryIdleLockHolds.isEmpty, now() - (lastActivity ?? started) >= Double(autoLockMinutes * 60) {
                 lock(reason: .timeout)
@@ -719,6 +771,7 @@ final class AppModel {
         scheduleAutomaticUnlock()
     }
     private func scheduleAutomaticUnlock() {
+        guard !enrollmentResetRequiresRestart else { return }
         if needsAccountDiscovery, isActive, !busy {
             needsAccountDiscovery = false
             Task { [weak self] in self?.discover() }
@@ -747,7 +800,7 @@ final class AppModel {
         service.userActivity()
         checkExpiration()
         guard isActive else { return }
-        if service.isAuthenticated || localSessionStarted != nil { lastActivity = now() }
+        if hasConnectionAuthorization || localSessionStarted != nil { lastActivity = now() }
     }
     private let usageStore: any ItemUsageStoring
     private(set) var lastUsed: [ItemUsageIdentity: Date] = [:] {
@@ -1369,6 +1422,7 @@ final class AppModel {
         conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil
     }
     func activate() {
+        guard !enrollmentResetRequiresRestart else { return }
         service.setMaintenanceActive(true)
         Task { try? await AutoFillPublisher.shared.reconcile() }
         checkExpiration(); isActive = true
@@ -1379,7 +1433,7 @@ final class AppModel {
             launchUnlockAvailable = true
         }
         reloadUsage()
-        if service.isAuthenticated || localSessionStarted != nil, !busy { lastActivity = now() }
+        if hasConnectionAuthorization || localSessionStarted != nil, !busy { lastActivity = now() }
         scheduleAutomaticUnlock(); checkRetention()
         if launchAttempted {
             requestBackgroundSynchronization()
@@ -1419,7 +1473,7 @@ final class AppModel {
         usageLoadTask?.cancel(); usageLoadGeneration += 1; lastUsed = [:]
         search = ""; searchHighlighted = nil; searchIsFocused = false; lastBackupURL = nil
         syncWakeTask?.cancel(); syncWakeTask = nil; syncWakeID = nil
-        syncWakeAgain = false; requestingSynchronization = false; syncIssue = nil; syncIssueDetails = nil
+        syncWakeAgain = false; refreshPrerequisitesOnNextWake = false; requestingSynchronization = false; syncIssue = nil; syncIssueDetails = nil
         synchronizationHealth = nil
         connectionUnlockPending = false; waitingForVaultMetadata = false; connectionLastProgress = nil
         lockReason = reason; unlocking = false; unlockQueued = false; launchUnlockAvailable = false
@@ -1427,7 +1481,7 @@ final class AppModel {
         copyFeedback = nil; exchangeOutput = ""
         automaticUnlockTask?.cancel(); automaticUnlockTask = nil
         cancelCatalogLoading()
-        service.lock(); operationTask?.cancel(); refreshTask?.cancel(); lastActivity = nil
+        service.lock(); enrollmentAuthorizedAt = nil; operationTask?.cancel(); refreshTask?.cancel(); lastActivity = nil
         clearView(); if clearClipboard { self.clearClipboard() }
         status = "Locked"
     }
@@ -1507,7 +1561,7 @@ final class AppModel {
 
     func perform(local: Bool = false, operation: String = #function, file: String = #fileID, line: Int = #line, _ action: @escaping @MainActor (Int) async throws -> Void) {
         checkExpiration()
-        guard !busy else { return }
+        guard !enrollmentResetRequiresRestart, !busy else { return }
         foregroundRevision += 1
         busy = true; localOperation = local; error = nil; notice = nil
         let token = generation
@@ -1582,7 +1636,7 @@ final class AppModel {
     }
 
     func discover(autoUnlock: Bool = false, selectedOnly: Bool = false) {
-        guard !busy, allowTransition(.refresh) else { return }
+        guard !enrollmentResetRequiresRestart, !busy, allowTransition(.refresh) else { return }
         let refreshContents = authenticated
         if autoUnlock && !authenticated { unlocking = true }
         perform { token in
@@ -1613,7 +1667,7 @@ final class AppModel {
                 row.enrolled && self.vaults.contains { $0.id == row.id && !$0.enrolled }
             }
             self.enrollmentProgress = result.enrollmentProgress
-            if !self.authenticated, rows.contains(where: { $0.supported && $0.enrolled }),
+            if !self.authenticated, self.hasConnectionAuthorization, rows.contains(where: { $0.supported && $0.enrolled }),
                result.enrollmentProgress.values.contains(where: { $0.total > 0 && $0.ready < $0.total }) {
                 self.waitingForVaultMetadata = true
                 self.connectionUnlockPending = true
@@ -1650,14 +1704,14 @@ final class AppModel {
         }
     }
     func authorizeVaultConnection() {
-        guard isActive, !authenticated, !unlocking, !deviceRemoved else { return }
+        guard isActive, connectionNeedsUnlock, !authenticated, !unlocking, !deviceRemoved else { return }
         launchUnlockAvailable = false; accessNeedsRepair = false; error = nil
         if busy { unlockQueued = true; return }
         unlockQueued = false
         discover(autoUnlock: true)
     }
     func unlock() {
-        guard !authenticated, !unlocking, isActive, !deviceRemoved else { return }
+        guard !enrollmentResetRequiresRestart, !authenticated, !unlocking, isActive, !deviceRemoved else { return }
         launchUnlockAvailable = false; accessNeedsRepair = false; error = nil
         if busy { unlockQueued = true; return }
         unlockQueued = false
@@ -2055,21 +2109,16 @@ final class AppModel {
         perform { _ in
             do { try await self.service.debugResetEnrollment() }
             catch { self.error = (error as? LocalizedError)?.errorDescription ?? "Enrollment reset failed."; return }
-            self.operationTask = nil // Lock must not cancel the fresh discovery below.
+            self.operationTask = nil // Lock must not cancel the reset completion below.
             self.lock()
             self.deviceRemoved = false; self.removalCleanupPending = false
             self.vaults = []; self.vault = ""; self.devices = []
             self.accessNeedsRepair = false
-            self.notice = "Enrollment reset. Unlock an existing owner device to approve this device again."
-            do {
-                let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
-                self.offline = discovery.usingCache
-                self.vaults = discovery.vaults
-                self.sheet = .enrollDevice
-            } catch {
-                self.error = "Enrollment was reset. Cloud discovery could not finish; reopen the app to continue."
-                self.recordError(error, operation: "debugResetEnrollment discovery")
-            }
+            // This process must not discover or enroll again after clearing its identity.
+            self.enrollmentResetRequiresRestart = true
+            self.service.setMaintenanceActive(false)
+            self.notice = Self.enrollmentResetInstructions
+            self.enrollmentResetAlertPresented = true
         }
     }
     #endif
@@ -2489,9 +2538,10 @@ extension AppModel {
     func showSettingsCategory(_ category: SettingsCategory) { settingsCategory = category }
 
     func refresh() {
+        guard !enrollmentResetRequiresRestart else { return }
         service.invalidateDiscovery()
         if isLocalVaultSelected { openLocalVault(); return }
-        requestBackgroundSynchronization()
+        requestBackgroundSynchronization(refreshPrerequisites: true)
         requestTransition(.refresh)
     }
 

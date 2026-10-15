@@ -157,9 +157,12 @@ public protocol VaultService: Sendable {
     func invalidateDiscovery()
     /// Foreground/push wake, independent of local catalog reads and authentication.
     func requestSynchronization() async throws
+    func requestSynchronization(refreshPrerequisites: Bool) async throws
     func synchronizationHealth() async throws -> SyncHealthSnapshot?
     var sessionGeneration: Int { get }
     var authenticatedAt: TimeInterval? { get }
+    /// Authorization retained while a new device waits for vault admission.
+    var enrollmentAuthorizedAt: TimeInterval? { get }
     var operationProgress: String? { get }
     var operationFraction: Double? { get }
     func endRecoverySession()
@@ -197,6 +200,7 @@ public extension VaultService {
     }
     func invalidateDiscovery() {}
     func requestSynchronization() async throws {}
+    func requestSynchronization(refreshPrerequisites: Bool) async throws { try await requestSynchronization() }
     func synchronizationHealth() async throws -> SyncHealthSnapshot? { nil }
     var capabilities: Set<VaultServiceCapability> { Set(VaultServiceCapability.allCases) }
     func events() async -> AsyncStream<VaultChange> {
@@ -218,6 +222,7 @@ public extension VaultService {
     func cachedCatalog(vault: String) async throws -> VaultResult? { nil }
     var operationProgress: String? { nil }
     var operationFraction: Double? { nil }
+    var enrollmentAuthorizedAt: TimeInterval? { nil }
     var isAuthenticated: Bool { authenticatedAt != nil }
     func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult {
         guard isAuthenticated else { throw MopError.authentication }

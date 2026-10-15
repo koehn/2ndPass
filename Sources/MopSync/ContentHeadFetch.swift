@@ -72,7 +72,7 @@ public struct ContentHeadFetcher: Sendable {
             try await repository.finishContentHeadFetch(operation, incoming: incoming, permit: permit)
             return .completed
         } catch SyncJournalError.staleOperation { return .retry(.dependency) }
-        catch SyncJournalError.inboxFull { return .retry(.storagePressure) }
+        catch SyncJournalError.inboxFull { return .retry(.inboxFull) }
         catch CloudSyncAdapterError.operationInterrupted { return .retry(.authorization) }
         catch let error as CKError {
             // unknownItem can be publication ordering, never proof of deletion.

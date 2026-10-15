@@ -211,3 +211,65 @@ Waiting grant requests now persist their observed item head and membership diges
 A generation mismatch alone never retires a request. Retirement requires the existing verified removed-device path or a signed successor chain from the current publishable head, followed by a transactional state/policy check and reconciliation of current recipient grants. Unknown cloud records and unproven generations remain pending; genuine verification failures remain failures.
 
 Validation: 108 MopSync tests and 215 MopAppSupport tests passed with `swift test --disable-sandbox --filter 'MopSyncTests|MopAppSupportTests'` and the cache/permission settings above (`/tmp/mop-prereq-broad-final.log`). New regressions cover relevant versus unrelated changes, restart persistence, stale-head refresh, deduplicated fetches, missing ancestry, verified retirement versus unknown generations, excluded recipients, wrong record routes, unknown cloud records, checkpoint preservation, and bounded fetch/inbox scheduling. Live iCloud convergence of the iPad's existing backlog still requires a signed-device run.
+
+## Missing-prerequisite recovery and blocked-operation details (2026-10-14)
+
+Rotation and grant preparation now persist signed own-grant requests and an observation-scoped head refresh when local access is missing. Rotation persists exact ancestor fetches before waiting. Dependency availability is a scheduling hint only: normal authenticated inbox application and session/publication verification still gate access and writes. Durable engine checkpoints are untouched by prerequisite requests and manual refresh. Historical grants may be verified for recovery without permitting obsolete grants to be published.
+
+Sync health maintains incremental blocked-work groups containing counts, oldest operation creation dates and effective retry deadlines, without retaining payloads or dependency identifiers in the diagnostic projection. The existing sync issue details show corrective steps and distinguish untimed prerequisite waits from scheduled retries. Explicit Refresh/Synchronize can rearm completed unchanged-head reads in one transaction; lifecycle, push and other background wakes cannot. Responses awaiting verification, quarantined work and server retry floors are preserved.
+
+New regressions cover missing grants/ancestors across store reopening, request deduplication, malformed-record rejection, no readiness from reception alone, successful resumed rotation, unchanged checkpoints, manual retry floors, persisted/cleared health details, and manual versus background UI routing. Existing checkpoint, security, search and selection tests remain in the full suite. Full suite: 719 tests passed (`/tmp/mop-prerequisite-final.log`); the final batched-refresh change passed 113 additional sync and focused recovery/reporting/UI tests (`/tmp/mop-prerequisite-batch-final.log`). Physical-device CloudKit convergence remains a separate validation step; no production iCloud data, device enrollment, local app data or key hierarchy was changed.
+
+### Reset completion pause (2026-10-14)
+
+After a successful debug enrollment reset, the app locks and shows a force-quit
+alert. It does not discover vaults or open enrollment. Discovery, unlock,
+reconnect, and refresh remain blocked in that process even after dismissing the
+alert or returning to the foreground. Force quit; keep the remaining devices
+online and unlocked, using Vault → Force reconcile on Mac, and reopen the reset
+device only after the remaining devices have finished re-syncing. This pause
+does not claim to verify convergence on those devices. Failed resets retain
+their existing enrollment and error handling.
+
+### Bounded rotation readback regression
+
+Run `swift test --disable-sandbox --filter 'rotationBatch|previewRotationReadback'`
+with the module-cache environment above. Cases cover 895/1,000 operations,
+success/throttling, enrollment fairness, retry floors, partial responses,
+missing accepted heads, invalid payloads, account invalidation during fetch
+and between items, and unchanged checkpoints. Run
+`python3 scripts/test_audit_cloud_sync.py` for offline timing-parser checks.
+The full suite retains interrupted rotation recovery and signature/authority
+tests. These are software tests, not CloudKit/Secure Enclave measurements.
+
+Validation result: full Swift suite passed 723 tests. After the final runtime
+error-routing adjustment, all 6 targeted tests passed (including four scheduler
+parameter cases); both Python parser tests passed. The repeated local 895-item
+benchmark recorded 18.45 s for rotation and 2.60 s for new-device grants, excluding
+CloudKit and Secure Enclave. No physical-device reset or production data change
+was performed.
+
+## Enrollment grant-request suppression (2026-10-15)
+
+Grant preparation is indexed per item and recipient on every device. Previously,
+a newly admitted device immediately requested its own missing grant, even while
+existing devices were preparing those grants automatically. Initial enrollment
+now waits up to 120 seconds from each durable operation's creation before
+publishing repair requests or fetching heads. Verified grant arrival releases
+the wait early; restart, foreground and unlock do not extend or bypass its
+deadline. Existing devices with source grants still prepare grants immediately.
+The enrollment marker is a scheduling hint, never evidence of authorization or
+completion. Grants still missing at the deadline use the existing repair path.
+
+Authenticated echoes addressed to the current session's recipient complete
+without starting another head fetch. Concurrent signing of the same deterministic
+grant request reuses the authenticated durable winner, while mismatched payloads
+are rejected. The wire format is unchanged.
+
+Regression coverage includes automatic grant arrival, timed repair, reopening
+the repository, repeated wakes, deduplicated requests and fetches, own-request
+echoes, concurrent signing and payload mismatch rejection. Physical-device
+iCloud enrollment remains a separate validation step.
+
+Validation: all 737 Swift tests passed (`/tmp/mop-enrollment-grant-full-tests.log`),
+and the unsigned generic iOS build succeeded (`/tmp/mop-grant-repair-ios.log`).

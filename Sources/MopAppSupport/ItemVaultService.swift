@@ -8,6 +8,7 @@ import MopSync
 import MopVaultNext
 
 public protocol ItemVaultServiceBackend: Sendable {
+    var enrollmentAuthorizedAt: TimeInterval? { get }
     #if DEBUG
     func debugResetEnrollment() async throws
     #endif
@@ -31,6 +32,7 @@ public protocol ItemVaultServiceBackend: Sendable {
     func inventory(offline: Bool) async throws -> [VaultDescriptor]
     func create(name: String, id: UUID, archiveData: Data?, recoveryKey: SecretBytes?) async throws -> ItemVaultSession
     func requestSync() async throws
+    func requestSync(refreshPrerequisites: Bool) async throws
     func enrollmentProgress() async throws -> [String: VaultEnrollmentProgress]
     func synchronizationHealth() async throws -> SyncHealthSnapshot?
     func waitForDelivery(_ mutationIDs: [UUID], timeout: Duration) async throws -> Bool
@@ -42,6 +44,8 @@ public protocol ItemVaultServiceBackend: Sendable {
     func resolveVault(named name: String, offline: Bool) async throws -> UUID?
 }
 public extension ItemVaultServiceBackend {
+    var enrollmentAuthorizedAt: TimeInterval? { nil }
+    func requestSync(refreshPrerequisites: Bool) async throws { try await requestSync() }
     #if DEBUG
     func debugResetEnrollment() async throws { throw ItemVaultServiceFailure.unavailable }
     #endif
@@ -235,11 +239,12 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         }
         return destinations.sorted { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
     }
-    public func requestSynchronization() async throws {
-        guard authenticatedAt != nil else { return }
+    public func requestSynchronization() async throws { try await requestSynchronization(refreshPrerequisites: false) }
+    public func requestSynchronization(refreshPrerequisites: Bool) async throws {
+        guard authenticatedAt != nil || enrollmentAuthorizedAt != nil else { return }
         let token = sessionGeneration
         // Do not resolve/open a vault or request biometric authorization here.
-        try await backend.requestSync()
+        try await backend.requestSync(refreshPrerequisites: refreshPrerequisites)
         try checked(token)
     }
     public func synchronizationHealth() async throws -> SyncHealthSnapshot? {
@@ -250,6 +255,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
     public var sessionGeneration: Int { state.withLock { $0.generation } }
     public var authenticatedAt: TimeInterval? { state.withLock { $0.authenticated } }
+    public var enrollmentAuthorizedAt: TimeInterval? { backend.enrollmentAuthorizedAt }
     public func changes() async -> AsyncStream<Void> {
         let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let source = await events()
@@ -626,7 +632,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             return result
         case .sync:
             guard !offline else { throw MopError.offlineWrite }
-            try await backend.requestSync()
+            try await backend.requestSync(refreshPrerequisites: true)
             var result = VaultResult()
             result.message = "Synchronization requested."
             result.mutationIDs = try await backend.pendingDeliveryReceipts(vault: vault.flatMap(UUID.init(uuidString:)))

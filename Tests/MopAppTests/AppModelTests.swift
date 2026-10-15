@@ -19,6 +19,9 @@ struct TestBreachClient: BreachChecking {
 private final class FakeService: VaultService, Sendable {
     struct State {
         var started: TimeInterval?
+        var enrollmentStarted: TimeInterval?
+        var authorizeEnrollment = false
+        var enrollmentPrompts = 0
         var locks = 0
         var operations: [VaultOperation] = []
         var progress: String?
@@ -29,6 +32,7 @@ private final class FakeService: VaultService, Sendable {
         var displayResult: VaultResult?
         var suggestionRefreshes = 0
         var syncRequests = 0
+        var prerequisiteRefreshes = 0
         var syncFails = false
         var enrollmentResets = 0
         var resetFails = false
@@ -69,6 +73,10 @@ private final class FakeService: VaultService, Sendable {
         if fails { throw DebugEnrollmentResetFailure.lastOwner }
     }
     #endif
+    func requestSynchronization(refreshPrerequisites: Bool) async throws {
+        if refreshPrerequisites { state.withLock { $0.prerequisiteRefreshes += 1 } }
+        try await requestSynchronization()
+    }
     func requestSynchronization() async throws {
         let fail = state.withLock { $0.syncRequests += 1; return $0.syncFails }
         if fail { throw MopError.cloudUnavailable }
@@ -92,6 +100,7 @@ private final class FakeService: VaultService, Sendable {
     func cachedCatalog(vault: String) async throws -> VaultResult? { try await cachedHandler(vault) }
 
     var authenticatedAt: TimeInterval? { state.withLock { $0.started } }
+    var enrollmentAuthorizedAt: TimeInterval? { state.withLock { $0.enrollmentStarted } }
     var capabilities: Set<VaultServiceCapability> { state.withLock { $0.capabilities } }
     func changes() async -> AsyncStream<Void> {
         let id = UUID()
@@ -118,9 +127,14 @@ private final class FakeService: VaultService, Sendable {
     var operationProgress: String? { state.withLock { $0.progress } }
     var operationFraction: Double? { state.withLock { $0.fraction } }
     func authenticate(at time: TimeInterval = 0) { state.withLock { $0.started = time } }
-    func lock() { state.withLock { $0.started = nil; $0.locks += 1 } }
+    func lock() { state.withLock { $0.started = nil; $0.enrollmentStarted = nil; $0.locks += 1 } }
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult {
-        state.withLock { $0.operations.append(operation) }
+        state.withLock {
+            $0.operations.append(operation)
+            if case .manage(.automaticEnrollment) = operation, $0.authorizeEnrollment, $0.enrollmentStarted == nil {
+                $0.enrollmentStarted = 0; $0.enrollmentPrompts += 1
+            }
+        }
         return try await handler(operation, vault, offline)
     }
 }
@@ -155,7 +169,7 @@ private actor Barrier {
         let app = model(service); app.vault = id
         app.discover(); try await finish(app)
         #expect(app.waitingForVaultMetadata)
-        #expect(app.connectionTitle == "Device connected")
+        #expect(app.connectionTitle == "Setting up your vault")
         #expect(!app.connectionNeedsUnlock)
         #expect(!app.unlocking && !app.busy)
     }
@@ -167,9 +181,103 @@ private actor Barrier {
         service.authenticate()
         #expect(!app.authenticated)
         #expect(!app.connectionNeedsUnlock)
-        #expect(app.connectionTitle == "Waiting for secure access")
+        #expect(app.connectionTitle == "Waiting for vault access")
         service.lock()
         #expect(app.connectionNeedsUnlock)
+    }
+
+    @Test func enrollmentAuthorizesOnceAndOpensFromStoreNotifications() async throws {
+        let stage = Mutex(0), id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            let current = stage.withLock { $0 }
+            var result = VaultResult()
+            if case .discover = operation {
+                result.vaults = [.init(id: id, name: nil, format: "mop-content-v3", enrolled: current > 0)]
+                if current > 0 { result.enrollmentProgress = [id: .init(ready: current == 1 ? 0 : 10, total: 10)] }
+            } else if case .catalog = operation {
+                if current < 2 { throw ItemVaultSessionFailure.missingVaultMetadata }
+                result.catalog = ItemCatalog(vault: "personal", revision: "ready", items: [])
+            }
+            return result
+        }
+        service.state.withLock { $0.authorizeEnrollment = true }
+        let app = model(service); app.vault = ""; app.vaults = []
+        app.start(); try await finish(app)
+        #expect(service.state.withLock { $0.enrollmentPrompts } == 1)
+        #expect(!service.isAuthenticated && !app.authenticated)
+        #expect(app.isConnectingVaults && !app.connectionNeedsUnlock)
+        #expect(!app.canAuthorizeVaultConnection)
+        #expect(app.connectionTitle == "Waiting for vault access")
+        let before = service.state.withLock { $0.operations.count }
+        app.authorizeVaultConnection()
+        #expect(service.state.withLock { $0.operations.count } == before)
+        app.requestBackgroundSynchronization()
+        let syncDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while service.state.withLock({ $0.syncRequests }) == 0, ContinuousClock.now < syncDeadline { await Task.yield() }
+        #expect(service.state.withLock { $0.syncRequests } > 0)
+        stage.withLock { $0 = 1 }; service.notifyChange()
+        let waitingDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !app.waitingForVaultMetadata, ContinuousClock.now < waitingDeadline { await Task.yield() }
+        try await finish(app)
+        #expect(app.waitingForVaultMetadata && !app.connectionNeedsUnlock)
+        #expect(app.connectionTitle == "Setting up your vault")
+        #expect(app.connectionProgressText == "Secure access received for 0 records")
+        stage.withLock { $0 = 2 }; service.notifyChange()
+        let readyDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !app.authenticated, ContinuousClock.now < readyDeadline { await Task.yield() }
+        #expect(app.rootPresentation == .ready && app.catalogs[id] != nil)
+        #expect(service.state.withLock { $0.enrollmentPrompts } == 1)
+        app.lock()
+        #expect(service.enrollmentAuthorizedAt == nil && app.connectionNeedsUnlock)
+    }
+
+    @Test func lockingDuringEnrollmentDoesNotReopenFromIncompleteProgress() async throws {
+        let admitted = Mutex(false), id = UUID().uuidString
+        let service = FakeService { operation, _, _ in
+            var result = VaultResult()
+            if case .discover = operation {
+                let connected = admitted.withLock { $0 }
+                result.vaults = [.init(id: id, name: nil, format: "mop-content-v3", enrolled: connected)]
+                if connected { result.enrollmentProgress = [id: .init(ready: 1, total: 10)] }
+            }
+            return result
+        }
+        service.state.withLock { $0.authorizeEnrollment = true }
+        let app = model(service); app.vault = ""; app.vaults = []
+        app.start(); try await finish(app)
+        #expect(!app.connectionNeedsUnlock)
+        app.lock()
+        admitted.withLock { $0 = true }
+        app.cloudChanged(); try await finish(app)
+        #expect(app.connectionNeedsUnlock && !app.waitingForVaultMetadata)
+        #expect(app.rootPresentation == .locked && !app.authenticated)
+        #expect(service.state.withLock { $0.displayCalls } == 0)
+        #expect(service.state.withLock { $0.enrollmentPrompts } == 1)
+        #expect(app.connectionProgressText == nil)
+    }
+
+    @Test func fullInboxStatusIsDistinctFromStorageFailureAndClearsAfterDrain() {
+        let app = model(FakeService())
+        app.applySyncHealth(SyncHealthSnapshot(pendingCount: 1, oldestPendingAt: nil, lastDeliveryAt: nil,
+            blockedReasons: [.inboxFull], pendingKinds: [.recoverTransport]))
+        #expect(app.syncIssue == "The sync inbox is full. Downloads will resume automatically after queued changes are processed.")
+        app.applySyncHealth(SyncHealthSnapshot(pendingCount: 1, oldestPendingAt: nil, lastDeliveryAt: nil,
+            blockedReasons: [.storagePressure, .inboxFull]))
+        #expect(app.syncIssue?.contains("local storage") == true)
+        app.applySyncHealth(SyncHealthSnapshot(pendingCount: 0, oldestPendingAt: nil, lastDeliveryAt: nil, blockedReasons: []))
+        #expect(app.syncIssue == nil)
+    }
+
+    @Test func enrollmentAuthorizationExpiresWithoutAnOpenCatalog() async throws {
+        let clock = Clock(), service = FakeService()
+        let app = model(service, clock: clock)
+        service.state.withLock { $0.enrollmentStarted = 0 }
+        app.checkExpiration()
+        #expect(!app.connectionNeedsUnlock)
+        clock.time = Double(app.autoLockMinutes * 60 + 1)
+        app.checkExpiration()
+        #expect(service.enrollmentAuthorizedAt == nil)
+        #expect(app.connectionNeedsUnlock && app.sessionState == .locked(.timeout))
     }
 
     @Test func connectionProgressTimestampOnlyChangesWithObservedProgress() {
@@ -183,7 +291,7 @@ private actor Barrier {
     }
 
     #if DEBUG
-    @Test func debugResetReturnsToFreshEnrollmentWithoutCancellingDiscovery() async throws {
+    @Test func debugResetStopsUntilRestartWithoutDiscoveryOrEnrollment() async throws {
         let service = FakeService { operation, _, _ in
             try Task.checkCancellation()
             var result = VaultResult()
@@ -197,8 +305,21 @@ private actor Barrier {
         app.debugResetEnrollment(); try await finish(app)
         #expect(service.state.withLock { $0.enrollmentResets } == 1)
         #expect(!app.authenticated)
-        #expect(app.vaults.map(\.id) == ["new"])
-        #expect(app.sheet == .enrollDevice)
+        #expect(app.vaults.isEmpty)
+        #expect(app.sheet == nil)
+        #expect(app.enrollmentResetRequiresRestart)
+        #expect(app.enrollmentResetAlertPresented)
+        #expect(app.notice == AppModel.enrollmentResetInstructions)
+        app.enrollmentResetAlertPresented = false
+        app.activate()
+        app.unlock()
+        app.discover(autoUnlock: true)
+        app.refresh()
+        app.reconnectDevice()
+        try await finish(app)
+        #expect(!app.canUnlock)
+        #expect(service.state.withLock { $0.operations.isEmpty && $0.syncRequests == 0 })
+        #expect(app.sheet == nil)
     }
     @Test func debugResetRefusalKeepsLocalEnrollmentAndExplainsWhy() async throws {
         let service = FakeService(); service.authenticate()
@@ -208,6 +329,8 @@ private actor Barrier {
         app.debugResetEnrollment(); try await finish(app)
         #expect(app.authenticated && app.vault == original)
         #expect(app.error == DebugEnrollmentResetFailure.lastOwner.errorDescription)
+        #expect(!app.enrollmentResetRequiresRestart)
+        #expect(!app.enrollmentResetAlertPresented)
     }
     #endif
     @Test func repeatedConflictUpdatesCoalesceWhileScanIsBlocked() async throws {
@@ -3753,4 +3876,40 @@ extension AppModelTests {
     let health = try await repository.syncHealth(account: "test", database: "private")
     #expect(health.pendingKinds.isEmpty)
     #expect(health.blockedReasons.contains(.invalidAuthority))
+}
+
+extension AppModelTests {
+    @Test func blockedPrerequisitesShowActionsAndClearAfterRecovery() {
+        let app = model(FakeService())
+        app.applySyncHealth(.init(pendingCount: 1, oldestPendingAt: nil, lastDeliveryAt: nil, blockedReasons: [.dependency],
+            blockedWork: [.init(reason: .missingGrant, count: 1, oldestOperationAt: Date(timeIntervalSince1970: 100), nextAttempt: nil)]))
+        #expect(app.syncIssue?.contains("authorized device") == true)
+        app.showSyncIssue()
+        #expect(app.errorDetails?.contains("1 operation(s)") == true)
+        #expect(app.errorDetails?.contains("Oldest operation created") == true)
+        app.applySyncHealth(.init(pendingCount: 0, oldestPendingAt: nil, lastDeliveryAt: nil, blockedReasons: []))
+        #expect(app.syncIssue == nil)
+        for reason in SyncBlockReason.allCases { #expect(!AppModel.blockedWorkExplanation(reason).isEmpty) }
+    }
+}
+
+
+extension AppModelTests {
+    @Test func onlyExplicitRefreshRechecksCompletedPrerequisites() async throws {
+        let service = FakeService { _, _, _ in
+            var result = VaultResult(); result.catalog = Self.catalog; return result
+        }
+        service.authenticate()
+        let app = model(service)
+        app.unlock(); try await finish(app)
+        app.requestBackgroundSynchronization()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while app.requestingSynchronization, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(service.state.withLock { $0.prerequisiteRefreshes } == 0)
+        app.refresh()
+        while service.state.withLock({ $0.prerequisiteRefreshes }) == 0, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(service.state.withLock { $0.prerequisiteRefreshes } == 1)
+        try await finish(app)
+        app.shutdown()
+    }
 }

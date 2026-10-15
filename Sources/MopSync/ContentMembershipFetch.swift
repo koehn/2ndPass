@@ -58,7 +58,7 @@ public struct ContentMembershipFetcher: Sendable {
             }
             try await repository.stageMembershipFetch(operation, incoming: incoming, permit: permit)
             return .retry(.dependency)
-        } catch SyncJournalError.inboxFull { return .retry(.storagePressure) }
+        } catch SyncJournalError.inboxFull { return .retry(.inboxFull) }
         catch SyncJournalError.staleOperation { return .retry(.dependency) }
         catch let error as CKError {
             AccessSyncTrace.failure("membership fetch cloud failure", operation: operation.id, error: error)

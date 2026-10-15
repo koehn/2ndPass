@@ -3,7 +3,8 @@ import Foundation
 import CloudKit
 import CryptoKit
 
-// Health reads never need encrypted payloads, dependencies, or system fields.
+// Health reads never retain payloads, dependency identifiers, or system fields.
+private struct DependencyHealthFields: Decodable, Hashable { let kind: SyncDependency.Kind }
 private struct OperationHealthFields: Decodable {
     let kind: SyncOperation.Kind
     let id: UUID
@@ -11,6 +12,31 @@ private struct OperationHealthFields: Decodable {
     let createdAt: Date
     let deliveredAt: Date?
     let failure: SyncFailure?
+    let dependencies: Set<DependencyHealthFields>
+    let nextAttempt: Date?
+    let retryNotBefore: Date?
+    var blockReason: SyncBlockReason? {
+        guard state != .completed else { return nil }
+        switch failure {
+        case .accountChanged: return .account
+        case .invalidAuthority: return .verification
+        case .conflict: return .conflict
+        case .inboxFull: return .inboxFull
+        case .storagePressure: return .storage
+        case .processing: return .processing
+        case .authorization: return .authorization
+        case .transport: return .transport
+        default: break
+        }
+        if state == .waitingForAuthorization { return .authorization }
+        guard state == .waitingForDependency || failure == .dependency else { return nil }
+        let kinds = Set(dependencies.map(\.kind))
+        if kinds.contains(.grant) { return .missingGrant }
+        if kinds.contains(.membership) || kind == .fetchMembership { return .missingMembership }
+        if !kinds.isDisjoint(with: [.content, .contentHead, .contentKeyState, .contentKeyGeneration]) || [.fetchContentHead, .fetchContentVersion].contains(kind) { return .missingContent }
+        if kinds.contains(.grantRequestState) { return .unprovenGeneration }
+        return .prerequisite
+    }
 }
 // Lazy-deletion heap: removing the oldest pending row does not scan the backlog.
 private struct HealthDates {
@@ -54,6 +80,9 @@ private final class SyncHealthAggregate {
     private var deliveries = HealthDates()
     private var failures: [SyncFailure: Int] = [:]
     private var kinds: [SyncOperation.Kind: Int] = [:]
+    private var blockedCounts: [SyncBlockReason: Int] = [:]
+    private var blockedDates: [SyncBlockReason: HealthDates] = [:]
+    private var retryDates: [SyncBlockReason: HealthDates] = [:]
 
     private func count<K>(_ key: K, in counts: inout [K: Int], added: Bool) {
         let value = counts[key, default: 0] + (added ? 1 : -1)
@@ -77,6 +106,13 @@ private final class SyncHealthAggregate {
             if let failure = row.failure { count(failure, in: &failures, added: added) }
             if row.state != .needsAttention { count(row.kind, in: &kinds, added: added) }
         }
+        if let reason = row.blockReason {
+            count(reason, in: &blockedCounts, added: added)
+            blockedDates[reason, default: HealthDates()].update(row.createdAt, added: added)
+            if let next = row.nextAttempt {
+                retryDates[reason, default: HealthDates()].update(max(next, row.retryNotBefore ?? next), added: added)
+            }
+        }
         // Negating the timestamp turns a minimum heap into latest delivery.
         if let date = row.deliveredAt { deliveries.update(Date(timeIntervalSinceReferenceDate: -date.timeIntervalSinceReferenceDate), added: added) }
     }
@@ -89,7 +125,12 @@ private final class SyncHealthAggregate {
     func snapshot() -> SyncHealthSnapshot {
         SyncHealthSnapshot(pendingCount: pending, oldestPendingAt: dates.first,
             lastDeliveryAt: deliveries.first.map { Date(timeIntervalSinceReferenceDate: -$0.timeIntervalSinceReferenceDate) },
-            blockedReasons: Set(failures.keys), pendingKinds: Set(kinds.keys))
+            blockedReasons: Set(failures.keys), pendingKinds: Set(kinds.keys),
+            blockedWork: SyncBlockReason.allCases.compactMap { reason in
+                guard let count = blockedCounts[reason] else { return nil }
+                return SyncBlockedWork(reason: reason, count: count, oldestOperationAt: blockedDates[reason]?.first,
+                    nextAttempt: retryDates[reason]?.first)
+            })
     }
 }
 private struct IncomingHealthFields: Decodable {
@@ -138,10 +179,12 @@ private struct IncomingAddressFields: Decodable {
 
 private struct IncomingBudgetFields: Decodable {
     let size: Int
-    private enum CodingKeys: String, CodingKey { case bytes, systemFields }
+    let prerequisiteKind: SyncOperation.Kind?
+    private enum CodingKeys: String, CodingKey { case bytes, systemFields, prerequisiteKind }
     init(from decoder: any Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
         size = try fields.decode(Data.self, forKey: .bytes).count + fields.decode(Data.self, forKey: .systemFields).count
+        prerequisiteKind = try fields.decodeIfPresent(SyncOperation.Kind.self, forKey: .prerequisiteKind)
     }
 }
 
@@ -156,6 +199,7 @@ public struct QuarantinedSyncRecord: Codable, Equatable, Sendable {
 
 extension EncryptedItemRepository {
     public static let maximumInboxBytes = 256 * 1024 * 1024
+    public static let maximumPrerequisiteInboxBytes = 8 * 1024 * 1024
     public static let maximumQuarantineBytes = 32 * 1024 * 1024
 
     public func pendingAssetVersions(account: String, database: String) throws -> Set<UUID> {
@@ -499,23 +543,74 @@ extension EncryptedItemRepository {
         }
     }
 
-    private struct InboxUsage { var count = 0; var bytes = 0 }
+    private struct InboxUsage {
+        var count = 0; var bytes = 0
+        var prerequisites: [SyncOperation.Kind: Int] = [:]
+    }
     private func inboxUsage(account: String) throws -> InboxUsage {
         try journalReadCache.summary(prefix: journalPrefix("IncomingRecord", account: account, database: nil),
             in: context, initial: InboxUsage()) { (usage: inout InboxUsage, row: IncomingBudgetFields, added: Bool) in
                 usage.count += added ? 1 : -1
                 usage.bytes += added ? row.size : -row.size
+                if let kind = row.prerequisiteKind { usage.prerequisites[kind, default: 0] += added ? row.size : -row.size }
             }
     }
 
     /// Use the same account-wide budget as reception. Hysteresis leaves room
     /// for replay of the uncheckpointed batch instead of restarting per record.
-    func inboxReadyToResume(account: String, budget: Int = maximumInboxBytes) throws -> Bool {
+    public func inboxReadyToResume(account: String, budget: Int = maximumInboxBytes) throws -> Bool {
         guard budget > 0 else { throw SyncJournalError.invalidOperation }
         return try transaction {
             return try inboxUsage(account: account).bytes <= budget / 2
         }
     }
+    /// Each dependency level has its own reserve. Versions can depend on
+    /// membership and heads on versions; sharing a reserve recreates the deadlock.
+    public func prerequisiteInboxReadyToResume(account: String, kind: SyncOperation.Kind) throws -> Bool {
+        guard [.fetchMembership, .fetchContentHead, .fetchContentVersion].contains(kind) else {
+            throw SyncJournalError.invalidOperation
+        }
+        // An oversized dependency needs an empty lane. Waking at half capacity
+        // could repeatedly retry a batch that still cannot fit.
+        return try transaction { try inboxUsage(account: account).prerequisites[kind, default: 0] == 0 }
+    }
+
+    // Called only after the targeted fetch has validated the exact requested
+    // addresses. This is capacity reservation, never permission to apply data.
+    // One oversized batch is allowed in an empty lane, as for ordinary reception;
+    // individual record limits still apply and another batch must wait for drain.
+    func stagePrerequisiteIncomingInTransaction(_ records: [IncomingRecord], kind: SyncOperation.Kind,
+                                                budget: Int = maximumPrerequisiteInboxBytes) throws {
+        guard budget > 0, !records.isEmpty, records.count <= (kind == .fetchMembership ? 2 : 1),
+              [.fetchMembership, .fetchContentHead, .fetchContentVersion].contains(kind),
+              let account = records.first?.account, records.allSatisfy({ $0.account == account }) else {
+            throw SyncJournalError.invalidOperation
+        }
+        try writeJournal(UUID(), entity: "StateBlob", key: journalKey(account, "inbox-boundary", ""))
+        try journalReadCache.begin(in: context, persistent: context.persistentStoreCoordinator?.persistentStores.first?.type == NSSQLiteStoreType)
+        let currentUsage = try inboxUsage(account: account)
+        var usage: InboxUsage? = currentUsage
+        var additions: [IncomingRecord] = []
+        var added = 0
+        for record in records {
+            if let old: IncomingRecord = try journalValue("IncomingRecord", key: journalKey(record.account, record.database, record.id)) {
+                // An existing bulk record already has its apply operation. Do
+                // not duplicate or reclassify it just because a fetch replayed it.
+                var comparable = record; comparable.prerequisiteKind = old.prerequisiteKind
+                _ = try stageIncomingInTransaction(comparable, budget: Int.max)
+            } else {
+                var reserved = record; reserved.prerequisiteKind = kind
+                additions.append(reserved)
+                added += record.bytes.count + record.systemFields.count
+            }
+        }
+        guard !additions.isEmpty else { return }
+        let reserved = currentUsage.prerequisites[kind, default: 0]
+        guard reserved == 0 || (added <= budget && reserved <= budget - added) else { throw SyncJournalError.inboxFull }
+        // The lane quota above and normal per-record validation bound this write.
+        for record in additions { _ = try stageIncomingInTransaction(record, budget: currentUsage.bytes + added, usage: &usage) }
+    }
+
     func stageIncomingInTransaction(_ record: IncomingRecord, budget: Int) throws -> IncomingRecord {
         var usage: InboxUsage?
         return try stageIncomingInTransaction(record, budget: budget, usage: &usage)
@@ -653,8 +748,8 @@ extension EncryptedItemRepository {
                     guard record.account == expected.account, record.database == expected.database, record.vaultID == expected.vaultID,
                           record.zoneName == id.zoneID.zoneName, record.zoneOwner == id.zoneID.ownerName,
                           record.recordName == id.recordName, record.recordType == NativeVaultProvisioningTransport.recordType else { throw SyncJournalError.invalidOperation }
-                    _ = try stageIncomingInTransaction(record, budget: Self.maximumInboxBytes)
                 }
+                try stagePrerequisiteIncomingInTransaction(incoming, kind: .fetchMembership)
             }
         }
     }
@@ -677,7 +772,7 @@ extension EncryptedItemRepository {
                       incoming.zoneName == SyncStoreLayout.contentZone(vault: fetch.vault),
                       incoming.recordName == fetch.item.uuidString + ":" + fetch.version.uuidString,
                       incoming.recordType == ContentRecordKind.version.rawValue else { throw SyncJournalError.invalidOperation }
-                _ = try stageIncomingInTransaction(incoming, budget: Self.maximumInboxBytes)
+                try stagePrerequisiteIncomingInTransaction([incoming], kind: expected.kind)
                 current.state = .completed; current.completedAt = Date(); current.revision = UUID()
                 current.failure = nil; current.nextAttempt = nil; current.retryNotBefore = nil; current.attempts += 1
                 try writeJournal(current, entity: "SyncOperation", key: key, account: current.account, database: current.database)
@@ -688,6 +783,34 @@ extension EncryptedItemRepository {
     /// Deduplicate targeted prerequisite work under the account/lease permit.
     public func enqueuePrerequisite(_ operation: SyncOperation, permit: any RepositoryWritePermit) throws -> SyncOperation {
         try permit.withWritePermission { try transaction { try enqueueInTransaction(operation) } }
+    }
+
+    /// Explicit user refresh only: retry a completed read of an unchanged head.
+    /// Never resets a server retry floor, quarantined work, or publication state.
+    public func refreshCompletedContentHeadFetches(_ requests: [SyncOperation], permit: any RepositoryWritePermit) throws {
+        guard let first = requests.first else { return }
+        guard requests.allSatisfy({ $0.kind == .fetchContentHead && $0.account == first.account && $0.database == first.database }) else {
+            throw SyncJournalError.invalidOperation
+        }
+        try permit.withWritePermission {
+            try transaction {
+                // One inbox projection and transaction for a manual bulk refresh.
+                let receiving = try incomingCloudRecordIDsInTransaction(account: first.account, database: first.database)
+                for request in requests {
+                    let key = journalKey(request.account, request.database, request.id.uuidString)
+                    guard var current: SyncOperation = try journalValue("SyncOperation", key: key),
+                          current.kind == request.kind, current.payload == request.payload,
+                          current.vaultID == request.vaultID, current.zoneOwner == request.zoneOwner,
+                          current.state == .completed else { continue }
+                    let fetch = try JSONDecoder().decode(ContentHeadFetch.self, from: current.payload)
+                    guard !receiving.contains(fetch.recordID(owner: current.zoneOwner)) else { continue }
+                    current.state = .ready; current.completedAt = nil; current.deliveredAt = nil
+                    current.failure = nil; current.nextAttempt = nil; current.retryNotBefore = nil
+                    current.dependencies = []; current.revision = UUID()
+                    try writeJournal(current, entity: "SyncOperation", key: key, account: current.account, database: current.database)
+                }
+            }
+        }
     }
 
     public func finishContentHeadFetch(_ expected: SyncOperation, incoming: IncomingRecord,
@@ -706,7 +829,7 @@ extension EncryptedItemRepository {
                       incoming.zoneName == SyncStoreLayout.contentZone(vault: fetch.vault),
                       incoming.recordName == fetch.item.uuidString,
                       incoming.recordType == ContentRecordKind.head.rawValue else { throw SyncJournalError.invalidOperation }
-                _ = try stageIncomingInTransaction(incoming, budget: Self.maximumInboxBytes)
+                try stagePrerequisiteIncomingInTransaction([incoming], kind: expected.kind)
                 current.state = .completed; current.completedAt = Date(); current.revision = UUID()
                 current.failure = nil; current.nextAttempt = nil; current.retryNotBefore = nil; current.attempts += 1
                 try writeJournal(current, entity: "SyncOperation", key: key, account: current.account, database: current.database)
@@ -773,7 +896,7 @@ extension EncryptedItemRepository {
                 let lastDelivery: Date? = try journalValue("StateBlob", key: "sync-last-delivery:" + journalKey(account, database, ""))
                 return SyncHealthSnapshot(pendingCount: summary.pendingCount, oldestPendingAt: summary.oldestPendingAt,
                     lastDeliveryAt: [summary.lastDeliveryAt, lastDelivery].compactMap { $0 }.max(),
-                    blockedReasons: summary.blockedReasons, pendingKinds: summary.pendingKinds)
+                    blockedReasons: summary.blockedReasons, pendingKinds: summary.pendingKinds, blockedWork: summary.blockedWork)
             }
         }
     }

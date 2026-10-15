@@ -507,6 +507,10 @@ extension EncryptedItemRepository {
                     return delivered.contains(id)
                 }
             }
+            // Reserve a bounded share for grants while immutable versions/heads
+            // are pending. Otherwise every 100-record page can contain only
+            // content, delaying usable access until the whole vault is sent.
+            let contentLimit = operations.contains { $0.kind == .grant && eligible($0) } ? 84 : 100
             var result: [ContentUpload] = [], totalBytes = 0
             let request = NSFetchRequest<NSDictionary>(entityName: "PendingMutation")
             request.resultType = .dictionaryResultType
@@ -533,7 +537,7 @@ extension EncryptedItemRepository {
                 if !result.isEmpty, content.version.ciphertext.count > 16 * 1024 * 1024 - min(totalBytes, 16 * 1024 * 1024) { break }
                 result.append(upload)
                 totalBytes += content.version.ciphertext.count
-                if result.count == 100 || totalBytes >= 16 * 1024 * 1024 { break }
+                if result.count == contentLimit || totalBytes >= 16 * 1024 * 1024 { break }
             }
             for operation in operations where operation.kind == .grant && eligible(operation) {
                 guard result.count < 100 else { break }

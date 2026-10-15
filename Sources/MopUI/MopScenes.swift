@@ -142,7 +142,7 @@ struct SessionSettings: View {
         .confirmationDialog("Reset this device’s cloud enrollment?", isPresented: $resetEnrollment, titleVisibility: .visible) {
             Button("Remove Device and Reset Enrollment", role: .destructive) { model.debugResetEnrollment() }
         } message: {
-            Text("Testing only. Removes this device from every enrolled cloud vault, then clears its V3 local cache and device keys. Cloud vaults and device-local vaults remain. Every vault needs another owner device. Keep that device unlocked to enroll again. Interrupted resets can be resumed with this button.")
+            Text("Testing only. Removes this device from every enrolled cloud vault, then clears its V3 local cache and device keys. Cloud vaults and device-local vaults remain. Every vault needs another owner device. After the reset, force quit this app and do not restart it until the other devices have finished re-syncing. Interrupted resets can be resumed with this button.")
         }
         #endif
         .confirmationDialog("Remove this device?", isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), titleVisibility: .visible) {
@@ -156,6 +156,9 @@ struct SessionSettings: View {
                     ". It must explicitly reconnect to join again. A vault’s last owner device cannot be removed.")
             }
         }
+        .alert("Enrollment reset — force quit now", isPresented: Binding(get: { model.settingsVisible && model.enrollmentResetAlertPresented }, set: { if !$0 { model.enrollmentResetAlertPresented = false } })) {
+            Button("OK") { model.enrollmentResetAlertPresented = false }
+        } message: { Text(AppModel.enrollmentResetInstructions) }
         .alert("Operation not completed", isPresented: Binding(get: { model.sheet == nil && model.error != nil }, set: { if !$0 { model.error = nil } })) {
             if model.developerDiagnosticsEnabled { Button("Copy Details") { model.copyErrorDetails() } }
             Button("OK") { model.error = nil }
