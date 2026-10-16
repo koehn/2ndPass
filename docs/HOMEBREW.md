@@ -65,11 +65,9 @@ old CLI installation/link before switching installers. Neither normal cask remov
 nor the direct installer deletes vault data or Keychain identities. No `zap` stanza
 removes shared vault state.
 
-The existing `Formula/secondpass.rb` remains a source-development formula; its
-ad-hoc build cannot access production vault keys. `Formula/mop.rb` describes the
-historical release. Do not use the source-formula release helper for signed CLI
-releases. Current source remains inspection-only under the repository LICENSE;
-release publication requires the copyright holder's authorization.
+Source formulas and source-formula release helpers have been removed. Current
+source remains inspection-only under the repository LICENSE; release publication
+requires the copyright holder's authorization.
 
 ## Acceptance checks
 

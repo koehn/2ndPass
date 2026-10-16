@@ -23,11 +23,11 @@ Formerly Mop. See [branding and upgrade compatibility](docs/BRANDING.md) for ret
 
 2ndPass is a macOS/iOS password vault with a native app, AutoFill, and a command-line client. These clients now use independently encrypted item records in a shared device-local Core Data store. CKSyncEngine transfers committed changes through one synchronization owner per account/database. Saves are durable locally before cloud delivery.
 
-**Development preview.** Same-account private vaults connect automatically through iCloud while an existing device is unlocked. Shared vaults, device removal, permanent vault deletion and general document import are unavailable. See the [vault architecture](docs/VAULT.md), [backup guide](docs/BACKUPS.md) and [validation gates](docs/VALIDATION.md).
+**Development preview.** Same-account private vaults connect automatically through iCloud while an existing device is unlocked. Shared vaults and general document import are unavailable. Device removal and permanent cloud-vault deletion are preview features awaiting physical acceptance; see the build gates below. See the [vault architecture](docs/VAULT.md), [backup guide](docs/BACKUPS.md) and [validation gates](docs/VALIDATION.md).
 
 ## Recent items
 
-Recently Added, Recently Changed, and Recently Used show the newest 50 active, unarchived items across connected vaults. Search filters those 50 items. Item details show known creation, addition, change, and device-local usage times. Existing items have no invented historical dates; imports preserve source dates when available and record when they were added to 2ndPass.
+Recently Added, Recently Changed, and Recently Used show the newest 50 active, unarchived items across connected vaults. Search filters those 50 items. Item details show known creation, addition, change, and device-local usage times. Existing items have no invented historical dates; portable restores preserve source dates when available and record when they were added to 2ndPass.
 Usage records successful copies, explicit reveals, AutoFill, and CLI reads (including injection and command execution). Browsing, editing preloads, OTP refreshes, and exports do not count. Usage stays in private app-group storage on this device, outside cloud synchronization and backups.
 Upgrade the Mac app, iOS app, AutoFill extensions, and CLI together before editing timestamped items. This change has no feature flag or mixed-version support.
 ## Start or restore a vault
@@ -51,7 +51,7 @@ sp vault rename --vault VAULT_UUID new-name
 sp vault sync --vault VAULT_UUID             # optional diagnostic wake / receipt wait
 sp read --offline sp://personal/service/token
 ```
-Normal synchronization resumes automatically; `sp vault sync` is not required for delivery. The new protocol uses a separate store and cloud namespace; existing preview data requires [explicit portable export/import](docs/ITEM-SYNC-MIGRATION.md).
+Normal synchronization resumes automatically; `sp vault sync` is not required for delivery. The current protocol uses its existing store and cloud namespace; latest-format stores, enrolled identities and recipient-grant zones remain supported. Retired V2 stores are rejected without migration.
 Local operations use the encrypted Core Data store and a device-only account binding. They cannot detect unobserved remote revocation or prove freshness. Observed account changes invalidate that binding. GUI, CLI and AutoFill share the device-local App Group store; cloud clients no longer accept an isolated `--state-directory`. CLI writes normally wait up to 20 seconds for their exact cloud delivery receipts. Use `--local-save` to return after the durable local commit; `--offline` prevents network use. A delivery timeout leaves the local save queued and exits nonzero with receipt IDs and a pending message; do not repeat the write. GUI saves report local durability, not an unconfirmed cloud upload.
 The GUI retains an authenticated session context until lock/expiry, while releasing hardware key handles and individual secret keys after operations. CLI commands own their session. AutoFill always starts fresh authentication and locks after filling. Plaintext necessarily reaches 2ndPass, clipboard destinations, and commands receiving secrets.
 `read` releases plaintext to stdout or a selected file; `inject` produces plaintext configuration on stdout or disk. `run` supplies plaintext environment variables to a child: that program, its dependencies and inheriting descendants become trusted with the secret. Environments can leak through diagnostics or privileged host access. Default masking only filters exact secret bytes in stdout/stderr; it does not constrain transformed output, files or network traffic. 2ndPass cannot control a child's use of plaintext. See [CLI boundaries](docs/SECURITY.md#cli-and-extension-disclosure-boundaries).
@@ -75,7 +75,7 @@ sharing or export Secure Enclave private keys. Keep the original vault until you
 have verified the restored contents. See the [backup guide](docs/BACKUPS.md)
 for format limits and acceptance gates.
 
-The service exports a locally stored snapshot (also available with `--offline`); it cannot yet certify a complete remote inventory. Keep the original archive until restored contents have been checked. Its wire format, key encoding, validation limits and restoration semantics are defined in the [standalone specification](docs/formats/PORTABLE-BACKUP-v1.md). Permanent cloud-vault deletion is unavailable.
+The service exports a locally stored snapshot (also available with `--offline`); it cannot yet certify a complete remote inventory. Keep the original archive until restored contents have been checked. Its wire format, key encoding, validation limits and restoration semantics are defined in the [standalone specification](docs/formats/PORTABLE-BACKUP-v2.md). Device removal and permanent cloud-vault deletion are preview features; physical-device acceptance remains pending. Vault deletion is enabled in Development builds and requires `MOP_VAULT_DELETION` in Production; the separate V3 Production review gate also applies.
 
 ## Build and provision
 
@@ -104,7 +104,7 @@ scripts/install.sh dist/2ndPass.app
 open /Applications/2ndPass.app
 sp vault list
 ```
-The GUI installer places the sandboxed app at `/Applications/2ndPass.app`; it contains no CLI. The separate CLI installer places its signed bundle under `/usr/local/lib/sp` and links `/usr/local/bin/sp`, manpages, and completions. Set `MOP_INSTALL_ROOT` for a different CLI prefix, or `MOP_APPLICATIONS_DIR` for a different GUI destination. Install the CLI before upgrading an older combined app so its shell link continues to work.
+The GUI installer places the sandboxed app at `/Applications/2ndPass.app`; it contains no CLI. The separate CLI installer places its signed bundle under `/usr/local/lib/sp` and links `/usr/local/bin/sp`, manpages, and completions. Set `MOP_INSTALL_ROOT` for a different CLI prefix, or `MOP_APPLICATIONS_DIR` for a different GUI destination.
 
 Register a separate `com.koehn.mop.CLI` App ID with access to the existing host Keychain group, App Group, and CloudKit container. The host and AutoFill extension need their AutoFill capability and shared App Group as well. See [CLI provisioning and Homebrew releases](docs/HOMEBREW.md) for exact capabilities and notarized release commands. Both packages default to Production and reject profiles that do not authorize the requested resources. Keep the CLI inside its own signed bundle; expose it through a symlink.
 
@@ -112,7 +112,7 @@ Register a separate `com.koehn.mop.CLI` App ID with access to the existing host 
 `sp-keychain-check --run` explicitly creates and retains a uniquely scoped disposable hardware identity and verifies opaque Keychain reload and signing. See [validation](docs/VALIDATION.md) for automated and physical-device acceptance requirements. Do not treat software fixtures or simulator builds as hardware evidence.
 ## Current limitations
 
-Cross-account sharing and document imports require further integration. Account recovery is implemented, with physical iCloud acceptance pending. Cloud software credential bytes can survive portable restore, but account registration management is not yet connected. The separate `local` vault and its hardware-backed operations remain available.
+Cross-account sharing and general document import are unimplemented roadmap requirements; their scaffolding has been removed. Account recovery is implemented, with physical iCloud acceptance pending. Cloud software credential bytes can survive portable restore, but credential-account management is unimplemented. The separate `local` vault and its hardware-backed operations remain available.
 
 ## Public website and build shortcuts
 

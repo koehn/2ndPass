@@ -14,11 +14,20 @@ public struct ContentRecordAddress: Sendable {
     public let vault: UUID
     public let item: UUID
     public let identity: String?
+    public let recipient: String?
 
     public init(recordType: String, zone: String, record: String) throws {
-        guard let kind = ContentRecordKind(rawValue: recordType), zone.hasPrefix("MopContent3-"),
-              let vault = UUID(uuidString: String(zone.dropFirst("MopContent3-".count))),
-              zone == SyncStoreLayout.contentZone(vault: vault) else { throw CloudSyncAdapterError.malformedRecord }
+        guard let kind = ContentRecordKind(rawValue: recordType) else { throw CloudSyncAdapterError.malformedRecord }
+        let vault: UUID
+        if let routing = try? RecipientGrantZone(name: zone) {
+            guard kind == .grant else { throw CloudSyncAdapterError.malformedRecord }
+            vault = routing.vault; recipient = routing.recipient
+        } else {
+            guard kind != .grant, zone.hasPrefix("MopContent3-"),
+                  let id = UUID(uuidString: String(zone.dropFirst("MopContent3-".count))),
+                  zone == SyncStoreLayout.contentZone(vault: id) else { throw CloudSyncAdapterError.malformedRecord }
+            vault = id; recipient = nil
+        }
         let parts = record.split(separator: ":", omittingEmptySubsequences: false)
         guard let first = parts.first, let item = UUID(uuidString: String(first)), first == Substring(item.uuidString),
               parts.count == (kind == .head ? 1 : 2) else { throw CloudSyncAdapterError.malformedRecord }
@@ -57,14 +66,15 @@ public enum ContentRecordTransport {
     public static func grant(_ grant: PreparedContentGrant, systemFields: Data? = nil) throws -> CKRecord {
         guard grant.bytes.count <= 16_384 else { throw CloudSyncAdapterError.malformedRecord }
         return try record(kind: .grant, scope: grant.scope, name: grant.scope.itemID.uuidString + ":" + grant.identifier,
-            bytes: grant.bytes, systemFields: systemFields, assetURL: nil)
+            bytes: grant.bytes, systemFields: systemFields, assetURL: nil,
+            zoneName: RecipientGrantZone(vault: grant.scope.vaultID, recipient: grant.recipient).name)
     }
 
     private static func record(kind: ContentRecordKind, scope: ItemScope, name: String, bytes: Data,
-                               systemFields: Data?, assetURL: URL?, assetURLs: [URL]? = nil) throws -> CKRecord {
+                               systemFields: Data?, assetURL: URL?, assetURLs: [URL]? = nil, zoneName: String? = nil) throws -> CKRecord {
         guard !bytes.isEmpty, bytes.count <= EncryptedItemRepository.maximumCiphertextBytes,
               scope.database == "private", !scope.account.isEmpty else { throw CloudSyncAdapterError.malformedRecord }
-        let zone = CKRecordZone.ID(zoneName: SyncStoreLayout.contentZone(vault: scope.vaultID), ownerName: scope.zoneOwner)
+        let zone = CKRecordZone.ID(zoneName: zoneName ?? SyncStoreLayout.contentZone(vault: scope.vaultID), ownerName: scope.zoneOwner)
         _ = try ContentRecordAddress(recordType: kind.rawValue, zone: zone.zoneName, record: name)
         let id = CKRecord.ID(recordName: name, zoneID: zone)
         let record: CKRecord

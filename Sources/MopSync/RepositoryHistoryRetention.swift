@@ -24,6 +24,17 @@ extension EncryptedItemRepository {
                     }
                     tokens.append(token)
                 }
+                // Startup retries must not materialize the entire transaction
+                // history when nothing is old enough to prune. Query at most one
+                // eligible transaction before doing the conservative token scan.
+                guard let fetch = NSPersistentHistoryTransaction.fetchRequest else { throw ItemRepositoryError.corruptStore }
+                fetch.predicate = NSPredicate(format: "timestamp < %@", cutoff as NSDate)
+                fetch.fetchLimit = 1
+                let probe = NSPersistentHistoryChangeRequest.fetchHistory(withFetch: fetch)
+                probe.resultType = .transactionsOnly
+                guard let probeResult = try context.execute(probe) as? NSPersistentHistoryResult,
+                      let oldTransactions = probeResult.result as? [NSPersistentHistoryTransaction] else { throw ItemRepositoryError.corruptStore }
+                if oldTransactions.isEmpty { return }
                 let request = NSPersistentHistoryChangeRequest.fetchHistory(after: nil as NSPersistentHistoryToken?)
                 request.resultType = .transactionsOnly
                 guard let result = try context.execute(request) as? NSPersistentHistoryResult,

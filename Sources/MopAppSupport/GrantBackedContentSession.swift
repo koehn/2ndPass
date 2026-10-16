@@ -60,8 +60,35 @@ public final class GrantBackedContentSession: @unchecked Sendable {
     }
 
     public func open(item: UUID, component: String, expected: UUID) async throws -> SecretBytes {
-        let (content, grant) = try await readable(item: item, expected: expected)
-        return try permit.withDevice { try content.open(component: component, grant: grant, history: history, device: $0) }
+        try await projectReadable(item: item) { content, grant, device in
+            guard content.header.version == expected else { throw ItemRepositoryError.staleLocalVersion }
+            return try content.open(component: component, grant: grant, history: history, device: device)
+        }
+    }
+
+    /// Select a verified pair without changing the last successfully read reference.
+    /// Missing grants retain the durable previous reference across lock/restart.
+    /// Mutation entry points deliberately continue to require the current head.
+    func lastReadable(item: UUID) async throws -> (ContentEnvelope, ContentKeyGrant) {
+        try permit.check()
+        return try await storage.readablePair(scope: binding.item(item), history: history, recipient: identity.fingerprint)
+    }
+
+    /// Persist promotion only after the requested projection actually decrypts.
+    /// A signed but unusable grant/ciphertext must not erase a working reference.
+    func projectReadable<T>(item: UUID, _ body: (ContentEnvelope, ContentKeyGrant, any DeviceOperations) throws -> T) async throws -> T {
+        let scope = binding.item(item)
+        guard let observedHead = try await repository.item(scope) else { throw MopError.notFound }
+        let (content, grant) = try await lastReadable(item: item)
+        let result = try permit.withDevice { try body(content, grant, $0) }
+        let reference = try ReadableContentReference(version: content.header.version,
+            keyGeneration: content.header.keyGeneration, grant: grant.identifier, recipient: identity.fingerprint)
+        if try await repository.readableContent(scope: scope, recipient: identity.fingerprint) != reference {
+            try await repository.rememberReadableContent(scope: scope, reference: reference,
+                expectedHead: observedHead.versionID, permit: permit)
+        }
+        try permit.check()
+        return result
     }
 
     func readable(item: UUID, expected: UUID) async throws -> (ContentEnvelope, ContentKeyGrant) {
@@ -397,7 +424,6 @@ extension GrantBackedContentSession {
         return true
     }
 }
-
 
 extension GrantBackedContentSession {
     /// The randomized notice, publication and local intent commit atomically.

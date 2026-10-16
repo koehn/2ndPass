@@ -6,4 +6,4 @@ Each edit is saved encrypted on this device before iCloud delivery. Independentl
 
 Other devices on your Apple Account connect automatically while an existing device is unlocked. This deliberately trusts the authenticated private iCloud container for initial admission. Protect your Apple Account as well as your devices.
 
-Keep a portable archive and its separate key for independent restoration. Live account recovery, sharing and device removal are not available. Read the [security model](SECURITY.md), [vault architecture](VAULT.md), [backups](BACKUPS.md) and [validation status](VALIDATION.md) for details.
+Keep a portable archive and its separate key for independent restoration. Device removal and permanent cloud-vault deletion are preview features awaiting physical acceptance; deletion availability depends on the build gates described in [the native application guide](GUI.md). Live account recovery and sharing have separate status described in the linked guides. Read the [security model](SECURITY.md), [vault architecture](VAULT.md), [backups](BACKUPS.md) and [validation status](VALIDATION.md) for details.

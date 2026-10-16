@@ -17,10 +17,10 @@ final class ContentRecoveryCoordinator: @unchecked Sendable {
     var operationFraction: Double? { nil }
     init(account: NativeItemCloudAccount, repository: EncryptedItemRepository, runtime: ItemVaultSyncRuntime) throws {
         self.account = account; self.repository = repository; self.runtime = runtime
-        trust = try KeychainItemVaultTrustStore(namespace: .contentPreview3)
+        trust = try KeychainItemVaultTrustStore()
         store = ItemRecoveryStateStore(directory: account.directory.appendingPathComponent("ContentPreview3"), account: account.accountNamespace)
     }
-    func lock() { key.withLock { $0?.close(); $0 = nil } }
+    func lock() { key.withLock { $0?.close(); $0 = nil }; Task { await runtime.clearRecoveryRecipient() } }
     deinit { lock() }
     private func recovery() throws -> OfflineRecoveryKey {
         guard let value = key.withLock({ $0 }) else { throw ItemRecoveryFailure.codeRequired }; return value
@@ -58,7 +58,7 @@ final class ContentRecoveryCoordinator: @unchecked Sendable {
         do {
             guard let vault = operation.vaultID, operation.kind == .recovery else { return .attention(.invalidAuthority) }
             let target = try JSONDecoder().decode(Rotation.self, from: operation.payload).target
-            let session = try await runtime.authorizedSession(vault).contentSession!
+            let session = try await runtime.authorizedSession(vault).contentSession
             if session.history.current.membership.offlineRecovery == target { return .completed }
             let current = session.history.current.membership
             let membership = try Membership(accounts: current.accounts, offlineRecovery: target, removedDevices: current.removedDevices)
@@ -127,18 +127,23 @@ final class ContentRecoveryCoordinator: @unchecked Sendable {
             }
             guard !vaults.isEmpty else { lock(); throw MopError.invalidRecovery }
             if try store.load()?.blocksRegularAccess != true { try store.save(ItemRecoveryState(account: account.accountNamespace, vaults: vaults)) }
-            try await runtime.refreshTrustedAddresses()
+            try await runtime.useRecoveryRecipient(value.identity.fingerprint)
             result.recoveryReadOnly = true
             result.message = "Recovery access is open. Encrypted content and grants download automatically."
         case .recoveryCatalog(let vault), .recoveryRead(let vault, _):
             let recovery = try recovery(), history = try history(vault)
+            guard history.current.membership.offlineRecovery == recovery.identity else { throw MopError.invalidRecovery }
             let versions = try await repository.itemsForPortableExport(account: account.accountNamespace, vaultID: vault)
             var items: [VaultItem] = []
             for version in versions where version.scope.itemID != ItemVaultSession.metadataRecordID && !version.isTombstone {
-                let content = try ContentEnvelope.decode(version.ciphertext, history: history, item: version.scope.itemID)
-                let grant = try await grant(content, scope: version.scope, recovery: recovery, history: history)
+                let (content, grant) = try await GrantBackedContentStorage(repository: repository)
+                    .readablePair(scope: version.scope, history: history, recipient: recovery.identity.fingerprint)
                 let catalog = try ContentItemArchive.catalog(content.open(component: ContentItemArchive.catalogComponent, grant: grant, history: history, device: recovery),
                     item: version.scope.itemID, componentNames: Set(content.components.keys))
+                try check()
+                try await repository.rememberReadableContent(scope: version.scope,
+                    reference: ReadableContentReference(version: content.header.version, keyGeneration: content.header.keyGeneration,
+                        grant: grant.identifier, recipient: recovery.identity.fingerprint), expectedHead: version.versionID, permit: account)
                 items.append(catalog.item)
                 if case .recoveryRead(_, let path) = action, let id = catalog.references[path] {
                     let value = try content.open(component: id, grant: grant, history: history, device: recovery)
@@ -231,7 +236,8 @@ final class ContentRecoveryCoordinator: @unchecked Sendable {
         for vault in progress.vaults where !progress.completed.contains(vault) {
             guard let bytes = progress.approvals[vault.uuidString] else { continue }
             let approval = try DeviceEnrollmentApproval.decode(bytes), current = try history(vault)
-            guard try await repository.engineState(account: account.accountNamespace, database: "content-initial-fetch:" + vault.uuidString) != nil else { continue }
+            guard try await repository.recipientGrantReadiness(scope: account.setupScope(vaultID: vault).repositoryScope,
+                recipient: approval.request.identity.fingerprint) else { continue }
             guard current.current.membership.devices.contains(approval.request.identity),
                   !operations.contains(where: { $0.vaultID == vault && $0.state != .completed && [.membership, .rotateContent, .publishItem, .prepareGrant, .grant, .applyIncoming, .fetchContentVersion, .fetchMembership, .resolveConflict].contains($0.kind) }),
                   try await repository.item(account.setupScope(vaultID: vault).binding.item(ItemVaultSession.metadataRecordID)) != nil else { continue }

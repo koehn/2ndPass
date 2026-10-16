@@ -21,7 +21,6 @@ struct VaultDetailsView: View {
                         Button("Rename Vault…") { model.presentSheet(.renameVault, target: target) }
                         Button("Export Portable Backup…") { model.presentSheet(.portableBackup, target: target) }
                         Button("Restore Portable Backup…") { model.presentSheet(.restoreBackup, target: target) }
-                        if model.canPresent(.shareAccount) { Button("Share with Another Person…") { model.presentSheet(.shareAccount, target: target) } }
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.disabled(model.busy || model.offline)
                 Divider()
@@ -53,7 +52,6 @@ struct VaultDetailsView: View {
     var secondarySubmit: (() -> Void)?
 }
 
-
 struct VaultDetailsDialog: View {
     @Bindable var model: AppModel
     let target: VaultDescriptor
@@ -76,7 +74,6 @@ struct VaultDetailsDialog: View {
         .mopSheetWidth(640)
         .frame(minHeight: 380)
         .interactiveDismissDisabled(model.busy)
-        .documentTransfers(model: model, inDetails: true)
         .sheet(item: Binding(get: { model.sheetRequest?.inSettings == false ? model.sheetRequest : nil },
                              set: { if model.sheetRequest?.inSettings == false { model.sheetRequest = $0 } })) { request in
             AppSheetView(model: model, request: request)

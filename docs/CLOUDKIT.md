@@ -7,7 +7,7 @@ The native clients use one `ItemVaultSyncRuntime` and one CKSyncEngine per priva
 | Vault | `MopMembershipControlV1` | `membership-head`, immutable membership digest | `membership`: Bytes |
 | Vault | `MopContentHeadV3` | item/settings UUID | `payload`: Bytes, `asset`: Asset or `assets`: Asset list |
 | Vault | `MopContentVersionV3` | item UUID + version UUID | `payload`: Bytes, `asset`: Asset or `assets`: Asset list |
-| Vault | `MopContentGrantV3` | item UUID + signed grant digest | `payload`: Bytes |
+| Recipient grant zone | `MopContentGrantV3` | item UUID + signed grant digest | `payload`: Bytes |
 | Coordination | `MopCoordinationDiscoveryV3` | kind + vault UUID + identity UUID | `payload`: Bytes, or `asset`: Asset |
 | Coordination | `MopCoordinationEnrollmentRequestV3` | same routing pattern | `payload`: Bytes |
 | Coordination | `MopCoordinationEnrollmentApprovalV3` | same routing pattern | `payload`: Bytes, or `asset`: Asset |

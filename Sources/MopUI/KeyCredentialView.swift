@@ -19,7 +19,6 @@ struct KeyCredentialCreateView: View {
     @State private var acknowledged = false
     @State private var working = false
     @State private var error: String?
-    @State private var members: [VaultMemberRecord] = []
     @State private var operation: Task<Void, Never>?
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -48,9 +47,7 @@ struct KeyCredentialCreateView: View {
                     Toggle("I understand this key cannot be recovered on another device", isOn: $acknowledged)
                 } else if !destination.isEmpty {
                     Text("Encrypted and synchronized through this vault. Private keys are available to authorized software during use. Recovery requires another enrolled device or applicable configured offline recovery.").font(.callout)
-                    if !members.isEmpty {
-                        LabeledContent("Who has access", value: members.map { $0.id + " (" + $0.role + ")" }.joined(separator: ", "))
-                    }
+
                     if !importing {
                         Picker("Algorithm", selection: $algorithm) {
                             Text("Ed25519").tag(CredentialAlgorithm.ed25519)
@@ -83,12 +80,7 @@ struct KeyCredentialCreateView: View {
                 bytes = SecretBytes(copying: try LocalFile.read(url, limit: 1024 * 1024)); fileName = url.lastPathComponent
             } catch { self.error = error.localizedDescription }
         }
-        .task(id: destination) {
-            members = []
-            guard !destination.isEmpty, !LocalVault.isLocal(destination) else { return }
-            do { let result = try await model.service.execute(.members, vault: destination, offline: false); try Task.checkCancellation(); members = result.members }
-            catch { self.error = error.localizedDescription }
-        }
+
         .onDisappear { operation?.cancel(); bytes = nil; passphrase = "" }
     }
     private func save() {

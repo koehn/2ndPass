@@ -1,6 +1,6 @@
-# Import type mappings
+# Future document-import mapping requirements
 
-General document import is not connected to the current item service. The mappings below describe parser behavior and design requirements, not an available end-to-end import workflow. See [import status](IMPORT.md).
+General document import is unimplemented and its old parsers have been removed. The mappings below are requirements for any future implementation, not current parser behavior. See [import status](IMPORT.md).
 
 Bank Account and Address are compound **field types**, usable on any item. Both
 are concealed. Values are JSON objects; account numbers, routing numbers, postal
@@ -9,7 +9,7 @@ Editors show named components and preserve unknown source properties, including
 nested data, when another component changes. Revisions containing these fields
 require `compound-fields-1`; update all clients before using them.
 
-## Implemented compound-field mappings
+## Required compound-field mappings
 
 | Source | 2ndPass field | Components |
 | --- | --- | --- |

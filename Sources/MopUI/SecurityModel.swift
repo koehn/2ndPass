@@ -14,42 +14,7 @@ struct HistorySelection: Identifiable {
 
 extension AppModel {
     var healthEvidenceLoading: Bool { catalogs.values.contains { $0.healthEvidenceLoading == true } }
-    func credentialAccounts(in vault: String) -> [CredentialAccount] {
-        guard let catalog = catalogs[vault] else { return [] }
-        var accounts = catalog.security?.accounts ?? []
-        guard localReady, localError == nil else { return accounts }
-        let present = Set(localIdentities.map(\.id))
-        for a in accounts.indices {
-            for r in accounts[a].registrations.indices {
-                let registration = accounts[a].registrations[r]
-                if registration.deviceID == catalog.currentDeviceID, !registration.external,
-                   let id = registration.localIdentityID, !present.contains(id) {
-                    accounts[a].registrations[r].state = .removed
-                }
-            }
-        }
-        return accounts
-    }
-    func reconcileLocalCredentialEvidence() {
-        guard supports(.credentialAccounts), authenticated, localReady, !offline, !busy else { return }
-        let ids = Set(localIdentities.map(\.id))
-        let targets = catalogs.filter { _, catalog in
-            catalog.canEdit == true && catalog.security?.accounts.contains { account in
-                account.registrations.contains { registration in
-                    registration.deviceID == catalog.currentDeviceID && !registration.external && registration.state != .removed && registration.localIdentityID.map { !ids.contains($0) } == true
-                }
-            } == true
-        }
-        guard !targets.isEmpty else { return }
-        perform { token in
-            for (id, source) in targets {
-                let result = try await self.service.execute(.reconcileLocalCredentials(ids, revision: source.revision), vault: id, offline: false)
-                guard self.current(token), let updated = result.catalog else { return }
-                self.catalogs[id] = updated
-                if self.vault == id { try self.applyCatalog(updated) }
-            }
-        }
-    }
+
     func updateHealthScheduling() {
         guard authenticated else { return }
         guard healthSessionGeneration == service.sessionGeneration else { refreshHealth(); return }
@@ -210,9 +175,5 @@ extension AppModel {
             if self.vault == id { try self.applyCatalog(catalog) }
         }
     }
-    func beginSecurityUpgrade(_ id: String) {
-        guard let source = catalogs[id], source.canUpgradeSecurity == true, !busy, !offline else { return }
-        pendingSecurityUpgrade = (id, source.revision)
-        documentRequest = DocumentRequest(vault: id, generation: securityGeneration)
-    }
+
 }

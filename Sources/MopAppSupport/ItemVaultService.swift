@@ -25,7 +25,6 @@ public protocol ItemVaultServiceBackend: Sendable {
     func resumeDeletions() async throws -> [UUID: VaultDeletionPhase]
     func inventory() async throws -> [VaultDescriptor]
     func discover() async throws -> ItemVaultDiscovery
-    func invalidateDiscovery()
     func enrollment(_ action: VaultManagement, vaultID: UUID) async throws -> VaultResult
     func open(_ vaultID: UUID) async throws -> ItemVaultSession
     func open(_ vaultID: UUID, offline: Bool) async throws -> ItemVaultSession
@@ -61,7 +60,6 @@ public extension ItemVaultServiceBackend {
     func deleteVault(_ vaultID: UUID) async throws -> VaultDeletionPhase { throw ItemVaultServiceFailure.unavailable }
     func resumeDeletions() async throws -> [UUID: VaultDeletionPhase] { [:] }
     func discover() async throws -> ItemVaultDiscovery { try await ItemVaultDiscovery(vaults: inventory(), complete: true) }
-    func invalidateDiscovery() {}
     func enrollment(_ action: VaultManagement, vaultID: UUID) async throws -> VaultResult { throw ItemVaultServiceFailure.unavailable }
     func resolveVault(named name: String, offline: Bool) async throws -> UUID? {
         let matches = try await inventory(offline: offline).filter { $0.name == name }
@@ -136,7 +134,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         let waiting: [UUID: UUID]
         var versions: [UUID: UUID] { projection.versions }
         var entries: [UUID: ItemVaultCatalogEntry] { projection.entries }
-        var metadata: VaultEnvelopeMetadata { projection.metadata }
+        var metadata: VaultMetadata { projection.metadata }
     }
     func catalogProjectionWork(vault: UUID) -> (snapshots: Int, sortedRows: Int)? {
         catalogCache.withLock { $0[vault]?.projection.work.value }
@@ -218,9 +216,11 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
     public func userActivity() { idleWork.activity() }
     public func setMaintenanceActive(_ active: Bool) { idleWork.setActive(active) }
+    public func pendingVaultDeletionCount() async throws -> Int? {
+        try await backend.deletionStates().values.filter { $0 != .complete }.count
+    }
     public func invalidateDiscovery() {
         catalogUpdateFailures.withLock { $0.removeAll() }
-        backend.invalidateDiscovery()
     }
     /// Setup names are immutable trust data, not current display names. Resolve
     /// destinations from authenticated metadata without reading any login items.
@@ -352,7 +352,8 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     public func resolve(_ preview: ItemVaultConflictPreview, choice: ItemConflictChoice) async throws {
         let token = sessionGeneration
         guard let session = await backend.existing(preview.conflict.local.scope.vaultID), session.isUnlocked else { throw MopError.authentication }
-        if let content = session.contentSession {
+        do {
+            let content = session.contentSession
             switch choice {
             case .remote: try await content.queueConflictChoice(preview.conflict, catalog: nil)
             case .local: try await content.queueConflictChoice(preview.conflict, catalog: preview.local)
@@ -367,7 +368,6 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             try? await backend.requestSync()
             return
         }
-        throw ContentStoreError.wrongLayout
     }
 
     public func cachedCatalog(vault: String) async throws -> VaultResult? {
@@ -581,7 +581,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         default: guard try await backend.recoveryState()?.blocksRegularAccess != true else { throw ItemRecoveryFailure.recoveryInProgress }
         }
         switch operation {
-        case .manage(.automaticEnrollment), .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.checkEnrollment), .manage(.enrollmentInbox), .manage(.approveEnrollment), .manage(.confirmEnrollment), .manage(.cancelEnrollment), .manage(.rejectEnrollment), .manage(.devices), .manage(.removeDevice): break
+        case .manage(.automaticEnrollment), .manage(.devices), .manage(.removeDevice): break
         case .discover, .catalog, .recentlyDeleted, .read, .save, .write, .delete, .deleteVault, .create, .restorePortable,
              .trashItem, .restoreItem, .rename, .exportPortable, .sync, .readHistory, .restoreHistory, .clearHistory, .passwordQuality, .savePasswordChecks: break
         default: throw ItemVaultServiceFailure.unavailable
@@ -627,7 +627,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             if phase != .prepared {
                 catalogUpdates.withLock { $0.removeValue(forKey: id) }?.task.cancel()
                 catalogCache.withLock { $0[id] = nil }; publishedCatalogs.withLock { $0[id] = nil }
-                backend.invalidateDiscovery(); displayChanged(id)
+                invalidateDiscovery(); displayChanged(id)
             }
             return result
         case .sync:
@@ -1041,7 +1041,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             guard session.isUnlocked else { throw MopError.authentication }
         }
         for row in rows {
-            waiting[row.entry.itemID] = nil
+            waiting[row.entry.itemID] = row.entry.versionID == index[row.entry.itemID] ? nil : index[row.entry.itemID]
             entries[row.entry.itemID] = row.entry
             changedIDs.insert(row.entry.itemID)
             var item = row.item; item.storageID = row.entry.itemID.uuidString
@@ -1053,7 +1053,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         if limit == nil {
             guard Set(entries.keys) == itemIDs, Set(visible.keys) == itemIDs else { throw MopError.vaultConflict }
         }
-        let metadata: VaultEnvelopeMetadata
+        let metadata: VaultMetadata
         let metadataVersion: UUID
         if let previous, let version = index[ItemVaultSession.metadataRecordID], previous.versions[ItemVaultSession.metadataRecordID] == version {
             metadata = previous.metadata; metadataVersion = version
@@ -1237,7 +1237,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             result.message = "Saved on this device; iCloud confirmation is pending. Delivery continues automatically when cloud access is available."
         }
     }
-    private func renamed(_ catalog: ItemEnvelopeCatalog, to name: String) -> ItemEnvelopeCatalog {
+    private func renamed(_ catalog: ItemContentCatalog, to name: String) -> ItemContentCatalog {
         var result = catalog
         let old = SecretReference.encode(catalog.item.name) + "/"
         result.references = Dictionary(uniqueKeysWithValues: catalog.references.map { key, value in
@@ -1246,7 +1246,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         result.item.name = name
         return result
     }
-    private func trashed(_ catalog: ItemEnvelopeCatalog) -> ItemEnvelopeCatalog {
+    private func trashed(_ catalog: ItemContentCatalog) -> ItemContentCatalog {
         let deletion = ItemDeletion(originalName: catalog.item.name, deletedAt: Date())
         var result = renamed(catalog, to: "trashed-" + deletion.id.uuidString)
         result.item.deletion = deletion

@@ -2,11 +2,9 @@
 import CryptoKit
 import Foundation
 
-/// The preview has a separate store and cloud address space. Selecting it is
-/// explicit; native clients select this layout and leave legacy stores untouched.
+/// Stable paths and cloud identifiers for the sole supported content store.
 public enum SyncStoreLayout: Sendable {
     public static let contentSubscriptionID = "mop-content-v3-private"
-    case legacy, contentPreview3
 
     public static func contentPreviewURL(in root: URL) -> URL {
         root.appendingPathComponent("ContentPreview3", isDirectory: true).appendingPathComponent("Content3.sqlite")
@@ -14,11 +12,11 @@ public enum SyncStoreLayout: Sendable {
     public static let contentCoordinationZone = "MopCoordination3"
     public static func contentZone(vault: UUID) -> String { "MopContent3-" + vault.uuidString }
 
-    func validate(storeURL: URL) throws {
+    static func validate(storeURL: URL) throws {
         let resolved = storeURL.standardizedFileURL.resolvingSymlinksInPath()
         let isPreview = resolved.lastPathComponent.lowercased() == "content3.sqlite"
             && resolved.deletingLastPathComponent().lastPathComponent.lowercased() == "contentpreview3"
-        guard (self == .contentPreview3) == isPreview else { throw ContentStoreError.wrongLayout }
+        guard isPreview else { throw ContentStoreError.wrongLayout }
     }
 }
 
@@ -115,7 +113,6 @@ extension EncryptedItemRepository {
     /// indexes newly missing grants once on admission, not on routine wakes.
     public func setContentRecipients(scope: VaultScope, expected: ContentRecipientPolicy?,
                                      policy: ContentRecipientPolicy, authorization: any RepositoryWritePermit) throws {
-        try requireContentLayout()
         guard !scope.account.isEmpty, scope.database == "private", !scope.zoneOwner.isEmpty,
               validContentDigest(policy.membership), validContentDigest(policy.keyAuthority), !policy.recipients.isEmpty, policy.recipients.count <= 129,
               policy.recipients.allSatisfy(validContentDigest) else { throw ContentStoreError.invalidRecord }
@@ -137,7 +134,6 @@ extension EncryptedItemRepository {
     }
 
     public func contentRecipients(scope: VaultScope) throws -> ContentRecipientPolicy? {
-        try requireContentLayout()
         return try transaction { try contentPolicy(scope) }
     }
 
@@ -153,7 +149,6 @@ extension EncryptedItemRepository {
 
     private func commitContentInTransaction(_ content: PreparedContentVersion, grants: [PreparedContentGrant],
                                             expectedPolicy: ContentRecipientPolicy, prerequisites: [SyncOperation]) throws -> PendingItemMutation {
-        try requireContentLayout()
         try validate(content.version)
         guard validContentDigest(content.membership),
               content.keyAuthority == expectedPolicy.keyAuthority else { throw ContentStoreError.invalidRecord }
@@ -197,7 +192,6 @@ extension EncryptedItemRepository {
     public func initializeContentVault(scope: VaultScope, publications: [PreparedContentPublication],
                                        policy: ContentRecipientPolicy, membershipState: Data, setupID: String,
                                        provision: SyncOperation, authorization: any RepositoryWritePermit) throws -> VaultInitializationReceipt {
-        try requireContentLayout()
         guard !publications.isEmpty, !setupID.isEmpty, !membershipState.isEmpty,
               membershipState.count <= Self.maximumCiphertextBytes,
               validContentDigest(policy.membership), validContentDigest(policy.keyAuthority),
@@ -249,14 +243,13 @@ extension EncryptedItemRepository {
         }
     }
 
-
     /// The crypto layer has re-encrypted the latest local plaintext against the
     /// accepted cloud base. Preserve it while retiring only obsolete-key outbox
     /// representations; ordinary same-key edits still keep separate receipts.
     public func commitContentRotation(_ content: PreparedContentVersion, grants: [PreparedContentGrant],
                                       expectedLocal: UUID, expectedAccepted: UUID?, expectedPolicy: ContentRecipientPolicy,
                                       authorization: any RepositoryWritePermit) throws -> PendingItemMutation {
-        try requireContentLayout(); try validate(content.version)
+        try validate(content.version)
         return try authorization.withWritePermission {
             try transaction {
                 let scope = content.version.scope
@@ -320,7 +313,6 @@ extension EncryptedItemRepository {
     /// same signed identity is rejected instead of replacing an in-flight grant.
     public func commitContentGrant(_ grant: PreparedContentGrant, expectedPolicy: ContentRecipientPolicy,
                                    authorization: any RepositoryWritePermit) throws {
-        try requireContentLayout()
         try authorization.withWritePermission {
             try transaction {
                 guard try contentPolicy(VaultScope(grant.scope)) == expectedPolicy,
@@ -336,35 +328,36 @@ extension EncryptedItemRepository {
     }
 
     public func acknowledgeContentGrant(_ grant: PreparedContentGrant, serverSystemFields: Data, now: Date = Date()) throws {
-        try requireContentLayout()
         guard !serverSystemFields.isEmpty, serverSystemFields.count <= 1_048_576 else { throw ContentStoreError.invalidRecord }
         try transaction { try acknowledgeContentGrantInTransaction(grant, serverSystemFields: serverSystemFields, now: now) }
     }
 
-    private func acknowledgeContentGrantInTransaction(_ grant: PreparedContentGrant, serverSystemFields: Data, now: Date) throws {
+    func acknowledgeContentGrantInTransaction(_ grant: PreparedContentGrant, serverSystemFields: Data, now: Date) throws {
         let key = contentGrantKey(scope: grant.scope, keyGeneration: grant.keyGeneration, suffix: grant.identifier)
         guard let row = try fetchOne("ContentGrant", key: key) else { throw ContentStoreError.invalidRecord }
         let stored: PreparedContentGrant = try contentValue(row)
         guard stored == grant else { throw ContentStoreError.identityCollision }
-        let receiptKey = "content-grant-delivery:" + key
+        let receiptKey = "content-grant-delivery4:" + key
+        if let repair = try fetchOne("StateBlob", key: "grant-repair4:" + key) { context.delete(repair) }
         // Replay must not turn a 30-day receipt into perpetual confirmation.
         if try fetchOne("StateBlob", key: receiptKey) != nil { return }
         try touchVaultBoundary(VaultScope(grant.scope))
         let receipt = NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
         receipt.setValue(receiptKey, forKey: "key")
         receipt.setValue(try contentEncode(ContentGrantDelivery(systemFields: serverSystemFields, acknowledgedAt: now)), forKey: "value")
-        try finishPublicationInTransaction(contentOperationID("publish:" + key), account: grant.scope.account,
-            database: grant.scope.database, confirmed: true)
+        do {
+            try finishPublicationInTransaction(contentOperationID("publish:" + key), account: grant.scope.account,
+                database: grant.scope.database, confirmed: true)
+        }
     }
 
     public func contentGrantDelivery(_ grant: PreparedContentGrant, now: Date = Date()) throws -> ContentGrantDeliveryStatus {
-        try requireContentLayout()
         return try transaction {
             let key = contentGrantKey(scope: grant.scope, keyGeneration: grant.keyGeneration, suffix: grant.identifier)
             guard let row = try fetchOne("ContentGrant", key: key) else { return .expiredOrUnknown }
             let stored: PreparedContentGrant = try contentValue(row)
             guard stored == grant else { return .expiredOrUnknown }
-            guard let receipt = try fetchOne("StateBlob", key: "content-grant-delivery:" + key) else {
+            guard let receipt = try fetchOne("StateBlob", key: "content-grant-delivery4:" + key) else {
                 if let date: Date = try journalValue("StateBlob", key: "content-grant-superseded:" + key) {
                     return now.timeIntervalSince(date) < 30 * 86_400 ? .superseded : .expiredOrUnknown
                 }
@@ -376,12 +369,16 @@ extension EncryptedItemRepository {
     }
 
     public func contentState(scope: ItemScope) throws -> ContentKeyState? {
-        try requireContentLayout()
         return try transaction { try fetchOne("ContentKeyState", key: scope.storageKey).map { try contentValue($0) } }
     }
 
+    public func contentGrant(scope: ItemScope, keyGeneration: UUID, identifier: String) throws -> PreparedContentGrant? {
+        return try transaction {
+            try fetchOne("ContentGrant", key: contentGrantKey(scope: scope, keyGeneration: keyGeneration, suffix: identifier)).map { try contentValue($0) }
+        }
+    }
+
     public func contentGrants(scope: ItemScope, keyGeneration: UUID, recipient: String? = nil) throws -> [PreparedContentGrant] {
-        try requireContentLayout()
         return try transaction {
             let request = NSFetchRequest<NSManagedObject>(entityName: "ContentGrant")
             var predicates = [NSPredicate(format: "scopeKey == %@ AND keyGeneration == %@", scope.storageKey, keyGeneration as NSUUID)]
@@ -396,7 +393,6 @@ extension EncryptedItemRepository {
     /// A bounded, consistent preparation snapshot. The final commit still checks
     /// live authority and key generation; this read never authorizes publication.
     public func contentGrantPreparation(_ missing: MissingContentGrant, sourceRecipient: String) throws -> ContentGrantPreparationSnapshot? {
-        try requireContentLayout()
         return try transaction {
             grantPreparationReads += 1
             let key = contentGrantKey(scope: missing.scope, keyGeneration: missing.keyGeneration, suffix: missing.recipient)
@@ -424,7 +420,6 @@ extension EncryptedItemRepository {
     }
 
     public func missingContentGrants(scope: VaultScope) throws -> [MissingContentGrant] {
-        try requireContentLayout()
         return try transaction {
             let rows = try contentRows("MissingContentGrant", field: "vaultKey", equals: contentVaultKey(scope))
             missingGrantScanRows += rows.count
@@ -433,7 +428,6 @@ extension EncryptedItemRepository {
     }
 
     public func setContentUploadBlocked(_ id: UUID, account: String, blocked: Bool, permit: any RepositoryWritePermit) throws {
-        try requireContentLayout()
         try permit.withWritePermission {
             try transaction {
                 let key = journalKey(account, "private", id.uuidString)
@@ -461,7 +455,6 @@ extension EncryptedItemRepository {
     public func deferContentUpload(_ id: UUID, account: String, failure: SyncFailure,
                                    retryAfter: TimeInterval? = nil, now: Date = Date(), jitter: Double = 0,
                                    permit: any RepositoryWritePermit) throws {
-        try requireContentLayout()
         try permit.withWritePermission {
             try transaction {
                 let key = journalKey(account, "private", id.uuidString)
@@ -491,10 +484,14 @@ extension EncryptedItemRepository {
     /// Select the oldest unsent edit per item. Immutable versions precede heads;
     /// independent signed grants never replace content or its mutation receipts.
     public func contentPublications(account: String) throws -> [ContentUpload] {
-        try requireContentLayout()
         return try transaction {
             let receiving = try incomingCloudRecordIDsInTransaction(account: account, database: "private")
-            let operations = try activeOperationsInTransaction(account: account, database: "private")
+            let pending = try activeOperationsInTransaction(account: account, database: "private")
+            var deletedVaults: Set<UUID> = []
+            for vault in Set(pending.compactMap(\.vaultID)) {
+                if try deletionInTransaction(VaultScope(account: account, vaultID: vault)) != nil { deletedVaults.insert(vault) }
+            }
+            let operations = pending.filter { $0.vaultID.map { !deletedVaults.contains($0) } ?? true }
             let byID = Dictionary(uniqueKeysWithValues: operations.map { ($0.id, $0) })
             let prerequisiteIDs = Set(operations.flatMap(\.dependencies).filter { $0.kind == .operation }.compactMap { UUID(uuidString: $0.identifier) })
             var delivered: Set<UUID> = []
@@ -567,7 +564,6 @@ extension EncryptedItemRepository {
     public func receiveContent(_ content: PreparedContentVersion, from incoming: IncomingRecord,
                                action: IncomingContentAction, expectedHead: UUID?, expectedPolicy: ContentRecipientPolicy,
                                permit: any RepositoryWritePermit) throws {
-        try requireContentLayout()
         try validate(content.version)
         try permit.withWritePermission {
             try transaction {
@@ -656,7 +652,7 @@ extension EncryptedItemRepository {
     public func receiveRebasedContent(_ content: PreparedContentVersion, remote: PreparedContentVersion,
                                      from incoming: IncomingRecord, expectedHead: UUID,
                                      expectedPolicy: ContentRecipientPolicy, permit: any RepositoryWritePermit) throws {
-        try requireContentLayout(); try validate(content.version)
+        try validate(content.version)
         try permit.withWritePermission {
             try transaction {
                 try requireIncomingInTransaction(incoming)
@@ -704,7 +700,6 @@ extension EncryptedItemRepository {
 
     public func receiveContentGrant(_ grant: PreparedContentGrant, from incoming: IncomingRecord,
                                     expectedPolicy: ContentRecipientPolicy, permit: any RepositoryWritePermit) throws {
-        try requireContentLayout()
         try permit.withWritePermission {
             try transaction {
                 try requireIncomingInTransaction(incoming)
@@ -726,7 +721,6 @@ extension EncryptedItemRepository {
 
     public func archiveIncomingContent(_ content: PreparedContentVersion, from incoming: IncomingRecord,
                                        expectedPolicy: ContentRecipientPolicy, permit: any RepositoryWritePermit) throws {
-        try requireContentLayout()
         try validate(content.version)
         try permit.withWritePermission {
             try transaction {
@@ -742,14 +736,12 @@ extension EncryptedItemRepository {
     }
 
     public func contentVersion(scope: ItemScope, version: UUID) throws -> PreparedContentVersion? {
-        try requireContentLayout()
         return try transaction {
             try fetchOne("ContentVersion", key: scope.storageKey + ":" + version.uuidString).map { try contentValue($0) }
         }
     }
 
     public func contentVersion(scope: ItemScope, keyGeneration: UUID) throws -> PreparedContentVersion? {
-        try requireContentLayout()
         return try transaction {
             let request = NSFetchRequest<NSManagedObject>(entityName: "ContentVersion")
             request.predicate = NSPredicate(format: "scopeKey == %@ AND keyGeneration == %@", scope.storageKey, keyGeneration as NSUUID)
@@ -759,12 +751,10 @@ extension EncryptedItemRepository {
     }
 
     public func contentVersions(scope: ItemScope) throws -> [PreparedContentVersion] {
-        try requireContentLayout()
         return try transaction { try contentRows("ContentVersion", field: "scopeKey", equals: scope.storageKey).map { try contentValue($0) } }
     }
 
     public func contentBranches(scope: ItemScope) throws -> [PreparedContentVersion] {
-        try requireContentLayout()
         return try transaction {
             try contentRows("ContentBranch", field: "scopeKey", equals: scope.storageKey).map { row in
                 let branch: ContentKeyState = try contentValue(row)
@@ -787,7 +777,6 @@ extension EncryptedItemRepository {
     /// Only independently accepted local metadata can skip the rotation barrier.
     /// Missing state is not evidence that another device finished the work.
     public func contentRotationSatisfied(scope: ItemScope) throws -> Bool {
-        try requireContentLayout()
         return try transaction {
             guard let row = try fetchOne("ContentKeyState", key: scope.storageKey),
                   let policy = try contentPolicy(VaultScope(scope)) else { return false }
@@ -870,20 +859,19 @@ extension EncryptedItemRepository {
             database: missing.scope.database, confirmed: false)
     }
 
-    private func contentEncode<T: Encodable>(_ value: T) throws -> Data {
+    func contentEncode<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         return try encoder.encode(value)
     }
 
-    private func requireContentLayout() throws { guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout } }
     private func validContentDigest(_ text: String) -> Bool { text.utf8.count == 64 && text.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
     func contentVaultKey(_ scope: VaultScope) -> String {
         [scope.account, scope.database, scope.zoneOwner, scope.vaultID.uuidString].map { Data($0.utf8).base64EncodedString() }.joined(separator: ":")
     }
-    private func contentGrantKey(scope: ItemScope, keyGeneration: UUID, suffix: String) -> String {
+    func contentGrantKey(scope: ItemScope, keyGeneration: UUID, suffix: String) -> String {
         scope.storageKey + ":" + keyGeneration.uuidString + ":" + suffix
     }
-    private func contentOperationID(_ text: String) -> UUID {
+    func contentOperationID(_ text: String) -> UUID {
         let hash = Array(SHA256.hash(data: Data(text.utf8)).prefix(16))
         return UUID(uuid: (hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]))
     }
@@ -912,7 +900,6 @@ extension EncryptedItemRepository {
 
 extension EncryptedItemRepository {
     public func contentConflicts(account: String, includePendingDecisions: Bool = false) throws -> [EncryptedItemConflict] {
-        try requireContentLayout()
         return try transaction {
             let rows = try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "ContentBranch"))
             // The normal no-conflict path must not inspect the operation journal.
@@ -1055,7 +1042,6 @@ extension EncryptedItemRepository {
     }
 }
 
-
 extension EncryptedItemRepository {
     public func pendingContentConflictDecision(_ expected: EncryptedItemConflict) throws -> ContentConflictDecision? {
         let operations = try operations(account: expected.local.scope.account, database: expected.local.scope.database)
@@ -1065,7 +1051,6 @@ extension EncryptedItemRepository {
     }
     public func enqueueContentConflictDecision(_ expected: EncryptedItemConflict, replacement: PreparedContentPublication?,
                                               policy: ContentRecipientPolicy, permit: any RepositoryWritePermit) throws -> SyncOperation {
-        try requireContentLayout()
         return try permit.withWritePermission {
             try transaction {
                 let scope = expected.local.scope
@@ -1109,7 +1094,6 @@ extension EncryptedItemRepository {
         }
     }
     public func contentConflictDecision(_ operation: SyncOperation) throws -> (EncryptedItemConflict, PreparedContentPublication?) {
-        try requireContentLayout()
         return try transaction {
             let value = try JSONDecoder().decode(ContentConflictDecision.self, from: operation.payload)
             let scope = value.scope
@@ -1143,7 +1127,6 @@ extension EncryptedItemRepository {
     /// Presentation only, based on applied content and grants. Fetch indexed
     /// public columns once per discovery refresh, never ciphertext or keys.
     public func enrollmentDownloadProgress(scope: VaultScope, recipient: String, metadata: UUID) throws -> (ready: Int, total: Int)? {
-        try requireContentLayout()
         return try transaction {
             let key = "enrollment-progress-total:" + scope.storageKey
             let expected: Int? = try journalValue("StateBlob", key: key)

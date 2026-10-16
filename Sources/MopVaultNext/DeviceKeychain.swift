@@ -6,6 +6,34 @@ import MopKeychain
 
 /// Disjoint from v5 synchronized identities. Never reads, updates, or deletes them.
 public enum DeviceKeychain {
+    /// Read only the enrolled public identity, without constructing an enclave
+    /// provider, prompting, creating, or replacing keys. Used to restore routing
+    /// on the first upgraded launch before an authorized session is opened.
+    public static func publicIdentity(scope: String, member: UUID) throws -> DevicePublicKey? {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        defer { context.invalidate() }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecUseDataProtectionKeychain as String: true,
+            kSecAttrSynchronizable as String: false,
+            kSecAttrAccessGroup as String: try SigningIdentity.accessGroup(),
+            kSecAttrService as String: "mop.device-identity.v7." + Codec.digest(Data(scope.utf8)),
+            kSecAttrAccount as String: member.uuidString,
+            kSecUseAuthenticationContext as String: context,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var value: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &value)
+        if status == errSecItemNotFound || status == errSecInteractionNotAllowed { return nil }
+        guard status == errSecSuccess else { throw MopError.keychain(status) }
+        guard let bytes = value as? Data, bytes.count <= 64 * 1024 else { throw MopError.invalidIdentity }
+        let representation = try JSONDecoder().decode(EnclaveDevice.Representation.self, from: bytes)
+        guard representation.identity.member == member else { throw MopError.invalidIdentity }
+        return representation.identity
+    }
+
     public static func remove(scope: String, member: UUID) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

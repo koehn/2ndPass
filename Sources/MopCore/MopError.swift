@@ -124,7 +124,7 @@ public enum MopError: Error, LocalizedError, Equatable {
         case .invalidVault: "Vault is invalid, unsupported, or failed integrity verification."
         case .vaultConflict: "Vault changed concurrently. Review both saved versions before submitting the change again."
         case .vaultUntrusted: "Vault checkpoint is not trusted in this local binding. Import an encrypted checkpoint with an independently verified digest. Never trust a digest obtained only from the suspect file."
-        case .notVaultMember: "This device is not an authorized vault member. Request enrollment from the owner or use the offline recovery copy."
+        case .notVaultMember: "This device is not authorized for this vault. Keep an enrolled device unlocked for automatic connection or use the offline recovery copy."
         case .invalidIdentity: "Device identity or recipient key is invalid, unavailable, or does not match the expected fingerprint."
         case .invalidRecovery: "The offline recovery copy is invalid or does not match this account or vault."
         case .filePermissions: "Unsafe file type, permissions, or protected output path."

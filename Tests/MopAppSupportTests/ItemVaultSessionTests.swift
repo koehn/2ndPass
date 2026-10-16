@@ -56,16 +56,16 @@ final class SessionDevice: DeviceOperations {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-observation-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let owner = try SessionDevice()
     let vault = try sessionAuthority(owner: owner)
     let authority = try MembershipEnvelope.genesis(vault: vault.id, membership: vault.membership, owner: owner)
     let history = try TrustedMembershipHistory(genesis: authority, vault: vault.id, pinnedDigest: authority.digest())
     let archive = try sessionArchive()
-    let competing = try ItemEnvelope.seal(archive, vault: vault.id, generation: 1,
-        membership: vault.membership, membershipStateDigest: authority.digest(), signer: owner)
+    let components = try ContentItemArchive.components(archive)
+    let competing = try ContentEnvelope.seal(components.values, vault: vault.id, item: components.item, history: history, signer: owner)
     let binding = ItemVaultBinding(account: "observation", database: "private", zoneOwner: "__defaultOwner__", vaultID: vault.id)
-    let session = try ItemVaultSession(repository: repository, binding: binding, history: history, device: owner)
+    let session = try await currentTestSession(repository: repository, binding: binding, history: history, device: owner)
     let first = try await session.save(archive, expectedBase: nil)
     let state = ItemVaultViewState(repository: repository, session: session)
     state.start()
@@ -73,7 +73,7 @@ final class SessionDevice: DeviceOperations {
     #expect(state.entries.first?.versionID == first.version.versionID)
     #expect(state.pendingItems.contains(first.version.scope.itemID))
     let beforeAcknowledgement = owner.unwrapCount
-    try await repository.acknowledge(mutationID: first.id, account: binding.account, serverSystemFields: Data([1]))
+    try await confirmCurrentMutation(first, repository: repository)
     try await awaitItemView { state.pendingItems.isEmpty }
     #expect(owner.unwrapCount == beforeAcknowledgement)
     var catalog = try #require(state.entries.first?.catalog)
@@ -83,9 +83,7 @@ final class SessionDevice: DeviceOperations {
     #expect(state.entries.first?.catalog.item.metadata?.favorite == true)
     let beforeStatusChanges = owner.unwrapCount
     try await repository.saveEngineState(Data([1]), account: binding.account, database: "private")
-    let remote = EncryptedItemVersion(scope: first.version.scope, versionID: competing.header.version,
-        baseVersionID: competing.header.base, ciphertext: try competing.encoded(), generation: competing.header.generation)
-    try await repository.recordConflict(remote: remote, serverSystemFields: Data([9]))
+    _ = try await branchCurrentPublication(competing, repository: repository, scope: first.version.scope, history: history, fields: Data([9]))
     try await awaitItemView { state.conflictedItems.contains(first.version.scope.itemID) }
     #expect(owner.unwrapCount == beforeStatusChanges)
     state.lock()
@@ -153,7 +151,7 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-bootstrap-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
-    let url = directory.appendingPathComponent("items.sqlite")
+    let url = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite")
     let repository = try EncryptedItemRepository(storeURL: url)
     let archive = try sessionArchive()
     let backup = try PortableArchive.seal(archive)
@@ -204,7 +202,7 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-bootstrap-race-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
-    let url = directory.appendingPathComponent("items.sqlite")
+    let url = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite")
     let repository = try EncryptedItemRepository(storeURL: url)
     let backup = try PortableArchive.seal(sessionArchive())
     let owner = try SessionDevice(), otherOwner = SessionDevice(copying: owner)
@@ -229,7 +227,7 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-bootstrap-empty-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let scope = ItemVaultSetupScope(container: "iCloud.example.test", environment: "Development",
         binding: ItemVaultBinding(account: "empty", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
     let trust = TestItemTrustStore()
@@ -257,7 +255,7 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-conflict-preview-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let owner = try SessionDevice()
     let root = try sessionAuthority(owner: owner)
     let authority = try MembershipEnvelope.genesis(vault: root.id, membership: root.membership, owner: owner)
@@ -268,14 +266,12 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     let recordID = try #require(archive.references["Login/password"])
     let original = try #require(remoteArchive.records[recordID])
     remoteArchive.records[recordID] = PortableArchiveRecord(itemID: original.itemID, bytes: SecretBytes(utf8: "remote-secret"))
-    let remoteEnvelope = try ItemEnvelope.seal(remoteArchive, vault: root.id, generation: 1,
-        membership: root.membership, membershipStateDigest: digest, signer: owner)
+    let components = try ContentItemArchive.components(remoteArchive)
+    let remoteEnvelope = try ContentEnvelope.seal(components.values, vault: root.id, item: components.item, history: history, signer: owner)
     let binding = ItemVaultBinding(account: "review", database: "private", zoneOwner: "__defaultOwner__", vaultID: root.id)
-    let session = try ItemVaultSession(repository: repository, binding: binding, history: history, device: owner)
+    let session = try await currentTestSession(repository: repository, binding: binding, history: history, device: owner)
     let local = try await session.save(archive, expectedBase: nil)
-    let remote = EncryptedItemVersion(scope: local.version.scope, versionID: remoteEnvelope.header.version,
-        baseVersionID: nil, ciphertext: try remoteEnvelope.encoded())
-    let conflict = try await repository.recordConflict(remote: remote, serverSystemFields: Data([1]))
+    let conflict = try await branchCurrentPublication(remoteEnvelope, repository: repository, scope: local.version.scope, history: history, fields: Data([1]))
     let preview = try await session.conflictPreview(conflict)
     #expect(preview.local.editOrigin != nil)
     #expect(preview.remote.editOrigin == nil) // Existing envelopes remain readable.
@@ -286,7 +282,7 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     #expect(preview.remote.item.fields.allSatisfy { $0.value == nil })
     #expect(try await session.revealConflict(conflict, side: .local, recordID: recordID) == SecretBytes(utf8: "session-secret"))
     #expect(try await session.revealConflict(conflict, side: .remote, recordID: recordID) == SecretBytes(utf8: "remote-secret"))
-    let changed = try await repository.recordConflict(remote: remote, serverSystemFields: Data([2]))
+    let changed = try await branchCurrentPublication(remoteEnvelope, repository: repository, scope: local.version.scope, history: history, fields: Data([2]))
     let unwraps = owner.unwrapCount
     await #expect(throws: ItemRepositoryError.staleConflict) { try await session.conflictPreview(conflict) }
     await #expect(throws: ItemRepositoryError.staleConflict) { try await session.revealConflict(conflict, side: .remote, recordID: recordID) }
@@ -306,39 +302,18 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-session-test-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let owner = try SessionDevice()
     let root = try sessionAuthority(owner: owner)
     let authority = try MembershipEnvelope.genesis(vault: root.id, membership: root.membership, owner: owner)
     let history = try TrustedMembershipHistory(genesis: authority, vault: root.id, pinnedDigest: authority.digest())
     let binding = ItemVaultBinding(account: "session-account", database: "private", zoneOwner: "__defaultOwner__", vaultID: root.id)
     let archive = try sessionArchive()
-    let remoteEnvelope = try ItemEnvelope.seal(archive, vault: root.id, generation: 1, membership: root.membership,
-        membershipStateDigest: authority.digest(), signer: owner)
-    let session = try ItemVaultSession(repository: repository, binding: binding, history: history, device: owner)
-    _ = try await session.saveMetadata(VaultEnvelopeMetadata(name: "session"), expectedBase: nil)
+    let components = try ContentItemArchive.components(archive)
+    let remoteEnvelope = try ContentEnvelope.seal(components.values, vault: root.id, item: components.item, history: history, signer: owner)
+    let session = try await currentTestSession(repository: repository, binding: binding, history: history, device: owner)
+    _ = try await session.saveMetadata(VaultMetadata(name: "session"), expectedBase: nil)
     let receipt = try await session.save(archive, expectedBase: nil)
-    try session.validate(receipt.version, direction: .sending)
-    let rebound = EncryptedItemVersion(scope: ItemScope(account: "other-account", vaultID: root.id, itemID: receipt.version.scope.itemID),
-        versionID: receipt.version.versionID, baseVersionID: receipt.version.baseVersionID, ciphertext: receipt.version.ciphertext)
-    #expect(throws: (any Error).self) { try session.validate(rebound, direction: .receiving) }
-    let forgedVersion = EncryptedItemVersion(scope: receipt.version.scope, versionID: UUID(),
-        baseVersionID: receipt.version.baseVersionID, ciphertext: receipt.version.ciphertext)
-    #expect(throws: (any Error).self) { try session.validate(forgedVersion, direction: .receiving) }
-    let forgedGeneration = EncryptedItemVersion(scope: receipt.version.scope, versionID: receipt.version.versionID,
-        baseVersionID: receipt.version.baseVersionID, ciphertext: receipt.version.ciphertext, generation: 2)
-    #expect(throws: (any Error).self) { try session.validate(forgedGeneration, direction: .receiving) }
-    let forgedBase = EncryptedItemVersion(scope: receipt.version.scope, versionID: receipt.version.versionID,
-        baseVersionID: UUID(), ciphertext: receipt.version.ciphertext)
-    #expect(throws: (any Error).self) { try session.validate(forgedBase, direction: .receiving) }
-    for alteredScope in [
-        ItemScope(account: "session-account", vaultID: root.id, itemID: receipt.version.scope.itemID, database: "shared"),
-        ItemScope(account: "session-account", vaultID: root.id, itemID: receipt.version.scope.itemID, zoneOwner: "other-owner")
-    ] {
-        let forgedScope = EncryptedItemVersion(scope: alteredScope, versionID: receipt.version.versionID,
-            baseVersionID: receipt.version.baseVersionID, ciphertext: receipt.version.ciphertext)
-        #expect(throws: (any Error).self) { try session.validate(forgedScope, direction: .receiving) }
-    }
     let itemID = try #require(archive.itemIDs.values.first.flatMap(UUID.init(uuidString:)))
     let recordID = try #require(archive.references["Login/password"])
     let catalog = try await session.catalog()
@@ -354,58 +329,29 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     let secondSave = try await session.save(archive, expectedBase: receipt.version.versionID)
     #expect(secondSave.version.generation == 2)
     #expect(secondSave.version.baseVersionID == receipt.version.versionID)
-    let remote = EncryptedItemVersion(scope: receipt.version.scope, versionID: remoteEnvelope.header.version,
-        baseVersionID: remoteEnvelope.header.base, ciphertext: try remoteEnvelope.encoded())
-    try session.validate(remote, direction: .receiving)
-    try await repository.recordConflict(remote: remote, serverSystemFields: Data([9]))
+    _ = try await branchCurrentPublication(remoteEnvelope, repository: repository, scope: receipt.version.scope, history: history, fields: Data([9]))
     await #expect(throws: (any Error).self) { try await session.exportPortableLocalSnapshot() }
     await #expect(throws: (any Error).self) { try await session.save(archive, expectedBase: nil) }
     session.lock()
-    #expect(throws: (any Error).self) { try session.validate(receipt.version, direction: .sending) }
-    try session.validate(receipt.version, direction: .receiving)
     await #expect(throws: (any Error).self) { try await session.reveal(itemID: itemID, recordID: recordID) }
     await #expect(throws: (any Error).self) { try await session.exportPortableLocalSnapshot() }
     await #expect(throws: (any Error).self) { try await session.save(archive, expectedBase: receipt.version.versionID) }
     #expect(try await repository.pendingMutations(account: "session-account").count == 3)
     session.invalidate()
-    #expect(throws: (any Error).self) { try session.validate(receipt.version, direction: .receiving) }
-}
-
-@Test func itemVaultSessionViewerReadsButCannotQueueMutations() async throws {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-session-viewer-" + UUID().uuidString)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
-    let owner = try SessionDevice(), viewer = try SessionDevice()
-    var vault = try sessionAuthority(owner: owner)
-    vault.membership = try Membership(accounts: vault.membership.accounts + [AccountMember(id: viewer.identity.member, role: .viewer, devices: [viewer.identity])])
-    let authority = try MembershipEnvelope.genesis(vault: vault.id, membership: vault.membership, owner: owner)
-    let history = try TrustedMembershipHistory(genesis: authority, vault: vault.id, pinnedDigest: authority.digest())
-    let binding = ItemVaultBinding(account: "session-account", database: "shared", zoneOwner: "owner", vaultID: vault.id)
-    let ownerSession = try ItemVaultSession(repository: repository, binding: binding, history: history, device: owner)
-    let archive = try sessionArchive()
-    let pending = try await ownerSession.save(archive, expectedBase: nil)
-    let session = try ItemVaultSession(repository: repository, binding: binding, history: history, device: viewer)
-    let recordID = try #require(archive.references["Login/password"])
-    #expect(try await session.reveal(itemID: pending.version.scope.itemID, recordID: recordID) == SecretBytes(utf8: "session-secret"))
-    await #expect(throws: MopError.cloudPermission) { try await session.save(archive, expectedBase: pending.version.versionID) }
-    await #expect(throws: MopError.cloudPermission) { try await session.saveMetadata(VaultEnvelopeMetadata(name: "renamed"), expectedBase: nil) }
-    #expect(throws: MopError.cloudPermission) { try session.validate(pending.version, direction: .sending) }
-    #expect(try await repository.pendingMutations(account: "session-account").count == 1)
 }
 
 @Test func localHealthCacheAuthenticatesButDoesNotTransferDuringEnrollment() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mop-health-sync-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("owner.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("owner.sqlite/ContentPreview3/Content3.sqlite"))
     let owner = try SessionDevice(), joining = try SessionDevice(member: owner.identity.member)
     let root = try sessionAuthority(owner: owner)
     let genesis = try MembershipEnvelope.genesis(vault: root.id, membership: root.membership, owner: owner)
     let history = try TrustedMembershipHistory(genesis: genesis, vault: root.id, pinnedDigest: genesis.digest())
     let binding = ItemVaultBinding(account: "health-sync", database: "private", zoneOwner: "__defaultOwner__", vaultID: root.id)
-    let session = try ItemVaultSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: owner))
-    _ = try await session.saveMetadata(VaultEnvelopeMetadata(name: "test"), expectedBase: nil)
+    let session = try await currentTestSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: owner))
+    _ = try await session.saveMetadata(VaultMetadata(name: "test"), expectedBase: nil)
     let archive = try sessionArchive()
     let item = try await session.save(archive, expectedBase: nil)
     let record = try #require(archive.references.values.first), now = Date()
@@ -414,19 +360,12 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     check.breachResult = CachedBreachResult(exposed: true, checkedAt: now)
     check.strengthResult?.quality = .veryStrong
     let saved = try #require(try await session.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID))
-    try session.validate(saved, direction: .receiving)
-    let wrongParent = EncryptedItemVersion(scope: saved.scope, versionID: saved.versionID,
-        baseVersionID: saved.baseVersionID, ciphertext: saved.ciphertext, generation: saved.generation, healthItemID: UUID())
-    #expect(throws: (any Error).self) { try session.validate(wrongParent, direction: .receiving) }
-    let wrongKind = EncryptedItemVersion(scope: saved.scope, versionID: saved.versionID, baseVersionID: nil,
-        ciphertext: saved.ciphertext, generation: saved.generation)
-    #expect(throws: (any Error).self) { try session.validate(wrongKind, direction: .receiving) }
     await #expect(throws: ItemRepositoryError.staleLocalVersion) {
         try await session.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: UUID())
     }
     #expect(try await session.healthChecks() == [check])
     let unwraps = SessionUnwrapCounter()
-    let reopened = try ItemVaultSession(repository: repository, binding: binding, history: history,
+    let reopened = try await currentTestSession(repository: repository, binding: binding, history: history,
         device: SessionDevice(copying: owner, unwrapCounter: unwraps))
     #expect(try await reopened.healthChecks() == [check])
     #expect(unwraps.value.withLock { $0 } == 1) // One local index key, no companion-key unwrap.
@@ -461,7 +400,7 @@ private struct ContentStorageTestPermit: RepositoryWritePermit {
 @MainActor @Test func grantBackedStorageAuthenticatesBeforeAtomicCommitAndKeepsEnrollmentIndependent() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-content-adapter-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let storage = GrantBackedContentStorage(repository: repository)
     let owner = try SessionDevice(), joining = try SessionDevice(member: owner.identity.member)
     let membership = try Membership(accounts: [.init(id: owner.identity.member, role: .owner, devices: [owner.identity])])
@@ -506,7 +445,7 @@ private struct ContentStorageTestPermit: RepositoryWritePermit {
 
 @MainActor private func previewInboxFixture() async throws -> (URL, EncryptedItemRepository, SessionDevice, TrustedMembershipHistory, ItemScope) {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-inbox-" + UUID().uuidString)
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let owner = try SessionDevice()
     let membership = try Membership(accounts: [.init(id: owner.identity.member, role: .owner, devices: [owner.identity])])
     let genesis = try MembershipEnvelope.genesis(membership: membership, owner: owner)
@@ -660,7 +599,7 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     let incoming = try ContentRecordTransport.materialize(record, account: "a")
     try await repository.stageIncomingBatch([incoming], checkpoint: Data([8]), account: "a", database: "private", permit: ContentStorageTestPermit())
     try FileManager.default.removeItem(at: asset)
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     _ = try await GrantBackedContentInbox(repository: reopened, account: "a").process(id: incoming.id, history: history, permit: ContentStorageTestPermit())
     #expect(try await reopened.item(scope)?.ciphertext == content.version.ciphertext)
     #expect(try await reopened.engineState(account: "a", database: "private") == Data([8]))
@@ -807,7 +746,7 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     }
     let persisted = try await repository.operations(account: "a", database: "private").filter { $0.kind == .fetchContentVersion }
     #expect(persisted.count == 1)
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let resumedInbox = GrantBackedContentInbox(repository: reopened, account: "a")
     let fetched = AsyncStream<CKRecord.ID>.makeStream()
     let fetcher = ContentVersionFetcher(repository: reopened, account: "a") { id in
@@ -1188,8 +1127,8 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     let (root, repository, owner, history, scope) = try await previewInboxFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let binding = ItemVaultBinding(account: scope.account, database: scope.database, zoneOwner: scope.zoneOwner, vaultID: scope.vaultID)
-    let session = try ItemVaultSession(repository: repository, binding: binding, history: history, device: owner)
-    _ = try await session.saveMetadata(VaultEnvelopeMetadata(name: "preview", exclusions: ["temporary"]), expectedBase: nil)
+    let session = try await currentTestSession(repository: repository, binding: binding, history: history, device: owner)
+    _ = try await session.saveMetadata(VaultMetadata(name: "preview", exclusions: ["temporary"]), expectedBase: nil)
     let archive = try sessionArchive()
     let saved = try await session.save(archive, expectedBase: nil)
     let id = saved.version.scope.itemID
@@ -1221,7 +1160,7 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     let legacy = root.appendingPathComponent("Items.sqlite")
     let sentinel = Data("existing preview store must remain untouched".utf8)
     try sentinel.write(to: legacy)
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let owner = try SessionDevice(), store = TestItemTrustStore()
     let binding = ItemVaultBinding(account: "content-import", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID())
     let scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development", binding: binding)
@@ -1249,7 +1188,7 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
 @MainActor @Test func contentProvisioningUsesSignedJournalWhileLocked() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-content-provision-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let owner = try SessionDevice(), trust = TestItemTrustStore(), server = DomainProvisionServer()
     let binding = ItemVaultBinding(account: "content-provision", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID())
     let scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development", binding: binding)
@@ -1354,7 +1293,7 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
 @MainActor @Test func contentAdmissionCompletesBeforeDownloadAndReopensAfterGrantReception() async throws {
     let (root, _, owner, history, scope) = try await previewInboxFixture()
     defer { try? FileManager.default.removeItem(at: root) }
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root.appendingPathComponent("joining")), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root.appendingPathComponent("joining")))
     let joining = try SessionDevice(member: owner.identity.member), restarted = SessionDevice(copying: joining), trust = MemoryItemInventory()
     let setup = ItemVaultSetupScope(container: "iCloud.test", environment: "Development",
         binding: ItemVaultBinding(account: scope.account, database: "private", zoneOwner: scope.zoneOwner, vaultID: scope.vaultID))
@@ -1365,7 +1304,7 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     let session = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: setup, device: joining).acceptContentEnrollment(approval: approval, request: request)
     #expect(try await repository.vaultInitialization(setup.repositoryScope) != nil)
     await #expect(throws: ItemVaultSessionFailure.missingVaultMetadata) { try await session.vaultMetadata() }
-    let metadata = try ContentEnvelope.seal([ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultEnvelopeMetadata(name: "admitted"))],
+    let metadata = try ContentEnvelope.seal([ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultMetadata(name: "admitted"))],
         vault: scope.vaultID, item: ItemVaultSession.metadataRecordID, history: history, signer: owner)
     let grant = try ContentKeyGrant.extendingAccess(to: restarted.identity, content: metadata.content,
         existingGrant: #require(metadata.grants.first), history: admitted, decryptor: owner, signer: owner)
@@ -1389,7 +1328,7 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     defer { try? FileManager.default.removeItem(at: root) }
     let recoveryScope = try RecoveryScope(container: "iCloud.test", environment: "Development", account: "account")
     let owner = try SessionDevice(member: recoveryScope.member), joining = try SessionDevice(member: recoveryScope.member), recovery = try OfflineRecoveryKey(scope: recoveryScope)
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let trust = MemoryItemInventory(), setup = ItemVaultSetupScope(container: recoveryScope.container, environment: recoveryScope.environment,
         binding: ItemVaultBinding(account: "account", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
     let original = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: setup, device: SessionDevice(copying: owner), recovery: recovery.identity).create(name: "recovered")
@@ -1619,44 +1558,6 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
         _ = try await inbox.retireQuarantinedRequest(candidate, history: revoked, permit: ContentStorageTestPermit())
     }
 
-    let legacyEnvelope = try CoordinationEnvelope.sign(kind: .grantRequest, scope: enrollment, identity: UUID(),
-        payload: payload, history: history, device: joining)
-    let legacyRecord = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID,
-        kind: .grantRequest, identity: legacyEnvelope.identity, bytes: legacyEnvelope.encoded())
-    let cloudRecord = try legacyRecord.record()
-    let legacyIncoming = try PreparedCoordinationRecord.materialize(cloudRecord, account: scope.account)
-    try await repository.stageIncoming(legacyIncoming, permit: ContentStorageTestPermit())
-    // Reproduce the old format: retained bytes, but no operation linkage.
-    try await repository.quarantine(legacyIncoming.bytes, account: scope.account, database: "private",
-        zone: legacyIncoming.zoneName, owner: legacyIncoming.zoneOwner, record: legacyIncoming.recordName)
-    try await repository.completeIncoming(legacyIncoming, failure: .invalidAuthority)
-    var old = try #require(await repository.quarantinedRecords(account: scope.account).first { $0.payload == legacyRecord.bytes })
-    #expect(old.operations == nil)
-    #expect(inbox.legacyObsoleteRecord(old, history: history) == nil)
-    #expect(inbox.legacyObsoleteRecord(old, history: revoked) == legacyRecord)
-    let differentRevision = IncomingRecord(id: "different-revision", account: scope.account, database: "private",
-        zoneName: legacyIncoming.zoneName, zoneOwner: legacyIncoming.zoneOwner, recordName: legacyIncoming.recordName,
-        recordType: legacyIncoming.recordType, bytes: legacyIncoming.bytes, systemFields: Data(), vaultID: scope.vaultID)
-    await #expect(throws: SyncJournalError.staleOperation) {
-        _ = try await repository.linkLegacyQuarantine(old, incoming: differentRevision, permit: ContentStorageTestPermit())
-    }
-    try await repository.retainUnmatchedQuarantine(old, account: scope.account, permit: ContentStorageTestPermit())
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
-    old = try #require(await reopened.quarantinedRecords(account: scope.account).first { $0.digest == old.digest })
-    #expect(old.legacyReadbackUnmatched == true)
-    #expect(inbox.legacyObsoleteRecord(old, history: revoked) == nil) // no further cloud readback
-    #expect(try await reopened.operations(account: scope.account, database: "private")
-        .first { $0.id == legacyIncoming.operationID }?.failure == .invalidAuthority)
-    #expect(try await reopened.quarantinedRecords(account: scope.account).contains(badCandidate))
-    // Independently obtained exact evidence can still repair the record later.
-    let linked = try await repository.linkLegacyQuarantine(old,
-        incoming: PreparedCoordinationRecord.materialize(cloudRecord, account: scope.account), permit: ContentStorageTestPermit())
-    #expect(linked.operations == [legacyIncoming.operationID])
-    #expect(try await inbox.retireQuarantinedRequest(linked, history: revoked, permit: ContentStorageTestPermit()))
-    #expect(try await repository.operations(account: scope.account, database: "private")
-        .first { $0.id == legacyIncoming.operationID }?.state == .completed)
-    #expect(try await repository.quarantinedRecords(account: scope.account).contains(badCandidate))
-
 }
 
 @MainActor @Test func contentDeletionCarriesAuthorityForReturningDevicesAndReusesPreparedBytes() async throws {
@@ -1711,7 +1612,6 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     #expect(try await repository.quarantineSummary(account: scope.account).records == 0)
 }
 
-
 @MainActor @Test(arguments: [false, true])
 func contentConflictChoiceSurvivesNonOwnerExitAndCommitsWhileLocked(keepLocal: Bool) async throws {
     let (root, repository, owner, history, originalScope) = try await previewInboxFixture()
@@ -1719,8 +1619,8 @@ func contentConflictChoiceSurvivesNonOwnerExitAndCommitsWhileLocked(keepLocal: B
     let scope = ItemScope(account: originalScope.account, vaultID: originalScope.vaultID, itemID: ItemVaultSession.metadataRecordID)
     let binding = ItemVaultBinding(account: scope.account, database: "private", zoneOwner: scope.zoneOwner, vaultID: scope.vaultID)
     let session = try GrantBackedContentSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: owner))
-    let local = try await session.create(item: scope.itemID, components: [ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultEnvelopeMetadata(name: "local"))])
-    let remote = try ContentEnvelope.seal([ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultEnvelopeMetadata(name: "remote"))], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let local = try await session.create(item: scope.itemID, components: [ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultMetadata(name: "local"))])
+    let remote = try ContentEnvelope.seal([ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultMetadata(name: "remote"))], vault: history.vault, item: scope.itemID, history: history, signer: owner)
     let prepared = try GrantBackedContentStorage.prepare(remote, scope: scope, history: history)
     let inbox = GrantBackedContentInbox(repository: repository, account: scope.account)
     let records = try [ContentRecordTransport.content(prepared.content, kind: .version)] + prepared.grants.map { try ContentRecordTransport.grant($0) } + [ContentRecordTransport.content(prepared.content, kind: .head)]
@@ -1730,7 +1630,7 @@ func contentConflictChoiceSurvivesNonOwnerExitAndCommitsWhileLocked(keepLocal: B
         _ = try await inbox.process(id: incoming.id, history: history, permit: ContentStorageTestPermit(), comparison: session.comparison())
     }
     let expected = try #require(await repository.contentConflicts(account: scope.account).first)
-    let catalog = keepLocal ? ItemEnvelopeCatalog(item: VaultItem(name: "settings", fields: []), references: [:]) : nil
+    let catalog = keepLocal ? ItemContentCatalog(item: VaultItem(name: "settings", fields: []), references: [:]) : nil
     try await session.queueConflictChoice(expected, catalog: catalog)
     let decision = try #require(await repository.operations(account: scope.account, database: "private").first { $0.kind == .resolveConflict })
     try await session.queueConflictChoice(expected, catalog: catalog)
@@ -1740,7 +1640,7 @@ func contentConflictChoiceSurvivesNonOwnerExitAndCommitsWhileLocked(keepLocal: B
     #expect(try await !repository.syncHealth(account: scope.account, database: "private").blockedReasons.contains(.conflict))
     #expect(try await repository.item(scope) == local.version)
     session.lock(); owner.close()
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let (reviewed, replacement) = try await reopened.contentConflictDecision(decision)
     if let replacement {
         for grant in replacement.grants {
@@ -1764,7 +1664,7 @@ func contentConflictChoiceSurvivesNonOwnerExitAndCommitsWhileLocked(keepLocal: B
 func permanentCoordinationFailuresDoNotRetryOnWake(failure: MopError) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let operation = try await repository.enqueue(SyncOperation(account: "test", kind: .enrollment))
     let coordinator = DurableSyncCoordinator(repository: repository, account: "test", kinds: [.enrollment],
         dependencyAvailable: { _ in true }, handler: { _ in ItemVaultSyncRuntime.workFailureOutcome(failure) })
@@ -1787,7 +1687,7 @@ func permanentCoordinationFailuresDoNotRetryOnWake(failure: MopError) async thro
         CloudSyncAdapterError.invalidBinding, CloudSyncAdapterError.malformedRecord,
         CloudSyncAdapterError.untrustedRecord, ContentStoreError.invalidRecord,
         ContentStoreError.identityCollision, SyncJournalError.invalidOperation,
-        SyncJournalError.identityCollision, ItemEnvelopeFailure.invalidRecordMutation,
+        SyncJournalError.identityCollision, ItemContentFailure.invalidRecordMutation,
         ItemRepositoryError.invalidScope, ItemRepositoryError.invalidGeneration,
         ItemRepositoryError.emptyCiphertext, ItemRepositoryError.oversizedCiphertext,
         MopError.invalidRecovery, MopError.deviceRemoved,
@@ -1796,7 +1696,7 @@ func permanentCoordinationFailuresDoNotRetryOnWake(failure: MopError) async thro
     for failure in failures {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
         let operation = try await repository.enqueue(SyncOperation(account: "test", kind: .enrollment))
         let coordinator = DurableSyncCoordinator(repository: repository, account: "test", kinds: [.enrollment],
             dependencyAvailable: { _ in true }, handler: { _ in ItemVaultSyncRuntime.workFailureOutcome(failure) })
@@ -1849,7 +1749,7 @@ func permanentCoordinationFailuresDoNotRetryOnWake(failure: MopError) async thro
     _ = try await worker.reconcile(request: request, scope: scope, history: history, permit: permit)
     let fetches = try await repository.operations(account: "a", database: "private").filter { $0.kind == .fetchContentHead }
     #expect(fetches.count == 1)
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     #expect(try await reopened.operations(account: "a", database: "private").contains { $0.id == fetches.first?.id })
     let otherScope = ItemScope(account: "a", vaultID: history.vault, itemID: UUID())
     let other = try ContentEnvelope.seal(["password": "other"], vault: history.vault, item: otherScope.itemID, history: history, signer: owner)
@@ -1926,7 +1826,7 @@ func permanentCoordinationFailuresDoNotRetryOnWake(failure: MopError) async thro
     #expect(try await repository.item(scope) == nil)
     #expect(try await repository.engineState(account: "a", database: "private") == Data([7]))
     #expect(try await repository.incomingRecords(account: "a", database: "private").count == 1)
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     #expect(try await reopened.operations(account: "a", database: "private").first { $0.id == operation.id }?.state == .completed)
     let incoming = try #require(await reopened.incomingRecords(account: "a", database: "private").first)
     _ = try await GrantBackedContentInbox(repository: reopened, account: "a").process(id: incoming.id, history: history, permit: ContentStorageTestPermit())
@@ -2039,7 +1939,7 @@ func permanentCoordinationFailuresDoNotRetryOnWake(failure: MopError) async thro
     _ = await session.handle(waiting, owner: permit, grantRequestScope: enrollment)
     #expect(try await repository.coordinationPublications(account: scope.account) == before)
     #expect(before.filter { $0.kind == .grantRequest }.count == (missingAncestor ? 0 : 1))
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let fetches = try await reopened.activeOperations(account: scope.account, database: scope.database).filter { [.fetchContentVersion, .fetchContentHead].contains($0.kind) }
     #expect(fetches.count == 1)
     let inbox = GrantBackedContentInbox(repository: reopened, account: scope.account)
@@ -2149,7 +2049,7 @@ func enrollmentWaitsForAutomaticGrantsThenRepairsOnlyIfStillMissing(grantArrives
     }
     #expect(deadline == now.addingTimeInterval(GrantBackedContentSession.initialGrantRepairDelay))
     let waiting = try await repository.transition(operation, to: .waitingForDependency, dependencies: dependencies, failure: .dependency, nextAttempt: deadline)
-    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let resumed = try GrantBackedContentSession(repository: reopened, binding: binding, history: history, device: SessionDevice(copying: joining))
     for _ in 0..<3 {
         guard case .waitingUntil(_, let sameDeadline) = await resumed.handle(waiting, owner: permit, grantRequestScope: enrollment, now: now.addingTimeInterval(1)) else {
@@ -2244,4 +2144,53 @@ private final class SimultaneousGrantSigner: DeviceOperations {
     await #expect(throws: MopError.vaultUntrusted) {
         try await first.coordination(kind: .grantRequest, scope: enrollment, identity: id, payload: Data([1]), owner: ContentStorageTestPermit())
     }
+}
+
+@MainActor @Test func deletionPreflightVerifiesBeforeRetiringAndSurvivesRestart() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit()
+    let session = try GrantBackedContentSession(repository: repository,
+        binding: ItemVaultBinding(account: scope.account, database: "private", zoneOwner: scope.zoneOwner, vaultID: scope.vaultID), history: history, device: SessionDevice(copying: owner))
+    _ = try await session.create(item: scope.itemID, components: ["data": SecretBytes(utf8: "retained until cleanup")])
+    let original = try await repository.item(scope)
+    let enrollment = EnrollmentScope(container: "iCloud.test", environment: "Development", account: scope.account, vault: scope.vaultID, member: owner.identity.member)
+    let inbox = GrantBackedCoordinationInbox(repository: repository, container: enrollment.container,
+        environment: enrollment.environment, account: scope.account, member: owner.identity.member)
+    let notice = try VaultDeletionNotice.create(binding: inbox.deletionBinding(vault: scope.vaultID,
+        genesis: history.orderedStates[0].digest()), history: history, owner: owner)
+    let record = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID, kind: .deletion, identity: scope.vaultID,
+        bytes: CoordinationEnvelope.sign(kind: .deletion, scope: enrollment, identity: scope.vaultID,
+            payload: notice.encoded(), history: history, device: owner).encoded())
+    let wrong = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID, kind: .deletion,
+        identity: scope.vaultID, bytes: Data([1, 2]))
+    await #expect(throws: (any Error).self) {
+        try await inbox.acceptDeletionBeforeRouting(PreparedCoordinationRecord.materialize(wrong.record(), account: scope.account), history: history, permit: permit)
+    }
+    #expect(try await repository.deletion(VaultScope(scope)) == nil)
+    let incoming = try PreparedCoordinationRecord.materialize(record.record(), account: scope.account)
+    let wrongAccount = try PreparedCoordinationRecord.materialize(record.record(), account: "another-account")
+    await #expect(throws: (any Error).self) {
+        try await inbox.acceptDeletionBeforeRouting(wrongAccount, history: history, permit: permit)
+    }
+    #expect(try await repository.deletion(VaultScope(scope)) == nil)
+    let otherGenesis = try MembershipEnvelope.genesis(membership: history.current.membership, owner: owner)
+    let otherHistory = try TrustedMembershipHistory(genesis: otherGenesis, vault: otherGenesis.header.vault, pinnedDigest: otherGenesis.digest())
+    try await GrantBackedContentStorage(repository: repository).setAuthority(scope: VaultScope(account: scope.account, vaultID: otherHistory.vault), expected: nil, history: otherHistory, authorization: permit)
+    let otherSession = try GrantBackedContentSession(repository: repository,
+        binding: ItemVaultBinding(account: scope.account, database: "private", zoneOwner: scope.zoneOwner, vaultID: otherHistory.vault), history: otherHistory, device: SessionDevice(copying: owner))
+    _ = try await otherSession.create(item: UUID(), components: ["data": SecretBytes(utf8: "live vault")])
+    try await repository.saveEngineState(Data([8]), account: scope.account, database: "test-checkpoint")
+    try await inbox.acceptDeletionBeforeRouting(incoming, history: history, permit: permit)
+    try await inbox.acceptDeletionBeforeRouting(incoming, history: history, permit: permit)
+    #expect(try await repository.deletion(VaultScope(scope))?.phase == .prepared)
+    #expect(try await repository.item(scope) == original)
+    let uploads = try await repository.contentPublications(account: scope.account)
+    #expect(!uploads.isEmpty)
+    #expect(uploads.allSatisfy { $0.scope.vaultID == otherHistory.vault })
+    #expect(try await repository.operations(account: scope.account, database: "private").filter { $0.kind == .deletion }.count == 1)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+    #expect(try await reopened.deletion(VaultScope(scope))?.notice == record.bytes)
+    #expect(try await reopened.engineState(account: scope.account, database: "test-checkpoint") == Data([8]))
+
 }

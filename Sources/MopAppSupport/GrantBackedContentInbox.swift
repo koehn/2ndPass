@@ -100,7 +100,8 @@ public struct GrantBackedContentInbox: Sendable {
                 let grant = try authenticate { try JSONDecoder().decode(ContentKeyGrant.self, from: incoming.bytes) }
                 try requireMembership([grant.membership], history: history)
                 try authenticate {
-                    guard grant.item == scope.itemID, try grant.identifier == address.identity,
+                    guard grant.item == scope.itemID, address.recipient == nil || address.recipient == grant.recipient,
+                          try grant.identifier == address.identity,
                           try grant.encoded() == incoming.bytes else { throw MopError.vaultUntrusted }
                     try grant.verifySignature(history: history)
                 }

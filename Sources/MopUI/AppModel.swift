@@ -10,7 +10,7 @@ import MopVaultNext
 import MopSync
 
 enum AppPage: String, CaseIterable { case security = "Security", secrets = "Secrets", recentlyDeleted = "Recently Deleted" }
-enum AppSheet: String, Identifiable { case createVault, enrollDevice, addDevice, shareAccount, setupRecovery, renameVault, deleteVault, recover, importItems, portableBackup, restoreBackup
+enum AppSheet: String, Identifiable { case createVault, enrollDevice, addDevice, setupRecovery, renameVault, deleteVault, recover, portableBackup, restoreBackup
     var id: String { rawValue }
 }
 
@@ -36,7 +36,6 @@ final class AppModel {
         didSet { defaults.set(breachChecksEnabled, forKey: "breachChecksEnabled"); refreshHealth() }
     }
     var historySelection: HistorySelection?
-    var pendingSecurityUpgrade: (String, String)?
     private(set) var conflictPreviews: [ItemVaultConflictPreview] = []
     private(set) var conflictFailure: String?
     private(set) var checkingConflicts = false
@@ -195,12 +194,6 @@ final class AppModel {
     var cloudVaults: [VaultDescriptor] { vaults.filter { $0.id != LocalVault.id } }
     var cloudVaultsPresent: Bool { !cloudVaults.isEmpty }
     var selected: SecretReference?
-    var importAfterCreation = false
-    var importing = false
-    var importStatus: String?
-    var importFraction: Double?
-    var importReport: ImportReport?
-    var importFailed = false
     var showArchived: Bool {
         get { collection == .archive }
         set { if newValue { collection = .archive } else if collection == .archive { collection = .all } }
@@ -213,7 +206,6 @@ final class AppModel {
     var searchIsFocused = false
     var searchHighlighted: ItemRow.ID?
     var searchScope: String { collection.title ?? (vaultName.isEmpty ? "Items" : vaultName) }
-    var members: [VaultMemberRecord] = []
     var settingsVisible = false
     private(set) var enrollmentResetRequiresRestart = false
     var enrollmentResetAlertPresented = false
@@ -246,7 +238,13 @@ final class AppModel {
         return service.isAuthenticated || service.enrollmentAuthorizedAt != nil
     }
     var connectionNeedsUnlock: Bool { !hasConnectionAuthorization && !authenticated }
-    var canAuthorizeVaultConnection: Bool { connectionNeedsUnlock && canUnlock }
+    var canAuthorizeVaultConnection: Bool {
+        connectionNeedsUnlock && !enrollmentResetRequiresRestart && startupFinished &&
+            !unlocking && !unlockQueued && !deviceRemoved
+    }
+    var needsCloudEnrollmentAuthorization: Bool {
+        connectionNeedsUnlock && vaults.contains { $0.supported && !$0.enrolled }
+    }
     var connectionTitle: String {
         if connectionNeedsUnlock { return "Unlock 2ndPass to continue" }
         if waitingForVaultMetadata { return "Setting up your vault" }
@@ -265,6 +263,7 @@ final class AppModel {
             : "Secure access received for \(progress.ready) records"
     }
     var outgoingAccessStatus: String? {
+        if hasPendingVaultDeletion { return "Deleting vault from iCloud…" }
         guard let health = synchronizationHealth else { return nil }
         let kinds = health.pendingKinds
         if !kinds.isDisjoint(with: [.prepareGrant, .grant, .enrollment, .membership]) {
@@ -351,7 +350,11 @@ final class AppModel {
         else if health.blockedReasons.contains(.storagePressure) { syncIssue = "Synchronization is waiting on a local storage or processing error. Your local changes are saved." }
         else if health.blockedReasons.contains(.processing) { syncIssue = "Synchronization encountered a processing error. Your local changes are saved." }
         else if health.blockedReasons.contains(.conflict) { syncIssue = "Review conflicting item edits to finish synchronization." }
-        else if health.blockedReasons.contains(.authorization) { syncIssue = "Unlock an authorized device to finish sharing secure access." }
+        else if health.blockedReasons.contains(.authorization) {
+            syncIssue = needsCloudEnrollmentAuthorization
+                ? "Authorize this device to connect your iCloud vaults."
+                : "Unlock an authorized device to finish sharing secure access."
+        }
         else if health.blockedReasons.contains(.inboxFull) { syncIssue = Self.blockedWorkExplanation(.inboxFull) }
         else if let blocked = health.blockedWork.first { syncIssue = Self.blockedWorkExplanation(blocked.reason) }
         else if health.blockedReasons.contains(.dependency) { syncIssue = Self.blockedWorkExplanation(.prerequisite) }
@@ -398,9 +401,15 @@ final class AppModel {
     private(set) var catalogLoadProgress: [String: CatalogLoadProgress] = [:] { didSet { updateHealthScheduling() } }
     private(set) var catalogUpdatePaused = false
     private var catalogIssueDetails: String?
+    private var catalogNeedsAuthentication = false
+    private var catalogPauseMessage: String {
+        catalogNeedsAuthentication
+            ? "Some updates need device authentication. Lock and unlock 2ndPass to resume them."
+            : "Local catalog is temporarily unavailable. It will update automatically."
+    }
     func showCatalogIssue() {
         guard catalogUpdatePaused else { return }
-        error = "Local catalog is temporarily unavailable. It will update automatically."
+        error = catalogPauseMessage
         errorDetails = catalogIssueDetails
     }
     var isUpdatingCatalog: Bool { !catalogLoadProgress.isEmpty }
@@ -421,7 +430,7 @@ final class AppModel {
     }
     var catalogTransferStatus: String? {
         guard isUpdatingCatalog else { return nil }
-        if catalogUpdatePaused { return "Local catalog is temporarily unavailable. It will update automatically." }
+        if catalogUpdatePaused { return catalogPauseMessage }
         let values = selectedCatalogProgress
         guard !values.isEmpty else { return nil }
         if values.contains(where: { $0.downloading }) {
@@ -432,6 +441,7 @@ final class AppModel {
     }
     private func recordCatalogProgress(_ result: VaultResult, vaultID: String) {
         catalogUpdatePaused = false
+        catalogNeedsAuthentication = false
         catalogIssueDetails = nil
         if let loaded = result.catalogLoadedCount, let total = result.catalogTotalCount, loaded < total {
             catalogLoadProgress[vaultID] = CatalogLoadProgress(loaded: loaded, total: total, waiting: result.catalogWaitingCount ?? 0, downloading: result.catalogDownloading)
@@ -509,10 +519,8 @@ final class AppModel {
     var searchFocusRequest = 0
     var lastBackupURL: URL?
     var lastBackupVaultID: String?
-    var membersVaultID: String?
     var securityGeneration = 0
     var deleteConfirmation = false
-    var documentRequest: DocumentRequest?
     private var generation = 0
     private(set) var visibilityGeneration = 0
     @ObservationIgnored private let lifecycle: any AppLifecycleMonitoring
@@ -732,6 +740,9 @@ final class AppModel {
                     if let health = try? await service.synchronizationHealth(), self?.generation == token {
                         self?.applySyncHealth(health)
                     }
+                    if let count = try? await service.pendingVaultDeletionCount(), self?.generation == token {
+                        self?.updatePendingVaultDeletion(count > 0)
+                    }
                     self?.cloudChanged()
                 case .display(let vault):
                     self?.pendingDisplayVaults.insert(vault)
@@ -747,7 +758,6 @@ final class AppModel {
                     self?.checkExpiration()
                     self?.checkRetention()
                     if self?.removingDevice == true { self?.removalProgress = self?.service.operationProgress ?? "Preparing device removal…" }
-                    self?.refreshImportProgress()
                 }
             }
         }
@@ -1152,7 +1162,6 @@ final class AppModel {
                     pendingLocalSelection = nil
                     selectedLocalIdentityID = localIdentities.first(where: { $0.id == id })?.id
                 }
-                reconcileLocalCredentialEvidence()
             } catch {
                 localError = (error as? MopError)?.errorDescription ?? "Could not read the device-local vault."
             }
@@ -1220,7 +1229,6 @@ final class AppModel {
                 try localStore().delete(id: id, authorization: context)
                 localIdentities = try localStore().list()
                 localReady = true
-                reconcileLocalCredentialEvidence()
                 localError = nil
             } catch {
                 localError = "Could not delete the identity."
@@ -1418,7 +1426,13 @@ final class AppModel {
         // Biometric dialogs temporarily deactivate the app. Their dismissal is
         // not a new user visit and must not retry cancelled authentication.
         if !unlocking { activationUnlockPending = true }
-        service.setMaintenanceActive(false); isActive = false; visibilityGeneration += 1
+        // A desktop app losing focus remains executable. Let downloaded items
+        // continue through catalog/AutoFill preparation while the session is live.
+        // iOS background execution remains controlled by its lifecycle policy.
+        #if !os(macOS)
+        service.setMaintenanceActive(false)
+        #endif
+        isActive = false; visibilityGeneration += 1
         conceal(); automaticUnlockTask?.cancel(); automaticUnlockTask = nil
     }
     func activate() {
@@ -1445,10 +1459,9 @@ final class AppModel {
         selectedLocalIdentityID = nil
         generation += 1; editorGeneration += 1; itemDraft = nil; draftConflict = false
         selectedDeleted = nil; itemToDelete = nil
-        conceal(); catalog = nil; passwordQualities = [:]; passwordQualitySource = nil; selected = nil; members = []
+        conceal(); catalog = nil; passwordQualities = [:]; passwordQualitySource = nil; selected = nil
         selectedItem = nil; sheet = nil; notice = nil
-        importing = false; importStatus = nil; importFraction = nil; importReport = nil; importFailed = false
-        vaultDetailsTarget = nil; deleteConfirmation = false; documentRequest = nil; error = nil
+        vaultDetailsTarget = nil; deleteConfirmation = false; error = nil
     }
     private func clearView() {
         let wasRestoring = restoringSelection
@@ -1456,7 +1469,7 @@ final class AppModel {
         defer { restoringSelection = wasRestoring }
         authenticated = false
         clearSelection()
-        catalogLoadProgress = [:]; catalogUpdatePaused = false; catalogIssueDetails = nil; pendingDisplayVaults.removeAll()
+        catalogLoadProgress = [:]; catalogUpdatePaused = false; catalogNeedsAuthentication = false; catalogIssueDetails = nil; pendingDisplayVaults.removeAll()
         catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []; enrollmentProgress = [:]
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
@@ -1469,7 +1482,7 @@ final class AppModel {
         localAuthorization?.revoke(); localAuthorization = nil
         rememberSelection(); restoreLastSelection = true
         securityGeneration += 1
-        clearHealth(); pendingSecurityUpgrade = nil
+        clearHealth()
         usageLoadTask?.cancel(); usageLoadGeneration += 1; lastUsed = [:]
         search = ""; searchHighlighted = nil; searchIsFocused = false; lastBackupURL = nil
         syncWakeTask?.cancel(); syncWakeTask = nil; syncWakeID = nil
@@ -1519,46 +1532,6 @@ final class AppModel {
         return authenticated && catalogs[descriptor.id] != nil ? "Unlocked" : "Locked"
     }
 
-    func beginImport() {
-        importAfterCreation = itemCreationVaults.isEmpty
-        presentSheet(importAfterCreation ? .createVault : .importItems)
-    }
-    func refreshImportProgress() {
-        guard importing else { return }
-        importStatus = service.operationProgress ?? "Preparing import…"
-        importFraction = service.operationFraction
-    }
-    func commitImport(_ document: ImportDocument, preview: ImportPreview, selected: Set<Int>, destination: String) {
-        guard !busy else { return }
-        perform { token in
-            self.importing = true; self.importFailed = false; self.importReport = nil
-            self.importStatus = "Preparing import…"; self.importFraction = nil
-            defer { self.importing = false; self.importFraction = nil }
-            do {
-                let result = try await self.service.execute(.commitImport(document, selected: selected, vault: preview.vault, revision: preview.revision), vault: destination, offline: self.offline)
-                guard self.current(token), !Task.isCancelled else { return }
-                guard let report = result.importReport else { throw MopError.invalidVault }
-                self.importReport = report
-                self.importStatus = report.committed ? "Import complete. " + report.summary : "Import not completed. " + report.summary
-                self.importFailed = !report.committed
-                if let catalog = result.catalog {
-                    self.catalogs[destination] = catalog
-                    if self.vault == destination { self.catalog = catalog }
-                }
-            } catch {
-                if self.current(token) {
-                    self.importFailed = true
-                    self.importStatus = error as? MopError == .cloudUncertain
-                        ? "Import confirmation is pending. Its status will update automatically."
-                        : "Import did not complete. " + ((error as? MopError)?.errorDescription ?? (error as? ImportFailure)?.errorDescription ?? (error as? AttachmentFailure)?.errorDescription ?? "The saved import status will update automatically.")
-                }
-                throw error
-            }
-        }
-        if busy { sheet = nil }
-    }
-    func cancelImportOperation() { operationTask?.cancel() }
-
     func perform(local: Bool = false, operation: String = #function, file: String = #fileID, line: Int = #line, _ action: @escaping @MainActor (Int) async throws -> Void) {
         checkExpiration()
         guard !enrollmentResetRequiresRestart, !busy else { return }
@@ -1604,7 +1577,7 @@ final class AppModel {
                     } else if error as? MopError == .vaultUntrusted {
                         self.error = self.connectionRepairMessage
                     } else {
-                        self.error = (error as? MopError)?.errorDescription ?? (error as? ItemVaultServiceFailure)?.errorDescription ?? (error as? PortableArchiveFailure)?.errorDescription ?? (error as? ImportFailure)?.errorDescription ?? (error as? AttachmentFailure)?.errorDescription ?? (error as? CompoundFieldFailure)?.errorDescription ?? "The operation could not be completed."
+                        self.error = (error as? MopError)?.errorDescription ?? (error as? ItemVaultServiceFailure)?.errorDescription ?? (error as? PortableArchiveFailure)?.errorDescription ?? (error as? AttachmentFailure)?.errorDescription ?? (error as? CompoundFieldFailure)?.errorDescription ?? "The operation could not be completed."
                     }
                     self.recordError(originalError, operation: "\(operation) at \(file):\(line)")
                 }
@@ -1681,10 +1654,15 @@ final class AppModel {
             if self.vault.isEmpty {
                 if let id = result.defaultVault, ids.contains(id) { self.vault = id }
             } else if self.vault != LocalVault.id && !ids.contains(self.vault) {
-                self.vault = ""; self.lock(reason: .accessFailure)
-                if rows.isEmpty && result.discoveryComplete { self.offerVaultCreationIfNeeded() }
-                else if !rows.isEmpty && !rows.contains(where: { $0.supported && $0.enrolled }) { self.status = "Connecting iCloud vaults…" }
-                return
+                self.vault = ""
+                if !autoUnlock {
+                    self.lock(reason: .accessFailure)
+                    if rows.isEmpty && result.discoveryComplete { self.offerVaultCreationIfNeeded() }
+                    return
+                }
+                // An explicit unlock may discover that the selected vault was
+                // deleted. Continue with the surviving discovery results instead
+                // of cancelling the user's request before enrollment can begin.
             }
             self.status = ids.isEmpty ? (result.discoveryComplete ? "Create your first vault" : "Checking iCloud for vaults…") : self.authenticated ? "Refreshing vaults…" : "Locked"
             if self.sheet == nil {
@@ -1696,7 +1674,7 @@ final class AppModel {
             if autoUnlock && !rows.isEmpty && !rows.contains(where: { $0.supported && $0.enrolled }) {
                 try await self.connectDiscoveredVaults(token)
             }
-            if self.isActive, (refreshContents || self.connectionUnlockPending || ((autoUnlock || connectedAutomatically) && self.launchUnlockAvailable)),
+            if self.isActive, (refreshContents || self.connectionUnlockPending || (autoUnlock || (connectedAutomatically && self.launchUnlockAvailable))),
                self.vaults.contains(where: { $0.supported && $0.enrolled }) {
                 if !selectedOnly && !refreshContents { self.allVaults = true }
                 try await self.unlockContents(token, refresh: !refreshContents)
@@ -1724,8 +1702,21 @@ final class AppModel {
             perform(local: true) { token in
                 self.unlocking = true
                 defer { self.unlocking = false }
+                let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
+                guard self.current(token), !Task.isCancelled else { return }
+                if discovery.recoveryNeeded { throw MopError.vaultUntrusted }
+                if discovery.deviceRemoved { self.showDeviceRemoved(); return }
+                self.vaults = discovery.vaults
+                self.discoveryComplete = discovery.discoveryComplete
+                self.hasPendingVaultDeletion = !discovery.pendingVaultDeletions.isEmpty
+                if self.vaults.contains(where: { $0.supported }) {
+                    try await self.unlockContents(token)
+                    return
+                }
                 try await self.authorizeApplication()
-                guard self.current(token), !Task.isCancelled, self.isActive else { return }
+                // Face ID may finish before scene activation. A real background
+                // transition or explicit lock cancels this operation's generation.
+                guard self.current(token), !Task.isCancelled else { return }
                 self.localSessionStarted = self.now()
                 self.lastActivity = self.now()
                 if !self.restoreLocalSelection() {
@@ -1814,6 +1805,16 @@ final class AppModel {
             offline = !cachedVaults.isEmpty || !dates.isEmpty
             catalogs = loaded; deletedCatalogs = deleted; retentionDate = wallNow()
             guard !loaded.isEmpty else {
+                if vaults.contains(where: { $0.supported && !$0.enrolled }) {
+                    // The last enrolled vault disappeared while opening. The
+                    // replacement vault still needs admission, not another tap.
+                    try await connectDiscoveredVaults(token)
+                    guard current(token) else { return }
+                    if !requestedVaultIDs.isEmpty {
+                        try await unlockContents(token)
+                    }
+                    return
+                }
                 service.lock(); authenticated = false; lastActivity = nil
                 catalog = nil; vault = ""
                 status = vaults.isEmpty ? "Create your first vault" : "Connect this device to a vault to get started."
@@ -1897,6 +1898,7 @@ final class AppModel {
                         self.offline = !self.cachedVaults.isEmpty
                         if !self.offline { self.status = "Unlocked · \(self.catalogs.count) vaults" }
                     } catch {
+                        if self.deferBackgroundAuthentication(error, operation: "Load remaining catalog") { continue }
                         if error as? MopError == .deviceRemoved || error as? MopError == .deviceRemovalPending {
                             self.showDeviceRemoved(pending: error as? MopError == .deviceRemovalPending)
                             group.cancelAll(); return
@@ -2089,7 +2091,7 @@ final class AppModel {
         guard !offline, !busy else { return }
         removingDevice = true; removalProgress = "Preparing device removal…"
         perform { token in
-            let result = try await self.service.execute(.manage(.removeAccountDevice(id)), vault: self.selectedVault, offline: false)
+            let result = try await self.service.execute(.manage(.removeDevice(id)), vault: self.selectedVault, offline: false)
             guard self.current(token) else { return }
             self.devices = result.devices
             if result.deviceRemovalIncomplete { self.error = result.message }
@@ -2123,31 +2125,6 @@ final class AppModel {
     }
     #endif
 
-    func reconnectDevice() {
-        perform { token in
-            _ = try await self.service.execute(.manage(.reconnect), vault: nil, offline: false)
-            guard self.current(token) else { return }
-            self.deviceRemoved = false; self.removalCleanupPending = false
-            self.accessNeedsRepair = false
-            self.launchUnlockAvailable = false
-            let discovery = try await self.service.execute(.discover, vault: nil, offline: false)
-            guard self.current(token) else { return }
-            self.offline = discovery.usingCache
-            self.hasPendingVaultDeletion = !discovery.pendingVaultDeletions.isEmpty
-            self.vaults = discovery.vaults
-            self.sheet = .enrollDevice
-        }
-    }
-    func loadMembers(target: VaultDescriptor? = nil) {
-        guard !offline else { return }
-        let id = target?.id ?? selectedVault
-        perform { token in
-            let result = try await self.service.execute(.members, vault: id, offline: false)
-            guard self.current(token) else { return }
-            self.members = result.members; self.membersVaultID = id
-            self.status = "Account membership verified"
-        }
-    }
     var enrollmentView: MopAppSupport.ItemEnrollmentView?
     func enrollmentAction(_ action: VaultManagement, vaultID: String) {
         guard !vaultID.isEmpty, !busy else { return }
@@ -2252,6 +2229,7 @@ final class AppModel {
                 if selectedItem == nil && selectedDeleted == nil { restoreSelection() }
             } catch {
                 guard current(token), !Task.isCancelled else { return }
+                if deferBackgroundAuthentication(error, operation: "Local catalog refresh") { return }
                 if Authentication.requiresRenewal(error) {
                     lock(reason: .accessFailure)
                     self.error = "Unlock 2ndPass again to continue. Your device requires authentication."
@@ -2268,6 +2246,21 @@ final class AppModel {
             }
         }
     }
+    /// Background reads cannot turn an expiring hardware authorization into an
+    /// application lock. Keep already verified UI state and the original idle
+    /// deadline; protected operations still fail until the user authenticates.
+    @discardableResult
+    func deferBackgroundAuthentication(_ failure: Error, operation: String) -> Bool {
+        guard authenticated, service.isAuthenticated,
+              Authentication.requiresInteraction(failure) else { return false }
+        catalogUpdatePaused = true
+        catalogNeedsAuthentication = true
+        notice = catalogPauseMessage
+        recordError(failure, operation: operation)
+        catalogIssueDetails = errorDetails
+        return true
+    }
+
     func cloudChanged() {
         refreshConflicts()
         cloudRefreshPending = true
@@ -2337,6 +2330,7 @@ final class AppModel {
                 reconcileAgain = false
                 if isUpdatingCatalog { catalogUpdatePaused = true }
                 guard token == generation, !Task.isCancelled else { return }
+                if deferBackgroundAuthentication(error, operation: "Background cloud refresh") { return }
                 if Authentication.requiresRenewal(error) {
                     lock(reason: .accessFailure)
                     self.error = "Unlock 2ndPass again to continue. Your device requires authentication."
@@ -2363,7 +2357,7 @@ final class AppModel {
     func createVault(name: String) {
         guard !offline, !busy else { return }
         restoreLastSelection = false
-        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; passwordQualitySource = nil; selected = nil; members = []; authenticated = false
+        conceal(); catalog = nil; catalogs = [:]; passwordQualities = [:]; passwordQualitySource = nil; selected = nil; authenticated = false
         let id = UUID().uuidString
         perform { token in
             // Retain this UUID even on a failed/uncertain initialization for reconciliation.
@@ -2373,7 +2367,7 @@ final class AppModel {
             guard self.current(token) else { return }
             try self.applyCatalog(result.requireCatalog())
             try await self.unlockContents(token, refresh: false)
-            self.selected = nil; self.sheet = self.importAfterCreation ? .importItems : nil; self.importAfterCreation = false; self.showsSetupChecklist = true
+            self.selected = nil; self.sheet = nil; self.showsSetupChecklist = true
             self.notice = result.message; self.status = "Vault created · save a portable backup in settings"
         }
     }
@@ -2416,6 +2410,17 @@ final class AppModel {
         }
     }
 
+    func updatePendingVaultDeletion(_ pending: Bool) {
+        let completed = hasPendingVaultDeletion && !pending
+        hasPendingVaultDeletion = pending
+        if completed {
+            if notice == "Vault deletion is pending. Cleanup continues automatically." { notice = nil }
+            if status == "Vault deletion pending" {
+                status = authenticated ? "Unlocked · \(catalogs.count) vaults" : "Locked"
+            }
+        }
+    }
+
     func deleteVault(target: VaultDescriptor, confirmation: String) {
         guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.deleteVault) ?? ""; return }
         guard !offline, !busy, confirmation == (target.name ?? target.id) else { return }
@@ -2434,40 +2439,8 @@ final class AppModel {
             }
             self.sheetRequest = nil
             self.hasPendingVaultDeletion = pending
-            self.notice = result.message
-            self.status = pending ? "Vault deletion pending" : "Vault deleted"
-        }
-    }
-
-    func chooseExportBackup(target: VaultDescriptor? = nil) {
-        guard !busy, let target = target ?? selectedVaultDescriptor, target.enrolled else { return }
-        guard target.id != LocalVault.id else { error = LocalVaultPolicy.disallowedReason(.export) ?? ""; return }
-        pendingSecurityUpgrade = nil
-        documentRequest = DocumentRequest(vault: target.id, generation: securityGeneration)
-    }
-    func completeBackupSelection(folder: URL, request: DocumentRequest) {
-        guard securityGeneration == request.generation else { return }
-        let rawName = vaults.first { $0.id == request.vault }?.name ?? "vault"
-        let name = String(rawName.prefix(80).map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "-" })
-        let date = wallNow().formatted(.iso8601.year().month().day().dateSeparator(.dash))
-        exportBackup(to: folder.appendingPathComponent("sp-" + name + "-" + date + "-" + String(UUID().uuidString.prefix(8)) + ".mopfile"), vaultID: request.vault)
-    }
-    func exportBackup(to url: URL, vaultID: String? = nil) {
-        guard !busy, let id = vaultID ?? selectedVault, vaults.contains(where: { $0.id == id && $0.enrolled }) else { return }
-        perform { token in
-            let operation: VaultOperation
-            if let upgrade = self.pendingSecurityUpgrade, upgrade.0 == id {
-                operation = .upgradeSecurity(backup: url, revision: upgrade.1)
-            } else { operation = .export(url) }
-            self.pendingSecurityUpgrade = nil
-            let result = try await self.service.execute(operation, vault: id, offline: false)
-            if self.current(token), let updated = result.catalog {
-                self.catalogs[id] = updated
-                if self.vault == id { try self.applyCatalog(updated) }
-            }
-            guard self.current(token) else { return }
-            self.lastBackupURL = url; self.lastBackupVaultID = id
-            self.notice = "Encrypted backup exported. Keep your offline recovery copy separately."
+            self.notice = pending ? nil : "Vault deleted."
+            self.status = self.authenticated ? "Unlocked · \(self.catalogs.count) vaults" : "Locked"
         }
     }
 
@@ -2522,9 +2495,7 @@ extension AppModel {
     func canPresent(_ kind: AppSheet) -> Bool {
         switch kind {
         case .enrollDevice, .addDevice: supports(.enrollment)
-        case .shareAccount: supports(.sharing)
         case .setupRecovery, .recover: supports(.recovery)
-        case .importItems: supports(.importDocuments)
         case .deleteVault: supports(.vaultDeletion)
         case .portableBackup, .restoreBackup: supports(.portableBackup)
         default: true

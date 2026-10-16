@@ -29,7 +29,7 @@ import MopCore
 @Test func transportCancellationDoesNotInterruptDeliveredEventPersistence() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let entered = AsyncStream<Void>.makeStream()
     let resume = AsyncStream<Void>.makeStream()
     let delivered = Data([1, 2, 3])

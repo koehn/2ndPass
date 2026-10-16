@@ -39,9 +39,6 @@ struct Mop: AsyncParsableCommand {
         } catch let error as AttachmentFailure {
             IO.diagnostic("sp: \(error.errorDescription ?? "Attachment operation failed.")\n")
             exit(withError: ExitCode(1))
-        } catch let error as ImportFailure {
-            IO.diagnostic("sp: \(error.errorDescription ?? "Import failed.")\n")
-            exit(withError: ExitCode(1))
         } catch let error as PortableBackupInputFailure {
             IO.diagnostic("sp: \(error.message)\n")
             exit(withError: ExitCode(1))
@@ -173,7 +170,7 @@ struct Inject: AsyncParsableCommand {
 }
 
 struct Item: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "List typed items or atomically save an item from JSON stdin.", subcommands: [Catalog.self, Save.self, Import.self, Attachments.self, Create.self, ImportSSH.self, PublicKey.self, DeleteIdentity.self, CSR.self, Certificate.self])
+    static let configuration = CommandConfiguration(abstract: "List typed items or atomically save an item from JSON stdin.", subcommands: [Catalog.self, Save.self, Attachments.self, Create.self, ImportSSH.self, PublicKey.self, DeleteIdentity.self, CSR.self, Certificate.self])
     struct Catalog: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         func run() async throws {

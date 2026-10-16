@@ -5,6 +5,10 @@ permission, or Free/Pro limit is enforced. Purchase UI and production publicatio
 are disabled in default builds. Do not enable them for release until the paid
 offering and enforcement are ready.
 
+The implemented configuration uses an annual subscription. Final pricing, paid
+feature boundaries and enforcement policy remain undecided; this configuration
+must not be presented as a settled commercial promise.
+
 ## Configuration
 
 Create one auto-renewable **one-year** product `com.koehn.mop.pro.yearly` in one Pro

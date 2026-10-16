@@ -1,4 +1,4 @@
-# 2ndPass portable backup format, version 1
+# 2ndPass portable backup format, version 2
 
 This is a standalone recovery specification for `.moparchive` files produced by
 2ndPass in October 2026. It intentionally contains enough information to recreate
@@ -7,10 +7,7 @@ logical archive, **not** a CloudKit record or offline
 recovery private key. The archive and its separate key file are both required.
 Neither original device keys nor the original CloudKit zone are required.
 
-Preserve this document with the backup instructions, separately from the key.
-A second copy is retained under `dist/migration-preservation/` so an ordinary Git
-checkout/reset does not remove the specification. `git clean -x` or deleting
-`dist` can remove that copy; keep an external copy for long-term recovery.
+Version 1 archives and keys are unsupported. There is no compatibility reader or migration.
 
 ## Binary container and key file
 
@@ -18,11 +15,11 @@ All sizes here are bytes; MiB means 1,048,576 bytes.
 
 | Part | Exact representation |
 | --- | --- |
-| Header / authenticated additional data | UTF-8 `2NDPASS-PORTABLE-ARCHIVE-1` followed by one LF byte (`0a`), 27 bytes total |
+| Header / authenticated additional data | UTF-8 `2NDPASS-PORTABLE-ARCHIVE-2` followed by one LF byte (`0a`), 27 bytes total |
 | Nonce | 12 raw bytes, immediately after the header |
 | Ciphertext | AES-256-GCM encrypted UTF-8 JSON; no compression |
 | Authentication tag | Last 16 bytes of the file |
-| Key text | Exact ASCII prefix `2ndpass-archive-key-v1:` followed by 64 hexadecimal digits representing the 32-byte AES key |
+| Key text | Exact ASCII prefix `2ndpass-archive-key-v2:` followed by 64 hexadecimal digits representing the 32-byte AES key |
 
 The whole file is `header || nonce || ciphertext || tag`. The **exact header,
 including its newline**, is AES-GCM additional authenticated data (AAD). It is
@@ -76,13 +73,13 @@ Swift initializer defaults.
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `version` | yes | Integer `1`; reject other versions |
+| `version` | yes | Integer `2`; reject other versions |
 | `name` | yes | Source vault name |
 | `items` | yes | Array of item objects, including trashed/archived items |
 | `itemIDs` | yes | Object mapping each exact item name to its stable UUID string |
 | `references` | yes | Object mapping each current field's relative path to a record UUID string |
 | `records` | yes | Object mapping record UUID strings to `{ "itemID": UUID-string, "bytes": Base64-string }` |
-| `security` | no | History, credential-account metadata and optional derived scan cache |
+| `security` | no | Retained field histories only |
 | `exclusions` | yes | Array of informational strings describing things not restored |
 
 The `bytes` of every record are the **logical plaintext field value** inside
@@ -94,13 +91,13 @@ not be reassigned silently.
 A minimal empty archive plaintext is:
 
 ```json
-{"exclusions":[],"itemIDs":{},"items":[],"name":"restored","records":{},"references":{},"version":1}
+{"exclusions":[],"itemIDs":{},"items":[],"name":"restored","records":{},"references":{},"version":2}
 ```
 
 A one-field example (synthetic secret `example`, Base64 `ZXhhbXBsZQ==`) is:
 
 ```json
-{"exclusions":[],"itemIDs":{"Example":"11111111-1111-4111-8111-111111111111"},"items":[{"fields":[{"path":"password","type":"password"}],"name":"Example","type":"login"}],"name":"personal","records":{"22222222-2222-4222-8222-222222222222":{"bytes":"ZXhhbXBsZQ==","itemID":"11111111-1111-4111-8111-111111111111"}},"references":{"Example/password":"22222222-2222-4222-8222-222222222222"},"version":1}
+{"exclusions":[],"itemIDs":{"Example":"11111111-1111-4111-8111-111111111111"},"items":[{"fields":[{"path":"password","type":"password"}],"name":"Example","type":"login"}],"name":"personal","records":{"22222222-2222-4222-8222-222222222222":{"bytes":"ZXhhbXBsZQ==","itemID":"11111111-1111-4111-8111-111111111111"}},"references":{"Example/password":"22222222-2222-4222-8222-222222222222"},"version":2}
 ```
 
 ## Items and fields
@@ -178,8 +175,7 @@ are in this record; there are no external CKAsset URLs or sidecar files to fetch
 
 ## Security metadata
 
-`security`, when present, has required arrays `histories` and `accounts`, and an
-optional `passwordChecks` array. All of it is inside the encrypted archive.
+`security`, when present, contains the `histories` array inside the encrypted archive. Credential registrations and derived password-health results are excluded.
 
 Each history object has required `id` (UUID), `itemID` (item UUID string), `path`
 (field path), and `entries` array. Each entry has `id` (historical record UUID
@@ -188,32 +184,14 @@ type `password` or `concealed`, and that field's `historyID` equals the history'
 `id`. Retain the array order; at most 20 entries per field. Historical records
 are not present in the current `references` map.
 
-Each credential-account object has required `id` UUID, `service` string,
-`account` string, `registrations` array and `recoveryMethod` string. Optional
-keys: `linkedItemID` item UUID string, `relyingParty` string, `userHandle` Base64
-(1–64 decoded bytes). Service and account must be nonblank. Each registration has
-required `id` UUID, `protocolName`, `publicIdentifier`, `deviceID`, `deviceLabel`
-strings, `external` Boolean and `state` string (`generated`, `confirmed`,
-`removed`). Optional `localIdentityID` UUID, `confirmedAt` Date number,
-`confirmedBy` string. Protocol names: `ssh`, `git-signing`, `x509`, `webauthn`,
-`generic-signing`, `generic-ecdh`. Public identifier/device ID/device label must
-be nonempty; confirmed entries require finite confirmedAt and nonempty
-confirmedBy. Registration IDs are unique per account, at most 100 registrations
-per account. Service/account/recoveryMethod and registration text fields are at
-most 4096 UTF-8 bytes and contain no control characters other than newline.
+Current cloud metadata may contain empty obsolete `accounts` or `passwordChecks`
+arrays. Readers accept empty arrays or null, but reject nonempty removed metadata
+rather than silently discarding it. Writers omit both keys.
 
-Password-check objects contain required `record` string, `context` string array,
-`weak`, `exposed` Booleans, `checkedAt` Date number, `scope` string, `evaluator`
-integer, `batch` UUID; optional `breachCheckedAt` Date and `reuseGroup` UUID. They
-are disposable derived results, not secret data. Restore discards this cache and
-recalculates it; do not treat historical scan results as current security evidence.
-
-Hardware credential registrations are informational: no Secure Enclave private
-key or other device private scalar is exported. On restore, mark registrations
-`external = true`; do not imply that their referenced private keys were restored.
 Original enrollment, membership, CloudKit permissions and recovery authority are
-not reinstated. The destination is a new owner-only vault with fresh encryption
-and independently established authority.
+not reinstated. The destination has fresh encryption and independently established
+authority. Transferable software credentials are retained; hardware private keys
+are never exported.
 
 ## Required graph and size validation
 
@@ -233,8 +211,6 @@ and independently established authority.
 - Every current reference string is at most 4096 UTF-8 bytes. `exclusions` has at
   most 128 strings, each at most 4096 UTF-8 bytes. These strings are informational
   data, never commands or policy instructions.
-- Credential-account IDs are unique. Any linkedItemID refers to an existing
-  item. Check credential metadata as specified above.
 
 A recovery implementation should preserve unknown optional metadata when it can
 round-trip it. If it cannot represent a field type or required relationship,
@@ -260,4 +236,14 @@ The original archive bytes need not be reproduced byte-for-byte by a new writer:
 random key/nonce and JSON formatting will change the ciphertext. Logical contents
 and graph preservation are the compatibility requirement. A Git rollback does
 not require preserving the archive implementation itself: regenerate the reader
-from this document, or use an older compatible export and repeat migration.
+from this document, using this version 2 contract.
+
+## Independent version 2 test vector
+
+`Tests/MopVaultNextTests/PortableArchiveWireTests.swift` contains the exact
+one-field JSON fixture (raw bytes `00 ff 41`, Base64 `AP9B`). Its AES-256 key is
+32 repetitions of byte `41` and its nonce is 12 repetitions of byte `13`.
+The authenticated header is the 27-byte version 2 header above. The test builds
+this deterministic wire vector independently of the archive writer and model
+encoders, then verifies the reader preserves the bytes. These synthetic key and
+nonce values are for tests only; production exports generate both randomly.

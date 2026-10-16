@@ -7,13 +7,11 @@ import MopVaultNext
 /// ThisDeviceOnly, nonsynchronizing local trust. Cloud data cannot install or
 /// replace an enrollment pin. A duplicate add always rereads the existing winner.
 public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMembershipTrustStore {
-    public enum Namespace: Sendable { case legacy, contentPreview3 }
     private let accessGroup: String
-    private let namespace: Namespace
-    private var setupService: String { namespace == .contentPreview3 ? "mop.content-vault-setup.v3" : "mop.item-vault-setup.v1" }
-    private var membershipService: String { namespace == .contentPreview3 ? "mop.content-vault-membership.v3" : "mop.item-vault-membership.v1" }
-    public init(namespace: Namespace = .legacy) throws {
-        accessGroup = try SigningIdentity.accessGroup(); self.namespace = namespace
+    private let setupService = "mop.content-vault-setup.v3"
+    private let membershipService = "mop.content-vault-membership.v3"
+    public init() throws {
+        accessGroup = try SigningIdentity.accessGroup()
     }
 
     public func load(scope: ItemVaultSetupScope) throws -> ItemVaultSetupRecord? {
@@ -89,12 +87,12 @@ public struct KeychainItemVaultTrustStore: ItemVaultInventoryStore, ItemVaultMem
         guard slots.count <= 4095, slots.enumerated().allSatisfy({ $0.element.generation == UInt64($0.offset + 2) }),
               let record = try load(scope: scope) else { throw ItemVaultBootstrapFailure.invalidTrust }
         let bytes = slots.map(\.bytes)
-        _ = try ItemVaultMembershipAuthority.history(record: record, successors: bytes, allowingDeviceRemoval: namespace == .contentPreview3)
+        _ = try ItemVaultMembershipAuthority.history(record: record, successors: bytes, allowingDeviceRemoval: true)
         return bytes
     }
     public func reserveMembership(scope: ItemVaultSetupScope, successors: [Data]) throws {
         guard let record = try load(scope: scope) else { throw ItemVaultBootstrapFailure.missingSetup }
-        _ = try ItemVaultMembershipAuthority.history(record: record, successors: successors, allowingDeviceRemoval: namespace == .contentPreview3)
+        _ = try ItemVaultMembershipAuthority.history(record: record, successors: successors, allowingDeviceRemoval: true)
         let existing = try membershipHistory(scope: scope)
         guard existing.count <= successors.count,
               Array(successors.prefix(existing.count)) == existing else { throw ItemVaultBootstrapFailure.invalidTrust }

@@ -17,12 +17,12 @@ public struct PortableVaultArchive: Codable, Equatable, Sendable {
     public init(name: String, items: [VaultItem], itemIDs: [String: String], references: [String: String],
                 records: [String: PortableArchiveRecord], security: VaultSecurityMetadata? = nil,
                 exclusions: [String] = []) {
-        version = 1; self.name = name; self.items = items; self.itemIDs = itemIDs
+        version = 2; self.name = name; self.items = items; self.itemIDs = itemIDs
         self.references = references; self.records = records; self.security = security; self.exclusions = exclusions
     }
 
     public func validate() throws {
-        guard version == 1 else { throw PortableArchiveFailure.unsupportedVersion }
+        guard version == 2 else { throw PortableArchiveFailure.unsupportedVersion }
         try VaultName.validate(name)
         guard items.count <= 65_536, records.count <= 262_144,
               Set(items.map(\.name)).count == items.count,
@@ -50,8 +50,7 @@ public struct PortableVaultArchive: Codable, Equatable, Sendable {
         guard used == Set(references.values) else { throw PortableArchiveFailure.invalid }
         if let security {
             guard Set(security.histories.map(\.id)).count == security.histories.count,
-                  Set(security.histories.map { $0.itemID + ":" + $0.path }).count == security.histories.count,
-                  Set(security.accounts.map(\.id)).count == security.accounts.count else { throw PortableArchiveFailure.invalid }
+                  Set(security.histories.map { $0.itemID + ":" + $0.path }).count == security.histories.count else { throw PortableArchiveFailure.invalid }
             for history in security.histories {
                 guard let item = items.first(where: { itemIDs[$0.name] == history.itemID }),
                       item.fields.contains(where: { $0.path == history.path && $0.historyID == history.id && [.password, .concealed].contains($0.type) }),
@@ -62,10 +61,7 @@ public struct PortableVaultArchive: Codable, Equatable, Sendable {
                           used.insert(entry.id).inserted else { throw PortableArchiveFailure.invalid }
                 }
             }
-            for account in security.accounts {
-                try account.validate()
-                guard account.linkedItemID.map({ itemIDs.values.contains($0) }) ?? true else { throw PortableArchiveFailure.invalid }
-            }
+
         }
         guard used == Set(records.keys), records.allSatisfy({ id, record in
             UUID(uuidString: id)?.uuidString == id && record.bytes.count <= 16 * 1024 * 1024
@@ -121,8 +117,8 @@ public enum PortableArchiveFailure: Error, LocalizedError, Sendable {
 
 public enum PortableArchive {
     public static let maximumSize = 256 * 1024 * 1024
-    private static let header = Data("2NDPASS-PORTABLE-ARCHIVE-1\n".utf8)
-    private static let keyPrefix = Array("2ndpass-archive-key-v1:".utf8)
+    private static let header = Data("2NDPASS-PORTABLE-ARCHIVE-2\n".utf8)
+    private static let keyPrefix = Array("2ndpass-archive-key-v2:".utf8)
 
     public static func seal(_ document: PortableVaultArchive) throws -> PortableArchiveExport {
         try document.validate()
@@ -144,6 +140,7 @@ public enum PortableArchive {
 
     public static func open(_ data: Data, recoveryKey: SecretBytes) throws -> PortableVaultArchive {
         guard data.count <= maximumSize else { throw PortableArchiveFailure.tooLarge }
+        if data.starts(with: Data("2NDPASS-PORTABLE-ARCHIVE-1\n".utf8)) { throw PortableArchiveFailure.unsupportedVersion }
         guard data.starts(with: header), data.count >= header.count + 28 else { throw PortableArchiveFailure.invalid }
         let key = try decodeKey(recoveryKey)
         var plaintext: Data

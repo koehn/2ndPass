@@ -75,9 +75,7 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
             archive.name = name
             if var security = archive.security {
                 security.passwordChecks = nil
-                for a in security.accounts.indices {
-                    for r in security.accounts[a].registrations.indices { security.accounts[a].registrations[r].external = true }
-                }
+
                 archive.security = security
             }
             return try await prepare(archive, sourceDigest: setupHash(archiveData))
@@ -106,7 +104,7 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
     /// and grant records subsequently arrive through the durable inbox.
     public func acceptContentEnrollment(approval: DeviceEnrollmentApproval, request: DeviceEnrollmentRequest) async throws -> ItemVaultSession {
         try begin(); defer { end() }
-        guard repository.layout == .contentPreview3, let membershipStore = trustStore as? any ItemVaultMembershipTrustStore else { throw ItemVaultBootstrapFailure.invalidTrust }
+        guard let membershipStore = trustStore as? any ItemVaultMembershipTrustStore else { throw ItemVaultBootstrapFailure.invalidTrust }
         let expected = try permit.withDevice { device in
             guard device.identity == request.identity else { throw ItemVaultBootstrapFailure.invalidTrust }
             return EnrollmentScope(container: scope.container, environment: scope.environment, account: scope.binding.account,
@@ -152,7 +150,7 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
         guard record.scope == scope else { throw ItemVaultBootstrapFailure.invalidTrust }
         try VaultName.validate(record.name)
         let genesis = try MembershipEnvelope.decode(record.genesis)
-        let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trustStore, allowingDeviceRemoval: repository.layout == .contentPreview3)
+        let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trustStore, allowingDeviceRemoval: true)
         try permit.withDevice { device in
             guard genesis.membership.accounts.count == 1,
                   genesis.membership.accounts[0].role == .owner,
@@ -190,18 +188,14 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
             committed = receipt
         } else {
             do {
-                if repository.layout == .contentPreview3 {
+
                     let publications = try encryptContent(archive, history: history)
                     let provision = SyncOperation(account: scope.binding.account, vaultID: scope.binding.vaultID,
                         zoneOwner: scope.binding.zoneOwner, kind: .provision, payload: try setupEncode(record))
                     committed = try await repository.initializeContentVault(scope: scope.repositoryScope, publications: publications,
                         policy: GrantBackedContentStorage.recipientPolicy(history: history), membershipState: record.genesis,
                         setupID: record.setupID, provision: provision, authorization: permit)
-                } else {
-                    let versions = try encrypt(archive, history: history)
-                    committed = try await repository.initializeVault(scope: scope.repositoryScope, versions: versions,
-                        membershipState: record.genesis, setupID: record.setupID, authorization: permit)
-                }
+
             } catch {
                 // A competing process can commit this same pinned logical import
                 // using different random ciphertext. Authenticate its operation identity.
@@ -248,7 +242,7 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
             publications.append(try GrantBackedContentStorage.prepare(publication, scope: scope.binding.item(uuid), history: history))
         }
         var security = document.security; security?.histories = []
-        let metadata = VaultEnvelopeMetadata(name: document.name, security: security, exclusions: document.exclusions)
+        let metadata = VaultMetadata(name: document.name, security: security, exclusions: document.exclusions)
         try metadata.validate()
         let publication = try permit.withDevice { try ContentEnvelope.seal([ContentItemArchive.metadataComponent: ContentItemArchive.encode(metadata)],
             vault: scope.binding.vaultID, item: ItemVaultSession.metadataRecordID, history: history, signer: $0) }
@@ -256,37 +250,6 @@ public final class ItemVaultBootstrap: @unchecked Sendable {
         return publications
     }
 
-    private func encrypt(_ document: PortableVaultArchive, history: TrustedMembershipHistory) throws -> [EncryptedItemVersion] {
-        let membership = history.current.membership, digest = try history.current.digest()
-        var records: [String: [String: PortableArchiveRecord]] = [:]
-        for (id, record) in document.records { records[record.itemID, default: [:]][id] = record }
-        var references: [String: [String: String]] = [:]
-        for (path, id) in document.references {
-            guard let record = document.records[id] else { throw PortableArchiveFailure.invalid }
-            references[record.itemID, default: [:]][path] = id
-        }
-        let histories = Dictionary(grouping: document.security?.histories ?? [], by: \.itemID)
-        var versions: [EncryptedItemVersion] = []
-        for item in document.items {
-            try Task.checkCancellation()
-            guard let id = document.itemIDs[item.name], let uuid = UUID(uuidString: id) else { throw PortableArchiveFailure.invalid }
-            var security = VaultSecurityMetadata(); security.histories = histories[id] ?? []
-            let projection = PortableVaultArchive(name: document.name, items: [item], itemIDs: [item.name: id],
-                references: references[id] ?? [:], records: records[id] ?? [:], security: security)
-            let sealed = try permit.withDevice { try ItemEnvelope.seal(projection, vault: scope.binding.vaultID, generation: 1,
-                membership: membership, membershipStateDigest: digest, signer: $0) }
-            versions.append(EncryptedItemVersion(scope: scope.binding.item(uuid), versionID: sealed.header.version,
-                baseVersionID: nil, ciphertext: try sealed.encoded(), generation: 1))
-        }
-        var security = document.security; security?.histories = []
-        let metadata = try permit.withDevice { try VaultMetadataEnvelope.seal(VaultEnvelopeMetadata(name: document.name,
-            security: security, exclusions: document.exclusions), vault: scope.binding.vaultID, generation: 1,
-            membership: membership, membershipStateDigest: digest, signer: $0) }
-        versions.append(EncryptedItemVersion(scope: scope.binding.item(ItemVaultSession.metadataRecordID), versionID: metadata.header.version,
-            baseVersionID: nil, ciphertext: try metadata.encoded(), generation: 1))
-        try Task.checkCancellation()
-        return versions
-    }
 }
 
 func setupEncode<T: Encodable>(_ value: T) throws -> Data {

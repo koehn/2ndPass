@@ -22,7 +22,7 @@ public struct JournaledContentProvisioner: Sendable {
     public func handle(_ operation: SyncOperation, permit: any RepositoryWritePermit) async -> SyncOperationOutcome {
         do {
             try await check(permit)
-            guard operation.kind == .provision, repository.layout == .contentPreview3 else { return .attention(.invalidAuthority) }
+            guard operation.kind == .provision else { return .attention(.invalidAuthority) }
             let record = try JSONDecoder().decode(ItemVaultSetupRecord.self, from: operation.payload)
             let scope = record.scope.repositoryScope
             guard operation.account == scope.account, operation.database == scope.database,

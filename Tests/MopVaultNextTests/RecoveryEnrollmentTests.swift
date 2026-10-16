@@ -16,26 +16,27 @@ private func recoveryEnrollmentFixture() throws -> (TestDevice, TestDevice, Offl
     let (owner, joining, recovery, history, scope) = try recoveryEnrollmentFixture()
     let document = try portableDocument(items: [VaultItem(name: "login", type: .login,
         fields: [.init(path: "password", type: .password, value: "secret")])])
-    let original = try ItemEnvelope.seal(document, vault: scope.vault, generation: 1,
-        membership: history.current.membership, membershipStateDigest: history.current.digest(), signer: owner)
+    let components = try ContentItemArchive.components(document)
+    let original = try ContentEnvelope.seal(components.values, vault: scope.vault, item: components.item, history: history, signer: owner)
     let request = try DeviceEnrollmentRequest.create(scope: scope, device: joining)
     let approval = try DeviceEnrollmentApproval.create(request: request, history: history, owner: recovery)
     let accepted = try DeviceEnrollmentApproval.decode(approval.encoded()).acceptFromAuthenticatedPrivateCloudKit(request: request, scope: scope)
-    let repaired = try original.repairingMembership(history: accepted, decryptor: recovery, signer: joining)
+    let recoveryGrant = try #require(original.grants.first { $0.recipient == recovery.identity.fingerprint })
+    let repaired = try original.content.rotateKey(grant: recoveryGrant, history: accepted, decryptor: recovery, signer: joining)
     #expect(accepted.current.membership.devices.contains(owner.identity))
     #expect(accepted.current.membership.offlineRecovery == recovery.identity)
-    #expect(repaired.encryptedRecords == original.encryptedRecords)
-    #expect(repaired.header.keyGeneration == original.header.keyGeneration)
+    #expect(repaired.content.header.contentRevision == original.content.header.contentRevision)
+    #expect(repaired.content.header.keyGeneration != original.content.header.keyGeneration)
     for device: any DeviceOperations in [owner, joining, recovery] {
-        for (id, record) in document.records {
-            #expect(try repaired.read(record: id, device: device, membership: accepted.current.membership,
-                membershipStateDigest: accepted.current.digest()) == record.bytes)
+        let grant = try #require(repaired.grants.first { $0.recipient == device.identity.fingerprint })
+        for (id, record) in components.values {
+            #expect(try repaired.content.open(component: id, grant: grant, history: accepted, device: device) == record)
         }
     }
     #expect(throws: (any Error).self) {
-        try ItemEnvelope.seal(document, vault: scope.vault, generation: 1,
-            membership: accepted.current.membership, membershipStateDigest: accepted.current.digest(), signer: recovery)
+        try ContentEnvelope.seal(components.values, vault: scope.vault, item: components.item, history: accepted, signer: recovery)
     }
+
 }
 
 @Test func recoverySignerCannotReplaceRecoveryOrRemoveDevices() throws {

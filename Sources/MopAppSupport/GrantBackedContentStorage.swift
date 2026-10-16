@@ -70,6 +70,103 @@ public struct GrantBackedContentStorage: Sendable {
         }
     }
 
+    /// Shared device/recovery selection. Only authenticated history is eligible;
+    /// publication and decryption authorization remain separate from routing.
+    public func readablePair(scope: ItemScope, history: TrustedMembershipHistory, recipient: String) async throws -> (ContentEnvelope, ContentKeyGrant) {
+        guard scope.vaultID == history.vault, scope.database == "private",
+              try Self.recipientPolicy(history: history).recipients.contains(recipient) else { throw MopError.notVaultMember }
+        let item = scope.itemID
+        func readable(stored: EncryptedItemVersion, item: UUID) async throws -> (ContentEnvelope, ContentKeyGrant) {
+            let content = try ContentEnvelope.decode(stored.ciphertext, history: history, item: item)
+            guard stored.scope == scope, content.header.version == stored.versionID,
+                  content.header.base == stored.baseVersionID, content.header.generation == stored.generation,
+                  content.header.isTombstone == stored.isTombstone, stored.healthItemID == nil else { throw MopError.vaultUntrusted }
+            try Self.validateKind(content, history: history)
+            guard let prepared = try await repository.contentGrants(scope: scope, keyGeneration: content.header.keyGeneration, recipient: recipient).first else {
+                throw CloudSyncAdapterError.membershipUnavailable
+            }
+            let grant = try ContentKeyGrant.decode(prepared.bytes, content: content, history: history)
+            guard prepared.scope == scope, grant.recipient == recipient, try grant.identifier == prepared.identifier else { throw MopError.vaultUntrusted }
+            return (content, grant)
+        }
+        guard let head = try await repository.item(scope) else { throw MopError.notFound }
+        let reference = try await repository.readableContent(scope: scope, recipient: recipient)
+        do {
+            return try await readable(stored: head, item: item)
+        } catch CloudSyncAdapterError.membershipUnavailable {
+            if let reference, let stored = try await repository.contentVersion(scope: scope, version: reference.version) {
+                let content = try ContentEnvelope.decode(stored.version.ciphertext, history: history, item: item)
+                try GrantBackedContentStorage.validateKind(content, history: history)
+                guard content.header.version == reference.version, content.header.keyGeneration == reference.keyGeneration,
+                      reference.recipient == recipient,
+                      let prepared = try await repository.contentGrant(scope: scope, keyGeneration: reference.keyGeneration, identifier: reference.grant),
+                      prepared.scope == scope, prepared.recipient == recipient else { throw MopError.vaultUntrusted }
+                let grant = try ContentKeyGrant.decode(prepared.bytes, content: content, history: history)
+                guard grant.recipient == recipient, try grant.identifier == reference.grant else { throw MopError.vaultUntrusted }
+                return (content, grant)
+            }
+            // Upgrade bootstrap: walk the accepted ancestry, never select an
+            // unrelated conflict branch merely because it happens to decrypt.
+            var cursor = head
+            while let base = cursor.baseVersionID,
+                  let stored = try await repository.contentVersion(scope: scope, version: base) {
+                guard stored.version.generation < cursor.generation, cursor.generation - stored.version.generation == 1 else { throw MopError.vaultUntrusted }
+                cursor = stored.version
+                do {
+                    return try await readable(stored: cursor, item: item)
+                } catch CloudSyncAdapterError.membershipUnavailable { continue }
+            }
+            throw CloudSyncAdapterError.membershipUnavailable
+        }
+    }
+
+    /// One-time local bootstrap uses public verification to seed missing references.
+    /// Normal reads maintain them afterward. The durable checkpoint is independent
+    /// of routing, membership changes and retired grant-zone migration state.
+    public func initializeReadableVersions(scope: VaultScope, history: TrustedMembershipHistory,
+                                            permit: any RepositoryWritePermit) async throws {
+        guard scope.vaultID == history.vault, scope.database == "private" else { throw MopError.vaultUntrusted }
+        try Task.checkCancellation()
+        try permit.withWritePermission {}
+        guard try await !repository.readableVersionsInitialized(scope: scope) else { return }
+        let recipients = try Self.recipientPolicy(history: history).recipients
+        let index = try await repository.itemRevisionIndex(account: scope.account, vaultID: scope.vaultID,
+            database: scope.database, zoneOwner: scope.zoneOwner)
+        for (item, head) in index {
+            try Task.checkCancellation()
+            let itemScope = ItemScope(account: scope.account, vaultID: scope.vaultID, itemID: item,
+                database: scope.database, zoneOwner: scope.zoneOwner)
+            var remaining = recipients
+            for recipient in recipients {
+                if try await repository.readableContent(scope: itemScope, recipient: recipient) != nil {
+                    remaining.remove(recipient)
+                }
+            }
+            var cursor: UUID? = head
+            var previousGeneration: UInt64?
+            while let id = cursor, !remaining.isEmpty,
+                  let stored = try await repository.contentVersion(scope: itemScope, version: id) {
+                try Task.checkCancellation()
+                let content = try ContentEnvelope.decode(stored.version.ciphertext, history: history, item: item)
+                try Self.validateKind(content, history: history)
+                guard content.header.version == id, content.header.keyGeneration == stored.keyGeneration else { throw MopError.vaultUntrusted }
+                if let previousGeneration { guard content.header.generation < previousGeneration, previousGeneration - content.header.generation == 1 else { throw MopError.vaultUntrusted } }
+                for grant in try await repository.contentGrants(scope: itemScope, keyGeneration: stored.keyGeneration) where remaining.contains(grant.recipient) {
+                    let verified = try ContentKeyGrant.decode(grant.bytes, content: content, history: history)
+                    guard verified.recipient == grant.recipient, try verified.identifier == grant.identifier else { throw MopError.vaultUntrusted }
+                    if try await repository.readableContent(scope: itemScope, recipient: grant.recipient) == nil {
+                        try await repository.rememberReadableContent(scope: itemScope,
+                            reference: ReadableContentReference(version: id, keyGeneration: stored.keyGeneration,
+                                grant: grant.identifier, recipient: grant.recipient), expectedHead: head, onlyIfAbsent: true, permit: permit)
+                    }
+                    remaining.remove(grant.recipient)
+                }
+                previousGeneration = content.header.generation; cursor = content.header.base
+            }
+        }
+        try await repository.finishReadableVersionInitialization(scope: scope, permit: permit)
+    }
+
     public func setAuthority(scope: VaultScope, expected: TrustedMembershipHistory?, history: TrustedMembershipHistory,
                              authorization: any RepositoryWritePermit) async throws {
         guard scope.vaultID == history.vault, scope.database == "private" else { throw MopError.vaultUntrusted }

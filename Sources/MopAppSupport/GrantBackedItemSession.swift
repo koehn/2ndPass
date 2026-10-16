@@ -7,19 +7,19 @@ extension GrantBackedContentSession {
     public func catalog(itemID: UUID) async throws -> ItemVaultCatalogEntry {
         guard itemID != ItemVaultSession.metadataRecordID,
               let stored = try await repository.item(binding.item(itemID)), !stored.isTombstone else { throw MopError.notFound }
-        let (content, grant) = try await readable(stored: stored, item: itemID)
-        return try permit.withDevice { device in
+        return try await projectReadable(item: itemID) { content, grant, device in
+            guard !content.header.isTombstone else { throw MopError.notFound }
             let bytes = try content.open(component: ContentItemArchive.catalogComponent, grant: grant, history: history, device: device)
             let catalog = try ContentItemArchive.catalog(bytes, item: itemID, componentNames: Set(content.components.keys))
-            return ItemVaultCatalogEntry(itemID: itemID, versionID: stored.versionID, catalog: catalog)
+            return ItemVaultCatalogEntry(itemID: itemID, versionID: content.header.version, catalog: catalog)
         }
     }
 
     public func displayItem(itemID: UUID) async throws -> ItemVaultDisplayEntry {
         guard itemID != ItemVaultSession.metadataRecordID,
               let stored = try await repository.item(binding.item(itemID)), !stored.isTombstone else { throw MopError.notFound }
-        let (content, grant) = try await readable(stored: stored, item: itemID)
-        return try permit.withDevice { device in
+        return try await projectReadable(item: itemID) { content, grant, device in
+            guard !content.header.isTombstone else { throw MopError.notFound }
             let (catalog, values) = try content.openProjection(initial: ContentItemArchive.catalogComponent,
                 grant: grant, history: history, device: device) { bytes in
                 let catalog = try ContentItemArchive.catalog(bytes, item: itemID, componentNames: Set(content.components.keys))
@@ -36,7 +36,7 @@ extension GrantBackedContentSession {
                       let value = values[record] else { throw MopError.invalidVault }
                 item.fields[index].value = String(decoding: try value.validatedUTF8(), as: UTF8.self)
             }
-            return ItemVaultDisplayEntry(entry: ItemVaultCatalogEntry(itemID: itemID, versionID: stored.versionID, catalog: catalog), item: item)
+            return ItemVaultDisplayEntry(entry: ItemVaultCatalogEntry(itemID: itemID, versionID: content.header.version, catalog: catalog), item: item)
         }
     }
 
@@ -48,7 +48,7 @@ extension GrantBackedContentSession {
         return try await create(item: prepared.item, components: prepared.values)
     }
 
-    public func edit(itemID: UUID, expectedBase: UUID, catalog: ItemEnvelopeCatalog,
+    public func edit(itemID: UUID, expectedBase: UUID, catalog: ItemContentCatalog,
                      changedRecords: [String: SecretBytes], removedRecords: Set<String>) async throws -> PendingItemMutation {
         guard itemID != ItemVaultSession.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
         let (content, grant) = try await readable(item: itemID, expected: expectedBase)
@@ -67,22 +67,21 @@ extension GrantBackedContentSession {
         return try await edit(item: itemID, expected: expectedBase, components: values)
     }
 
-    public func vaultMetadata() async throws -> (versionID: UUID, value: VaultEnvelopeMetadata) {
+    public func vaultMetadata() async throws -> (versionID: UUID, value: VaultMetadata) {
         let id = ItemVaultSession.metadataRecordID
         guard let stored = try await repository.item(binding.item(id)), !stored.isTombstone else { throw ItemVaultSessionFailure.missingVaultMetadata }
-        let (content, grant) = try await readable(item: id, expected: stored.versionID)
-        let author = try history.state(forDigest: content.header.membership).membership
-        guard author.devices.contains(where: { $0.fingerprint == content.header.author && author.role(of: $0) == .owner }),
-              Set(content.components.keys) == [ContentItemArchive.metadataComponent] else { throw MopError.vaultUntrusted }
-        let value = try permit.withDevice { device in
-            try content.open(component: ContentItemArchive.metadataComponent, grant: grant, history: history, device: device)
-                .withFoundationData { try JSONDecoder().decode(VaultEnvelopeMetadata.self, from: $0) }
+        return try await projectReadable(item: id) { content, grant, device in
+            let author = try history.state(forDigest: content.header.membership).membership
+            guard author.devices.contains(where: { $0.fingerprint == content.header.author && author.role(of: $0) == .owner }),
+                  Set(content.components.keys) == [ContentItemArchive.metadataComponent] else { throw MopError.vaultUntrusted }
+            let value = try content.open(component: ContentItemArchive.metadataComponent, grant: grant, history: history, device: device)
+                .withFoundationData { try JSONDecoder().decode(VaultMetadata.self, from: $0) }
+            try value.validate()
+            return (content.header.version, value)
         }
-        try value.validate()
-        return (stored.versionID, value)
     }
 
-    public func saveMetadata(_ settings: VaultEnvelopeMetadata, expectedBase: UUID?) async throws -> PendingItemMutation {
+    public func saveMetadata(_ settings: VaultMetadata, expectedBase: UUID?) async throws -> PendingItemMutation {
         try permit.check()
         guard history.current.membership.role(of: identity) == .owner else { throw MopError.cloudPermission }
         try settings.validate()

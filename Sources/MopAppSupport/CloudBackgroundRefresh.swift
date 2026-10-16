@@ -7,7 +7,7 @@ import MopSync
 public enum CloudBackgroundRefresh {
     public static func request() async throws {
         let account = try await NativeItemCloudAccount.connect(offline: true)
-        let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: account.directory), layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: account.directory))
         _ = try await repository.requestSync(account: account.accountNamespace, database: "private", reason: .foreground)
         let runtime = try ItemVaultSyncRuntime(account: account, repository: repository)
         await withTaskCancellationHandler {

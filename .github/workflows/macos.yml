@@ -1,0 +1,33 @@
+name: macOS
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build and test
+        run: swift test --disable-sandbox
+      - name: Check packaging
+        run: |
+          python3 scripts/test-signing-config.py
+          python3 scripts/test-install-layout.py
+          python3 scripts/test-gui-install.py
+          python3 scripts/test-cli-cask.py
+          python3 -m unittest discover -s scripts -p test_audit_cloud_sync.py
+      - name: Smoke test CLI
+        run: |
+          python3 scripts/smoke-test.py "$(swift build --show-bin-path)/sp"
+          python3 scripts/test-subscription-cli.py "$(swift build --show-bin-path)/sp"
+          python3 scripts/test-source-shell-support.py "$(swift build --show-bin-path)/sp"

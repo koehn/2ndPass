@@ -56,22 +56,23 @@ private func enrollmentFixture() throws -> (TestDevice, TestDevice, EnrollmentSc
     let document = try portableDocument(items: [VaultItem(name: "Login", type: .login, fields: [
         ItemField(path: "password", type: .password, value: "existing-secret"),
         ItemField(path: "attachment", type: .attachment, value: try attachment.encodedValue())])])
-    let original = try ItemEnvelope.seal(document, vault: scope.vault, generation: 1, membership: history.current.membership,
-        membershipStateDigest: history.current.digest(), signer: owner)
+    let components = try ContentItemArchive.components(document)
+    let original = try ContentEnvelope.seal(components.values, vault: scope.vault, item: components.item, history: history, signer: owner)
     let request = try DeviceEnrollmentRequest.create(scope: scope, device: joining)
     let approval = try DeviceEnrollmentApproval.create(request: request, history: history, owner: owner)
-    let admitted = try original.admittingDevice(joining.identity, previous: history.current, successor: approval.successor, signer: owner)
-    #expect(admitted.encryptedRecords == original.encryptedRecords)
-    #expect(admitted.header.keyGeneration == original.header.keyGeneration)
-    #expect(admitted.header.base == original.header.version && admitted.header.generation == 2)
     let trusted = try approval.acceptFromAuthenticatedPrivateCloudKit(request: request, scope: scope)
-    for (record, value) in document.records {
-        #expect(try admitted.read(record: record, device: joining, membership: trusted.current.membership,
-            membershipStateDigest: trusted.current.digest()) == value.bytes)
+    let ownerGrant = try #require(original.grants.first)
+    let before = try original.content.encoded()
+    let grant = try ContentKeyGrant.extendingAccess(to: joining.identity, content: original.content,
+        existingGrant: ownerGrant, history: trusted, decryptor: owner, signer: owner)
+    #expect(try original.content.encoded() == before)
+    for (record, value) in components.values {
+        #expect(try original.content.open(component: record, grant: grant, history: trusted, device: joining) == value)
     }
     #expect(throws: (any Error).self) {
-        try original.catalog(device: joining, membership: history.current.membership, membershipStateDigest: history.current.digest())
+        try original.content.open(component: ContentItemArchive.catalogComponent, grant: ownerGrant, history: history, device: joining)
     }
+
 }
 
 @Test func deviceAdditionCannotSmuggleAnotherRecipientOrReplacePinnedAuthority() throws {
@@ -95,8 +96,8 @@ private func enrollmentFixture() throws -> (TestDevice, TestDevice, EnrollmentSc
     let (owner, joining, scope, initial) = try enrollmentFixture()
     let document = try portableDocument(items: [VaultItem(name: "Login", type: .login,
         fields: [ItemField(path: "password", type: .password, value: "offline-secret")])])
-    let original = try ItemEnvelope.seal(document, vault: scope.vault, generation: 1,
-        membership: initial.current.membership, membershipStateDigest: initial.current.digest(), signer: owner)
+    let components = try ContentItemArchive.components(document)
+    let original = try ContentEnvelope.seal(components.values, vault: scope.vault, item: components.item, history: initial, signer: owner)
     let request = try DeviceEnrollmentRequest.create(scope: scope, device: joining)
     let first = try DeviceEnrollmentApproval.create(request: request, history: initial, owner: owner)
     var current = try first.acceptFromAuthenticatedPrivateCloudKit(request: request, scope: scope)
@@ -104,19 +105,19 @@ private func enrollmentFixture() throws -> (TestDevice, TestDevice, EnrollmentSc
     let secondRequest = try DeviceEnrollmentRequest.create(scope: scope, device: third)
     let second = try DeviceEnrollmentApproval.create(request: secondRequest, history: current, owner: owner)
     try current.append(second.successor)
-    let adopted = try original.adoptingMembership(history: current, signer: owner)
-    #expect(adopted.encryptedRecords == original.encryptedRecords)
-    #expect(adopted.header.keyGeneration == original.header.keyGeneration)
-    #expect(adopted.header.base == original.header.version)
-    for (id, value) in document.records {
-        #expect(try adopted.read(record: id, device: third, membership: current.current.membership,
-            membershipStateDigest: current.current.digest()) == value.bytes)
+    let ownerGrant = try #require(original.grants.first)
+    let before = try original.content.encoded()
+    let grant = try ContentKeyGrant.extendingAccess(to: third.identity, content: original.content,
+        existingGrant: ownerGrant, history: current, decryptor: owner, signer: owner)
+    #expect(try original.content.encoded() == before)
+    for (id, value) in components.values {
+        #expect(try original.content.open(component: id, grant: grant, history: current, device: third) == value)
     }
     let revokedMembership = try Membership(accounts: [.init(id: owner.identity.member, role: .owner,
         devices: [owner.identity, third.identity])], removedDevices: [joining.identity.device])
     let revoked = try MembershipEnvelope.successor(of: current.current, membership: revokedMembership, owner: owner)
     try current.append(revoked)
-    #expect(throws: (any Error).self) { try original.adoptingMembership(history: current, signer: owner) }
+    #expect(throws: (any Error).self) { try original.content.verifyForPublication(history: current) }
 }
 
 @Test func reconnectReusesMembershipAndBindsExactRequest() throws {

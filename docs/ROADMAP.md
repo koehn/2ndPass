@@ -8,9 +8,11 @@ in an encrypted vault and make them available to commands at runtime, without
 depending on a separate password-manager vendor.
 
 The motivation included wanting the freedom to leave a vendor whose choices no
-longer aligned with the maintainer's values. 2ndPass should extend that same freedom
-to its own users: they should be able to inspect, modify, continue using, and
-leave 2ndPass. Matching every feature of a competing password manager is not the goal.
+longer aligned with the maintainer's values. 2ndPass supports inspection and security
+review through published source, and portability through documented exports and
+backups. Source access does not grant permission to compile, execute, modify or
+redistribute the software; see the [copyright notice](../LICENSE). Matching every
+feature of a competing password manager is not the goal.
 
 This document tracks implementation progress and remaining release requirements;
 it is not a release schedule. The [README](../README.md) describes current behavior, and
@@ -20,7 +22,7 @@ it is not a release schedule. The [README](../README.md) describes current behav
 
 ### Sync consolidation and clean preview cutover — October 9, 2026
 
-Native GUI, CLI, AutoFill and background callbacks now select `ContentPreview3/Content3.sqlite`, the separate V3 Keychain services, `MopContent3-UUID` vault zones and the `MopCoordination3` account zone. Existing databases, keys and cloud zones are preserved. Transfer existing data with a portable export from the previous preview and an explicit import into a new vault; see [cutover instructions](ITEM-SYNC-MIGRATION.md).
+Native GUI, CLI, AutoFill and background callbacks now select `ContentPreview3/Content3.sqlite`, the separate V3 Keychain services, `MopContent3-UUID` vault zones and the `MopCoordination3` account zone. Existing databases, keys and cloud zones are preserved. Latest-format vaults continue in place. Retired V2 stores and archive v1 are unsupported; see [supported versions](ITEM-SYNC-MIGRATION.md).
 
 `ItemVaultSyncRuntime` is the account coordinator. It owns one lease and CKSyncEngine, durable application operations, the inbox, dependency reconciliation and health. Connectivity, unlock, foreground, incoming changes and owner release wake it. CKSyncEngine owns transport retry; application operations use the persisted bounded backoff. Background opportunities may transfer signed records while locked. Secret-dependent work waits for authorization.
 
@@ -39,10 +41,10 @@ physical checks are separate from completion of the paid-release checklist.
 | --- | --- | --- |
 | Item storage and synchronization (SALE-10) | Shared App Group Core Data store, CKSyncEngine transport, encrypted local saves/outbox, exact delivery receipts, automatic same-account connection, and cached display catalogs. User-reported checks cover iPhone → Mac/iPad delivery, Mac edits, and offline iPhone edits uploading after reconnect. | Physical restart/interruption, receipt supersession, account-change, and concurrent-edit acceptance; V3 schema and cryptographic review. |
 | Conflict review (SALE-10) | Conflict inbox and item banners, with a review dialog identifying each version's device, update time, and deletion state. Users can keep the local or remote version; failed resolution retains both versions for retry. | Physical concurrent-edit and conflict/history preservation checks. The current dialog offers whole-version selection, not field-by-field comparison or merging. |
-| Password security health (SALE-2) | Security findings for exposed, reused, and weak passwords; encrypted per-item check results and a local security index; independent check lifetimes, incremental results, and changed-password strength updates before network checks finish. | Real CloudKit propagation, simultaneous-device behavior, signed macOS UI, and full accessibility/appearance acceptance. Credential-account redundancy management (SALE-3) remains unavailable. |
+| Password security health (SALE-2) | Security findings for exposed, reused, and weak passwords; encrypted per-item check results and a local security index; independent check lifetimes, incremental results, and changed-password strength updates before network checks finish. | Per-device recomputation, signed macOS UI, and full accessibility/appearance acceptance. Health results do not synchronize. Credential-account redundancy management (SALE-3) remains unavailable. |
 | Native AutoFill (SALE-12) | Password, TOTP, and passkey flows; incremental suggestion publication with durable retry state; selected-item resolution without a whole-catalog read; new-login saving on iOS/iPadOS 26.2+. | Signed platform and live-site acceptance, password generation and existing-login updates, and the Firefox/Chrome lifecycle (SALE-4/SALE-5). |
 | Cloud key credentials (SALE-6/SALE-13) | Cloud passkey and SSH creation/use, supported OpenSSH imports, and portable restoration of software credential bytes. Device-local hardware credentials remain separate. | Physical SSH/Git/IDE and passkey acceptance, recovery and sharing integration, and documented device-bound passkey compatibility checks. |
-| History and portability (SALE-9/SALE-11) | Per-field retained history with restore/clear, plus portable archive export/restore using an independent archive key. Basic backup/restore has user-reported acceptance. | Complete remote inventory verification, fresh-identity/loss-of-account scenarios, physical history/conflict preservation, and SALE-1 master-recovery-key integration. General document import still needs service integration. |
+| History and portability (SALE-9/SALE-11) | Per-field retained history with restore/clear, plus portable archive export/restore using an independent archive key. Basic backup/restore has user-reported acceptance. | Complete remote inventory verification, fresh-identity/loss-of-account scenarios, physical history/conflict preservation, and SALE-1 master-recovery-key integration. General document import is unimplemented; the old scaffolding has been removed. |
 | Distribution and Pro (SALE-14/SALE-15) | Sandboxed Mac app, separate CLI packaging, and entitlement status reporting. Subscription scaffolding targets an annual Pro product. | Signed clean-machine distribution and developer workflows, Free/Pro enforcement, purchase publication, final commercial decisions, and purchase/downgrade acceptance. Purchases and enforcement remain disabled in the preview. |
 
 See [validation](VALIDATION.md) for the scope of recorded physical checks,
@@ -267,6 +269,18 @@ paid, maintained distribution can coexist.
 
 ## Current implementation boundaries
 
-Cross-account sharing, device removal, permanent vault deletion, general document import and credential-account management are unavailable. Cloud-key creation/use routes through item reads and saves, and software credential bytes survive portable restore; full physical acceptance remains pending. Device-local hardware credentials remain separate and cannot be synchronized or restored.
+Cross-account sharing, general document import and credential-account management are unavailable. Device removal and permanent cloud-vault deletion are preview features; physical-device acceptance remains pending. Vault deletion is enabled in Development builds and requires `MOP_VAULT_DELETION` in Production; the separate V3 Production review gate also applies. Cloud-key creation/use routes through item reads and saves, and software credential bytes survive portable restore; full physical acceptance remains pending. Device-local hardware credentials remain separate and cannot be synchronized or restored.
 
 The checklist boxes represent full release acceptance, not source implementation. All remain open until the described gates are evidenced. Implemented portions include password checks, basic history, portable archives, offline saves, distribution scaffolding and entitlement reporting. Free/Pro enforcement and purchase publication remain disabled in the preview. Complete the remaining integration and physical checks before treating any of these as release-ready.
+
+## Retired implementation cleanup
+
+Only current content and recipient-specific grants are supported. Latest-format
+stores, identities, keys and pending work are preserved; V2 and portable archive
+v1 compatibility are intentionally removed. General document import, cross-account
+sharing and credential-account management remain future requirements above, with
+no retained scaffolding presented as an implementation. Grant maintenance and
+old-zone migration are removed, without replacement garbage collection.
+
+Annual subscriptions are the implemented StoreKit configuration; final pricing,
+paid-feature policy and enforcement are not settled by that configuration.

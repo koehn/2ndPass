@@ -7,7 +7,7 @@ import MopVaultNext
 private func projectionEntry(_ id: UUID, name: String) -> ItemVaultCatalogEntry {
     var item = VaultItem(name: name, fields: [ItemField(path: "username", type: .username, value: name)])
     item.storageID = id.uuidString
-    var catalog = ItemEnvelopeCatalog(item: item, references: [:])
+    var catalog = ItemContentCatalog(item: item, references: [:])
     catalog.histories = [SecretFieldHistory(itemID: id.uuidString, path: "password")]
     return ItemVaultCatalogEntry(itemID: id, versionID: UUID(), catalog: catalog)
 }
@@ -18,7 +18,7 @@ private func projectionEntry(_ id: UUID, name: String) -> ItemVaultCatalogEntry 
     var entries = Dictionary(uniqueKeysWithValues: ids.enumerated().map { index, id in
         (id, projectionEntry(id, name: ["zebra", "éclair", "alpha", "Alpha"][index % 4]))
     })
-    var metadata = VaultEnvelopeMetadata(name: "projection")
+    var metadata = VaultMetadata(name: "projection")
     var projection = ItemCatalogProjection(previous: nil, entries: entries, items: entries.mapValues { $0.catalog.item },
         changedIDs: Set(ids), metadata: metadata, metadataVersion: metadataVersion, usageScope: "member", work: work)
     let original = try projection.catalog()

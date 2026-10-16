@@ -52,7 +52,6 @@ private struct MopCommands: Commands {
                 Button("New Item") { model.beginCreatingItem() }
                     .keyboardShortcut("n").disabled(model.busy || model.offline || !model.authenticated || model.itemCreationVaults.isEmpty || model.itemDraft != nil || model.page != .secrets)
                 Button("New SSH Key…") { model.keyCreationPresented = true }.disabled(model.busy || model.offline || !model.authenticated)
-                Button("Import…") { model.beginImport() }.disabled(model.busy || model.offline || !model.authenticated)
                 Button("New Vault…") { model.presentSheet(.createVault) }.disabled(model.busy || model.offline)
             }
             CommandGroup(after: .textEditing) {
@@ -137,7 +136,6 @@ struct SessionSettings: View {
         .onAppear { model.settingsVisible = true }
         .onDisappear { model.settingsVisible = false }
         .sheet(item: Binding<SheetRequest?>(get: { model.sheetRequest?.inSettings == true ? model.sheetRequest : nil }, set: { if model.sheetRequest?.inSettings == true { model.sheetRequest = $0 } })) { request in AppSheetView(model: model, request: request) }
-        .documentTransfers(model: model, inSettings: true)
         #if DEBUG
         .confirmationDialog("Reset this device’s cloud enrollment?", isPresented: $resetEnrollment, titleVisibility: .visible) {
             Button("Remove Device and Reset Enrollment", role: .destructive) { model.debugResetEnrollment() }

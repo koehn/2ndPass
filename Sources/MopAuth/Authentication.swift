@@ -13,6 +13,14 @@ public enum Authentication {
             || (native.domain == "com.apple.LocalAuthentication" && native.code == -1004)
     }
 
+    /// A noninteractive key operation needs renewed user presence. This is not
+    /// evidence that the application's independently timed session was revoked.
+    public static func requiresInteraction(_ error: any Error) -> Bool {
+        let native = error as NSError
+        return (native.domain == "com.apple.LocalAuthentication" && native.code == -1004)
+            || (native.domain == LAError.errorDomain && native.code == LAError.notInteractive.rawValue)
+    }
+
     /// GUI and extension callers must suspend while the system authenticates,
     /// rather than occupying a Swift concurrency worker with a semaphore wait.
     public static func authorizeAsync(reason: String, contextCreated: (LAContext) throws -> Void = { _ in }) async throws -> LAContext {

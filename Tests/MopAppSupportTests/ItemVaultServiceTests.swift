@@ -89,7 +89,7 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
         waitedMutations.withLock { $0.append(mutationIDs) }
         if confirmsDelivery.withLock({ $0 }) {
             for mutation in try await repository.pendingMutations(account: "service") {
-                try await repository.acknowledge(mutationID: mutation.id, account: "service", serverSystemFields: Data([1]))
+                try await confirmCurrentMutation(mutation, repository: repository)
             }
         }
         for id in mutationIDs {
@@ -103,7 +103,7 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
 @Test func itemServiceReportsCommittedCreationReceiptWhenLockWinsAfterSave() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), service = ItemVaultService(backend: backend), id = UUID()
     backend.locksAfterCreate.withLock { $0 = true }
     let result = try await service.execute(.create(name: "locked"), vault: id.uuidString, offline: false)
@@ -116,7 +116,7 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
 @Test func itemServiceCloudDeliveryReportsOnlyExactMutationAcknowledgements() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository)
     let service = ItemVaultService(backend: backend, delivery: .cloudConfirmed(timeout: .zero))
     let id = UUID()
@@ -139,7 +139,7 @@ private final class SoftwareItemBackend: ItemVaultServiceBackend {
 func loginDestinationsUseCurrentMetadataWithoutReadingLoginItems(itemCount: Int) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
     let session = try await backend.create(name: "original", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -162,7 +162,7 @@ func loginDestinationsUseCurrentMetadataWithoutReadingLoginItems(itemCount: Int)
 func conflictReviewDoesNotExecuteSynchronizationWork(different: Bool) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     var contents = try sessionArchive()
     let archive = try PortableArchive.seal(contents)
@@ -173,12 +173,20 @@ func conflictReviewDoesNotExecuteSynchronizationWork(different: Bool) async thro
         contents.records[key] = PortableArchiveRecord(itemID: contents.records[key]!.itemID, bytes: SecretBytes(copying: Data("changed".utf8)))
         _ = try await session.save(contents, expectedBase: original.versionID)
     }
-    _ = try await repository.recordConflict(remote: original, serverSystemFields: Data([1]))
+    let content = try #require(try await repository.contentVersion(scope: original.scope, version: original.versionID))
+    let policy = try #require(try await repository.contentRecipients(scope: VaultScope(original.scope)))
+    let incoming = IncomingRecord(id: UUID().uuidString, account: "service", database: "private",
+        zoneName: SyncStoreLayout.contentZone(vault: id), zoneOwner: original.scope.zoneOwner,
+        recordName: original.scope.itemID.uuidString, recordType: ContentRecordKind.head.rawValue,
+        bytes: original.ciphertext, systemFields: Data([1]), vaultID: id)
+    try await repository.stageIncomingBatch([incoming], checkpoint: Data([1]), account: "service", database: "private", permit: DomainAccountAuthorization())
+    try await repository.receiveContent(content, from: incoming, action: .branch, expectedHead: repository.item(original.scope)?.versionID,
+        expectedPolicy: policy, permit: DomainAccountAuthorization())
     let service = ItemVaultService(backend: backend)
     let report = try await service.checkConflicts(vault: id.uuidString)
     #expect(report.choices.count == 1)
     #expect(report.pending == 0)
-    #expect(try await repository.conflicts(account: "service").count == 1)
+    #expect(try await repository.contentConflicts(account: "service").count == 1)
 }
 
 private func serviceLocation() throws -> URL {
@@ -187,10 +195,10 @@ private func serviceLocation() throws -> URL {
     return directory
 }
 
-@Test func itemServiceIndependentItemEditsPreserveCiphertextAndRejectSameItemStaleness() async throws {
+@Test func itemServiceIndependentItemEditsPreserveKeysAndRejectSameItemStaleness() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let service = ItemVaultService(backend: backend)
     _ = try await service.execute(.create(name: "personal"), vault: id.uuidString, offline: false)
@@ -206,7 +214,7 @@ private func serviceLocation() throws -> URL {
     let session = try await backend.open(id)
     let alphaID = try #require(alpha.storageID.flatMap(UUID.init(uuidString:)))
     let before = try #require(try await repository.item(session.binding.item(alphaID)))
-    let oldEnvelope = try JSONDecoder().decode(ItemEnvelope.self, from: before.ciphertext)
+    let oldEnvelope = try JSONDecoder().decode(ContentEnvelope.self, from: before.ciphertext)
     let originalDates = try #require(alpha.metadata)
     #expect(originalDates.createdAt != nil && originalDates.addedAt != nil && originalDates.updatedAt != nil)
     let beforeSave = Date()
@@ -222,8 +230,9 @@ private func serviceLocation() throws -> URL {
     #expect(savedAlpha.metadata?.addedAt == originalDates.addedAt)
     #expect(try #require(savedAlpha.metadata?.updatedAt) >= beforeSave)
     let after = try #require(try await repository.item(session.binding.item(alphaID)))
-    let newEnvelope = try JSONDecoder().decode(ItemEnvelope.self, from: after.ciphertext)
-    #expect(newEnvelope.encryptedRecords == oldEnvelope.encryptedRecords)
+    let newEnvelope = try JSONDecoder().decode(ContentEnvelope.self, from: after.ciphertext)
+    #expect(newEnvelope.header.keyGeneration == oldEnvelope.header.keyGeneration)
+    #expect(Set(newEnvelope.components.keys) == Set(oldEnvelope.components.keys))
     beta.metadata = ItemMetadata(tags: ["independent"])
     _ = try await service.execute(.save(ItemEdit(revision: original.revision, item: beta, create: false)), vault: id.uuidString, offline: true)
     await #expect(throws: MopError.vaultConflict) {
@@ -235,7 +244,7 @@ private func serviceLocation() throws -> URL {
     #expect(!pending.isEmpty)
     for value in pending { #expect(try await repository.mutationReceipt(id: value.id, account: "service")?.status == .queued) }
     let first = try #require(pending.first)
-    try await repository.acknowledge(mutationID: first.id, account: "service", serverSystemFields: Data([1]))
+    try await confirmCurrentMutation(first, repository: repository)
     #expect(try await repository.mutationReceipt(id: first.id, account: "service")?.status == .cloudConfirmed)
     service.lock()
     await #expect(throws: MopError.authentication) { try await service.readLocal(reference, vault: id.uuidString) }
@@ -244,7 +253,7 @@ private func serviceLocation() throws -> URL {
 @Test func itemServiceRestoreAndExportUsePortableLocalSnapshotAndUnsupportedManagementIsExplicit() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), service = ItemVaultService(backend: backend), id = UUID()
     let original = try sessionArchive(), archive = try PortableArchive.seal(original)
     _ = try await service.execute(.restorePortable(document: archive.data, key: archive.recoveryKey, name: "restored"), vault: id.uuidString, offline: false)
@@ -258,14 +267,14 @@ private func serviceLocation() throws -> URL {
     #expect(result.message.contains("local snapshot"))
     #expect(service.capabilities == [.portableBackup, .enrollment, .passwordCheckCache])
     await #expect(throws: ItemVaultServiceFailure.unavailable) {
-        try await service.execute(.manage(.requestEnrollment(name: "old")), vault: id.uuidString, offline: false)
+        try await service.execute(.manage(.automaticEnrollment), vault: id.uuidString, offline: false)
     }
 }
 
 @Test func itemServiceTrashAllowsReusedNameWithoutDroppingEitherPortableRecordGraph() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), service = ItemVaultService(backend: backend), id = UUID()
     let archive = try PortableArchive.seal(sessionArchive())
     _ = try await service.execute(.restorePortable(document: archive.data, key: archive.recoveryKey, name: "trash"), vault: id.uuidString, offline: false)
@@ -291,7 +300,7 @@ private func serviceLocation() throws -> URL {
 @Test func itemServiceOfflineInitializationRejectsBeforeAnyDurableMutation() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), service = ItemVaultService(backend: backend), id = UUID()
     await #expect(throws: MopError.offlineWrite) {
         try await service.execute(.create(name: "offline"), vault: id.uuidString, offline: true)
@@ -305,7 +314,7 @@ private func serviceLocation() throws -> URL {
 func itemServiceCatalogAndWarmRevealHaveBoundedKeyUnwraps(itemCount: Int) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let document = performanceDocument(itemCount: itemCount)
     let backup = try PortableArchive.seal(document)
@@ -380,7 +389,7 @@ private func performanceDocument(itemCount: Int) -> PortableVaultArchive {
 func autoFillDirectReadUnwrapsOnlySelectedItemAndRejectsStaleHints(itemCount: Int, kind: AutoFillKind) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let location = directory.appendingPathComponent("items.sqlite")
+    let location = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite")
     let repository = try EncryptedItemRepository(storeURL: location)
     let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
     var document = performanceDocument(itemCount: itemCount)
@@ -443,7 +452,7 @@ func autoFillDirectReadUnwrapsOnlySelectedItemAndRejectsStaleHints(itemCount: In
 @Test func deletingLoginRemovesSuggestionsBeforeReturningWithoutIdleWork() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
     _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -487,7 +496,7 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
 @Test func manualAutoFillRefreshUsesCatalogPublicationAndRepairsEmptyPicker() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
     _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -523,7 +532,7 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
 @Test func discoveryPrunesObsoleteSuggestionsOnlyWithAuthoritativeInventory() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     _ = try await backend.create(name: "current", id: id, archiveData: nil, recoveryKey: nil)
     let publisher = CatalogPublicationRecorder()
@@ -541,7 +550,7 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
 @Test func progressiveCatalogPublishesBoundedDeltasThenCompleteInventory() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID(), total = 64
     let archive = try PortableArchive.seal(performanceDocument(itemCount: total))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -589,7 +598,7 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
 @Test func lockDuringProgressiveOpeningDiscardsRemainingPlaintextAndPublication() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 64))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -607,7 +616,7 @@ private actor CatalogPublicationRecorder: AutoFillPublishing {
 func reopenedNamedReadUsesDurableIndexWithoutOpeningEveryItem(itemCount: Int) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let location = directory.appendingPathComponent("items.sqlite")
+    let location = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite")
     let repository = try EncryptedItemRepository(storeURL: location)
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
@@ -629,7 +638,7 @@ func reopenedNamedReadUsesDurableIndexWithoutOpeningEveryItem(itemCount: Int) as
 @Test func durableNameLookupRepairsTamperAndRejectsExternallyIntroducedDuplicates() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -666,7 +675,7 @@ func reopenedNamedReadUsesDurableIndexWithoutOpeningEveryItem(itemCount: Int) as
 func persistentDisplayCatalogOpensWholeListWithConstantHardwareWork(itemCount: Int) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let url = directory.appendingPathComponent("items.sqlite")
+    let url = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite")
     let repository = try EncryptedItemRepository(storeURL: url)
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
@@ -696,7 +705,7 @@ func persistentDisplayCatalogOpensWholeListWithConstantHardwareWork(itemCount: I
 @Test func persistentDisplayCatalogReconcilesOneChangedItemAfterRestart() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let url = directory.appendingPathComponent("items.sqlite"), id = UUID()
+    let url = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"), id = UUID()
     let repository = try EncryptedItemRepository(storeURL: url)
     let backend = try SoftwareItemBackend(repository: repository)
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 40))
@@ -725,7 +734,7 @@ func persistentDisplayCatalogOpensWholeListWithConstantHardwareWork(itemCount: I
 @Test func damagedDisplayRowsRebuildIndividuallyAndKeyDamageRebuildsWithoutChangingItems() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let url = directory.appendingPathComponent("items.sqlite"), id = UUID()
+    let url = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"), id = UUID()
     let repository = try EncryptedItemRepository(storeURL: url)
     let backend = try SoftwareItemBackend(repository: repository)
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 40))
@@ -774,7 +783,7 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
 @MainActor @Test func itemServiceStoresHealthSeparatelyWithoutRewritingItems() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let service = ItemVaultService(backend: backend)
     #expect(service.capabilities.contains(.passwordCheckCache))
@@ -841,7 +850,6 @@ private struct ClosureRepositoryWritePermit: RepositoryWritePermit {
         try await service.execute(.savePasswordChecks(checks, revision: before.revision), vault: id.uuidString, offline: true)
     }
 
-
 }
 private struct UnusedHealthBreach: BreachChecking {
     func contains(_ lookup: BreachLookup, force: Bool) async throws -> Bool { try await contains(Data(), force: force) }
@@ -867,7 +875,7 @@ func waitForDisplay(_ service: ItemVaultService, vault: UUID,
 @Test func cachedLaunchDefersAutoFillUntilIdleAndLockCancelsPublication() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 3))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -907,7 +915,7 @@ func waitForDisplay(_ service: ItemVaultService, vault: UUID,
 func projectionFailurePreservesCauseAndRefreshRetriesWithoutRelocking(replaceSession: Bool) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -949,7 +957,7 @@ func projectionFailurePreservesCauseAndRefreshRetriesWithoutRelocking(replaceSes
 func idlePreparationMaterializesOnlyRequestedSnapshots(itemCount: Int) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -983,7 +991,7 @@ func idlePreparationMaterializesOnlyRequestedSnapshots(itemCount: Int) async thr
 @Test func itemSaveDefersAllAutoFillWorkUntilBackgroundRefresh() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
     _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -1017,7 +1025,7 @@ func idlePreparationMaterializesOnlyRequestedSnapshots(itemCount: Int) async thr
 func savingOneItemDoesNotDecryptUnchangedItems(itemCount: Int) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: itemCount))
     _ = try await backend.create(name: "performance", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -1046,7 +1054,7 @@ private actor RestartHealthBreach: BreachChecking {
 @MainActor @Test(arguments: [false, true]) func passwordHealthSurvivesRepositoryAndSessionRestartAcrossVaults(useAppWriter: Bool) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let url = directory.appendingPathComponent("items.sqlite")
+    let url = directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite")
     let repository = try EncryptedItemRepository(storeURL: url)
     let backend = try SoftwareItemBackend(repository: repository), service = ItemVaultService(backend: backend)
     var catalogs: [String: ItemCatalog] = [:]
@@ -1110,7 +1118,7 @@ private actor RestartHealthBreach: BreachChecking {
 @MainActor @Test func healthCacheWritesDoNotInvokeAutoFillIncludingNoOpBatches() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), vault = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 2))
     _ = try await backend.create(name: "health", id: vault, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -1134,7 +1142,7 @@ private actor RestartHealthBreach: BreachChecking {
 @Test func localPasswordStrengthCheckDoesNotPauseAnUnlockedVault() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository)
     let archive = try PortableArchive.seal(sessionArchive())
     let id = UUID()
@@ -1148,7 +1156,7 @@ private actor RestartHealthBreach: BreachChecking {
 @Test func displayReplacementKeepsVerifiedRowsUntilProjectionIsReady() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 40))
     let session = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -1182,7 +1190,7 @@ private actor RestartHealthBreach: BreachChecking {
 @Test func rotationWaitsForGrantWithoutRemovingVerifiedDisplayRow() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: directory), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: directory))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 1))
     let session = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)
@@ -1230,7 +1238,7 @@ private actor RestartHealthBreach: BreachChecking {
 @Test func authorizedSessionReplacementKeepsCompleteDisplayWithoutRehydratingRows() async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
     let backend = try SoftwareItemBackend(repository: repository), id = UUID()
     let archive = try PortableArchive.seal(performanceDocument(itemCount: 40))
     _ = try await backend.create(name: "performance", id: id, archiveData: archive.data, recoveryKey: archive.recoveryKey)

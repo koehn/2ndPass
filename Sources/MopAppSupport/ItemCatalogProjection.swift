@@ -19,13 +19,13 @@ final class ItemCatalogProjection: Sendable {
     let items: [UUID: VaultItem]
     let orderedIDs: [UUID]
     let versions: [UUID: UUID]
-    let metadata: VaultEnvelopeMetadata
+    let metadata: VaultMetadata
     let usageScope: String
     let work: ItemCatalogProjectionWork
     private let snapshot = Mutex<ItemCatalog?>(nil)
 
     init(previous: ItemCatalogProjection?, entries: [UUID: ItemVaultCatalogEntry], items: [UUID: VaultItem],
-         changedIDs: Set<UUID>, metadata: VaultEnvelopeMetadata, metadataVersion: UUID, usageScope: String,
+         changedIDs: Set<UUID>, metadata: VaultMetadata, metadataVersion: UUID, usageScope: String,
          work: ItemCatalogProjectionWork) {
         self.entries = entries; self.items = items; self.metadata = metadata
         self.usageScope = usageScope; self.work = work
@@ -73,7 +73,7 @@ final class ItemCatalogProjection: Sendable {
         result.healthEvidenceLoading = true
         result.canEdit = true; result.security = metadata.security ?? VaultSecurityMetadata()
         result.security?.histories = rows.flatMap { $0.catalog.histories }
-        result.securityEnabled = true; result.canUpgradeSecurity = false
+        result.securityEnabled = true
         result.usageScope = usageScope
         return result
     }

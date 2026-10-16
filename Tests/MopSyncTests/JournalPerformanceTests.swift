@@ -134,7 +134,7 @@ extension EncryptedItemRepository {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("ContentPreview3/Content3.sqlite")
-        let repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: url)
         try await repository.seedLargeJournal()
         func pass() async throws {
             #expect(try await repository.syncHealth(account: "benchmark", database: "private").pendingCount == 1200)
@@ -152,7 +152,7 @@ extension EncryptedItemRepository {
         let baseline = clock.now
         for _ in 0..<20 { #expect(try await repository.previousDerivedPass() == 2400) }
         print("Derived journal benchmark: 20 health/sorted-work/asset-reference queries, 10,000 completed + 1,200 active; cached=\(elapsed); previous=\(baseline.duration(to: clock.now)); repeated sorts=0, health summary updates=0")
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: url)
         let operation = try await writer.enqueue(SyncOperation(account: "benchmark", kind: .publishCoordination))
         #expect(try await repository.pendingCoordinationAssetOperations(account: "benchmark", database: "private") == [operation.id])
         #expect(try await repository.syncHealth(account: "benchmark", database: "private").pendingCount == 1201)
@@ -168,8 +168,8 @@ extension EncryptedItemRepository {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("ContentPreview3/Content3.sqlite")
-        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let reader = try EncryptedItemRepository(storeURL: url)
+        let writer = try EncryptedItemRepository(storeURL: url)
         var first = SyncOperation(account: "a", kind: .publishCoordination, now: Date(timeIntervalSince1970: 1))
         var second = SyncOperation(account: "a", kind: .publishCoordination, now: Date(timeIntervalSince1970: 2))
         try await writer.replaceHealthFixture(first)
@@ -200,9 +200,9 @@ extension EncryptedItemRepository {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("ContentPreview3/Content3.sqlite")
-        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let reader = try EncryptedItemRepository(storeURL: url)
         try await reader.seedLargeJournal()
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: url)
         let original = try await reader.syncHealth(account: "benchmark", database: "private")
         let before = await reader.metrics(), start = ContinuousClock.now
         for index in 0..<100 {
@@ -229,7 +229,7 @@ extension EncryptedItemRepository {
             recordName: "record-\($0)", recordType: "content", bytes: Data(repeating: 7, count: 32768), systemFields: Data([1])) }
         var elapsed: [Duration] = []
         for batched in [false, true] {
-            let url = root.appendingPathComponent(batched ? "batch/store.sqlite" : "single/store.sqlite")
+            let url = root.appendingPathComponent(batched ? "batch/ContentPreview3/Content3.sqlite" : "single/ContentPreview3/Content3.sqlite")
             let repository = try EncryptedItemRepository(storeURL: url)
             let start = ContinuousClock.now
             if batched {
@@ -257,7 +257,7 @@ extension EncryptedItemRepository {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("ContentPreview3/Content3.sqlite")
-        let repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: url)
         try await repository.seedLargeJournal()
         func read() async throws {
             #expect(try await repository.contentConflicts(account: "benchmark").isEmpty)
@@ -274,7 +274,7 @@ extension EncryptedItemRepository {
         let baseline = clock.now
         for _ in 0..<100 { try await repository.previousConflictStatusPass() }
         print("Enrolling status benchmark: 100 conflict/deletion reads over 11,200 operations; optimized=\(warm); previous decoded queries=\(baseline.duration(to: clock.now)); repeated full fetches=0, decodes=0, writes=0")
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: url)
         let scope = VaultScope(account: "benchmark", vaultID: UUID())
         let deletion = VaultDeletionState(scope: scope, notice: Data([1]), phase: .prepared)
         try await writer.writeDeletionFixture(deletion, scope: scope)
@@ -298,7 +298,7 @@ extension EncryptedItemRepository {
     @Test func thousandItemJournalAvoidsRepeatedFetchAndDecode() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"), layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"))
         try await repository.seedLargeJournal()
         let clock = ContinuousClock()
         let coldStart = clock.now
@@ -324,7 +324,7 @@ extension EncryptedItemRepository {
         print("Journal benchmark: 1,000 pending item operations, 10,000 completed, 200 incoming; cold=\(cold); 10 warm passes=\(warm); 10 legacy passes=\(baseline); warm decoded rows=\(after.decodedRows - before.decodedRows), full fetches=\(after.fullFetches - before.fullFetches)")
         // A different repository represents another app-group process. Its
         // writes must be visible without relying on notification delivery.
-        let writer = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"), layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"))
         let first = try #require(active.first)
         _ = try await writer.transition(first, to: .completed)
         #expect(try await repository.activeOperations(account: "benchmark", database: "private").count == 1199)
@@ -337,9 +337,9 @@ extension EncryptedItemRepository {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("ContentPreview3/Content3.sqlite")
-        let repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: url)
         try await repository.seedLargeJournal()
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let writer = try EncryptedItemRepository(storeURL: url)
         let stale = try await writer.enqueue(SyncOperation(account: "benchmark", kind: .enrollment))
         _ = try await writer.transition(stale, to: .ready)
         let vault = UUID(), clock = ContinuousClock()
@@ -389,7 +389,7 @@ extension EncryptedItemRepository {
     @Test func projectionsRespectAtomicChangesRollbackAndDeletion() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
         let operation = try await repository.enqueue(SyncOperation(account: "a", kind: .enrollment))
         #expect(try await repository.activeOperations(account: "a", database: "private") == [operation])
         await #expect(throws: SyncJournalError.invalidOperation) { try await repository.rollbackProjectionChange(operation) }
@@ -464,8 +464,8 @@ extension JournalPerformanceTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = SyncStoreLayout.contentPreviewURL(in: root)
-        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let reader = try EncryptedItemRepository(storeURL: url)
+        let writer = try EncryptedItemRepository(storeURL: url)
         try await writer.seedLargeJournal(incomingCount: 5000, incomingBytes: 1024)
         _ = try await reader.syncHealth(account: "benchmark", database: "private")
         _ = try await reader.inboxReadyToResume(account: "benchmark")
@@ -508,8 +508,8 @@ extension JournalPerformanceTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = SyncStoreLayout.contentPreviewURL(in: root)
-        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let reader = try EncryptedItemRepository(storeURL: url)
+        let writer = try EncryptedItemRepository(storeURL: url)
         func record(_ id: String) -> IncomingRecord {
             IncomingRecord(id: id, account: "a", database: "private", zoneName: "z", zoneOwner: "o", recordName: id,
                 recordType: "test", bytes: Data(repeating: 1, count: 50), systemFields: Data([1]))
@@ -525,7 +525,7 @@ extension JournalPerformanceTests {
         #expect(try await !reader.inboxReadyToResume(account: "a", budget: 100))
         try await writer.completeIncoming(first)
         #expect(try await reader.inboxReadyToResume(account: "a", budget: 100))
-        let reopened = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let reopened = try EncryptedItemRepository(storeURL: url)
         #expect(try await reopened.inboxReadyToResume(account: "a", budget: 100))
     }
 }
@@ -535,8 +535,8 @@ extension JournalPerformanceTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = SyncStoreLayout.contentPreviewURL(in: root)
-        let reader = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
-        let writer = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let reader = try EncryptedItemRepository(storeURL: url)
+        let writer = try EncryptedItemRepository(storeURL: url)
         func check() async throws {
             let actual = try await reader.syncHealth(account: "benchmark", database: "private")
             let previous = try await reader.previousHealthSnapshot()

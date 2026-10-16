@@ -194,7 +194,6 @@ public struct QuarantinedSyncRecord: Codable, Equatable, Sendable {
     public var payload: Data?
     public var operations: [UUID]?
     var retired: Bool?
-    public var legacyReadbackUnmatched: Bool?
 }
 
 extension EncryptedItemRepository {
@@ -332,47 +331,6 @@ extension EncryptedItemRepository {
         try transaction { try quarantineRows(account: account).map(\.1).filter { $0.retired != true } }
     }
 
-    /// Remember a conclusive readback mismatch without clearing any failure.
-    /// Transport errors must not call this: they remain retryable.
-    public func retainUnmatchedQuarantine(_ expected: QuarantinedSyncRecord, account: String,
-                                          permit: any RepositoryWritePermit) throws {
-        try permit.withWritePermission {
-            try transaction {
-                let key = "sync-quarantine:" + Data(account.utf8).base64EncodedString() + ":" + expected.digest
-                guard let current: QuarantinedSyncRecord = try journalValue("StateBlob", key: key), current == expected,
-                      current.operations == nil, current.retired != true else { throw SyncJournalError.staleOperation }
-                var retained = current; retained.legacyReadbackUnmatched = true
-                try writeJournal(retained, entity: "StateBlob", key: key)
-            }
-        }
-    }
-
-    /// Recover legacy linkage only from the exact materialized cloud revision.
-    /// Its inbox hash includes routing, system fields and bytes; no fuzzy match.
-    public func linkLegacyQuarantine(_ expected: QuarantinedSyncRecord, incoming: IncomingRecord,
-                                     permit: any RepositoryWritePermit) throws -> QuarantinedSyncRecord {
-        try permit.withWritePermission {
-            try transaction {
-                guard expected.operations == nil, expected.payload == incoming.bytes,
-                      incoming.database == "private", incoming.zoneName == SyncStoreLayout.contentCoordinationZone,
-                      incoming.recordType == CoordinationRecordKind.grantRequest.recordType else { throw SyncJournalError.invalidOperation }
-                let scope = try JSONEncoder().encode([incoming.database, incoming.zoneName, incoming.zoneOwner, incoming.recordName])
-                let digest = SHA256.hash(data: scope + incoming.bytes).map { String(format: "%02x", $0) }.joined()
-                guard digest == expected.digest else { throw SyncJournalError.invalidOperation }
-                let key = "sync-quarantine:" + Data(incoming.account.utf8).base64EncodedString() + ":" + digest
-                guard let current: QuarantinedSyncRecord = try journalValue("StateBlob", key: key), current == expected,
-                      current.retired != true,
-                      let operation: SyncOperation = try journalValue("SyncOperation", key: journalKey(incoming.account, incoming.database, incoming.operationID.uuidString)),
-                      operation.kind == .applyIncoming, operation.state == .needsAttention,
-                      operation.failure == .invalidAuthority, operation.payload == Data(incoming.id.utf8),
-                      operation.vaultID == incoming.vaultID, operation.zoneOwner == incoming.zoneOwner else { throw SyncJournalError.staleOperation }
-                var linked = current; linked.operations = [incoming.operationID]
-                try writeJournal(linked, entity: "StateBlob", key: key)
-                return linked
-            }
-        }
-    }
-
     /// Caller verifies the signed request; storage independently checks routing
     /// digest, exact retained evidence, and every linked operation before commit.
     public func retireQuarantinedGrant(_ expected: QuarantinedSyncRecord, record: PreparedCoordinationRecord,
@@ -438,7 +396,7 @@ extension EncryptedItemRepository {
             }
             return old
         }
-        if layout == .contentPreview3, operation.kind == .membership {
+        if operation.kind == .membership {
             let pending: [SyncOperation] = try journalValues("SyncOperation", account: operation.account, database: operation.database)
             guard !pending.contains(where: { $0.kind == .membership && $0.vaultID == operation.vaultID && $0.state != .completed }) else { throw ContentStoreError.staleAuthority }
         }
@@ -715,7 +673,7 @@ extension EncryptedItemRepository {
     /// leave a durable dependency without the work needed to retrieve it.
     public func deferContentIncoming(_ expected: IncomingRecord, dependencies: Set<SyncDependency>,
                                      permit: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3, expected.database == "private" else { throw ContentStoreError.wrongLayout }
+        guard expected.database == "private" else { throw ContentStoreError.wrongLayout }
         try permit.withWritePermission {
             try transaction {
                 try requireIncomingInTransaction(expected)
@@ -738,7 +696,7 @@ extension EncryptedItemRepository {
     }
 
     public func stageMembershipFetch(_ expected: SyncOperation, incoming: [IncomingRecord], permit: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3, expected.kind == .fetchMembership,
+        guard expected.kind == .fetchMembership,
               let request = try? JSONDecoder().decode(ContentMembershipFetch.self, from: expected.payload),
               request.vault == expected.vaultID, expected.database == "private", incoming.count == 2 else { throw SyncJournalError.invalidOperation }
         try permit.withWritePermission {
@@ -758,7 +716,7 @@ extension EncryptedItemRepository {
     /// in the inbox and completes its exact request in the same transaction.
     public func finishContentVersionFetch(_ expected: SyncOperation, incoming: IncomingRecord,
                                           permit: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+
         try permit.withWritePermission {
             try transaction {
                 let key = journalKey(expected.account, expected.database, expected.id.uuidString)
@@ -815,7 +773,7 @@ extension EncryptedItemRepository {
 
     public func finishContentHeadFetch(_ expected: SyncOperation, incoming: IncomingRecord,
                                           permit: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+
         try permit.withWritePermission {
             try transaction {
                 let key = journalKey(expected.account, expected.database, expected.id.uuidString)
@@ -922,7 +880,7 @@ extension EncryptedItemRepository {
 
     func purgeSyncJournalInTransaction(_ scope: VaultScope) throws {
         let operations: [SyncOperation] = try journalValues("SyncOperation", account: scope.account, database: scope.database)
-        for operation in operations where operation.vaultID == scope.vaultID && operation.zoneOwner == scope.zoneOwner && !(layout == .contentPreview3 && operation.kind == .deletion) {
+        for operation in operations where operation.vaultID == scope.vaultID && operation.zoneOwner == scope.zoneOwner && operation.kind != .deletion {
             if let row = try journalRow("SyncOperation", key: journalKey(scope.account, scope.database, operation.id.uuidString)) { context.delete(row) }
         }
         let incoming: [IncomingRecord] = try journalValues("IncomingRecord", account: scope.account, database: scope.database)
@@ -952,8 +910,8 @@ extension EncryptedItemRepository {
         let row = try journalRow(entity, key: key) ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
         row.setValue(journalStorageKey(entity, key: key), forKey: "key"); row.setValue(bytes, forKey: "value")
     }
-    /// Use the existing opaque-state table while v3 remains isolated. This keeps
-    /// the foundation transactional without migrating the legacy store's schema.
+    /// Keep journal records in the current opaque-state table and retain their
+    /// storage keys so existing pending operations survive upgrades.
     private func journalStorageKey(_ entity: String, key: String) -> String {
         entity == "StateBlob" ? key : "sync-journal-v1:" + entity + ":" + key
     }

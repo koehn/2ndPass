@@ -6,7 +6,7 @@ extension EncryptedItemRepository {
     /// screen owns retries, and replay never signs a replacement request.
     public func enqueueCoordination(_ record: PreparedCoordinationRecord, prerequisites: [SyncOperation] = [],
                                      authorization: any RepositoryWritePermit) throws -> SyncOperation {
-        guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+
         return try authorization.withWritePermission {
             try transaction {
                 let candidate = try record.operation(dependencies: Set(prerequisites.map { SyncDependency(.operation, identifier: $0.id.uuidString) }))
@@ -25,7 +25,7 @@ extension EncryptedItemRepository {
     }
 
     public func preparedCoordination(account: String, vault: UUID, kind: CoordinationRecordKind, identity: UUID) throws -> PreparedCoordinationRecord? {
-        guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+
         let address = try PreparedCoordinationRecord(account: account, vault: vault, kind: kind, identity: identity, bytes: Data([0]))
         return try transaction {
             let key = journalKey(account, "private", address.operationID.uuidString)
@@ -38,7 +38,7 @@ extension EncryptedItemRepository {
     }
 
     public func coordinationPublications(account: String, limit: Int = 100) throws -> [PreparedCoordinationRecord] {
-        guard layout == .contentPreview3, limit > 0, limit <= 100 else { throw ContentStoreError.wrongLayout }
+        guard limit > 0, limit <= 100 else { throw ContentStoreError.wrongLayout }
         return try transaction {
             let receiving = try incomingCloudRecordIDsInTransaction(account: account, database: "private")
             let operations = try activeOperationsInTransaction(account: account, database: "private")
@@ -53,6 +53,8 @@ extension EncryptedItemRepository {
                 let record = try JSONDecoder().decode(PreparedCoordinationRecord.self, from: operation.payload)
                 guard record.account == account, record.operationID == operation.id, record.vault == operation.vaultID,
                       record.zoneOwner == operation.zoneOwner else { throw ItemRepositoryError.corruptStore }
+                if record.kind != .deletion,
+                   try deletionInTransaction(VaultScope(account: account, vaultID: record.vault)) != nil { continue }
                 guard !receiving.contains(record.recordID) else { continue }
                 result.append(record)
                 if result.count == limit { break }
@@ -67,7 +69,7 @@ extension EncryptedItemRepository {
     public func receiveCoordination(_ record: PreparedCoordinationRecord, from incoming: IncomingRecord,
                                      work: [SyncOperation] = [], equivalentPending: PreparedCoordinationRecord? = nil,
                                      permit: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3, incoming.account == record.account, incoming.database == "private",
+        guard incoming.account == record.account, incoming.database == "private",
               incoming.zoneName == SyncStoreLayout.contentCoordinationZone, incoming.zoneOwner == record.zoneOwner,
               incoming.recordName == record.recordName, incoming.recordType == record.kind.recordType,
               incoming.vaultID == record.vault, incoming.bytes == record.bytes else { throw ContentStoreError.invalidRecord }
@@ -102,7 +104,7 @@ extension EncryptedItemRepository {
     }
 
     public func coordinationRecords(account: String, kind: CoordinationRecordKind? = nil, vault: UUID? = nil) throws -> [PreparedCoordinationRecord] {
-        guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+
         return try transaction {
             let query = NSFetchRequest<NSManagedObject>(entityName: "StateBlob")
             query.predicate = NSPredicate(format: "key BEGINSWITH %@", coordinationPrefix(account))
@@ -132,12 +134,15 @@ extension EncryptedItemRepository {
         try transaction { try journalValue("StateBlob", key: "discovery3:" + journalKey(account, "private", "index")) ?? [] }
     }
     public func retainContentDiscovery(account: String, addresses: [VaultCloudAddress], authorization: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3, addresses.allSatisfy({ $0.zoneName == SyncStoreLayout.contentZone(vault: $0.vaultID) && $0.ownerName == "__defaultOwner__" }) else { throw ContentStoreError.invalidRecord }
+        guard addresses.allSatisfy({ $0.zoneName == SyncStoreLayout.contentZone(vault: $0.vaultID) && $0.ownerName == "__defaultOwner__" }) else { throw ContentStoreError.invalidRecord }
         try authorization.withWritePermission {
             try transaction {
                 let key = "discovery3:" + journalKey(account, "private", "index")
                 var values: [VaultCloudAddress] = try journalValue("StateBlob", key: key) ?? []
                 for address in addresses where !values.contains(address) {
+                    // Zone existence is a routing hint, not evidence that a
+                    // signed deletion was undone. Cleanup may still be pending.
+                    guard try deletionInTransaction(VaultScope(account: account, vaultID: address.vaultID)) == nil else { continue }
                     values.append(address)
                     // Deterministic durable bootstrap request; its handler still
                     // needs an authorized device before signing enrollment.
@@ -212,7 +217,7 @@ extension EncryptedItemRepository {
 extension EncryptedItemRepository {
     public func saveContentWorkflowState(_ data: Data, account: String, name: String,
                                         operations: [SyncOperation], permit: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3, operations.allSatisfy({ $0.account == account && $0.database == "private" }) else { throw ContentStoreError.invalidRecord }
+        guard operations.allSatisfy({ $0.account == account && $0.database == "private" }) else { throw ContentStoreError.invalidRecord }
         try permit.withWritePermission {
             try transaction {
                 let row = try fetchOne("StateBlob", key: blobKey(account, name)) ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)

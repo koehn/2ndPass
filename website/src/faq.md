@@ -40,7 +40,7 @@ The decision to leave, and the characterization above, are the creator’s own j
 
 Write **2ndPass**, say “Second Pass.” It’s a second pass at the tools used to protect and work with secrets. The website is **2ndpass.app** and the command is `sp`.
 
-Secret references use `sp://`, spelled out because a URI scheme cannot start with a number. Older `mop://` references continue to work. Internal Apple identifiers retain their original names to preserve access to existing keys and vaults.
+Secret references use `sp://`, spelled out because a URI scheme cannot start with a number. Retired `mop://` references are rejected. Internal Apple identifiers retain their original names to preserve access to existing keys and vaults.
 
 ## Different
 
@@ -76,7 +76,7 @@ Build and installation documentation is for the copyright holder and separately 
 
 The project targets macOS 15+ and iOS/iPadOS 18+ with supported Secure Enclave hardware. The command-line tool runs on Mac. There is no Windows, Linux, Android, or browser vault client.
 
-Passwords, TOTP, typed items, encrypted attachments, local offline saves, portable archives and developer integrations use the item service. Same-account connection is automatic. General document import, sharing, device removal, account recovery and credential-account management are unavailable. Cloud-key workflows require further physical acceptance. AutoFill can save new logins on iOS/iPadOS 26.2 and later; cards/identities and in-extension password generation are not implemented. See [capabilities](docs.html#vault-capabilities).
+Passwords, TOTP, typed items, encrypted attachments, local offline saves, portable archives and developer integrations use the item service. Same-account connection is automatic. General document import, sharing and credential-account management are unimplemented. Account recovery is implemented, with physical iCloud acceptance pending. Device removal and permanent vault deletion are preview features awaiting physical acceptance; see [availability and deletion build gates](docs.html#sharing). Cloud-key workflows require further physical acceptance. AutoFill can save new logins on iOS/iPadOS 26.2 and later; cards/identities and in-extension password generation are not implemented. See [capabilities](docs.html#vault-capabilities).
 
 ## Account
 

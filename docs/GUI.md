@@ -16,7 +16,7 @@ Recent lists show the newest 50 active, unarchived items per category. Search fi
 
 ## Available workflows
 
-Create/rename vaults, edit/read items, inspect history, trash/restore, check password health, use password/TOTP AutoFill and export/restore portable archives. General document import, device removal, sharing, permanent vault deletion and credential-account management are unavailable.
+Create/rename vaults, edit/read items, inspect history, trash/restore, check password health, use password/TOTP AutoFill and export/restore portable archives. Device removal and permanent cloud-vault deletion are preview features; physical-device acceptance remains pending. Vault deletion is enabled in Development builds and requires `MOP_VAULT_DELETION` in Production; the separate V3 Production review gate also applies. General document import, sharing and credential-account management are unavailable.
 
 See [backups](BACKUPS.md), [AutoFill](AUTOFILL.md), [architecture](VAULT.md) and [validation](VALIDATION.md).
 

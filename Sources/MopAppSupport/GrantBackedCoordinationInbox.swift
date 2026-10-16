@@ -70,16 +70,6 @@ public struct GrantBackedCoordinationInbox: Sendable {
         return true
     }
 
-    func legacyObsoleteRecord(_ candidate: QuarantinedSyncRecord, history: TrustedMembershipHistory?) -> PreparedCoordinationRecord? {
-        guard candidate.operations == nil, candidate.legacyReadbackUnmatched != true, let bytes = candidate.payload,
-              let envelope = try? JSONDecoder().decode(CoordinationEnvelope.self, from: bytes),
-              envelope.kind == .grantRequest,
-              let record = try? PreparedCoordinationRecord(account: account, vault: envelope.scope.vault,
-                  kind: .grantRequest, identity: envelope.identity, bytes: bytes),
-              (try? obsoleteGrantRequest(record, history: history)) == true else { return nil }
-        return record
-    }
-
     public func verify(_ record: PreparedCoordinationRecord, history: TrustedMembershipHistory?) throws -> CoordinationEnvelope {
         guard record.account == account, record.zoneOwner == "__defaultOwner__" else { throw MopError.vaultUntrusted }
         let value = try CoordinationEnvelope.decode(record.bytes, scope: scope(vault: record.vault))
@@ -127,6 +117,25 @@ public struct GrantBackedCoordinationInbox: Sendable {
         default: break
         }
         return value
+    }
+
+    /// Exact public deletion readback before grant routing. Verification precedes
+    /// the atomic marker/work save; no content or cloud data is deleted here.
+    func acceptDeletionBeforeRouting(_ incoming: IncomingRecord, history: TrustedMembershipHistory,
+                                       permit: any RepositoryWritePermit) async throws {
+        let address = try PreparedCoordinationRecord.address(recordType: incoming.recordType, zone: incoming.zoneName, record: incoming.recordName)
+        guard incoming.account == account, incoming.database == "private", incoming.zoneOwner == "__defaultOwner__",
+              address.kind == .deletion, address.vault == history.vault, address.identity == history.vault,
+              incoming.vaultID == history.vault else { throw MopError.vaultUntrusted }
+        let record = try PreparedCoordinationRecord(account: account, vault: history.vault,
+            kind: .deletion, identity: history.vault, bytes: incoming.bytes)
+        _ = try verify(record, history: history)
+        let scope = VaultScope(account: account, vaultID: history.vault)
+        if try await repository.deletion(scope) != nil { return }
+        let digest = Array(SHA256.hash(data: Data(("apply-coordination:" + record.operationID.uuidString).utf8)).prefix(16))
+        let id = UUID(uuid: (digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7], digest[8], digest[9], digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]))
+        let work = SyncOperation(id: id, account: account, vaultID: record.vault, kind: .deletion, payload: try setupEncode(record))
+        _ = try await repository.saveDeletion(scope: scope, notice: record.bytes, phase: .prepared, cleanup: work, authorization: permit)
     }
 
     public func handle(_ operation: SyncOperation, history: TrustedMembershipHistory?,

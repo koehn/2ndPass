@@ -25,10 +25,16 @@ Vault backup exports local transferable contents to a portable archive and a
 separate generated key file. It cannot certify complete remote inventory.
 Vault restore-backup requires both files and a fresh --restore-id UUID retained
 for retries. Use --dry-run to validate before creating an independent owned vault.
-Hardware private keys and membership are not restored.
+Hardware private keys and membership are not restored. Only archive v2 is accepted;
+v1 archives are unsupported. Derived health results and credential registrations
+are excluded.
 .Pp
-Cross-account sharing, device removal, account recovery, permanent vault deletion,
-general document import and credential-account management are unavailable.
+Device removal and permanent cloud-vault deletion are preview features awaiting
+physical-device acceptance. Vault deletion is enabled in Development; Production
+requires MOP_VAULT_DELETION and the separate V3 Production review gate.
+Cross-account sharing, general document import and credential-account management
+are unimplemented. Account recovery is implemented with physical acceptance pending.
+Secret references accept only sp://; retired mop:// values are rejected.
 .Sh OPTIONS
 .Fl -vault Ar NAME-OR-UUID
 constrains selection. Management requires selection when multiple vaults exist.

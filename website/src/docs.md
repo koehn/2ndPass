@@ -72,7 +72,8 @@ Read the [vault architecture](vault.html) and [validation status](vault-validati
 | SSH/Git keys | Software keys, generated or imported | Hardware-generated keys only |
 | Passkeys | Software credentials; physical acceptance pending | Device-bound; platform limitations apply |
 | Portable backup | Local transferable contents and separate key | Private keys cannot be exported |
-| Account recovery, sharing, device removal | Unavailable | No key recovery |
+| Account recovery and sharing | See recovery status below; sharing unavailable | No key recovery |
+| Device removal and permanent vault deletion | Preview features; deletion build gates apply | No cloud membership |
 
 Cloud private keys enter authorized process memory. Local private keys stay in the Secure Enclave. Credential-account management and general document import remain unavailable. See [cloud credentials](https://github.com/koehn/2ndPass/blob/main/docs/CLOUD-KEY-CREDENTIALS.md) and [local identities](https://github.com/koehn/2ndPass/blob/main/docs/LOCAL-VAULT.md).
 
@@ -124,7 +125,7 @@ The app’s credential details provide commands for the actual key and vault. Ea
 
 ## Import
 
-General CSV, JSON and 1PUX document import is not connected to the current service. Parser support in the source is not a supported import workflow. Keep your source manager available.
+General CSV, JSON and 1PUX document import is unimplemented. The old import parsers and workflow scaffolding have been removed. Keep your source manager available.
 
 You can restore a portable `.moparchive` with its separate generated key; see [backups](#recovery). Restore preserves transferable contents and creates a new owned vault.
 
@@ -171,7 +172,7 @@ sp write sp://personal/github/token --replace
 sp read sp://personal/github/token
 ```
 
-`mop://` references remain supported. The new scheme is `sp://`, with the word spelled out; URI schemes cannot begin with a number.
+Only `sp://` references are accepted. Retired `mop://` references fail before secret-dependent commands are launched.
 
 ## Runtime
 
@@ -273,7 +274,7 @@ Export creates a plaintext, owner-only file and refuses to overwrite an existing
 
 Devices on the same Apple Account connect automatically while an existing device is unlocked. No access-request approval or comparison code is required. The authenticated private iCloud container is an explicit enrollment trust channel; see [account trust](security.html#icloud).
 
-Cross-account sharing, device removal and permanent vault deletion are unavailable. Removing a stored credential cannot retract secrets already copied or revoke it at the external service.
+Cross-account sharing is unavailable. Device removal and permanent cloud-vault deletion are preview features; physical-device acceptance remains pending. Vault deletion is enabled in Development builds and requires `MOP_VAULT_DELETION` in Production; the separate V3 Production review gate also applies. Removing a stored credential cannot retract secrets already copied or revoke it at the external service.
 
 ## Recovery
 

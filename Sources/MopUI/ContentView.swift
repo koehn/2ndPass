@@ -42,8 +42,7 @@ struct ContentView: View {
     }.sheet(isPresented: $model.conflictReviewPresented) {
         ItemConflictReview(model: model)
     } }
-    private var navigation: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $compactColumn) {
+    private var sidebar: some View {
             VStack(alignment: .leading, spacing: 12) {
                 List(selection: Binding<String?>(get: { model.sidebarSelection }, set: { if let value = $0 { model.sidebarSelection = value } })) {
                     NavigationLink(value: "all") { Label("All Items", systemImage: "square.stack.3d.up") }
@@ -73,6 +72,11 @@ struct ContentView: View {
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
             .mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout)
+    }
+
+    private var navigation: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $compactColumn) {
+            sidebar
         } content: {
             Group {
                 if model.page == .security {
@@ -117,7 +121,6 @@ struct ContentView: View {
                                         }
                                         else if model.collection != .passkeys {
                                             Button("Add Your First Login") { model.beginCreatingItem() }.disabled(model.offline || model.busy)
-                                            Button("Import…") { model.beginImport() }.disabled(model.offline || model.busy)
                                         }
                                     }
                                 }
@@ -209,7 +212,15 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     Spacer()
                 }.padding(12)
-                if let activity = model.outgoingAccessStatus {
+                if model.needsCloudEnrollmentAuthorization {
+                    HStack {
+                        Text("Local access is unlocked. Connect to access your iCloud vaults.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button("Connect iCloud Vaults") { model.authorizeVaultConnection() }
+                            .disabled(!model.canAuthorizeVaultConnection || model.busy)
+                    }.padding(.horizontal, 12).padding(.bottom, 8)
+                }
+                if let activity = model.outgoingAccessStatus, !model.needsCloudEnrollmentAuthorization {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
                         Text(activity).font(.caption).foregroundStyle(.secondary)
@@ -243,25 +254,7 @@ struct ContentView: View {
                 }.background(.background)
             }.mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout, isDetail: true)
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if let status = model.importStatus {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(alignment: .top) {
-                        Text(status).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                            .foregroundStyle(model.importFailed ? Color.red : Color.primary)
-                        if !model.importing {
-                            Button("Dismiss") { model.importStatus = nil; model.importReport = nil }
-                        }
-                    }
-                    if model.importing {
-                        ProgressView(value: model.importFraction).progressViewStyle(.linear)
-                            .accessibilityLabel("Import progress")
-                    } else if model.importReport?.committed == true {
-                        Text("Check the results before deleting the unencrypted source file manually.").font(.caption).foregroundStyle(.secondary)
-                    }
-                }.padding().background(.regularMaterial).accessibilityIdentifier("Import status")
-            }
-        }
+
         .navigationSplitViewStyle(.balanced)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
             availableWidth = width
@@ -288,7 +281,6 @@ struct ContentView: View {
         }
         .transaction { if !model.authenticated { $0.disablesAnimations = true } }
         .sheet(isPresented: $settingsPresented) { SessionSettings(model: model) }
-        .documentTransfers(model: model)
         .task(id: model.notice) {
             let notice = model.notice
             let temporary = ["Value copied.", "Value copied. 2ndPass clears its clipboard entry after 30 seconds.",
@@ -315,13 +307,6 @@ struct ContentView: View {
     }
     private var content: some View {
         sessionContent
-        .safeAreaInset(edge: .bottom) {
-            if model.hasPendingVaultDeletion {
-                HStack {
-                    ProgressView("Vault deletion is pending. Cleanup continues automatically.")
-                }.padding().frame(maxWidth: .infinity).background(.bar)
-            }
-        }
         .sheet(isPresented: $model.keyCreationPresented) { KeyCredentialCreateView(model: model) }
         .sheet(item: $model.vaultDetailsTarget) { target in
             VaultDetailsDialog(model: model, target: target)

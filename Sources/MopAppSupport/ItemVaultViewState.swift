@@ -59,7 +59,7 @@ import MopVaultNext
     /// delivery is tracked separately by its receipt; no network wait blocks the
     /// editor. Expected versions keep overlapping edits from overwriting changes.
     @discardableResult
-    public func edit(itemID: UUID, expectedBase: UUID, catalog: ItemEnvelopeCatalog,
+    public func edit(itemID: UUID, expectedBase: UUID, catalog: ItemContentCatalog,
                      changedRecords: [String: SecretBytes] = [:], removedRecords: Set<String> = []) async throws -> PendingItemMutation {
         guard session.isUnlocked, status == .ready else { throw MopError.authentication }
         let token = generation

@@ -103,7 +103,7 @@ private func emit(_ result: VaultResult) throws {
 private func readFile(_ path: String) throws -> Data { try LocalFile.read(URL(fileURLWithPath: path), limit: 24 * 1024 * 1024) }
 
 struct Vault: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal and shared vaults.", subcommands: [Devices.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Export.self, Backup.self, RestoreBackup.self, Fingerprint.self, Members.self, Invite.self, Accept.self, Approve.self, RemoveMember.self, RemoveDevice.self, Role.self, Recovery.self, ReconcileShare.self, DeleteVault.self])
+    static let configuration = CommandConfiguration(abstract: "Manage hardware-protected personal vaults.", subcommands: [Devices.self, Initialize.self, ListVaults.self, Sync.self, Rename.self, Backup.self, RestoreBackup.self, RemoveDevice.self, Recovery.self, DeleteVault.self])
     struct Devices: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "List or remove devices across enrolled personal vaults.")
         @OptionGroup var storage: VaultOptions
@@ -170,11 +170,7 @@ struct Vault: AsyncParsableCommand {
         func validate() throws { try VaultName.validate(name) }
         func run() async throws { try emit(await storage.execute(.rename(name))) }
     }
-    struct Export: AsyncParsableCommand {
-        @OptionGroup var storage: VaultOptions
-        @Argument(completion: .file()) var file: String
-        func run() async throws { try emit(await storage.execute(.export(URL(fileURLWithPath: file)))) }
-    }
+
     struct Backup: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Export a portable encrypted archive and a separate generated key. Neither output is overwritten.")
         @OptionGroup var storage: VaultOptions
@@ -224,50 +220,7 @@ struct Vault: AsyncParsableCommand {
             try emit(await storage.execute(.restorePortable(document: data, key: key, name: name), selection: restoreID))
         }
     }
-    struct Fingerprint: AsyncParsableCommand {
-        @OptionGroup var storage: VaultOptions
-        func run() async throws { try emit(await storage.execute(.manage(.fingerprint))) }
-    }
-    struct Members: AsyncParsableCommand {
-        @OptionGroup var storage: VaultOptions
-        func run() async throws {
-            for member in try await storage.execute(.members).members { try IO.output("\(member.id)\t\(member.role)\n") }
-        }
-    }
-    struct Invite: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Verify a public device request and issue a one-day invitation. JSON on stdout; share URL/checkpoint on stderr.")
-        @OptionGroup var storage: VaultOptions
-        @Argument(completion: .file()) var request: String
-        @Option var fingerprint: String
-        @Option var role: String = "editor"
-        func run() async throws {
-            guard let role = MemberRole(rawValue: role) else { throw MopError.invalidProcess }
-            try emit(await storage.execute(.manage(.invite(request: readFile(request), fingerprint: fingerprint, role: role))))
-        }
-    }
-    struct Accept: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Accept an independently verified invitation; return acceptance JSON to the owner.")
-        @OptionGroup var storage: VaultOptions
-        @Argument(completion: .file()) var invitation: String
-        @Option var checkpoint: String
-        @Option var shareURL: String?
-        func run() async throws { try emit(await storage.execute(.manage(.accept(packet: readFile(invitation), checkpoint: checkpoint, shareURL: shareURL.flatMap(URL.init(string:)))))) }
-    }
-    struct Approve: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Approve the exact accepted device and grant current secrets. Stale invitations must be reissued.")
-        @OptionGroup var storage: VaultOptions
-        @Argument(completion: .file()) var acceptance: String
-        @Option var fingerprint: String
-        func run() async throws { try emit(await storage.execute(.manage(.approve(packet: readFile(acceptance), fingerprint: fingerprint)))) }
-    }
-    struct RemoveMember: AsyncParsableCommand {
-        @OptionGroup var storage: VaultOptions
-        @Argument var member: String
-        func run() async throws {
-            guard let id = UUID(uuidString: member) else { throw MopError.invalidProcess }
-            try emit(await storage.execute(.manage(.removeMember(id))))
-        }
-    }
+
     struct RemoveDevice: AsyncParsableCommand {
         @OptionGroup var storage: VaultOptions
         @Argument var device: String
@@ -276,15 +229,7 @@ struct Vault: AsyncParsableCommand {
             try emit(await storage.execute(.manage(.removeDevice(id))))
         }
     }
-    struct Role: AsyncParsableCommand {
-        @OptionGroup var storage: VaultOptions
-        @Argument var member: String
-        @Argument var role: String
-        func run() async throws {
-            guard let id = UUID(uuidString: member), let role = MemberRole(rawValue: role) else { throw MopError.invalidProcess }
-            try emit(await storage.execute(.manage(.role(id, role))))
-        }
-    }
+
     struct Recovery: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "recovery", abstract: "Manage the account's offline recovery key or recover after device loss.", subcommands: [Generate.self, Activate.self, Status.self, Resume.self, Revoke.self, Open.self])
         struct Generate: AsyncParsableCommand {
@@ -365,11 +310,7 @@ struct Vault: AsyncParsableCommand {
             return SecretBytes(copying: bytes)
         }
     }
-    struct ReconcileShare: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Retry cloud participant permissions after a committed roster change.")
-        @OptionGroup var storage: VaultOptions
-        func run() async throws { try emit(await storage.execute(.manage(.reconcileShare))) }
-    }
+
     struct DeleteVault: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "delete", abstract: "Permanently delete the selected cloud vault. Updated devices erase cached copies when they reconnect; backups remain.")
         @OptionGroup var storage: VaultOptions

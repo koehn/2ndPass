@@ -171,7 +171,7 @@ Each authorized device has its own hardware identity. Other devices on the same 
 
 Admission signs an additive membership successor and wraps item keys for the new device. It preserves concealed-field ciphertext while updating recipient wrappers. Durable staging makes interrupted admission resumable; the joining device verifies metadata before opening. Initial download progress uses a signed record-count hint, not a cryptographic guarantee of complete remote inventory.
 
-Cross-account sharing, device removal and permanent vault deletion are currently unavailable. Their presence in a design or a test fixture must not be mistaken for a usable release feature. Future revocation must address membership and per-item keys, but no revocation mechanism can erase plaintext, retained keys or historical ciphertext that a recipient already copied. If someone knows a service password, change it at the service when their access must end.
+Cross-account sharing is unavailable. Device removal and permanent cloud-vault deletion are preview features; physical-device acceptance remains pending. Vault deletion is enabled in Development builds and requires `MOP_VAULT_DELETION` in Production; the separate V3 Production review gate also applies. Device removal updates membership and schedules key rotation; a saved removal does not mean that rotation and cloud delivery have completed. No revocation mechanism can erase plaintext, retained keys or historical ciphertext that a recipient already copied. If someone knows a service password, change it at the service when their access must end.
 
 Device-local credentials remain a separate choice: their private keys never leave the original Secure Enclave. Register an independent credential on another device rather than assuming that a cloud vault or portable archive can recover them.
 
@@ -181,7 +181,7 @@ Portable backups provide an independent restore path for transferable vault cont
 
 Archives preserve locally available item fields, metadata, retained history, trash, attachment bytes and cloud software credential bytes. They do not export Secure Enclave private keys or reinstate sharing, device membership or account recovery configuration. Restoring a credential’s bytes does not prove it remains registered or accepted by its website or server.
 
-The current exporter cannot certify complete remote inventory. Finish downloading, inspect the source and verify restored contents before relying on a backup or discarding the original. Use a fresh restore UUID and retain it for retries. The [backup guide](docs.html#recovery) provides commands, and the [standalone archive specification](https://github.com/koehn/2ndPass/blob/main/docs/formats/PORTABLE-BACKUP-v1.md) documents the format independently of an installed app.
+The current exporter cannot certify complete remote inventory. Finish downloading, inspect the source and verify restored contents before relying on a backup or discarding the original. Use a fresh restore UUID and retain it for retries. The [backup guide](docs.html#recovery) provides commands, and the [standalone archive specification](https://github.com/koehn/2ndPass/blob/main/docs/formats/PORTABLE-BACKUP-v2.md) documents the format independently of an installed app.
 
 Account-wide recovery of a live cloud vault is unavailable. If another enrolled device remains accessible, keep it unlocked while a new device connects through the same Apple Account. A portable archive cannot restore Apple Account access, and neither synchronization nor backup can recover device-local hardware keys.
 
@@ -194,7 +194,7 @@ The CLI deliberately releases plaintext where you ask it to:
 - `read` writes a plaintext secret to standard output or the requested file.
 - `run` gives resolved secrets to a child process through its environment. Default output masking matches exact secret bytes; transformed output, files, and network traffic are outside that protection.
 - `inject` writes literal plaintext values to stdout or generated configuration files. It does not escape values for the destination format.
-- Attachment exports contain plaintext. External password-manager export files also contain plaintext; general document import is not currently connected to the vault service.
+- Attachment exports contain plaintext. External password-manager export files also contain plaintext; general document import is unimplemented.
 
 The child process, its dependencies and descendants receiving the environment become trusted with the secret. Environment variables can leak through the program itself, diagnostics or privileged host access; they are not a secure container. 2ndPass cannot control what an arbitrary child does with plaintext. This disclosure is necessary for developer-secret automation.
 
@@ -218,6 +218,6 @@ Treat those outputs as credentials. Removing a temporary file is ordinary deleti
 
 The maintainer reported successful same-account enrollment on October 3, 2026. On October 4, an item created on iPhone reached Mac and iPad, an edit on Mac reached both other devices, and an offline iPhone edit uploaded after reconnection without manual Refresh. These are physical-device observations for those scenarios, not proof of all synchronization behavior.
 
-Remaining gates include concurrent-edit conflict resolution, interruption and account-change handling, signed app/CLI/AutoFill acceptance across supported platforms, complete backup-inventory verification, Production provisioning and independent security review. Sharing, device removal and account recovery require implementation before their own physical acceptance. Simulator builds do not verify Secure Enclave behavior or real cross-account permissions.
+Remaining gates include concurrent-edit conflict resolution, interruption and account-change handling, signed app/CLI/AutoFill acceptance across supported platforms, complete backup-inventory verification, Production provisioning and independent security review. Sharing requires implementation before its physical acceptance. Device removal and permanent vault deletion require physical acceptance; account recovery has separate validation requirements. Simulator builds do not verify Secure Enclave behavior or real cross-account permissions.
 
 Keep your existing password manager and verified portable backups while evaluating the project. The [validation record](vault-validation.html) distinguishes completed observations from outstanding work, and the [security design](https://github.com/koehn/2ndPass/blob/main/docs/SECURITY.md) describes the current technical boundaries.

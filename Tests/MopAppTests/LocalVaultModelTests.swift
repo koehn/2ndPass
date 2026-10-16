@@ -153,9 +153,6 @@ private final class FakeLocalService: LocalVaultServing {
         model.deleteVault(target: local, confirmation: LocalVault.name)
         #expect(model.error != nil)
 
-        model.chooseExportBackup(target: local)
-        #expect(model.error != nil)
-        #expect(!service.contains { op in if case .export = op { true } else { false } })
     }
     @Test func cloudCollectionsDoNotKeepShowingLocalIdentities() {
         let (model, _) = localModel()

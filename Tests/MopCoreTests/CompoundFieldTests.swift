@@ -17,15 +17,3 @@ import Testing
         }
     }
 }
-
-extension CompoundFieldTests {
-    @Test func invalidCompoundImportNamesTheFieldWithoutPrintingItsContent() throws {
-        var field = ItemField(path: "bank", type: .bankAccount, value: "private-invalid-value")
-        field.label = "Checking account"
-        let document = ImportDocument(format: .auto, records: [.init(id: 1, item: .init(name: "Bank", fields: [field]))])
-        let row = try ImportPlanner.prepare(document, existing: []).report.rows[0]
-        #expect(row.disposition == .invalid)
-        #expect(row.warnings[0].contains("Checking account") && row.warnings[0].contains("Bank account"))
-        #expect(!row.warnings[0].contains("private-invalid-value"))
-    }
-}

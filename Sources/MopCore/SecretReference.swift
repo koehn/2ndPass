@@ -1,7 +1,7 @@
 import Foundation
 
 public struct SecretReference: Hashable, Sendable, Comparable, CustomStringConvertible {
-    static let prefixes = ["sp://", "mop://"]
+    static let prefixes = ["sp://"]
 
     public let vault: String
     public let item: String

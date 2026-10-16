@@ -21,7 +21,7 @@ env = os.environ | {'MOP_CLOUD_VAULT': '00000000-0000-0000-0000-000000000000',
 for shell, path in scripts.items():
     generated = subprocess.check_output([str(binary), 'completion', shell], env=env)
     assert generated == path.read_bytes()
-    assert b'rename' in generated and b'fingerprint' in generated and b'no-masking' in generated and b'strict-biometrics' not in generated
+    assert b'rename' in generated and b'no-masking' in generated and b'strict-biometrics' not in generated
     executable = shutil.which(shell)
     if executable:
         subprocess.run([executable, '-n', str(path)], check=True, env=env)
@@ -46,7 +46,11 @@ printf '%s\\n' "${COMPREPLY[@]}"
     return result.stdout.splitlines()
 
 assert 'read' in bash_candidates(['sp', 're'])
-assert 'enrollment' in bash_candidates(['sp', 'vault', 'en'])
+assert 'enrollment' not in bash_candidates(['sp', 'vault', 'en'])
+assert 'members' not in bash_candidates(['sp', 'vault', 'mem'])
+assert 'invite' not in bash_candidates(['sp', 'vault', 'inv'])
+assert 'backup' in bash_candidates(['sp', 'vault', 'back'])
+assert 'import' not in bash_candidates(['sp', 'item', 'imp'])
 assert 'rename' in bash_candidates(['sp', 'vault', 'ren'])
 assert 'delete' in bash_candidates(['sp', 'vault', 'del'])
 assert '--confirm' in bash_candidates(['sp', 'vault', 'delete', '--con'])
@@ -59,8 +63,7 @@ with tempfile.TemporaryDirectory(prefix='sp-completion-test-') as directory:
     (root / 'input file.env').write_text('literal')
     (root / 'input directory').mkdir()
     assert 'input file.env' in bash_candidates(['sp', 'run', '--env-file', 'input'], cwd=root)
-    directories = bash_candidates(['sp', 'read', '--state-directory', 'input'], cwd=root)
-    assert 'input directory' in directories and 'input file.env' not in directories
+    assert '--state-directory' not in bash_candidates(['sp', 'read', '--state'])
     # Register zsh's autoload completion without writing a completion cache.
     subprocess.run(['/bin/zsh', '-f', '-c',
                     'fpath=("$1" $fpath); autoload -Uz compinit; compinit -D; [[ ${_comps[sp]} == _sp ]]',

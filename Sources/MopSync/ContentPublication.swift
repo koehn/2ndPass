@@ -17,7 +17,7 @@ public struct ContentUpload: Sendable {
     public var recordID: CKRecord.ID {
         let suffix = grant.map { ":" + $0.identifier } ?? (kind == .version ? ":" + content.version.versionID.uuidString : "")
         return CKRecord.ID(recordName: scope.itemID.uuidString + suffix,
-            zoneID: CKRecordZone.ID(zoneName: SyncStoreLayout.contentZone(vault: scope.vaultID), ownerName: scope.zoneOwner))
+            zoneID: CKRecordZone.ID(zoneName: grant != nil ? "MopGrants4-" + scope.vaultID.uuidString + "-" + grant!.recipient : SyncStoreLayout.contentZone(vault: scope.vaultID), ownerName: scope.zoneOwner))
     }
     public var byteCount: Int { grant?.bytes.count ?? content.version.ciphertext.count }
 
@@ -63,7 +63,7 @@ public actor PublicationAuthorityChecks {
     }
     private var reads: [Key: Task<Void, Error>] = [:]
 
-    init() {}
+    public init() {}
 
     public func check(vault: UUID, authority: Data,
                       read: @escaping @Sendable () async throws -> Void) async throws {

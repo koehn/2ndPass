@@ -33,7 +33,7 @@ struct NativeContentHistoryReader: Sendable {
         }
         guard let genesis = states.last, genesis.membership.accounts.count == 1,
               genesis.membership.accounts[0].id == account.memberID else { throw MopError.cloudPermission }
-        let scope = try account.setupScope(vaultID: vault), store = try KeychainItemVaultTrustStore(namespace: .contentPreview3)
+        let scope = try account.setupScope(vaultID: vault), store = try KeychainItemVaultTrustStore()
         let pinned = try store.load(scope: scope)
         let rootDigest = try genesis.digest()
         guard pinned == nil || pinned?.pinnedDigest == rootDigest else { throw MopError.vaultUntrusted }

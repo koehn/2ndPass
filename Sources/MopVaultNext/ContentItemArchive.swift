@@ -11,11 +11,10 @@ public enum ContentItemArchive {
         try archive.validate()
         guard archive.items.count == 1, let item = archive.items.first,
               let id = archive.itemIDs[item.name].flatMap(UUID.init(uuidString:)),
-              archive.security?.accounts.isEmpty ?? true,
               archive.security?.passwordChecks?.isEmpty ?? true else { throw PortableArchiveFailure.invalid }
         var projection = item
         for index in projection.fields.indices { projection.fields[index].value = nil }
-        let catalog = ItemEnvelopeCatalog(item: projection, references: archive.references,
+        let catalog = ItemContentCatalog(item: projection, references: archive.references,
             histories: archive.security?.histories ?? [],
             projectedValuePaths: item.fields.filter { $0.value != nil }.map(\.path), editOrigin: editOrigin)
         try catalog.validate(itemID: id, recordIDs: Set(archive.records.keys))
@@ -24,14 +23,14 @@ public enum ContentItemArchive {
         return (id, values)
     }
 
-    public static func catalog(_ bytes: SecretBytes, item: UUID, componentNames: Set<String>) throws -> ItemEnvelopeCatalog {
+    public static func catalog(_ bytes: SecretBytes, item: UUID, componentNames: Set<String>) throws -> ItemContentCatalog {
         guard componentNames.contains(catalogComponent) else { throw PortableArchiveFailure.invalid }
-        let catalog = try bytes.withFoundationData { try JSONDecoder().decode(ItemEnvelopeCatalog.self, from: $0) }
+        let catalog = try bytes.withFoundationData { try JSONDecoder().decode(ItemContentCatalog.self, from: $0) }
         try catalog.validate(itemID: item, recordIDs: componentNames.subtracting([catalogComponent]))
         return catalog
     }
 
-    public static func archive(name: String, item: UUID, catalog: ItemEnvelopeCatalog,
+    public static func archive(name: String, item: UUID, catalog: ItemContentCatalog,
                                records: [String: SecretBytes]) throws -> PortableVaultArchive {
         try catalog.validate(itemID: item, recordIDs: Set(records.keys))
         var projection = catalog.item
@@ -64,7 +63,7 @@ extension ContentItemArchive {
         guard let a = lhs[catalogComponent], let b = rhs[catalogComponent] else { return lhs == rhs }
         var left = try catalog(a, item: item, componentNames: Set(lhs.keys))
         var right = try catalog(b, item: item, componentNames: Set(rhs.keys))
-        func canonical(_ value: inout ItemEnvelopeCatalog, records: [String: SecretBytes]) throws -> [String: SecretBytes] {
+        func canonical(_ value: inout ItemContentCatalog, records: [String: SecretBytes]) throws -> [String: SecretBytes] {
             value.editOrigin = nil; value.item.metadata?.updatedAt = nil
             var values: [String: SecretBytes] = [:]
             for path in value.references.keys.sorted() {

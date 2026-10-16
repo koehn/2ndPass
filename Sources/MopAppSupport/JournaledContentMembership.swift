@@ -27,8 +27,7 @@ public struct JournaledContentMembership: Sendable {
     public func handle(_ operation: SyncOperation, permit: any RepositoryWritePermit) async -> SyncOperationOutcome {
         do {
             guard operation.kind == .membership, operation.account == scope.binding.account, operation.database == "private",
-                  operation.vaultID == scope.binding.vaultID, operation.zoneOwner == scope.binding.zoneOwner,
-                  repository.layout == .contentPreview3 else { return .attention(.invalidAuthority) }
+                  operation.vaultID == scope.binding.vaultID, operation.zoneOwner == scope.binding.zoneOwner else { return .attention(.invalidAuthority) }
             try await check(permit)
             guard let pin = try trustStore.load(scope: scope) else { return .retry(.dependency) }
             let local = try ItemVaultMembershipAuthority.history(record: pin, trustStore: trustStore, allowingDeviceRemoval: true)

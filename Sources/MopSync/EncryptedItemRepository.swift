@@ -8,10 +8,10 @@ import CryptoKit
 /// Core Data optimistic locking rejects conflicting writers across app-group processes.
 public actor EncryptedItemRepository {
     public static let maximumCiphertextBytes = 256 * 1024 * 1024
-    public nonisolated let layout: SyncStoreLayout
     private let container: NSPersistentContainer
     let context: NSManagedObjectContext
     let journalReadCache = JournalReadCache()
+    var itemRevisionIndexReads = 0
     var displayValidationRows = 0
     var grantPreparationReads = 0
     var grantPreparationRows = 0
@@ -20,16 +20,15 @@ public actor EncryptedItemRepository {
     private var changeObserver: StoreChangeObserver?
     private var changeStreams: [UUID: AsyncStream<Void>.Continuation] = [:]
 
-    public init(storeURL: URL, inMemory: Bool = false, layout: SyncStoreLayout = .legacy) throws {
-        try layout.validate(storeURL: storeURL)
-        self.layout = layout
+    public init(storeURL: URL, inMemory: Bool = false) throws {
+        try SyncStoreLayout.validate(storeURL: storeURL)
         supportsQueryGenerations = !inMemory
-        container = NSPersistentContainer(name: "MopEncryptedItems", managedObjectModel: RepositoryModel.make(contentPreview: layout == .contentPreview3))
+        container = NSPersistentContainer(name: "MopEncryptedItems", managedObjectModel: RepositoryModel.make())
         var options: [AnyHashable: Any] = [
             NSPersistentHistoryTrackingKey: true,
             NSPersistentStoreRemoteChangeNotificationPostOptionKey: true,
-            NSMigratePersistentStoresAutomaticallyOption: layout == .legacy,
-            NSInferMappingModelAutomaticallyOption: layout == .legacy
+            NSMigratePersistentStoresAutomaticallyOption: false,
+            NSInferMappingModelAutomaticallyOption: false
         ]
         #if os(iOS)
         options[NSPersistentStoreFileProtectionKey] = FileProtectionType.complete
@@ -50,12 +49,11 @@ public actor EncryptedItemRepository {
             }
         }
         if !inMemory, FileManager.default.fileExists(atPath: storeURL.path) {
-            // Names alone do not identify a protocol: a renamed/copied preview
-            // database must never enter the legacy automatic-migration path.
+            // Reject retired models before opening them; never rewrite an older store.
             let metadata = try NSPersistentStoreCoordinator.metadataForPersistentStore(ofType: NSSQLiteStoreType, at: storeURL)
             let raw = metadata[NSStoreModelVersionIdentifiersKey]
             let identifiers = (raw as? [String]) ?? Array((raw as? Set<String>) ?? [])
-            if identifiers.contains("MopContentPreview3"), layout != .contentPreview3 { throw ContentStoreError.wrongLayout }
+            guard identifiers == ["MopContentPreview3"] else { throw ContentStoreError.wrongLayout }
         }
         try container.persistentStoreCoordinator.addPersistentStore(ofType: inMemory ? NSInMemoryStoreType : NSSQLiteStoreType,
             configurationName: nil, at: inMemory ? nil : storeURL, options: options)
@@ -81,7 +79,7 @@ public actor EncryptedItemRepository {
             return values.filter { $0.scope.account == account }
         }
     }
-    private func deletionInTransaction(_ scope: VaultScope) throws -> VaultDeletionState? {
+    func deletionInTransaction(_ scope: VaultScope) throws -> VaultDeletionState? {
         guard let bytes = try fetchOne("StateBlob", key: "deletion:" + scope.storageKey)?.value(forKey: "value") as? Data else { return nil }
         let value = try JSONDecoder().decode(VaultDeletionState.self, from: bytes)
         guard value.scope == scope else { throw ItemRepositoryError.corruptStore }
@@ -93,13 +91,22 @@ public actor EncryptedItemRepository {
     /// The authenticated domain coordinator owns authorization. Commitment and
     /// removal of ciphertext/outbox are one optimistic-lock transaction.
     public func saveDeletion(scope: VaultScope, notice: Data, phase: VaultDeletionPhase,
-                             publication: PreparedCoordinationRecord? = nil, authorization: any RepositoryWritePermit) throws -> VaultDeletionState {
+                             publication: PreparedCoordinationRecord? = nil, cleanup: SyncOperation? = nil, authorization: any RepositoryWritePermit) throws -> VaultDeletionState {
         try authorization.withWritePermission {
             try transaction {
                 let old = try deletionInTransaction(scope)
                 guard !notice.isEmpty, notice.count <= 1_048_576 else { throw VaultDeletionFailure.invalidNotice }
+                if let cleanup {
+                    guard phase == .prepared, cleanup.kind == .deletion, cleanup.account == scope.account,
+                          cleanup.database == scope.database, cleanup.zoneOwner == scope.zoneOwner,
+                          cleanup.vaultID == scope.vaultID,
+                          let record = try? JSONDecoder().decode(PreparedCoordinationRecord.self, from: cleanup.payload),
+                          record.account == scope.account, record.vault == scope.vaultID, record.zoneOwner == scope.zoneOwner,
+                          record.kind == .deletion, record.identity == scope.vaultID, record.bytes == notice else { throw VaultDeletionFailure.invalidNotice }
+                    _ = try enqueueInTransaction(cleanup)
+                }
                 if let publication {
-                    guard layout == .contentPreview3, phase == .prepared, publication.kind == .deletion,
+                    guard phase == .prepared, publication.kind == .deletion,
                           publication.account == scope.account, publication.vault == scope.vaultID,
                           publication.identity == scope.vaultID, publication.zoneOwner == scope.zoneOwner,
                           publication.bytes == notice else { throw VaultDeletionFailure.invalidNotice }
@@ -119,11 +126,11 @@ public actor EncryptedItemRepository {
                 var assets = old?.assetVersions ?? []
                 if phase == .committed && (old == nil || old?.phase == .prepared || old?.phase == .publishing) {
                     try purgeSyncJournalInTransaction(scope)
-                    if layout == .contentPreview3 {
-                        for entity in ["ContentKeyState", "ContentGrant", "MissingContentGrant", "ContentVersion", "ContentBranch"] {
-                            for row in try contentRows(entity, field: "vaultKey", equals: contentVaultKey(scope)) { context.delete(row) }
-                        }
+
+                    for entity in ["ContentKeyState", "ContentGrant", "MissingContentGrant", "ContentVersion", "ContentBranch"] {
+                        for row in try contentRows(entity, field: "vaultKey", equals: contentVaultKey(scope)) { context.delete(row) }
                     }
+
                     // Dirty the same boundary used by all local item writers.
                     let boundary = try fetchOne("VaultBoundary", key: scope.storageKey)
                         ?? NSEntityDescription.insertNewObject(forEntityName: "VaultBoundary", into: context)
@@ -155,7 +162,7 @@ public actor EncryptedItemRepository {
                     for row in try context.fetch(blobs) where row.value(forKey: "key") as? String != "deletion:" + scope.storageKey { context.delete(row) }
                     try fetchOne("VaultBoundary", key: scope.storageKey)?.setValue(nil, forKey: "initialization")
                 }
-                let state = VaultDeletionState(scope: scope, notice: phase == .complete && layout != .contentPreview3 ? Data(SHA256.hash(data: notice)) : notice, phase: phase,
+                let state = VaultDeletionState(scope: scope, notice: notice, phase: phase,
                     assetVersions: phase == .complete ? [] : Array(Set(assets)))
                 let key = "deletion:" + scope.storageKey
                 let row = try fetchOne("StateBlob", key: key) ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
@@ -165,75 +172,7 @@ public actor EncryptedItemRepository {
         }
     }
 
-    /// Initializes only an entirely absent vault. The signed control bytes and all
-    /// initial ciphertext/outbox rows become visible together at the SQLite commit.
-    /// Exact retries return the creation receipt, never replacing later edits.
-    public func initializeVault(scope: VaultScope, versions: [EncryptedItemVersion],
-                                membershipState: Data, setupID: String,
-                                authorization: any RepositoryWritePermit) throws -> VaultInitializationReceipt {
-        guard !versions.isEmpty, !membershipState.isEmpty, !setupID.isEmpty,
-              membershipState.count <= Self.maximumCiphertextBytes,
-              Set(versions.map { $0.scope.itemID }).count == versions.count else {
-            throw ItemRepositoryError.invalidInitialization
-        }
-        for version in versions {
-            try validate(version)
-            guard VaultScope(version.scope) == scope, version.generation == 1,
-                  version.baseVersionID == nil else { throw ItemRepositoryError.invalidInitialization }
-        }
-        let ordered = versions.sorted { $0.scope.itemID.uuidString < $1.scope.itemID.uuidString }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        // Hash each bounded input separately, so initialization does not duplicate
-        // the complete vault into one large serialized buffer.
-        var hash = SHA256()
-        hash.update(data: Data("MopVaultInitialization1".utf8))
-        hash.update(data: Data(SHA256.hash(data: try encoder.encode(scope))))
-        hash.update(data: Data(SHA256.hash(data: Data(setupID.utf8))))
-        hash.update(data: Data(SHA256.hash(data: membershipState)))
-        for version in ordered { hash.update(data: Data(SHA256.hash(data: try encoder.encode(version)))) }
-        let digest = Data(hash.finalize())
-        return try authorization.withWritePermission {
-            try transaction {
-                if let boundary = try fetchOne("VaultBoundary", key: scope.storageKey) {
-                    guard let bytes = boundary.value(forKey: "initialization") as? Data else { throw ItemRepositoryError.existingVault }
-                    let receipt = try JSONDecoder().decode(VaultInitializationReceipt.self, from: bytes)
-                    guard receipt.scope == scope, receipt.setupID == setupID,
-                          receipt.inputDigest == digest, receipt.membershipState == membershipState else {
-                        throw ItemRepositoryError.initializationMismatch
-                    }
-                    return receipt
-                }
-                // Also refuse pre-boundary stores, and any orphaned retained data.
-                for entity in ["Item", "PendingMutation", "Conflict"] {
-                    let request = NSFetchRequest<NSManagedObject>(entityName: entity)
-                    request.fetchLimit = 1
-                    request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
-                        scope.account, scope.vaultID as NSUUID, scope.database, scope.zoneOwner)
-                    guard try context.fetch(request).isEmpty else { throw ItemRepositoryError.existingVault }
-                }
-                let receipts = NSFetchRequest<NSManagedObject>(entityName: "MutationReceipt")
-                receipts.fetchLimit = 1
-                receipts.predicate = NSPredicate(format: "scopeKey BEGINSWITH %@", scope.storageKey + ":")
-                guard try context.fetch(receipts).isEmpty else { throw ItemRepositoryError.existingVault }
-                try touchVaultBoundary(scope)
-                var ids: [UUID] = []
-                let lastSequence = try highestPendingSequence()
-                guard UInt64(ordered.count) <= UInt64(Int64.max - lastSequence) else { throw ItemRepositoryError.corruptStore }
-                for (offset, version) in ordered.enumerated() {
-                    let item = NSEntityDescription.insertNewObject(forEntityName: "Item", into: context)
-                    encode(version, into: item)
-                    ids.append(try insertPending(version, status: .queued, reservedSequence: lastSequence + Int64(offset) + 1).id)
-                }
-                let receipt = VaultInitializationReceipt(scope: scope, setupID: setupID,
-                    membershipState: membershipState, inputDigest: digest, mutationIDs: ids)
-                guard let boundary = try fetchOne("VaultBoundary", key: scope.storageKey) else { throw ItemRepositoryError.corruptStore }
-                boundary.setValue(try encoder.encode(receipt), forKey: "initialization")
-                return receipt
-            }
-        }
-    }
-
+    /// Returns the durable receipt of an atomic vault initialization.
     public func vaultInitialization(_ scope: VaultScope) throws -> VaultInitializationReceipt? {
         try transaction {
             guard let bytes = try fetchOne("VaultBoundary", key: scope.storageKey)?.value(forKey: "initialization") as? Data else { return nil }
@@ -328,7 +267,7 @@ public actor EncryptedItemRepository {
 
     public func initializeEnrolledContentVault(scope: VaultScope, policy: ContentRecipientPolicy, expectedItemCount: Int? = nil, enrollmentRecipient: String? = nil, membershipState: Data, currentControl: Data,
         setupID: String, authorization: any RepositoryWritePermit) throws -> VaultInitializationReceipt {
-        guard layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+
         guard scope.database == "private", scope.zoneOwner == "__defaultOwner__",
               !membershipState.isEmpty, !currentControl.isEmpty, !setupID.isEmpty,
               membershipState.count <= 512 * 1024, currentControl.count <= 512 * 1024 else { throw ItemRepositoryError.invalidInitialization }
@@ -418,22 +357,9 @@ public actor EncryptedItemRepository {
         }
     }
 
-    public func commitLocalMutation(_ version: EncryptedItemVersion, expectedHealthParentVersion: UUID? = nil) throws -> PendingItemMutation {
-        guard layout == .legacy else { throw ContentStoreError.wrongLayout }
-        try validate(version)
-        return try transaction { try commitLocalMutationInTransaction(version, expectedHealthParentVersion: expectedHealthParentVersion) }
-    }
-
     func commitLocalMutationInTransaction(_ version: EncryptedItemVersion,
-                                          expectedHealthParentVersion: UUID? = nil, dependencies: Set<SyncDependency> = []) throws -> PendingItemMutation {
+                                          dependencies: Set<SyncDependency> = []) throws -> PendingItemMutation {
         try touchVaultBoundary(VaultScope(version.scope))
-        if let expectedHealthParentVersion {
-            guard let parent = version.healthItemID else { throw ItemRepositoryError.staleLocalVersion }
-            let parentScope = ItemScope(account: version.scope.account, vaultID: version.scope.vaultID, itemID: parent,
-                database: version.scope.database, zoneOwner: version.scope.zoneOwner)
-            guard let row = try fetchOne("Item", key: parentScope.storageKey),
-                  try decodeVersion(row).versionID == expectedHealthParentVersion else { throw ItemRepositoryError.staleLocalVersion }
-        }
         let current = try fetchOne("Item", key: version.scope.storageKey)
         let previous = try current.map(decodeVersion)
         guard previous?.versionID == version.baseVersionID else { throw ItemRepositoryError.staleLocalVersion }
@@ -448,40 +374,8 @@ public actor EncryptedItemRepository {
         guard try context.fetch(duplicate).isEmpty else { throw ItemRepositoryError.duplicateVersion }
         let item = current ?? NSEntityDescription.insertNewObject(forEntityName: "Item", into: context)
         encode(version, into: item)
-        let conflict = try fetchOne("Conflict", key: version.scope.storageKey)
-        if let conflict {
-            conflict.setValue(try JSONEncoder().encode(version), forKey: "local")
-            conflict.setValue(UUID(), forKey: "conflictID")
-        }
-        return try insertPending(version, status: conflict == nil ? .queued : .conflict, dependencies: dependencies)
-    }
-
-    public func commitLocalMutation(_ version: EncryptedItemVersion,
-                                    authorization: any RepositoryWritePermit, expectedHealthParentVersion: UUID? = nil) throws -> PendingItemMutation {
-        try authorization.withWritePermission { try commitLocalMutation(version, expectedHealthParentVersion: expectedHealthParentVersion) }
-    }
-
-    /// Additive membership catch-up preserves the latest local plaintext while
-    /// replacing obsolete recipient wrappers. The caller holds the publication
-    /// lease with its uploader stopped; prior receipts become superseded, never
-    /// falsely cloud-confirmed. Conflicts still require explicit resolution.
-    public func commitMembershipCatchUp(_ version: EncryptedItemVersion,
-                                       authorization: any RepositoryWritePermit) throws -> PendingItemMutation {
-        try validate(version)
-        return try authorization.withWritePermission {
-            try transaction {
-                try touchVaultBoundary(VaultScope(version.scope))
-                guard let item = try fetchOne("Item", key: version.scope.storageKey) else { throw ItemRepositoryError.staleLocalVersion }
-                let previous = try decodeVersion(item)
-                guard previous.versionID == version.baseVersionID else { throw ItemRepositoryError.staleLocalVersion }
-                guard previous.generation < UInt64(Int64.max), version.generation == previous.generation + 1,
-                      previous.versionID != version.versionID else { throw ItemRepositoryError.invalidGeneration }
-                guard try fetchOne("Conflict", key: version.scope.storageKey) == nil else { throw ItemRepositoryError.unresolvedConflict }
-                try supersedePending(scope: version.scope)
-                encode(version, into: item)
-                return try insertPending(version, status: .queued)
-            }
-        }
+        let conflicts = try contentRows("ContentBranch", field: "scopeKey", equals: version.scope.storageKey)
+        return try insertPending(version, status: conflicts.isEmpty ? .queued : .conflict, dependencies: dependencies)
     }
 
     public func item(_ scope: ItemScope) throws -> EncryptedItemVersion? {
@@ -489,23 +383,18 @@ public actor EncryptedItemRepository {
     }
 
     public func itemRevisionIndex(account: String, vaultID: UUID, database: String = "private",
-                                   zoneOwner: String = "__defaultOwner__", includeHealth: Bool = false) throws -> [UUID: UUID] {
-        try transaction { try revisionIndexInTransaction(VaultScope(account: account, vaultID: vaultID,
-            database: database, zoneOwner: zoneOwner), includeHealth: includeHealth) }
+                                   zoneOwner: String = "__defaultOwner__") throws -> [UUID: UUID] {
+        itemRevisionIndexReads += 1
+        return try transaction { try revisionIndexInTransaction(VaultScope(account: account, vaultID: vaultID,
+            database: database, zoneOwner: zoneOwner)) }
     }
 
-    public func healthRevisionIndex(scope: VaultScope) throws -> [UUID: UUID] {
-        try transaction { try revisionIndexInTransaction(scope, onlyHealth: true) }
-    }
-
-    private func revisionIndexInTransaction(_ scope: VaultScope, includeHealth: Bool = true, onlyHealth: Bool = false) throws -> [UUID: UUID] {
+    private func revisionIndexInTransaction(_ scope: VaultScope) throws -> [UUID: UUID] {
         let request = NSFetchRequest<NSDictionary>(entityName: "Item")
         request.resultType = .dictionaryResultType
         request.propertiesToFetch = ["itemID", "versionID"]
         request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
             scope.account, scope.vaultID as NSUUID, scope.database, scope.zoneOwner)
-        if onlyHealth { request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [request.predicate!, NSPredicate(format: "healthItemID != nil")]) }
-        if !includeHealth { request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [request.predicate!, NSPredicate(format: "healthItemID == nil")]) }
         var index: [UUID: UUID] = [:]
         for row in try context.fetch(request) {
             guard let item = row["itemID"] as? UUID, let version = row["versionID"] as? UUID else { throw ItemRepositoryError.corruptStore }
@@ -544,7 +433,7 @@ public actor EncryptedItemRepository {
 
     public func displayCatalogRows(scope: VaultScope) throws -> [EncryptedDisplayCatalogRow] {
         try transaction(publishLocalChanges: false) {
-            let index = try revisionIndexInTransaction(scope, includeHealth: true)
+            let index = try revisionIndexInTransaction(scope)
             let request = NSFetchRequest<NSManagedObject>(entityName: "StateBlob")
             request.predicate = NSPredicate(format: "key BEGINSWITH %@", "display-row:" + scope.storageKey + ":")
             return try context.fetch(request).compactMap { row in
@@ -612,13 +501,13 @@ public actor EncryptedItemRepository {
                 let key = "local-name-index:" + scope.storageKey
                 let existing = try fetchOne("StateBlob", key: key)
                 if existing?.value(forKey: "value") as? Data == bytes {
-                    guard try revisionIndexInTransaction(scope, includeHealth: false) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
+                    guard try revisionIndexInTransaction(scope) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
                     return
                 }
                 // Read/dirty the serialization boundary before projecting items:
                 // a concurrent writer between these operations then fails this save.
                 try touchVaultBoundary(scope)
-                guard try revisionIndexInTransaction(scope, includeHealth: false) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
+                guard try revisionIndexInTransaction(scope) == expectedVersions else { throw ItemRepositoryError.staleLocalVersion }
                 let row = existing ?? NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
                 row.setValue(key, forKey: "key")
                 row.setValue(bytes, forKey: "value")
@@ -629,15 +518,9 @@ public actor EncryptedItemRepository {
     public func conflictedItemIDs(account: String, vaultID: UUID, database: String = "private",
                                    zoneOwner: String = "__defaultOwner__") throws -> Set<UUID> {
         try transaction {
-            let request = NSFetchRequest<NSDictionary>(entityName: "Conflict")
-            request.resultType = .dictionaryResultType
-            request.propertiesToFetch = ["itemID"]
-            request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
-                account, vaultID as NSUUID, database, zoneOwner)
-            return Set(try context.fetch(request).map { row in
-                guard let id = row["itemID"] as? UUID else { throw ItemRepositoryError.corruptStore }
-                return id
-            })
+            Set(try currentConflictScopesInTransaction(account: account).filter {
+                $0.vaultID == vaultID && $0.database == database && $0.zoneOwner == zoneOwner
+            }.map(\.itemID))
         }
     }
 
@@ -708,37 +591,12 @@ public actor EncryptedItemRepository {
             }
         }
     }
-    /// Caller authenticates the legacy health envelope before retiring its queue.
-    /// Discard only the matching derived head; never publish a remote deletion.
-    public func retireHealthSynchronization(_ version: EncryptedItemVersion) throws {
-        guard version.healthItemID != nil else { throw ItemRepositoryError.invalidScope }
-        try transaction {
-            if let head = try fetchOne("Item", key: version.scope.storageKey),
-               try decodeVersion(head) == version { context.delete(head) }
-            for entity in ["PendingMutation", "Conflict"] {
-                let request = NSFetchRequest<NSManagedObject>(entityName: entity)
-                request.predicate = NSPredicate(format: "key == %@", version.scope.storageKey)
-                for row in try context.fetch(request) { context.delete(row) }
-            }
-            let receipts = NSFetchRequest<NSManagedObject>(entityName: "MutationReceipt")
-            receipts.predicate = NSPredicate(format: "scopeKey == %@", version.scope.storageKey)
-            for row in try context.fetch(receipts) { context.delete(row) }
-        }
-    }
-
-    public func healthItems(account: String, vaultID: UUID, database: String = "private", zoneOwner: String = "__defaultOwner__") throws -> [EncryptedItemVersion] {
-        try transaction {
-            let request = NSFetchRequest<NSManagedObject>(entityName: "Item")
-            request.predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@ AND healthItemID != nil", account, vaultID as NSUUID, database, zoneOwner)
-            return try context.fetch(request).map(decodeVersion)
-        }
-    }
 
     #if DEBUG
     /// Caller holds the account's sync lease and has confirmed revocation.
     /// This deliberately resets only the isolated V3 database, never legacy stores.
     public func debugClearEnrollmentStore(authorization: any RepositoryWritePermit) throws {
-        guard layout == .contentPreview3 else { throw ItemRepositoryError.invalidScope }
+
         try authorization.withWritePermission {
             try transaction {
                 guard try context.count(for: NSFetchRequest<NSFetchRequestResult>(entityName: "PendingMutation")) == 0,
@@ -772,12 +630,24 @@ public actor EncryptedItemRepository {
         try transaction {
             let pending = try scopeProjection(entity: "PendingMutation", account: account)
             return excludingConflicts
-                ? try pending.subtracting(scopeProjection(entity: "Conflict", account: account)) : pending
+                ? try pending.subtracting(currentConflictScopesInTransaction(account: account)) : pending
         }
     }
 
     public func conflictedScopes(account: String) throws -> Set<ItemScope> {
-        try transaction { try scopeProjection(entity: "Conflict", account: account) }
+        try transaction { try currentConflictScopesInTransaction(account: account) }
+    }
+
+    /// Current branch metadata contains scopes without loading version ciphertext.
+    private func currentConflictScopesInTransaction(account: String) throws -> Set<ItemScope> {
+        let request = NSFetchRequest<NSDictionary>(entityName: "ContentBranch")
+        request.resultType = .dictionaryResultType
+        request.propertiesToFetch = ["value"]
+        return Set(try context.fetch(request).compactMap { row in
+            guard let bytes = row["value"] as? Data else { throw ItemRepositoryError.corruptStore }
+            let state = try JSONDecoder().decode(ContentKeyState.self, from: bytes)
+            return state.scope.account == account ? state.scope : nil
+        })
     }
 
     /// Projects queue metadata first; large ciphertext is fetched only for selected
@@ -842,8 +712,8 @@ public actor EncryptedItemRepository {
             if supportsQueryGenerations { try context.setQueryGenerationFrom(.current) }
             let predicate = NSPredicate(format: "account == %@ AND vaultID == %@ AND database == %@ AND zoneOwner == %@",
                 account, vaultID as NSUUID, database, zoneOwner)
-            let conflicts = NSFetchRequest<NSManagedObject>(entityName: "Conflict")
-            conflicts.predicate = predicate
+            let conflicts = NSFetchRequest<NSManagedObject>(entityName: "ContentBranch")
+            conflicts.predicate = NSPredicate(format: "vaultKey == %@", contentVaultKey(VaultScope(account: account, vaultID: vaultID, database: database, zoneOwner: zoneOwner)))
             conflicts.fetchLimit = 1
             guard try context.fetch(conflicts).isEmpty else { throw ItemRepositoryError.unresolvedConflict }
             let items = NSFetchRequest<NSManagedObject>(entityName: "Item")
@@ -854,9 +724,6 @@ public actor EncryptedItemRepository {
     }
 
     /// Acknowledges exactly one submitted operation. A later working version is never overwritten.
-    public func acknowledge(mutationID: UUID, account: String, serverSystemFields: Data) throws {
-        try transaction { try acknowledgeInTransaction(mutationID: mutationID, account: account, serverSystemFields: serverSystemFields) }
-    }
 
     func acknowledgeInTransaction(mutationID: UUID, account: String, serverSystemFields: Data) throws {
         let request = NSFetchRequest<NSManagedObject>(entityName: "PendingMutation")
@@ -886,37 +753,6 @@ public actor EncryptedItemRepository {
         context.delete(pending)
     }
 
-
-    /// Caller must authenticate the remote envelope and membership before applying it.
-    public func applyRemote(_ version: EncryptedItemVersion, serverSystemFields: Data) throws {
-        try validate(version)
-        try transaction {
-            try touchVaultBoundary(VaultScope(version.scope))
-            let request = NSFetchRequest<NSManagedObject>(entityName: "PendingMutation")
-            request.predicate = NSPredicate(format: "key == %@", version.scope.storageKey)
-            request.fetchLimit = 1
-            guard try context.fetch(request).isEmpty else { throw ItemRepositoryError.pendingLocalChanges }
-            guard try fetchOne("Conflict", key: version.scope.storageKey) == nil else { throw ItemRepositoryError.unresolvedConflict }
-            let existing = try fetchOne("Item", key: version.scope.storageKey)
-            if let bytes = existing?.value(forKey: "acceptedVersion") as? Data {
-                let accepted = try JSONDecoder().decode(EncryptedItemVersion.self, from: bytes)
-                let superseded = try isSuperseded(version)
-                guard version == accepted || !superseded else { throw ItemRepositoryError.remoteVersionConflict }
-                let newer = version.generation > accepted.generation && version.versionID != accepted.versionID
-                let immediateSuccessor = accepted.generation < UInt64.max && version.generation == accepted.generation + 1
-                guard version == accepted || (newer && (!immediateSuccessor || version.baseVersionID == accepted.versionID)) else {
-                    throw ItemRepositoryError.remoteVersionConflict
-                }
-            } else if existing != nil { throw ItemRepositoryError.corruptStore }
-            else if try isSuperseded(version) { throw ItemRepositoryError.remoteVersionConflict }
-            let item = existing ?? NSEntityDescription.insertNewObject(forEntityName: "Item", into: context)
-            encode(version, into: item)
-            item.setValue(serverSystemFields, forKey: "serverSystemFields")
-            item.setValue(try JSONEncoder().encode(version), forKey: "acceptedVersion")
-            item.setValue(try JSONEncoder().encode(version), forKey: "publicationBaseVersion")
-        }
-    }
-
     public func serverSystemFields(_ scope: ItemScope) throws -> Data? {
         try transaction { try fetchOne("Item", key: scope.storageKey)?.value(forKey: "serverSystemFields") as? Data }
     }
@@ -925,134 +761,6 @@ public actor EncryptedItemRepository {
         try transaction {
             guard let bytes = try fetchOne("Item", key: scope.storageKey)?.value(forKey: "acceptedVersion") as? Data else { return nil }
             return try JSONDecoder().decode(EncryptedItemVersion.self, from: bytes)
-        }
-    }
-
-    /// Refresh metadata for an already accepted base without overwriting a local overlay.
-    public func rememberAcceptedVersion(_ version: EncryptedItemVersion, serverSystemFields: Data) throws {
-        try validate(version)
-        try transaction {
-            guard let item = try fetchOne("Item", key: version.scope.storageKey) else { throw ItemRepositoryError.staleLocalVersion }
-            let bytes = (item.value(forKey: "publicationBaseVersion") as? Data) ?? (item.value(forKey: "acceptedVersion") as? Data)
-            guard let bytes, try JSONDecoder().decode(EncryptedItemVersion.self, from: bytes) == version else {
-                throw ItemRepositoryError.remoteVersionConflict
-            }
-            item.setValue(serverSystemFields, forKey: "serverSystemFields")
-            item.setValue(try JSONEncoder().encode(version), forKey: "publicationBaseVersion")
-        }
-    }
-
-    /// Preserve authenticated competing ciphertext before presenting any resolution UI.
-    @discardableResult
-    public func recordConflict(remote: EncryptedItemVersion, serverSystemFields: Data) throws -> EncryptedItemConflict {
-        try validate(remote)
-        return try transaction {
-            guard let item = try fetchOne("Item", key: remote.scope.storageKey) else { throw ItemRepositoryError.staleLocalVersion }
-            let local = try decodeVersion(item)
-            let value = try fetchOne("Conflict", key: remote.scope.storageKey)
-                ?? NSEntityDescription.insertNewObject(forEntityName: "Conflict", into: context)
-            let id = value.value(forKey: "conflictID") as? UUID ?? UUID()
-            value.setValue(remote.scope.storageKey, forKey: "key")
-            value.setValue(remote.scope.account, forKey: "account")
-            value.setValue(remote.scope.vaultID, forKey: "vaultID")
-            value.setValue(remote.scope.itemID, forKey: "itemID")
-            value.setValue(remote.scope.database, forKey: "database")
-            value.setValue(remote.scope.zoneOwner, forKey: "zoneOwner")
-            value.setValue(id, forKey: "conflictID")
-            value.setValue(try JSONEncoder().encode(local), forKey: "local")
-            value.setValue(try JSONEncoder().encode(remote), forKey: "remote")
-            value.setValue(serverSystemFields, forKey: "serverSystemFields")
-            item.setValue(serverSystemFields, forKey: "serverSystemFields")
-            let receipts = NSFetchRequest<NSManagedObject>(entityName: "MutationReceipt")
-            receipts.predicate = NSPredicate(format: "scopeKey == %@ AND status == %@", remote.scope.storageKey,
-                MutationDeliveryStatus.queued.rawValue)
-            for receipt in try context.fetch(receipts) {
-                receipt.setValue(MutationDeliveryStatus.conflict.rawValue, forKey: "status")
-                guard let id = receipt.value(forKey: "mutationID") as? UUID else { throw ItemRepositoryError.corruptStore }
-                try conflictPublicationInTransaction(id, scope: remote.scope)
-            }
-            return EncryptedItemConflict(id: id, local: local, remote: remote, serverSystemFields: serverSystemFields)
-        }
-    }
-
-    public func conflicts(account: String) throws -> [EncryptedItemConflict] {
-        try transaction {
-            let request = NSFetchRequest<NSManagedObject>(entityName: "Conflict")
-            request.predicate = NSPredicate(format: "account == %@", account)
-            return try context.fetch(request).map(decodeConflict)
-        }
-    }
-
-    public func conflict(_ scope: ItemScope) throws -> EncryptedItemConflict? {
-        try transaction { try fetchOne("Conflict", key: scope.storageKey).map(decodeConflict) }
-    }
-
-    public func reviewedConflict(_ expected: EncryptedItemConflict) throws -> EncryptedItemConflict {
-        try transaction {
-            if supportsQueryGenerations { try context.setQueryGenerationFrom(.current) }
-            let (_, conflict) = try checkedConflict(expected)
-            return try decodeConflict(conflict)
-        }
-    }
-
-    /// Low-level operation: caller must own the database publication lease and have
-    /// quiesced its uploader. Production callers use CloudKitSyncAdapter's wrapper.
-    /// This accepts the reviewed server state; it does not claim a new cloud write.
-    public func resolveConflictUsingRemote(_ expected: EncryptedItemConflict,
-                                           authorization: any RepositoryWritePermit) throws -> EncryptedItemVersion {
-        try authorization.withWritePermission {
-            try transaction {
-                try touchVaultBoundary(VaultScope(expected.local.scope))
-                let (item, conflict) = try checkedConflict(expected)
-                if let bytes = item.value(forKey: "acceptedVersion") as? Data {
-                    let accepted = try JSONDecoder().decode(EncryptedItemVersion.self, from: bytes)
-                    guard expected.remote.generation >= accepted.generation else { throw ItemRepositoryError.remoteVersionConflict }
-                }
-                try supersedePending(scope: expected.local.scope)
-                encode(expected.remote, into: item)
-                item.setValue(try JSONEncoder().encode(expected.remote), forKey: "acceptedVersion")
-                item.setValue(try JSONEncoder().encode(expected.remote), forKey: "publicationBaseVersion")
-                item.setValue(expected.serverSystemFields, forKey: "serverSystemFields")
-                context.delete(conflict)
-                _ = try updateSyncRequest(account: expected.local.scope.account, database: expected.local.scope.database, reason: .manual)
-                return expected.remote
-            }
-        }
-    }
-
-    /// A new signed resolution is based on the reviewed remote version, with a
-    /// generation above both competing versions. Earlier saves are superseded,
-    /// never falsely marked cloud-confirmed. The receipt returned here is queued.
-    public func resolveConflict(_ expected: EncryptedItemConflict, with resolved: EncryptedItemVersion,
-                                authorization: any RepositoryWritePermit) throws -> PendingItemMutation {
-        try validate(resolved)
-        return try authorization.withWritePermission {
-            try transaction {
-                try touchVaultBoundary(VaultScope(expected.local.scope))
-                let (item, conflict) = try checkedConflict(expected)
-                let highest = max(expected.local.generation, expected.remote.generation)
-                guard highest < UInt64(Int64.max), resolved.generation == highest + 1,
-                      resolved.scope == expected.local.scope,
-                      resolved.baseVersionID == expected.remote.versionID,
-                      resolved.versionID != expected.local.versionID,
-                      resolved.versionID != expected.remote.versionID else { throw ItemRepositoryError.invalidGeneration }
-                if let bytes = item.value(forKey: "acceptedVersion") as? Data {
-                    guard try JSONDecoder().decode(EncryptedItemVersion.self, from: bytes).generation <= highest else {
-                        throw ItemRepositoryError.staleConflict
-                    }
-                }
-                try supersedePending(scope: expected.local.scope)
-                encode(resolved, into: item)
-                let acceptedBytes = item.value(forKey: "acceptedVersion") as? Data
-                let accepted = try acceptedBytes.map { try JSONDecoder().decode(EncryptedItemVersion.self, from: $0) }
-                if accepted == nil || expected.remote.generation >= accepted!.generation {
-                    item.setValue(try JSONEncoder().encode(expected.remote), forKey: "acceptedVersion")
-                }
-                item.setValue(try JSONEncoder().encode(expected.remote), forKey: "publicationBaseVersion")
-                item.setValue(expected.serverSystemFields, forKey: "serverSystemFields")
-                context.delete(conflict)
-                return try insertPending(resolved, status: .queued)
-            }
         }
     }
 
@@ -1267,25 +975,6 @@ public actor EncryptedItemRepository {
         return PendingItemMutation(id: id, version: version, createdAt: date, sequence: sequence)
     }
 
-    private func decodeConflict(_ value: NSManagedObject) throws -> EncryptedItemConflict {
-        guard let id = value.value(forKey: "conflictID") as? UUID,
-              let local = value.value(forKey: "local") as? Data,
-              let remote = value.value(forKey: "remote") as? Data,
-              let fields = value.value(forKey: "serverSystemFields") as? Data else { throw ItemRepositoryError.corruptStore }
-        return EncryptedItemConflict(id: id, local: try JSONDecoder().decode(EncryptedItemVersion.self, from: local),
-            remote: try JSONDecoder().decode(EncryptedItemVersion.self, from: remote), serverSystemFields: fields)
-    }
-
-    private func checkedConflict(_ expected: EncryptedItemConflict) throws -> (NSManagedObject, NSManagedObject) {
-        guard expected.local.scope == expected.remote.scope,
-              let conflict = try fetchOne("Conflict", key: expected.local.scope.storageKey),
-              try decodeConflict(conflict) == expected,
-              let item = try fetchOne("Item", key: expected.local.scope.storageKey),
-              try decodeVersion(item) == expected.local,
-              item.value(forKey: "serverSystemFields") as? Data == expected.serverSystemFields else { throw ItemRepositoryError.staleConflict }
-        return (item, conflict)
-    }
-
     func supersedePending(scope: ItemScope) throws {
         let request = NSFetchRequest<NSManagedObject>(entityName: "PendingMutation")
         request.predicate = NSPredicate(format: "key == %@", scope.storageKey)
@@ -1297,15 +986,6 @@ public actor EncryptedItemRepository {
             try finishPublicationInTransaction(id, account: scope.account, database: scope.database, confirmed: false)
             context.delete(pending)
         }
-    }
-
-    private func isSuperseded(_ version: EncryptedItemVersion) throws -> Bool {
-        if try fetchOne("StateBlob", key: "superseded:" + version.versionID.uuidString + ":" + version.scope.storageKey) != nil { return true }
-        let request = NSFetchRequest<NSManagedObject>(entityName: "MutationReceipt")
-        request.predicate = NSPredicate(format: "scopeKey == %@ AND versionID == %@ AND status == %@",
-            version.scope.storageKey, version.versionID as NSUUID, MutationDeliveryStatus.superseded.rawValue)
-        request.fetchLimit = 1
-        return try !context.fetch(request).isEmpty
     }
 
     private func updateSyncRequest(account: String, database: String, reason: SyncRequestReason) throws -> DurableSyncRequest {

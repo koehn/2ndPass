@@ -159,18 +159,12 @@ authenticated, with fresh nonces when encrypted. HPKE using
 `P256_SHA256_AES_GCM_256` wraps the item key for each authorized device. The private
 agreement key stays in hardware; unwrapped symmetric keys do not.
 
-The current `2ndpass-item-envelope-2` header binds vault and item UUIDs, version,
-monotonic revision generation, encryption-key generation, base version, membership
-state digest and author. The signature covers the header, encrypted catalog,
-encrypted records and recipient wrappers. Signature, catalog, recipient-key and
-record contexts use distinct domains. Recipient contexts bind the exact membership
-state and recipient; record contexts bind vault, item, key generation and record ID.
-
-Revision generation is distinct from encryption-key generation. Selective edits can
-reuse unchanged ciphertext while generating fresh identities for changed records.
-This avoids decrypting every concealed field for a metadata edit, but the complete
-envelope still transfers. Membership addition changes wrappers and authority; it
-is not a secret rotation or revocation operation.
+The current `ContentEnvelope` binds vault/item identity, storage ancestry, logical
+revision, key generation, author and signed membership authority. Separate
+`ContentKeyGrant` records wrap keys for specific recipients. Signed component and
+grant contexts retain their current cryptographic domains. Ordinary edits retain
+the key generation while resealing content; additive enrollment supplies grants
+without rewriting content. Revocation and recovery admission require rotation.
 
 A normal explicit secret read proceeds through these boundaries:
 
@@ -256,8 +250,8 @@ database, zone owner, vault and pinned genesis.
 `2ndpass-membership-1`. A successor binds its parent digest and next generation;
 its signature is checked using the parent's owner authority, not a role newly
 asserted by the successor. Structure checks preserve removed-device history and
-reject changing an existing device's keys in place. These protocol checks do not
-make device removal or cross-account role management available to clients.
+reject changing an existing device's keys in place. The device-removal workflow uses these checks together with key rotation.
+Cross-account role management remains unavailable.
 
 ### Automatic same-account enrollment
 
@@ -302,14 +296,15 @@ existing pin only for this reconnect case with no initialization receipt.
 
 ### Cross-account sharing and removal
 
-Cross-account sharing, device removal and permanent vault deletion
-are unavailable through the current service. Protocol types, primitive operations
-and test fixtures do not establish a user-facing implementation. Sharing requires
-both transport permissions and cryptographic authorization, with separate physical
-accounts and permission/revocation acceptance before release.
+Cross-account sharing remains unavailable. Sharing requires both transport
+permissions and cryptographic authorization, with separate physical accounts and
+permission/revocation acceptance before release.
 
-Future removal must distinguish membership exclusion from key rotation and external
-credential revocation. An old recipient can retain plaintext, keys and ciphertext.
+Device removal and permanent cloud-vault deletion are preview features; physical-device acceptance remains pending. Vault deletion is enabled in Development builds and requires `MOP_VAULT_DELETION` in Production; the separate V3 Production review gate also applies.
+
+Device removal commits membership exclusion and schedules key rotation. A saved
+removal is not confirmation that all rotation and cloud delivery have completed.
+Membership exclusion and key rotation do not revoke credentials at external services. An old recipient can retain plaintext, keys and ciphertext.
 An offline client cannot learn a change it has not observed. Changing a password or
 revoking a key at its service is necessary when copied credentials must stop working.
 
@@ -405,8 +400,8 @@ a device's encrypted database without its hardware keys.
 
 Archives preserve locally available fields, metadata, retained history, trash,
 attachments and cloud software credential bytes. They do not export hardware private
-keys, reinstate device membership or restore account recovery configuration. Hardware
-registration references are informational, not private-key backups.
+keys, reinstate device membership or restore account recovery configuration. Credential-registration metadata and derived password-health results are excluded.
+Only portable archive v2 is accepted; v1 is explicitly unsupported.
 
 The current exporter cannot certify complete remote inventory. A successful export
 only establishes an export of the local state it accepted; verify downloads and
@@ -415,7 +410,7 @@ invalid or oversized inputs fail rather than silently omit data. Output refuses
 existing files. A restore uses a fresh UUID retained for retries and creates an
 independent vault. A dry run validates without creating it.
 
-See [backup and restore](BACKUPS.md) and the [standalone archive specification](formats/PORTABLE-BACKUP-v1.md)
+See [backup and restore](BACKUPS.md) and the [standalone archive specification](formats/PORTABLE-BACKUP-v2.md)
 for exact framing, key encoding, limits and retry semantics. Keep an independent
 copy of that specification with recovery materials so restoration does not depend
 solely on an installed application.
@@ -558,7 +553,7 @@ screen capture, or receiving application has already copied.
 | Replayed enrollment | Exact request, scope, identity, approval-time and history checks | A fresh valid identity can still join through a compromised trusted account channel. |
 | Malware reading process memory | Concealed fields opened on demand; owned buffers cleared where practical | Temporary keys, visible metadata and requested secrets enter memory; not all framework copies can be wiped. |
 | Clipboard reader or screen capture | Concealment, reveal timeout and expiring device-local secret copies | Already captured plaintext cannot be retracted. |
-| Recipient retains data | No claim of retrospective secrecy | Device removal is unavailable; even future rotation cannot invalidate copied external credentials. |
+| Recipient retains data | No claim of retrospective secrecy | Device removal and key rotation cannot invalidate copied external credentials. |
 | All enrolled devices unavailable | Configured account recovery code, or portable archive plus its separate key | Same iCloud account required for live recovery; hardware credential keys cannot be recovered. Physical acceptance remains pending. |
 
 ## The device-local `local` vault
@@ -621,7 +616,7 @@ lock/sleep during an outstanding prompt, and late Secure Enclave results.
 Typed cloud SSH/Git credentials and passkeys store normalized software private keys
 as concealed encrypted item payloads, with public protocol metadata inside the
 encrypted catalog. Authorized members can obtain software key material; these
-credentials do not inherit Secure Enclave non-extractability. Key creation/use routes through authenticated item catalog/read/save operations. Cross-account sharing and device removal are unavailable. Configured account recovery also covers these software credentials. Portable archives preserve software key bytes, not proof of external service registration. Hardware keys remain
+credentials do not inherit Secure Enclave non-extractability. Key creation/use routes through authenticated item catalog/read/save operations. Cross-account sharing is unavailable. Device removal is a preview feature awaiting physical acceptance. Configured account recovery also covers these software credentials. Portable archives preserve software key bytes, not proof of external service registration. Hardware keys remain
 non-exportable and never enter this format. See [supported cloud keys and
 validation limits](CLOUD-KEY-CREDENTIALS.md).
 
@@ -637,7 +632,7 @@ Health-result caching and per-item history use encrypted item-service state. Pre
 password/token values remain secrets protected by their item encryption. Local commit
 establishes the edit and retained history even if delivery is delayed. Clearing live
 history cannot erase prior archives, copied ciphertext or plaintext already disclosed.
-Credential-account registration and redundancy management are not connected; generating
+Credential-account registration and redundancy management are unimplemented; generating
 a second local key does not establish that a service accepts it as an alternate.
 See [security health and history](SECURITY-HEALTH.md).
 
@@ -662,7 +657,7 @@ Principal implementation entry points:
 | --- | --- |
 | Device keys, access controls and handle lifetime | [Device.swift](../Sources/MopVaultNext/Device.swift), [DeviceKeychain.swift](../Sources/MopVaultNext/DeviceKeychain.swift) |
 | HPKE and canonical encoding | [Crypto.swift](../Sources/MopVaultNext/Crypto.swift) |
-| Independent item signatures and encryption | [ItemEnvelope.swift](../Sources/MopVaultNext/ItemEnvelope.swift) |
+| Independent item signatures and encryption | [ContentEnvelope.swift](../Sources/MopVaultNext/ContentEnvelope.swift) |
 | Membership authority | [MembershipEnvelope.swift](../Sources/MopVaultNext/MembershipEnvelope.swift), [TrustedMembershipHistory.swift](../Sources/MopVaultNext/TrustedMembershipHistory.swift) |
 | Device-only trust pins | [KeychainItemVaultTrustStore.swift](../Sources/MopAppSupport/KeychainItemVaultTrustStore.swift) |
 | Enrollment requests, grants and admission | [DeviceEnrollment.swift](../Sources/MopVaultNext/DeviceEnrollment.swift), [ItemDeviceEnrollment.swift](../Sources/MopAppSupport/ItemDeviceEnrollment.swift), [VaultAdmission.swift](../Sources/MopSync/VaultAdmission.swift) |
@@ -674,13 +669,13 @@ Principal implementation entry points:
 | AutoFill resolution and publication | [AutoFillSession.swift](../Sources/MopAppSupport/AutoFillSession.swift), [AutoFillPublicationState.swift](../Sources/MopAppSupport/AutoFillPublicationState.swift) |
 
 The [vault architecture](VAULT.md), [CloudKit schema](CLOUDKIT.md), [account identity](ACCOUNT-IDENTITY.md)
-and [portable archive specification](formats/PORTABLE-BACKUP-v1.md) complement this threat model.
+and [portable archive specification](formats/PORTABLE-BACKUP-v2.md) complement this threat model.
 
 ## Validation
 
 Release acceptance must include concurrent edits and explicit conflict resolution,
 restart/interruption, lock during operations, account changes, large-vault catalog
 repair, backup completeness and restore independence, and signed app/CLI/AutoFill
-behavior on supported physical platforms. Sharing and removal need further implementation;
-account recovery needs separate physical acceptance before release.
+behavior on supported physical platforms. Sharing needs further implementation; device removal, permanent vault deletion
+and account recovery need separate physical acceptance before release.
 Production provisioning and independent security review remain distinct gates.

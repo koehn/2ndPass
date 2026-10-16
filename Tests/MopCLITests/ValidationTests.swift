@@ -87,9 +87,9 @@ import MopCore
     #expect(throws: (any Error).self) { try Mop.parseAsRoot(arguments) }
 }
 
-@Test func deviceRequestsAndSharingCommandsAreAvailable() throws {
-    #expect(try Mop.parseAsRoot(["device", "request"]) is Device.Request)
-    #expect(try Mop.parseAsRoot(["vault", "members"]) is Vault.Members)
+@Test func retiredCommandsAreRejectedAndDeviceRemovalRemainsAvailable() throws {
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["device", "request"]) }
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["vault", "members"]) }
     #expect(try Mop.parseAsRoot(["vault", "remove-device", UUID().uuidString]) is Vault.RemoveDevice)
 }
 
@@ -108,11 +108,8 @@ import MopCore
     #expect(!VaultDeletionPending().message.contains("Run sp vault sync"))
 }
 
-@Test func importCLIRequiresExplicitVaultAndSupportsFormats() throws {
-    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["item", "import", "export.csv"]) }
-    #expect(try Mop.parseAsRoot(["item", "import", "export.csv", "--vault", "personal", "--dry-run", "--format", "apple-csv", "--json"]) is Item.Import)
-    #expect(try Mop.parseAsRoot(["item", "import", "export.1pux", "--vault", "personal", "--yes"]) is Item.Import)
-    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["item", "import", "export.csv", "--vault", "personal", "--offline"]) }
+@Test func retiredGeneralImportCommandIsRejected() {
+    #expect(throws: (any Error).self) { try Mop.parseAsRoot(["item", "import", "export.csv", "--vault", "personal", "--yes"]) }
 }
 
 @Test func localCommandsAreAvailable() throws {

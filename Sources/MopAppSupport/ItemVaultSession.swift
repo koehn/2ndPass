@@ -29,7 +29,7 @@ public struct ItemVaultBinding: Codable, Equatable, Sendable {
 public struct ItemVaultCatalogEntry: Codable, Sendable {
     public let itemID: UUID
     public let versionID: UUID
-    public let catalog: ItemEnvelopeCatalog
+    public let catalog: ItemContentCatalog
 }
 
 public struct ItemVaultDisplayEntry: Codable, Sendable {
@@ -41,8 +41,8 @@ public enum ItemVaultConflictSide: String, Hashable, Sendable { case local, remo
 
 public struct ItemVaultConflictPreview: Sendable {
     public let conflict: EncryptedItemConflict
-    public let local: ItemEnvelopeCatalog
-    public let remote: ItemEnvelopeCatalog
+    public let local: ItemContentCatalog
+    public let remote: ItemContentCatalog
     public var localAuthorName: String? = nil
     public var remoteAuthorName: String? = nil
     public var localDeviceName: String { local.editOrigin?.deviceName ?? localAuthorName ?? "Device name unavailable (local version)" }
@@ -86,7 +86,7 @@ public final class ItemVaultSession: @unchecked Sendable {
     private let identity: DevicePublicKey
     private let permit: ItemVaultPermit
     private let authorityValid = ItemVaultAuthority()
-    let contentSession: GrantBackedContentSession?
+    let contentSession: GrantBackedContentSession
 
     public convenience init(repository: EncryptedItemRepository, binding: ItemVaultBinding,
                             history: TrustedMembershipHistory, device: any DeviceOperations) throws {
@@ -103,7 +103,7 @@ public final class ItemVaultSession: @unchecked Sendable {
         currentDigest = try history.current.digest()
         self.identity = identity
         self.permit = permit
-        contentSession = repository.layout == .contentPreview3 ? try GrantBackedContentSession(repository: repository, binding: binding, history: history, permit: permit) : nil
+        contentSession = try GrantBackedContentSession(repository: repository, binding: binding, history: history, permit: permit)
     }
 
     private let displayContinuity = Mutex(UUID())
@@ -137,7 +137,6 @@ public final class ItemVaultSession: @unchecked Sendable {
     public var currentDeviceID: UUID { get throws { try permit.check(); return identity.device } }
     public var enrolledDevices: [DevicePublicKey] { get throws { try permit.check(); return history.current.membership.devices } }
 
-
     /// Public-key control validation continues while keys are locked, but stops
     /// when account or membership authority is explicitly retired.
     func validateMembershipAuthority(digest: String) throws {
@@ -146,42 +145,6 @@ public final class ItemVaultSession: @unchecked Sendable {
             guard currentDigest == digest, history.current.membership.role(of: identity) == .owner else {
                 throw CloudSyncAdapterError.untrustedRecord
             }
-        }
-    }
-
-    /// Binds every untrusted transport field to signed ciphertext, including the
-    /// account/database/owner namespace that is intentionally absent on the wire.
-    public func validate(_ version: EncryptedItemVersion, direction: CloudRecordDirection) throws {
-        try authorityValid.withLock { valid in
-            guard valid else { throw MopError.vaultUntrusted }
-            switch direction {
-            case .receiving:
-                try validateCurrentState(version)
-            case .cached:
-                if version.healthItemID != nil { _ = try healthEnvelope(version) }
-                else if version.scope.itemID == Self.metadataRecordID { _ = try metadata(version) }
-                else { _ = try envelope(version) }
-            case .sending:
-                try permit.withWritePermission {
-                    try validateCurrentState(version)
-                    let role = history.current.membership.role(of: identity)
-                    guard role == .owner || role == .editor else { throw MopError.cloudPermission }
-                }
-            }
-        }
-    }
-
-    private func validateCurrentState(_ version: EncryptedItemVersion) throws {
-        try validateScope(version)
-        if version.healthItemID != nil {
-            let value = try healthEnvelope(version)
-            guard value.header.membership == currentDigest else { throw ItemVaultSessionFailure.staleMembershipState }
-        } else if version.scope.itemID == Self.metadataRecordID {
-            let value = try metadata(version)
-            guard value.header.membership == currentDigest else { throw ItemVaultSessionFailure.staleMembershipState }
-        } else {
-            let value = try envelope(version)
-            guard value.header.membership == currentDigest else { throw ItemVaultSessionFailure.staleMembershipState }
         }
     }
 
@@ -292,8 +255,7 @@ public final class ItemVaultSession: @unchecked Sendable {
             var result: [ItemVaultCatalogEntry] = []
             for version in versions where version.scope.itemID != Self.metadataRecordID && version.healthItemID == nil {
                 try Task.checkCancellation()
-                if let contentSession { result.append(try await contentSession.catalog(itemID: version.scope.itemID)) }
-                else { result.append(try catalogEntry(version)) }
+                result.append(try await contentSession.catalog(itemID: version.scope.itemID))
             }
             try permit.check()
             return result
@@ -301,30 +263,13 @@ public final class ItemVaultSession: @unchecked Sendable {
     }
 
     public func catalog(itemID: UUID) async throws -> ItemVaultCatalogEntry {
-        if let contentSession { return try await contentSession.catalog(itemID: itemID) }
-        try permit.check()
-        guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        guard let version = try await repository.item(binding.item(itemID)) else { throw MopError.notFound }
-        return try await background { [self] in try catalogEntry(version) }
+        return try await contentSession.catalog(itemID: itemID)
     }
 
     /// Read only the chosen item's metadata and visible fields; no revision-index
     /// scan, display-cache hydration, or background catalog preparation.
     public func displayItem(itemID: UUID) async throws -> ItemVaultDisplayEntry {
-        if let contentSession { return try await contentSession.displayItem(itemID: itemID) }
-        try permit.check()
-        guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        guard let version = try await repository.item(binding.item(itemID)) else { throw MopError.notFound }
-        return try await background(priority: .userInitiated) { [self] in
-            try permit.check()
-            let value = try envelope(version)
-            let state = try readableState(value.header.membership)
-            let projection = try permit.withDevice { device in
-                try value.displayCatalog(device: device, membership: state.membership, membershipStateDigest: value.header.membership)
-            }
-            return ItemVaultDisplayEntry(entry: ItemVaultCatalogEntry(itemID: itemID, versionID: version.versionID,
-                catalog: projection.catalog), item: projection.item)
-        }
+        return try await contentSession.displayItem(itemID: itemID)
     }
 
     private struct NameIndexContext: Encodable {
@@ -416,16 +361,6 @@ public final class ItemVaultSession: @unchecked Sendable {
         return state
     }
 
-    private func catalogEntry(_ version: EncryptedItemVersion) throws -> ItemVaultCatalogEntry {
-        try permit.check()
-        let value = try envelope(version)
-        let state = try readableState(value.header.membership)
-        return try permit.withDevice { device in
-            try ItemVaultCatalogEntry(itemID: version.scope.itemID, versionID: version.versionID,
-                catalog: value.catalog(device: device, membership: state.membership, membershipStateDigest: value.header.membership))
-        }
-    }
-
     /// A bounded projection for progressive UI loading. The caller supplies a
     /// revision-index snapshot; this is never evidence of a complete vault.
     /// Fetching one row at a time avoids retaining a batch of large attachments.
@@ -448,32 +383,15 @@ public final class ItemVaultSession: @unchecked Sendable {
                 try permit.check()
                 guard let version = try await repository.item(binding.item(id)),
                       version.versionID == expectedVersions[id] else { throw ItemRepositoryError.staleLocalVersion }
-                if let contentSession {
+
                     do {
                         let row = try await contentSession.displayItem(itemID: id)
-                        guard row.entry.versionID == version.versionID else { throw ItemRepositoryError.staleLocalVersion }
+                        if row.entry.versionID != version.versionID { waiting[id] = version.versionID }
                         result.append(row)
                     } catch CloudSyncAdapterError.membershipUnavailable { waiting[id] = version.versionID }
                     await Task.yield()
                     continue
-                }
-                let value = try envelope(version)
-                let state = try history.state(forDigest: value.header.membership)
-                if state.membership.role(of: identity) == nil {
-                    try history.verifyAccountPath(from: value.header.membership)
-                    waiting[id] = version.versionID
-                    continue
-                }
-                let projection = try permit.withDevice { device in
-                    try value.displayCatalog(device: device, membership: state.membership,
-                        membershipStateDigest: value.header.membership)
-                }
-                result.append(ItemVaultDisplayEntry(entry: ItemVaultCatalogEntry(itemID: id,
-                    versionID: version.versionID, catalog: projection.catalog), item: projection.item))
-                // A selected-item reveal can take the device gate before the
-                // next background item. Keys are not retained across this yield.
-                await Task.yield()
-            }
+                            }
             let current = try await revisionIndex()
             guard expectedVersions.allSatisfy({ current[$0.key] == $0.value }) else {
                 throw ItemRepositoryError.staleLocalVersion
@@ -494,20 +412,12 @@ public final class ItemVaultSession: @unchecked Sendable {
     private func revealValue(itemID: UUID, recordID: String, expectedVersion: UUID?) async throws -> SecretBytes {
         try permit.check()
         guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        guard let stored = try await repository.item(binding.item(itemID)) else { throw MopError.notFound }
-        if let expectedVersion, stored.versionID != expectedVersion { throw ItemRepositoryError.staleLocalVersion }
-        if let contentSession {
-            guard UUID(uuidString: recordID)?.uuidString == recordID else { throw MopError.notFound }
-            return try await contentSession.open(item: itemID, component: recordID, expected: stored.versionID)
-        }
-        return try await background(priority: .userInitiated) { [self] in
-            try permit.check()
-            let value = try envelope(stored)
-            let state = try readableState(value.header.membership)
-            return try permit.withDevice { device in
-                try value.read(record: recordID, device: device, membership: state.membership, membershipStateDigest: value.header.membership)
-            }
-        }
+        guard try await repository.item(binding.item(itemID)) != nil else { throw MopError.notFound }
+
+        guard UUID(uuidString: recordID)?.uuidString == recordID else { throw MopError.notFound }
+        let readableVersion = try await contentSession.lastReadable(item: itemID).0.header.version
+        return try await contentSession.open(item: itemID, component: recordID, expected: expectedVersion ?? readableVersion)
+
     }
 
     /// Explicitly keeps expensive signature checking and hardware operations off
@@ -523,7 +433,7 @@ public final class ItemVaultSession: @unchecked Sendable {
         return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
     }
 
-    private static func editingDeviceName() async -> String {
+    static func editingDeviceName() async -> String {
         #if os(iOS)
         return await MainActor.run { UIDevice.current.name }
         #else
@@ -534,113 +444,34 @@ public final class ItemVaultSession: @unchecked Sendable {
     }
 
     public func save(_ item: PortableVaultArchive, expectedBase: UUID?) async throws -> PendingItemMutation {
-        if let contentSession {
-            return try await contentSession.save(item, expectedBase: expectedBase, editOrigin: ItemEditOrigin(deviceID: identity.device, deviceName: Self.editingDeviceName(), updatedAt: Date()))
-        }
-        try permit.check()
-        try item.validate()
-        guard item.items.count == 1, let itemName = item.items.first?.name,
-              let itemID = item.itemIDs[itemName].flatMap(UUID.init(uuidString:)),
-              itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        let previous = try await repository.item(binding.item(itemID))
-        let deviceName = await Self.editingDeviceName()
-        let version = try permit.withDevice { device in
-            let generation = try nextGeneration(previous, expectedBase: expectedBase)
-            let envelope = try ItemEnvelope.seal(item, vault: binding.vaultID, generation: generation, base: expectedBase,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device,
-                editOrigin: ItemEditOrigin(deviceID: device.identity.device, deviceName: deviceName, updatedAt: Date()))
-            guard envelope.header.item != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-            return try EncryptedItemVersion(scope: binding.item(envelope.header.item), versionID: envelope.header.version,
-                baseVersionID: expectedBase, ciphertext: envelope.encoded(), generation: generation)
-        }
-        return try await repository.commitLocalMutation(version, authorization: permit)
+        return try await contentSession.save(item, expectedBase: expectedBase, editOrigin: ItemEditOrigin(deviceID: identity.device, deviceName: Self.editingDeviceName(), updatedAt: Date()))
+
     }
 
-    /// Applies an explicit metadata/record graph patch without decrypting any
-    /// unchanged field, retained history value, or attachment.
-    public func edit(itemID: UUID, expectedBase: UUID, catalog: ItemEnvelopeCatalog,
+    /// Applies a revision-checked logical patch through current content encryption.
+    public func edit(itemID: UUID, expectedBase: UUID, catalog: ItemContentCatalog,
                      changedRecords: [String: SecretBytes] = [:], removedRecords: Set<String> = []) async throws -> PendingItemMutation {
-        if let contentSession {
-            var catalog = catalog
-            catalog.editOrigin = await ItemEditOrigin(deviceID: identity.device, deviceName: Self.editingDeviceName(), updatedAt: Date())
-            return try await contentSession.edit(itemID: itemID, expectedBase: expectedBase, catalog: catalog, changedRecords: changedRecords, removedRecords: removedRecords)
-        }
-        let timing = ItemSaveTiming()
-        defer { timing.mark("session edit finished") }
-        try permit.check()
-        timing.mark("edit permission checked")
-        guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        let stored = try await repository.item(binding.item(itemID))
-        timing.mark("stored version loaded")
-        let deviceName = await Self.editingDeviceName()
-        timing.mark("device name loaded")
-        let version = try permit.withDevice { device in
-            guard let stored, stored.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
-            let current = try envelope(stored)
-            var catalog = catalog
-            catalog.editOrigin = ItemEditOrigin(deviceID: device.identity.device, deviceName: deviceName, updatedAt: Date())
-            let changed = try current.edit(catalog: catalog, changedRecords: changedRecords, removedRecords: removedRecords,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
-            return try EncryptedItemVersion(scope: stored.scope, versionID: changed.header.version,
-                baseVersionID: expectedBase, ciphertext: changed.encoded(), generation: changed.header.generation)
-        }
-        timing.mark("envelope encrypted and signed")
-        return try await repository.commitLocalMutation(version, authorization: permit)
+        var catalog = catalog
+        catalog.editOrigin = await ItemEditOrigin(deviceID: identity.device, deviceName: Self.editingDeviceName(), updatedAt: Date())
+        return try await contentSession.edit(itemID: itemID, expectedBase: expectedBase, catalog: catalog, changedRecords: changedRecords, removedRecords: removedRecords)
+
     }
 
     public func replaceField(itemID: UUID, expectedBase: UUID, path: String, value: SecretBytes,
                              at date: Date = Date()) async throws -> PendingItemMutation {
-        if let contentSession {
-            let entry = try await contentSession.catalog(itemID: itemID)
-            guard entry.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
-            let patch = try entry.catalog.replacingField(path, value: value, itemID: itemID, at: date)
-            return try await edit(itemID: itemID, expectedBase: expectedBase, catalog: patch.catalog, changedRecords: patch.changedRecords, removedRecords: patch.removedRecords)
-        }
-        try permit.check()
-        guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        let stored = try await repository.item(binding.item(itemID))
-        let deviceName = await Self.editingDeviceName()
-        let version = try permit.withDevice { device in
-            guard let stored, stored.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
-            let current = try envelope(stored)
-            guard current.header.membership == currentDigest else { throw ItemEnvelopeFailure.rekeyRequired }
-            let catalog = try current.catalog(device: device, membership: history.current.membership, membershipStateDigest: currentDigest)
-            let patch = try catalog.replacingField(path, value: value, itemID: itemID, at: date)
-            var editedCatalog = patch.catalog
-            editedCatalog.editOrigin = ItemEditOrigin(deviceID: device.identity.device, deviceName: deviceName, updatedAt: date)
-            let changed = try current.edit(catalog: editedCatalog, changedRecords: patch.changedRecords, removedRecords: patch.removedRecords,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
-            return try EncryptedItemVersion(scope: stored.scope, versionID: changed.header.version,
-                baseVersionID: expectedBase, ciphertext: changed.encoded(), generation: changed.header.generation)
-        }
-        return try await repository.commitLocalMutation(version, authorization: permit)
-    }
+        let entry = try await contentSession.catalog(itemID: itemID)
+        guard entry.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
+        let patch = try entry.catalog.replacingField(path, value: value, itemID: itemID, at: date)
+        return try await edit(itemID: itemID, expectedBase: expectedBase, catalog: patch.catalog, changedRecords: patch.changedRecords, removedRecords: patch.removedRecords)
 
-    /// An explicit full rewrite for an authenticated membership transition. This
-    /// intentionally decrypts retained contents; ordinary edit() never does.
-    public func rekey(itemID: UUID, expectedBase: UUID, name: String) async throws -> PendingItemMutation {
-        try permit.check()
-        guard itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        let stored = try await repository.item(binding.item(itemID))
-        let version = try permit.withDevice { device in
-            guard let stored, stored.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
-            let current = try envelope(stored)
-            let previous = try history.state(forDigest: current.header.membership)
-            let changed = try current.rekey(name: name, previousMembership: previous.membership,
-                previousMembershipStateDigest: current.header.membership,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
-            return try EncryptedItemVersion(scope: stored.scope, versionID: changed.header.version,
-                baseVersionID: expectedBase, ciphertext: changed.encoded(), generation: changed.header.generation)
-        }
-        return try await repository.commitLocalMutation(version, authorization: permit)
     }
 
     public func conflictPreviews() async throws -> [ItemVaultConflictPreview] {
         try Task.checkCancellation()
         try permit.check()
-        let conflicts = try await (contentSession == nil ? repository.conflicts(account: binding.account) : repository.contentConflicts(account: binding.account))
+        let conflicts = try await repository.contentConflicts(account: binding.account)
         var result: [ItemVaultConflictPreview] = []
-        for conflict in conflicts where binding.contains(conflict.local.scope) && (contentSession != nil || conflict.local.scope.itemID != Self.metadataRecordID) && conflict.local.healthItemID == nil {
+        for conflict in conflicts where binding.contains(conflict.local.scope) && conflict.local.healthItemID == nil {
             try Task.checkCancellation()
             result.append(try await conflictPreview(conflict))
         }
@@ -651,31 +482,13 @@ public final class ItemVaultSession: @unchecked Sendable {
     /// Compare all records, history, metadata and edit attribution before treating
     /// a conflict as a duplicate; matching visible fields alone is insufficient.
     public func isDuplicateConflict(_ expected: EncryptedItemConflict) async throws -> Bool {
-        if let contentSession { return try await contentSession.isDuplicateConflict(expected) }
-        try validateConflictScope(expected)
-        let live = try await repository.reviewedConflict(expected)
-        return try await background(priority: .utility) { [self] in
-            try Task.checkCancellation()
-            return try permit.withDevice { device in
-                try Task.checkCancellation()
-                guard live == expected else { throw ItemRepositoryError.staleConflict }
-                let local = try envelope(expected.local), remote = try envelope(expected.remote)
-                let left = try history.state(forDigest: local.header.membership)
-                let right = try history.state(forDigest: remote.header.membership)
-                let a = try local.catalog(device: device, membership: left.membership, membershipStateDigest: local.header.membership)
-                let b = try remote.catalog(device: device, membership: right.membership, membershipStateDigest: remote.header.membership)
-                guard a == b else { return false }
-                return try local.portableArchive(name: "conflict", device: device, membership: left.membership,
-                    membershipStateDigest: local.header.membership) == remote.portableArchive(name: "conflict", device: device,
-                    membership: right.membership, membershipStateDigest: remote.header.membership)
-            }
-        }
+        return try await contentSession.isDuplicateConflict(expected)
     }
 
     /// Field choices include absence on either side, allowing explicit deletion.
     /// Remote records get fresh IDs and are re-encrypted with the local item key.
     public func combinedConflict(_ expected: EncryptedItemConflict, metadata: ItemVaultConflictSide,
-                                 fields: [String: ItemVaultConflictSide]) async throws -> ItemEnvelopePatch {
+                                 fields: [String: ItemVaultConflictSide]) async throws -> ItemContentPatch {
         let preview = try await conflictPreview(expected)
         let paths = Set(preview.local.item.fields.map(\.path)).union(preview.remote.item.fields.map(\.path))
         guard Set(fields.keys) == paths else { throw MopError.invalidVault }
@@ -711,56 +524,18 @@ public final class ItemVaultSession: @unchecked Sendable {
         let old = Set(preview.local.references.values).union(preview.local.histories.flatMap { $0.entries.map(\.id) })
         let retained = Set(catalog.references.values).union(catalog.histories.flatMap { $0.entries.map(\.id) })
         try catalog.validate(itemID: expected.local.scope.itemID, recordIDs: retained)
-        return ItemEnvelopePatch(catalog: catalog, changedRecords: changed, removedRecords: old.subtracting(retained))
+        return ItemContentPatch(catalog: catalog, changedRecords: changed, removedRecords: old.subtracting(retained))
     }
 
     public func conflictPreview(_ expected: EncryptedItemConflict) async throws -> ItemVaultConflictPreview {
-        if let contentSession { return try await contentSession.conflictPreview(expected) }
-        try permit.check()
-        try validateConflictScope(expected)
-        let live = try await repository.reviewedConflict(expected)
-        let deviceName = await Self.editingDeviceName()
-        return try await background(priority: .utility) { [self] in
-            try Task.checkCancellation()
-            return try permit.withDevice { device in
-                try Task.checkCancellation()
-                guard live == expected else { throw ItemRepositoryError.staleConflict }
-                let local = try envelope(expected.local), remote = try envelope(expected.remote)
-                let localState = try history.state(forDigest: local.header.membership)
-                let remoteState = try history.state(forDigest: remote.header.membership)
-                return try ItemVaultConflictPreview(conflict: expected,
-                    local: local.catalog(device: device, membership: localState.membership, membershipStateDigest: local.header.membership),
-                    remote: remote.catalog(device: device, membership: remoteState.membership, membershipStateDigest: remote.header.membership),
-                    localAuthorName: local.header.author == device.identity.fingerprint ? deviceName : nil,
-                    remoteAuthorName: remote.header.author == device.identity.fingerprint ? deviceName : nil)
-            }
-        }
+        return try await contentSession.conflictPreview(expected)
     }
 
     /// Decrypts only the specifically selected record after rechecking that the
     /// reviewed conflict has not changed. Preview never reveals field values.
     public func revealConflict(_ expected: EncryptedItemConflict, side: ItemVaultConflictSide,
                                recordID: String) async throws -> SecretBytes {
-        if let contentSession { return try await contentSession.revealConflict(expected, side: side, recordID: recordID) }
-        try permit.check()
-        try validateConflictScope(expected)
-        let live = try await repository.reviewedConflict(expected)
-        return try permit.withDevice { device in
-            guard live == expected else { throw ItemRepositoryError.staleConflict }
-            let selected: EncryptedItemVersion
-            switch side { case .local: selected = expected.local; case .remote: selected = expected.remote }
-            let value = try envelope(selected)
-            let state = try history.state(forDigest: value.header.membership)
-            _ = try value.catalog(device: device, membership: state.membership, membershipStateDigest: value.header.membership)
-            return try value.read(record: recordID, device: device, membership: state.membership, membershipStateDigest: value.header.membership)
-        }
-    }
-
-    private func validateConflictScope(_ expected: EncryptedItemConflict) throws {
-        guard expected.local.scope == expected.remote.scope,
-              expected.local.scope.itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        try validateScope(expected.local)
-        try validateScope(expected.remote)
+        return try await contentSession.revealConflict(expected, side: side, recordID: recordID)
     }
 
     /// All production conflict choices run through the process that owns the
@@ -785,34 +560,21 @@ public final class ItemVaultSession: @unchecked Sendable {
         }
     }
 
-    public func healthConflicts() async throws -> [EncryptedItemConflict] {
-        try permit.check()
-        return try await repository.conflicts(account: binding.account).filter {
-            binding.contains($0.local.scope) && $0.local.healthItemID != nil
-        }
-    }
-
     public func saveHealthChecks(_ checks: [CachedPasswordCheck], itemID: UUID, expectedItemVersion: UUID) async throws -> EncryptedItemVersion? {
         try permit.check()
         guard let parent = try await repository.item(binding.item(itemID)), parent.versionID == expectedItemVersion else {
             throw ItemRepositoryError.staleLocalVersion
         }
-        let scope = binding.item(ItemHealthEnvelope.recordID(for: itemID))
+        let scope = binding.item(LocalPasswordHealthEnvelope.recordID(for: itemID))
         var previous = try await repository.localHealthItem(scope)
         if let invalid = previous, (try? healthEnvelope(invalid)) == nil {
             try await repository.discardLocalHealth(scope, expectedVersion: invalid.versionID, authorization: permit)
             previous = nil
         }
-        let contentCatalog = try await contentSession?.catalog(itemID: itemID)
-        if let contentCatalog, contentCatalog.versionID != expectedItemVersion { throw ItemRepositoryError.staleLocalVersion }
+        let contentCatalog = try await contentSession.catalog(itemID: itemID)
+        if contentCatalog.versionID != expectedItemVersion { throw ItemRepositoryError.staleLocalVersion }
         let version: EncryptedItemVersion? = try permit.withDevice { device in
-            let catalog: ItemEnvelopeCatalog
-            if let contentCatalog { catalog = contentCatalog.catalog }
-            else {
-                let item = try envelope(parent)
-                let state = try readableState(item.header.membership)
-                catalog = try item.catalog(device: device, membership: state.membership, membershipStateDigest: item.header.membership)
-            }
+            let catalog = contentCatalog.catalog
             guard Set(checks.map(\.record)).isSubset(of: Set(catalog.references.values)) else { throw MopError.invalidVault }
             var ordered = checks.sorted { $0.record < $1.record }
             if let previous {
@@ -832,7 +594,7 @@ public final class ItemVaultSession: @unchecked Sendable {
                 ordered = byRecord.values.sorted { $0.record < $1.record }
                 if existing == ordered { return nil }
             } else if ordered.isEmpty { return nil }
-            let sealed = try ItemHealthEnvelope.seal(ordered, vault: binding.vaultID, item: itemID,
+            let sealed = try LocalPasswordHealthEnvelope.seal(ordered, vault: binding.vaultID, item: itemID,
                 generation: nextGeneration(previous, expectedBase: previous?.versionID), base: previous?.versionID,
                 membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
             return try EncryptedItemVersion(scope: scope, versionID: sealed.header.version, baseVersionID: sealed.header.base,
@@ -843,17 +605,17 @@ public final class ItemVaultSession: @unchecked Sendable {
         return version
     }
 
-    private func healthEnvelope(_ version: EncryptedItemVersion) throws -> ItemHealthEnvelope {
+    private func healthEnvelope(_ version: EncryptedItemVersion) throws -> LocalPasswordHealthEnvelope {
         try verifiedHealthEnvelope(version).envelope
     }
 
-    private func verifiedHealthEnvelope(_ version: EncryptedItemVersion) throws -> ItemHealthEnvelope.Verified {
+    private func verifiedHealthEnvelope(_ version: EncryptedItemVersion) throws -> LocalPasswordHealthEnvelope.Verified {
         try validateScope(version)
         guard let parent = version.healthItemID, parent != Self.metadataRecordID,
-              version.scope.itemID == ItemHealthEnvelope.recordID(for: parent) else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        let probe = try JSONDecoder().decode(ItemHealthEnvelope.self, from: version.ciphertext)
+              version.scope.itemID == LocalPasswordHealthEnvelope.recordID(for: parent) else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
+        let probe = try JSONDecoder().decode(LocalPasswordHealthEnvelope.self, from: version.ciphertext)
         let state = try history.state(forDigest: probe.header.membership)
-        let verified = try ItemHealthEnvelope.decodeVerified(version.ciphertext, vault: binding.vaultID, item: parent,
+        let verified = try LocalPasswordHealthEnvelope.decodeVerified(version.ciphertext, vault: binding.vaultID, item: parent,
             membership: state.membership, membershipStateDigest: probe.header.membership)
         let value = verified.envelope
         guard value.header.version == version.versionID, value.header.base == version.baseVersionID,
@@ -861,45 +623,12 @@ public final class ItemVaultSession: @unchecked Sendable {
         return verified
     }
 
-    private func rewrapHealth(_ stored: EncryptedItemVersion, membership: Membership, digest: String,
-                              device: any DeviceOperations) throws -> EncryptedItemVersion {
-        let previous = try healthEnvelope(stored)
-        let state = try history.state(forDigest: previous.header.membership)
-        let checks = try previous.open(device: device, membership: state.membership, membershipStateDigest: previous.header.membership)
-        let next = try ItemHealthEnvelope.seal(checks, vault: binding.vaultID, item: previous.header.item,
-            generation: nextGeneration(stored, expectedBase: stored.versionID), base: stored.versionID,
-            membership: membership, membershipStateDigest: digest, signer: device)
-        return try EncryptedItemVersion(scope: stored.scope, versionID: next.header.version, baseVersionID: stored.versionID,
-            ciphertext: next.encoded(), generation: next.header.generation, healthItemID: stored.healthItemID)
+    public func vaultMetadata() async throws -> (versionID: UUID, value: VaultMetadata) {
+        return try await contentSession.vaultMetadata()
     }
 
-    public func vaultMetadata() async throws -> (versionID: UUID, value: VaultEnvelopeMetadata) {
-        if let contentSession { return try await contentSession.vaultMetadata() }
-        try permit.check()
-        guard let stored = try await repository.item(binding.item(Self.metadataRecordID)) else {
-            throw ItemVaultSessionFailure.missingVaultMetadata
-        }
-        return try permit.withDevice { device in
-            let envelope = try metadata(stored)
-            let state = try history.state(forDigest: envelope.header.membership)
-            return (stored.versionID, try envelope.open(device: device, membership: state.membership,
-                membershipStateDigest: envelope.header.membership))
-        }
-    }
-
-    public func saveMetadata(_ settings: VaultEnvelopeMetadata, expectedBase: UUID?) async throws -> PendingItemMutation {
-        if let contentSession { return try await contentSession.saveMetadata(settings, expectedBase: expectedBase) }
-        try permit.check()
-        let previous = try await repository.item(binding.item(Self.metadataRecordID))
-        let version = try permit.withDevice { device in
-            guard history.current.membership.role(of: device.identity) == .owner else { throw MopError.cloudPermission }
-            let generation = try nextGeneration(previous, expectedBase: expectedBase)
-            let envelope = try VaultMetadataEnvelope.seal(settings, vault: binding.vaultID, generation: generation, base: expectedBase,
-                membership: history.current.membership, membershipStateDigest: currentDigest, signer: device)
-            return try EncryptedItemVersion(scope: binding.item(Self.metadataRecordID), versionID: envelope.header.version,
-                baseVersionID: expectedBase, ciphertext: envelope.encoded(), generation: generation)
-        }
-        return try await repository.commitLocalMutation(version, authorization: permit)
+    public func saveMetadata(_ settings: VaultMetadata, expectedBase: UUID?) async throws -> PendingItemMutation {
+        return try await contentSession.saveMetadata(settings, expectedBase: expectedBase)
     }
 
     /// Exports the local working snapshot, including durable pending edits. It does
@@ -907,39 +636,7 @@ public final class ItemVaultSession: @unchecked Sendable {
     /// backup UI must establish that separately before claiming completeness.
     /// Missing settings/attachments and unresolved conflicts fail the operation.
     public func exportPortableLocalSnapshot() async throws -> PortableVaultArchive {
-        if let contentSession { return try await contentSession.exportPortableLocalSnapshot() }
-        try permit.check()
-        let versions = try await repository.itemsForPortableExport(account: binding.account, vaultID: binding.vaultID,
-            database: binding.database, zoneOwner: binding.zoneOwner)
-        return try permit.withDevice { device in
-            guard let metadataVersion = versions.first(where: { $0.scope.itemID == Self.metadataRecordID }) else {
-                throw ItemVaultSessionFailure.missingVaultMetadata
-            }
-            let sealedSettings = try metadata(metadataVersion)
-            let settingsState = try history.state(forDigest: sealedSettings.header.membership)
-            let settings = try sealedSettings.open(device: device, membership: settingsState.membership,
-                membershipStateDigest: sealedSettings.header.membership)
-            var result = PortableVaultArchive(name: settings.name, items: [], itemIDs: [:], references: [:],
-                records: [:], security: settings.security, exclusions: settings.exclusions)
-            for version in versions where version.scope.itemID != Self.metadataRecordID && version.healthItemID == nil {
-                let value = try envelope(version)
-                let state = try readableState(value.header.membership)
-                let item = try value.portableArchive(name: settings.name, device: device,
-                    membership: state.membership, membershipStateDigest: value.header.membership)
-                guard Set(result.itemIDs.keys).isDisjoint(with: item.itemIDs.keys),
-                      Set(result.records.keys).isDisjoint(with: item.records.keys) else { throw PortableArchiveFailure.invalid }
-                result.items.append(contentsOf: item.items)
-                result.itemIDs.merge(item.itemIDs) { _, new in new }
-                result.references.merge(item.references) { _, new in new }
-                result.records.merge(item.records) { _, new in new }
-                if let histories = item.security?.histories, !histories.isEmpty {
-                    if result.security == nil { result.security = VaultSecurityMetadata() }
-                    result.security?.histories.append(contentsOf: histories)
-                }
-            }
-            try result.validate()
-            return result
-        }
+        return try await contentSession.exportPortableLocalSnapshot()
     }
 
     private func validateScope(_ version: EncryptedItemVersion) throws {
@@ -950,39 +647,11 @@ public final class ItemVaultSession: @unchecked Sendable {
     private func nextGeneration(_ previous: EncryptedItemVersion?, expectedBase: UUID?) throws -> UInt64 {
         guard previous?.versionID == expectedBase else { throw ItemRepositoryError.staleLocalVersion }
         guard let previous else { return 1 }
-        let generation = try previous.healthItemID != nil ? healthEnvelope(previous).header.generation : (previous.scope.itemID == Self.metadataRecordID
-            ? metadata(previous).header.generation : envelope(previous).header.generation)
+        let generation = try healthEnvelope(previous).header.generation
         guard generation < UInt64(Int64.max) else { throw MopError.invalidVault }
         return generation + 1
     }
-    private func envelope(_ version: EncryptedItemVersion) throws -> ItemEnvelope {
-        try validateScope(version)
-        guard version.healthItemID == nil, version.scope.itemID != Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        let probe = try JSONDecoder().decode(ItemEnvelope.self, from: version.ciphertext)
-        let state = try history.state(forDigest: probe.header.membership)
-        let value = try ItemEnvelope.decode(version.ciphertext, vault: binding.vaultID, item: version.scope.itemID,
-            membership: state.membership, membershipStateDigest: probe.header.membership)
-        guard value.header.version == version.versionID, value.header.base == version.baseVersionID,
-              value.header.generation == version.generation else {
-            throw ItemVaultSessionFailure.invalidEnvelopeBinding
-        }
-        return value
-    }
-    private func metadata(_ version: EncryptedItemVersion) throws -> VaultMetadataEnvelope {
-        try validateScope(version)
-        guard version.healthItemID == nil, version.scope.itemID == Self.metadataRecordID else { throw ItemVaultSessionFailure.invalidEnvelopeBinding }
-        let probe = try JSONDecoder().decode(VaultMetadataEnvelope.self, from: version.ciphertext)
-        let state = try history.state(forDigest: probe.header.membership)
-        let value = try VaultMetadataEnvelope.decode(version.ciphertext, vault: binding.vaultID,
-            membership: state.membership, membershipStateDigest: probe.header.membership)
-        guard let author = state.membership.devices.first(where: { $0.fingerprint == value.header.author }),
-              state.membership.role(of: author) == .owner else { throw MopError.cloudPermission }
-        guard value.header.version == version.versionID, value.header.base == version.baseVersionID,
-              value.header.generation == version.generation else {
-            throw ItemVaultSessionFailure.invalidEnvelopeBinding
-        }
-        return value
-    }
+
 }
 
 /// A synchronous permit spans the repository transaction and its durable save.

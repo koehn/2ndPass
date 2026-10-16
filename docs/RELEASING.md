@@ -20,32 +20,11 @@ migrate identities or vault formats. See [branding and identity](BRANDING.md).
 
 Before release, update versions and complete the current checks in
 [validation](VALIDATION.md), including the outstanding physical-device,
-AutoFill, recovery, cross-account sharing, and Production CloudKit acceptance.
+AutoFill, recovery, removal/deletion, and Production CloudKit acceptance.
 Historical audit results do not establish current release readiness. 2ndPass has
 not yet received an independent security audit. Review both protocol correctness
-and implementation correctness; source availability is not a substitute. The
-[documentation audit](security-audit/2026-09-29-documentation.md) lists trust-boundary
-questions for acceptance and the eventual auditor.
-
-## Homebrew development formula
-
-`Formula/secondpass.rb` is currently HEAD-only and installs an ad-hoc CLI for
-non-secret development checks. It is not the supported vault distribution.
-`Formula/mop.rb` preserves the historical stable release. A future supported
-Homebrew distribution must retain the signed and provisioned app bundle.
-
-The [Homebrew workflow](../.github/workflows/homebrew.yml) stages a local archive
-of the reviewed commit, then checks compilation, CLI behavior, completions,
-and the manpage. It does not validate signing or hardware access.
-
-After publishing a compatible source tag, maintainers can prepare metadata for
-the development formula with:
-
-```sh
-python3 scripts/prepare-homebrew-release.py vMAJOR.MINOR.PATCH --license cannot_represent
-python3 scripts/test-homebrew-release.py
-```
-
-The script verifies the CLI version and computes the archive checksum. It does
-not publish anything. Review its output before committing. Keep published tags
-immutable and keep the source-only formula clearly labeled as a development tool.
+and implementation correctness; source availability is not a substitute.
+Source formulas and their release helpers have been retired. Distribute the CLI
+through the signed, notarized app bundle and generated cask described in
+[Homebrew releases](HOMEBREW.md). Ordinary macOS CI checks Swift, packaging,
+shell integration and documentation without installing a source formula.

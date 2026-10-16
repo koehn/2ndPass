@@ -33,7 +33,7 @@ extension EncryptedItemRepository {
     @Test func displayProjectionUsesOneUnwrapPerItem() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"), layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"))
         let owner = try SessionDevice(), vault = try sessionAuthority(owner: owner)
         let genesis = try MembershipEnvelope.genesis(vault: vault.id, membership: vault.membership, owner: owner)
         let history = try TrustedMembershipHistory(genesis: genesis, vault: vault.id, pinnedDigest: genesis.digest())
@@ -69,7 +69,7 @@ extension EncryptedItemRepository {
         for count in [100, 500, 1000] {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }
-            let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"), layout: .contentPreview3)
+            let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"))
             let owner = try SessionDevice(), joining = try SessionDevice(member: owner.identity.member)
             let vault = try sessionAuthority(owner: owner)
             let genesis = try MembershipEnvelope.genesis(vault: vault.id, membership: vault.membership, owner: owner)
@@ -131,7 +131,7 @@ extension EncryptedItemRepository {
     @Test(arguments: [false, true]) func preparedGrantCannotBypassLockOrAuthorityChange(lock: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"), layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"))
         let owner = try SessionDevice(), joining = try SessionDevice(member: owner.identity.member)
         let vault = try sessionAuthority(owner: owner)
         let genesis = try MembershipEnvelope.genesis(vault: vault.id, membership: vault.membership, owner: owner)
@@ -175,7 +175,7 @@ extension EncryptedItemRepository {
     @Test func enrollmentProgressRequiresMatchingGrantsAndMetadata() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"), layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"))
         let owner = try SessionDevice(), joining = try SessionDevice(member: owner.identity.member)
         let vault = try sessionAuthority(owner: owner)
         let genesis = try MembershipEnvelope.genesis(vault: vault.id, membership: vault.membership, owner: owner)
@@ -200,7 +200,7 @@ extension EncryptedItemRepository {
         _ = await sender.handle(work[0], owner: GrantBenchmarkPermit())
         let partial = try #require(await repository.enrollmentDownloadProgress(scope: scope, recipient: joining.identity.fingerprint, metadata: metadata))
         #expect(partial.ready == 1 && partial.total == 3)
-        let reopened = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"), layout: .contentPreview3)
+        let reopened = try EncryptedItemRepository(storeURL: root.appendingPathComponent("ContentPreview3/Content3.sqlite"))
         #expect(try await reopened.enrollmentDownloadProgress(scope: scope, recipient: joining.identity.fingerprint, metadata: metadata)?.ready == 1)
         for operation in work.dropFirst() { _ = await sender.handle(operation, owner: GrantBenchmarkPermit()) }
         #expect(try await reopened.enrollmentDownloadProgress(scope: scope, recipient: joining.identity.fingerprint, metadata: metadata) == nil)
@@ -214,7 +214,7 @@ extension GrantGenerationPerformanceTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("ContentPreview3/Content3.sqlite")
-        var repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        var repository = try EncryptedItemRepository(storeURL: url)
         let mac = try SessionDevice(), ipad = try SessionDevice(member: mac.identity.member)
         let oldPhone = try SessionDevice(member: mac.identity.member), newPhone = try SessionDevice(member: mac.identity.member)
         let vault = UUID(), permit = GrantBenchmarkPermit()
@@ -243,7 +243,7 @@ extension GrantGenerationPerformanceTests {
             if index == 447 {
                 // Reopen durable storage mid-cycle; never reset its journal.
                 session.lock()
-                repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+                repository = try EncryptedItemRepository(storeURL: url)
                 storage = GrantBackedContentStorage(repository: repository)
                 session = try GrantBackedContentSession(repository: repository, binding: binding, history: removed, device: SessionDevice(copying: mac))
                 #expect(try await repository.activeOperations(account: scope.account, database: scope.database).filter { $0.kind == .rotateContent }.count == 448)

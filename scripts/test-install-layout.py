@@ -52,21 +52,16 @@ if [ "${FAIL_INSTALLED:-}" = "$3" ] && [ ! -f "$3/old-version" ]; then exit 8; f
     for resource in resources:
         target = prefix / "share" / resource
         assert target.is_symlink() and target.read_text() == resource
-    # An existing signed app may still contain the previous CLI filename.
-    (installed / "Contents/MacOS/sp").rename(installed / "Contents/MacOS/2ndpass")
-    result = run()
-    assert result.returncode == 0, result.stderr
-    assert not result.stderr, result.stderr
-    assert (installed / "Contents/MacOS/sp").is_file()
-    assert not (installed / "Contents/MacOS/2ndpass").exists()
-    # Migrating the old GUI's link must never move or replace that GUI.
+    # A link into the separate GUI is a collision, never an upgrade path.
     gui = temp / "Applications/2ndPass.app"
     gui.mkdir(parents=True)
     (gui / "untouched").write_text("GUI")
     link.unlink()
     link.symlink_to("/Applications/2ndPass.app/Contents/MacOS/sp")
-    assert run().returncode == 0
+    assert run().returncode == 7
     assert (gui / "untouched").read_text() == "GUI"
+    link.unlink()
+    link.symlink_to(installed / "Contents/MacOS/sp")
     (installed / "old-version").touch()
     result = run({"FAIL_INSTALLED": str(installed)})
     assert result.returncode != 0

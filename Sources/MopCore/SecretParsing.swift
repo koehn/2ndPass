@@ -23,6 +23,7 @@ enum SecretParsing {
         }
         var references: [String: SecretReference] = [:]
         for key in environment.keys.sorted() {
+            if environment[key]?.starts(with: "mop://".utf8) == true { throw MopError.invalidReference }
             if let value = environment[key], SecretReference.prefixes.contains(where: { value.starts(with: $0.utf8) }) {
                 references[key] = try ReferenceExpansion.resolve(String(decoding: value, as: UTF8.self)) { name in
                     environment[name].map { String(decoding: $0, as: UTF8.self) }
@@ -50,6 +51,7 @@ enum SecretParsing {
                     closing = cursor; break
                 } else { cursor += 1 }
             }
+            if trim(template[start...]).starts(with: "mop://".utf8) { throw MopError.invalidTemplate }
             guard let closing else {
                 if SecretReference.prefixes.contains(where: { trim(template[start...]).starts(with: $0.utf8) }) { throw MopError.invalidTemplate }
                 break

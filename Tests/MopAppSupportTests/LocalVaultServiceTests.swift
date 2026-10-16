@@ -58,7 +58,7 @@ import MopAppSupport
 @Test func localReferencesAreRejectedBeforeCloudOrAuthentication() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let service = ItemVaultService(state: directory)
-    for operation: VaultOperation in [.catalog, .members, .sync, .export(directory), .manage(.devices), .deleteVault, .rename("other")] {
+    for operation: VaultOperation in [.catalog, .sync, .manage(.devices), .deleteVault, .rename("other")] {
         await #expect(throws: MopError.localOperationForbidden) { try await service.execute(operation, vault: "local", offline: false) }
     }
     await #expect(throws: MopError.localOperationForbidden) { try await service.execute(.create(name: "local"), vault: nil, offline: false) }

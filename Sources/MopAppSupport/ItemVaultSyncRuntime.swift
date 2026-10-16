@@ -27,12 +27,13 @@ actor ItemVaultSyncRuntime {
     private var startupRequested = false
     private var enabled = true
     private var retired = false
+    private var recoveryRecipient: String?
     nonisolated private let sessions = ItemVaultSessionRegistry()
 
     init(account: NativeItemCloudAccount, repository: EncryptedItemRepository) throws {
-        guard repository.layout == .contentPreview3 else { throw ContentStoreError.wrongLayout }
+
         self.account = account; self.repository = repository
-        trust = try KeychainItemVaultTrustStore(namespace: .contentPreview3)
+        trust = try KeychainItemVaultTrustStore()
     }
     func setSessionLoader(_ value: @escaping @Sendable (ItemVaultSetupRecord) async throws -> ItemVaultSession?) { loader = value }
     func setEnrollmentHandler(_ value: @escaping Enrollment) { enrollment = value }
@@ -49,7 +50,10 @@ actor ItemVaultSyncRuntime {
         try account.withWritePermission {}
         var result: [ItemVaultSetupRecord] = []
         for record in try trust.records(container: account.containerIdentifier, environment: account.environment, account: account.accountNamespace) {
-            if let deletion = try await repository.deletion(record.scope.repositoryScope), deletion.phase != .prepared { continue }
+            // A prepared signed deletion is already terminal intent. Its notice
+            // travels through the account coordination zone, not this content
+            // inventory; routing the deleted vault would block that notice.
+            if try await repository.deletion(record.scope.repositoryScope) != nil { continue }
             guard let receipt = try await repository.vaultInitialization(record.scope.repositoryScope) else { continue }
             guard receipt.setupID == (try record.setupID), receipt.membershipState == record.genesis else { throw MopError.vaultUntrusted }
             result.append(record)
@@ -63,8 +67,10 @@ actor ItemVaultSyncRuntime {
     private func address(_ id: UUID) -> VaultCloudAddress { VaultCloudAddress(vaultID: id, zoneName: SyncStoreLayout.contentZone(vault: id), ownerName: CKCurrentUserDefaultName) }
     @discardableResult
     func register(session: ItemVaultSession, synchronize: Bool = false) async throws -> ItemVaultSession {
-        guard let history = try history(session.binding.vaultID), session.contentSession != nil else { throw MopError.vaultUntrusted }
+        guard let history = try history(session.binding.vaultID) else { throw MopError.vaultUntrusted }
         let session = try sessions.install(session, authority: history.current.digest())
+        try await repository.saveEngineState(Data(session.contentSession.identity.fingerprint.utf8), account: account.accountNamespace,
+            database: "grant-local-recipient4:" + session.binding.vaultID.uuidString, permit: account)
         if let adapter { try await adapter.addContentAddresses([address(session.binding.vaultID)]) }
         if synchronize { try await wake(reason: .unlocked) }
         return session
@@ -122,6 +128,8 @@ actor ItemVaultSyncRuntime {
     /// Ensure one durable startup request without making every discovery a wake.
     func start() async throws {
         guard !retired else { throw CloudSyncAdapterError.accountChanged }
+        // Read-only status/discovery may reuse this context during maintenance;
+        // it must neither restart the engine nor masquerade as an account change.
         guard !startupRequested else { return }
         startupRequested = true
         Self.logger.notice("Sync trace: starting account coordinator for online discovery")
@@ -183,6 +191,8 @@ actor ItemVaultSyncRuntime {
         guard let coordinator else { return AsyncStream { $0.finish() } }
         return await coordinator.health()
     }
+    /// Explicit UI action only; migration/startup never calls this operation.
+
     private func ensureAdapter() async throws -> CloudKitSyncAdapter {
         guard enabled, !retired else { throw CloudSyncAdapterError.accountChanged }
         if let startup = adapterStartup { return try await startup.value }
@@ -192,6 +202,58 @@ actor ItemVaultSyncRuntime {
         defer { if adapterStartupID == id { adapterStartup = nil; adapterStartupID = nil } }
         return try await startup.value
     }
+    func useRecoveryRecipient(_ recipient: String) async throws {
+        recoveryRecipient = recipient
+        try await refreshTrustedAddresses()
+    }
+    func clearRecoveryRecipient() { recoveryRecipient = nil }
+
+    private func prepareGrantRouting(permit: any RepositoryWritePermit) async throws -> [String] {
+        var zones: [String] = []
+        for record in try await inventory() {
+            let scope = record.scope.repositoryScope, vault = scope.vaultID
+            if try await repository.deletion(scope) != nil { continue }
+            guard let history = try history(vault) else { throw MopError.vaultUntrusted }
+            // The account coordination zone survives vault deletion. Fetch the
+            // deterministic signed notice before touching any vault/grant zone.
+            let deletionID = CKRecord.ID(recordName: "deletion:" + vault.uuidString + ":" + vault.uuidString,
+                zoneID: CKRecordZone.ID(zoneName: SyncStoreLayout.contentCoordinationZone, ownerName: CKCurrentUserDefaultName))
+            do {
+                try permit.withWritePermission {}
+                guard try await account.validator() else { throw CloudSyncAdapterError.accountChanged }
+                let remote = try await account.container.privateCloudDatabase.record(for: deletionID)
+                guard try await account.validator() else { throw CloudSyncAdapterError.accountChanged }
+                try permit.withWritePermission {}
+                let incoming = try PreparedCoordinationRecord.materialize(remote, account: account.accountNamespace)
+                try await coordinationInbox.acceptDeletionBeforeRouting(incoming, history: history, permit: permit)
+                lock(vaultID: vault)
+                try await adapter?.removeContentAddress(address(vault))
+                AccessSyncTrace.event("verified deleted vault skipped before grant routing", detail: "vault=\(vault.uuidString)")
+                continue
+            } catch let error as CKError where error.code == .unknownItem || error.code == .zoneNotFound {
+                // Absence is not deletion. Preserve the live vault and its work.
+            }
+            try await GrantBackedContentStorage(repository: repository).initializeReadableVersions(scope: scope, history: history, permit: permit)
+            if try await repository.deletion(scope) != nil { continue }
+            var bytes = try await repository.engineState(account: account.accountNamespace, database: "grant-local-recipient4:" + vault.uuidString)
+            if bytes == nil {
+                let keyScope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vault.uuidString
+                if let identity = try DeviceKeychain.publicIdentity(scope: keyScope, member: account.memberID),
+                   history.current.membership.devices.contains(identity) {
+                    bytes = Data(identity.fingerprint.utf8)
+                    try await repository.saveEngineState(bytes!, account: account.accountNamespace,
+                        database: "grant-local-recipient4:" + vault.uuidString, permit: permit)
+                }
+            }
+            zones += try RecipientGrantZone.downloads(vault: vault,
+                devices: Set(history.current.membership.devices.map(\.fingerprint)),
+                local: bytes.flatMap { String(data: $0, encoding: .utf8) },
+                recovery: history.current.membership.offlineRecovery?.fingerprint, presentedRecovery: recoveryRecipient)
+
+        }
+        return zones
+    }
+
     private func createAdapter() async throws -> CloudKitSyncAdapter {
         if let adapter { return adapter }
         let records = try await inventory()
@@ -206,6 +268,9 @@ actor ItemVaultSyncRuntime {
             guard let self else { throw CloudSyncAdapterError.accountChanged }; try await self.discovered(addresses)
         }), authorizedWork: { [weak self] operation, permit in
             guard let self else { return .retry(.accountChanged) }; return await self.work(operation, permit: permit)
+        }, prepareGrantRouting: { [weak self] permit in
+            guard let self else { throw CloudSyncAdapterError.accountChanged }
+            return try await self.prepareGrantRouting(permit: permit)
         })
         let value = try CloudKitSyncAdapter(repository: repository, database: account.container.privateCloudDatabase,
             account: account.accountNamespace, stateNamespace: "MopContent3", leaseURL: account.leaseURL(database: "private"),
@@ -225,8 +290,14 @@ actor ItemVaultSyncRuntime {
         guard enabled, !retired else { return operations.map { _ in .retry(.authorization) } }
         do {
             try account.withWritePermission {}
+            let deleted = Set(try await repository.deletions(account: account.accountNamespace).map { $0.scope.vaultID })
+            let live = operations.filter { $0.vaultID.map { !deleted.contains($0) } ?? true }
+            guard !live.isEmpty else { return operations.map { _ in .completed } }
             let engine = try await ensureAdapter()
-            return await engine.processContentRotations(operations)
+            let results = await engine.processContentRotations(live)
+            guard results.count == live.count else { return operations.map { _ in .retry(.processing) } }
+            let byID = Dictionary(uniqueKeysWithValues: zip(live.map(\.id), results))
+            return operations.map { byID[$0.id] ?? .completed }
         } catch CloudSyncAdapterError.accountChanged {
             await stop(); return operations.map { _ in .attention(.accountChanged) }
         } catch MopError.cloudAccount {
@@ -242,6 +313,16 @@ actor ItemVaultSyncRuntime {
         guard enabled, !retired else { return .retry(.authorization) }
         do {
             try account.withWritePermission {}
+            if let vault = operation.vaultID,
+               try await repository.deletion(VaultScope(account: account.accountNamespace, vaultID: vault)) != nil {
+                switch operation.kind {
+                case .deletion, .applyIncoming: break // Drain durable inbox receipts through apply().
+                case .publishCoordination:
+                    let record = try JSONDecoder().decode(PreparedCoordinationRecord.self, from: operation.payload)
+                    if record.kind != .deletion { return .completed }
+                default: return .completed
+                }
+            }
             let engine = try await ensureAdapter()
             if [.publishItem, .grant, .publishCoordination, .removeCoordination].contains(operation.kind) {
                 try await engine.registerPendingChanges()
@@ -258,43 +339,26 @@ actor ItemVaultSyncRuntime {
                     guard let bytes = candidate.payload,
                           let envelope = try? JSONDecoder().decode(CoordinationEnvelope.self, from: bytes),
                           envelope.kind == .grantRequest else { skipped += 1; continue }
-                    if candidate.legacyReadbackUnmatched == true { skipped += 1; continue }
+                    guard candidate.operations != nil else { skipped += 1; continue }
                     do {
-                        var evidence = candidate
-                        if let record = coordinationInbox.legacyObsoleteRecord(candidate, history: try? history(envelope.scope.vault)) {
-                            AccessSyncTrace.event("quarantine readback starting", operation: operation.id, record: record.recordName)
-                            let remote = try await account.container.privateCloudDatabase.record(for: record.recordID)
-                            AccessSyncTrace.event("quarantine readback returned", operation: operation.id, record: record.recordName)
-                            let incoming = try PreparedCoordinationRecord.materialize(remote, account: account.accountNamespace)
-                            evidence = try await repository.linkLegacyQuarantine(candidate, incoming: incoming, permit: account)
-                        }
-                        if try await coordinationInbox.retireQuarantinedRequest(evidence,
+                        if try await coordinationInbox.retireQuarantinedRequest(candidate,
                             history: try? history(envelope.scope.vault), permit: account) { repaired += 1 }
                         else { skipped += 1 }
                     }
                     catch SyncJournalError.staleOperation {
                         skipped += 1
                         AccessSyncTrace.event("quarantine repair retained", operation: operation.id, detail: "reason=revisionMismatch")
-                        if candidate.operations == nil {
-                            do { try await repository.retainUnmatchedQuarantine(candidate, account: account.accountNamespace, permit: account) }
-                            catch SyncJournalError.staleOperation { }
-                        }
+
                     }
                     catch SyncJournalError.invalidOperation {
                         skipped += 1
                         AccessSyncTrace.event("quarantine repair retained", operation: operation.id, detail: "reason=evidenceMismatch")
-                        if candidate.operations == nil {
-                            do { try await repository.retainUnmatchedQuarantine(candidate, account: account.accountNamespace, permit: account) }
-                            catch SyncJournalError.staleOperation { }
-                        }
+
                     }
                     catch let error as CKError where error.code == .unknownItem {
                         skipped += 1
                         AccessSyncTrace.event("quarantine repair retained", operation: operation.id, detail: "reason=remoteRecordMissing")
-                        if candidate.operations == nil {
-                            do { try await repository.retainUnmatchedQuarantine(candidate, account: account.accountNamespace, permit: account) }
-                            catch SyncJournalError.staleOperation { }
-                        }
+
                     }
                 }
                 AccessSyncTrace.event("quarantine repair finished", operation: operation.id,
@@ -436,6 +500,11 @@ actor ItemVaultSyncRuntime {
             guard let id = String(data: operation.payload, encoding: .utf8),
                   let incoming = try await repository.incomingRecord(id: id, account: account.accountNamespace, database: "private"),
                   let vault = incoming.vaultID else { return .completed }
+            if incoming.recordType != CoordinationRecordKind.deletion.recordType,
+               try await repository.deletion(VaultScope(account: account.accountNamespace, vaultID: vault)) != nil {
+                try await repository.completeIncoming(incoming, failure: nil, permit: permit)
+                return .completed
+            }
             AccessSyncTrace.event("incoming application", operation: operation.id, record: incoming.recordName,
                 detail: "type=\(incoming.recordType)")
             if incoming.zoneName == SyncStoreLayout.contentCoordinationZone {
@@ -446,7 +515,7 @@ actor ItemVaultSyncRuntime {
                 return didApply(await GrantBackedMembershipInbox(repository: repository, trustStore: trust, record: record,
                     committed: { [weak self] history in try await self?.changedMembership(history) }).handle(operation, permit: permit))
             }
-            let comparison = (try? await unlocked(vault))?.contentSession?.comparison()
+            let comparison = (try? await unlocked(vault))?.contentSession.comparison()
             return didApply(await GrantBackedContentInbox(repository: repository, account: account.accountNamespace)
                 .handle(operation, history: history, permit: permit, comparison: comparison))
         } catch {
@@ -466,6 +535,8 @@ actor ItemVaultSyncRuntime {
     private func work(_ operation: SyncOperation, permit: any RepositoryWritePermit) async -> SyncOperationOutcome {
         do {
             guard let vault = operation.vaultID else { return .attention(.invalidAuthority) }
+            if operation.kind != .deletion,
+               try await repository.deletion(VaultScope(account: account.accountNamespace, vaultID: vault)) != nil { return .completed }
             switch operation.kind {
             case .provision:
                 return await JournaledContentProvisioner(repository: repository, trustStore: trust,
@@ -477,7 +548,7 @@ actor ItemVaultSyncRuntime {
                     else { proposed = try JSONDecoder().decode(ContentMembershipCommit.self, from: operation.payload).verified() }
                     if (try? current.state(forDigest: proposed.current.digest())) == nil,
                        proposed.orderedStates.dropLast().last != current.current {
-                        let session = try await unlocked(vault).contentSession!
+                        let session = try await unlocked(vault).contentSession
                         if try await session.reconcileMembership(operation, scope: coordinationInbox.scope(vault: vault), owner: permit) { return .retry(.dependency) }
                     }
                 }
@@ -507,7 +578,7 @@ actor ItemVaultSyncRuntime {
                     case .enrollmentRequest:
                         guard try pin(vault) != nil else { return .completed }
                         let session = try await unlocked(vault)
-                        let approval = try await session.contentSession!.prepareEnrollment(DeviceEnrollmentRequest.decode(envelope.payload),
+                        let approval = try await session.contentSession.prepareEnrollment(DeviceEnrollmentRequest.decode(envelope.payload),
                             scope: coordinationInbox.scope(vault: vault), owner: permit)
                         AccessSyncTrace.event("enrollment approval prepared", operation: approval.operationID, record: approval.recordName)
                     case .enrollmentApproval:
@@ -534,9 +605,27 @@ actor ItemVaultSyncRuntime {
                         let request = try JSONDecoder().decode(ContentGrantRequest.self, from: envelope.payload)
                         AccessSyncTrace.event("access request verified", operation: operation.id, item: request.item,
                             generation: request.keyGeneration, recipient: request.recipient, record: record.recordID.recordName)
-                        return try await GrantRequestPrerequisites(repository: repository).reconcile(request: request,
+                        let outcome = try await GrantRequestPrerequisites(repository: repository).reconcile(request: request,
                             scope: account.setupScope(vaultID: vault).binding.item(request.item), history: history, permit: permit,
-                            localRecipient: (try? session(vaultID: vault))?.contentSession?.identity.fingerprint)
+                            localRecipient: (try? session(vaultID: vault))?.contentSession.identity.fingerprint)
+                        if case .completed = outcome {
+                            let scope = try account.setupScope(vaultID: vault).binding.item(request.item)
+                            if try await repository.contentState(scope: scope)?.keyGeneration == request.keyGeneration,
+                               let content = try await repository.contentVersion(scope: scope, keyGeneration: request.keyGeneration),
+                               let grant = try await repository.contentGrants(scope: scope, keyGeneration: request.keyGeneration, recipient: request.recipient).first {
+                                // Repair only the requested immutable record. A
+                                // previous delivery receipt cannot prove that a
+                                // recipient zone still exists on the server.
+                                let upload = ContentUpload(operationID: operation.id, content: content, grant: grant, kind: .grant, systemFields: nil)
+                                try await validate(upload, authority: PublicationAuthorityChecks())
+                                let transport = NativeGrantZoneTransport(database: account.container.privateCloudDatabase, account: account.accountNamespace, validator: account.validator, permit: permit)
+                                try permit.withWritePermission {}
+                                try await transport.provision(RecipientGrantZone(vault: vault, recipient: grant.recipient).name)
+                                let receipt = try await transport.publishAndVerify(grant)
+                                try await repository.stageIncoming(receipt, permit: permit)
+                            }
+                        }
+                        return outcome
                     default: break
                     }
                 }
@@ -558,6 +647,20 @@ actor ItemVaultSyncRuntime {
                     do { _ = try await account.container.privateCloudDatabase.deleteRecordZone(withID: CKRecordZone.ID(zoneName: SyncStoreLayout.contentZone(vault: vault), ownerName: CKCurrentUserDefaultName)) }
                     catch let error as CKError where error.code == .zoneNotFound || error.code == .unknownItem { }
                     try permit.withWritePermission {}
+                    // The authenticated terminal vault-deletion notice permits
+                    // deleting all of its recipient zones, including retired
+                    // identities. Ordinary device removal never calls this.
+                    if let history = try history(vault) {
+                        let recipients = Set(history.orderedStates.flatMap { state in
+                            state.membership.devices.map(\.fingerprint) + [state.membership.offlineRecovery?.fingerprint].compactMap { $0 }
+                        })
+                        for recipient in recipients {
+                            try permit.withWritePermission {}
+                            let name = try RecipientGrantZone(vault: vault, recipient: recipient).name
+                            do { _ = try await account.container.privateCloudDatabase.deleteRecordZone(withID: CKRecordZone.ID(zoneName: name, ownerName: CKCurrentUserDefaultName)) }
+                            catch let error as CKError where error.code == .zoneNotFound || error.code == .unknownItem { }
+                        }
+                    }
                     state = try await repository.saveDeletion(scope: scope, notice: record.bytes, phase: .cloudDeleted, authorization: permit)
                 }
                 if state?.phase == .cloudDeleted {
@@ -600,7 +703,7 @@ actor ItemVaultSyncRuntime {
                 guard let recoveryWork else { return .authorization }
                 return await recoveryWork(operation, permit)
             case .prepareGrant, .rotateContent:
-                let session = try await unlocked(vault).contentSession!
+                let session = try await unlocked(vault).contentSession
                 if let recoveryGrant, let result = await recoveryGrant(operation, session, permit) { return result }
                 return await session.handle(operation, owner: permit, grantRequestScope: coordinationInbox.scope(vault: vault))
             default: return .attention(.invalidAuthority)
@@ -635,7 +738,7 @@ actor ItemVaultSyncRuntime {
              CloudSyncAdapterError.invalidBinding, CloudSyncAdapterError.malformedRecord,
              CloudSyncAdapterError.untrustedRecord, ContentStoreError.invalidRecord,
              ContentStoreError.identityCollision, SyncJournalError.invalidOperation,
-             SyncJournalError.identityCollision, ItemEnvelopeFailure.invalidRecordMutation,
+             SyncJournalError.identityCollision, ItemContentFailure.invalidRecordMutation,
              ItemRepositoryError.invalidScope, ItemRepositoryError.invalidGeneration,
              ItemRepositoryError.emptyCiphertext, ItemRepositoryError.oversizedCiphertext:
             return .attention(.invalidAuthority)
@@ -663,13 +766,13 @@ actor ItemVaultSyncRuntime {
         if let existing = try await repository.deletion(scope) { try await wake(reason: .foreground); return existing.phase }
         guard try pin(vault) != nil else { throw MopError.vaultMissing }
         let session = try await unlocked(vault)
-        try await session.contentSession!.prepareDeletion(scope: coordinationInbox.scope(vault: vault), owner: account)
+        try await session.contentSession.prepareDeletion(scope: coordinationInbox.scope(vault: vault), owner: account)
         try await wake(reason: .storeChanged)
         return .prepared
     }
     func approveEnrollment(_ request: DeviceEnrollmentRequest) async throws -> DeviceEnrollmentApproval {
         let session = try await unlocked(request.scope.vault)
-        let record = try await session.contentSession!.prepareEnrollment(request, scope: coordinationInbox.scope(vault: request.scope.vault), owner: account)
+        let record = try await session.contentSession.prepareEnrollment(request, scope: coordinationInbox.scope(vault: request.scope.vault), owner: account)
         try await wake(reason: .unlocked)
         return try DeviceEnrollmentApproval.decode(coordinationInbox.verify(record, history: history(record.vault)).payload)
     }

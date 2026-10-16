@@ -8,10 +8,6 @@ import MopKeychain
 import MopVaultNext
 import MopSync
 
-public struct VaultMemberRecord: Sendable, Identifiable {
-    public let id: String
-    public let role: String
-}
 public struct VaultDeviceRecord: Sendable, Identifiable {
     public let id: UUID
     public let name: String
@@ -22,39 +18,22 @@ public struct VaultDeviceRecord: Sendable, Identifiable {
     }
 }
 public enum VaultManagement: Sendable {
-    case requestEnrollment(name: String), restartEnrollment(name: String), cancelEnrollment, checkEnrollment, enrollmentInbox, automaticEnrollment, confirmEnrollment(code: String)
-    case approveEnrollment(id: UUID, code: String), rejectEnrollment(id: UUID)
-    case fingerprint, trust(fingerprint: String)
-    case deviceRequest
-    case inviteOwnDevice(request: Data, fingerprint: String)
-    case inviteAccount(request: Data, fingerprint: String, role: MemberRole)
-    case invite(request: Data, fingerprint: String, role: MemberRole)
-    case accept(packet: Data, checkpoint: String, shareURL: URL?)
-    case approve(packet: Data, fingerprint: String)
-    case devices, removeAccountDevice(UUID), reconnect, resetCloudAccess
-    case removeMember(UUID), removeDevice(UUID), role(UUID, MemberRole)
+    case automaticEnrollment
+    case devices, removeDevice(UUID)
     case recoveryEligibility, recoveryGenerate, recoveryStatus, recoveryRevoke, recoveryResume
-    case recoveryTestReset(copy: SecretBytes)
     case recoveryActivate(copy: SecretBytes, fingerprint: String)
     case recoveryOpen(copy: SecretBytes)
     case recoveryCatalog(UUID), recoveryRead(UUID, String), recoveryComplete(UUID), recoveryCompleteAll([UUID])
-    case reconcileShare
-    case importCheckpoint(document: Data, fingerprint: String, sharedOwner: String?)
 }
 public enum VaultOperation: Sendable {
-    case previewImport(ImportDocument, selected: Set<Int>?)
-    case commitImport(ImportDocument, selected: Set<Int>, vault: UUID, revision: String)
     case discover, catalog, passwordQuality(item: String), read(SecretReference), save(ItemEdit)
     case write(SecretReference, SecretBytes, replace: Bool), delete(SecretReference)
     case readHistory(entry: String, revision: String), restoreHistory(entry: String, revision: String), clearHistory(field: UUID, revision: String)
-    case reconcileLocalCredentials(Set<UUID>, revision: String)
-    case saveCredentialAccount(CredentialAccount, revision: String)
     case savePasswordChecks([CachedPasswordCheck], revision: String)
-    case upgradeSecurity(backup: URL, revision: String)
     case recentlyDeleted, trashItem(name: String, revision: String), restoreItem(id: UUID, revision: String)
-    case members, manage(VaultManagement), sync
+    case manage(VaultManagement), sync
     case create(name: String)
-    case rename(String), deleteVault, export(URL)
+    case rename(String), deleteVault
     /// Portable logical backup, independent of enrolled keys and cloud state.
     case exportPortable(URL)
     case restorePortable(document: Data, key: SecretBytes, name: String)
@@ -62,7 +41,7 @@ public enum VaultOperation: Sendable {
 extension VaultOperation {
     var allowsCachedRead: Bool {
         switch self {
-        case .discover, .catalog, .read, .passwordQuality, .recentlyDeleted, .readHistory, .export, .exportPortable: true
+        case .discover, .catalog, .read, .passwordQuality, .recentlyDeleted, .readHistory, .exportPortable: true
         default: false
         }
     }
@@ -97,8 +76,6 @@ public struct VaultResult: Sendable {
     public var usageVault: String?
     public var usageIdentity: ItemUsageIdentity?
     public var retainedItemIDs: Set<String>?
-    public var importPreview: ImportPreview?
-    public var importReport: ImportReport?
     public var vaults: [VaultDescriptor] = []
     public var discoveryComplete = true
     public var enrollmentProgress: [String: VaultEnrollmentProgress] = [:]
@@ -117,7 +94,6 @@ public struct VaultResult: Sendable {
     public var otpExpiresAt: Date?
     public var otpPeriod: Int?
     public var passwordQuality: [String: PasswordQuality] = [:]
-    public var members: [VaultMemberRecord] = []
     public var devices: [VaultDeviceRecord] = []
     public var deviceRemovalIncomplete = false
     public var deviceRemoved = false
@@ -133,7 +109,7 @@ public struct VaultResult: Sendable {
     }
 }
 public enum VaultServiceCapability: CaseIterable, Hashable, Sendable {
-    case enrollment, deviceRemoval, sharing, recovery, securityUpgrade, importDocuments, credentialAccounts, vaultDeletion, portableBackup, passwordCheckCache
+    case enrollment, deviceRemoval, recovery, vaultDeletion, portableBackup, passwordCheckCache
 }
 
 public enum VaultChange: Sendable {
@@ -172,6 +148,7 @@ public protocol VaultService: Sendable {
     func readLocal(_ reference: SecretReference, vault: String?, itemID: String?) async throws -> VaultResult
     func userActivity()
     func setMaintenanceActive(_ active: Bool)
+    func pendingVaultDeletionCount() async throws -> Int?
     func displayCatalog(vault: String) async throws -> VaultResult
     /// A verified, explicitly stale catalog for initial display, if available.
     func cachedCatalog(vault: String) async throws -> VaultResult?
@@ -187,6 +164,7 @@ public extension VaultService {
     }
     func userActivity() {}
     func setMaintenanceActive(_ active: Bool) {}
+    func pendingVaultDeletionCount() async throws -> Int? { nil }
     func conflicts(vault: String) async throws -> [ItemVaultConflictPreview] { [] }
     func checkConflicts(vault: String) async throws -> ItemVaultConflictCheck {
         try await ItemVaultConflictCheck(choices: conflicts(vault: vault), pending: 0)

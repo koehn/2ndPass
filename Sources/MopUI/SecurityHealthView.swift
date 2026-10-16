@@ -9,8 +9,6 @@ struct SecurityHealthView: View {
     @State private var vault = ""
     @State private var query = ""
     @State private var category: PasswordHealthKind?
-    @State private var registrations = false
-    @State private var upgrade: String?
     private var activeFindings: [PasswordHealthFinding] {
         model.healthReport.findings.filter { finding in
             model.catalogs[finding.vaultID]?.items.contains {
@@ -28,7 +26,6 @@ struct SecurityHealthView: View {
         List {
             if !model.authenticated {
                 Label("Security is locked", systemImage: "lock")
-                if model.supports(.credentialAccounts) { Button("Credential Backups") { model.openLocalVault(); registrations = true } }
                 Button("Unlock") { model.unlock() }.disabled(!model.canUnlock)
             } else {
                 Section {
@@ -71,7 +68,6 @@ struct SecurityHealthView: View {
                             }
                         }.pickerStyle(.inline)
                         Divider()
-                        if model.supports(.credentialAccounts) { Button("Credential Backups (\(backupCount))") { registrations = true } }
                     } label: {
                         HStack {
                             Text("Categories")
@@ -108,26 +104,13 @@ struct SecurityHealthView: View {
                     }
                 }
                 Section("History and backup tracking") {
-                    ForEach(model.vaults.filter { model.catalogs[$0.id]?.securityEnabled == false }) { descriptor in
-                        VStack(alignment: .leading) {
-                            Text("\(descriptor.name ?? "Vault") requires an upgrade")
-                            if model.catalogs[descriptor.id]?.canUpgradeSecurity == true {
-                                Button("Upgrade Vault…") { upgrade = descriptor.id }.disabled(model.offline || model.busy)
-                            } else { Text("Ask the vault owner to upgrade.").font(.caption) }
-                        }
-                    }
                     Text("Changing a saved password does not change it at the website. Register the replacement there, then save it here.").font(.caption)
                 }
             }
         }
         .accessibilityIdentifier("security-health-list")
         .navigationTitle("Security")
-        .sheet(isPresented: $registrations) { CredentialBackupsView(model: model) }
-        .confirmationDialog("Upgrade this vault?", isPresented: Binding(get: { upgrade != nil }, set: { if !$0 { upgrade = nil } }), titleVisibility: .visible) {
-            Button("Choose Backup Folder and Upgrade") { if let id = upgrade { model.beginSecurityUpgrade(id) }; upgrade = nil }
-        } message: {
-            Text("Older apps, CLI companions, and extensions will stop opening this vault. Update all clients first. An encrypted backup will be written and verified before the upgrade; history starts now. There is no in-place downgrade.")
-        }
+
     }
     private var selectedVaultCount: Int { vault.isEmpty ? model.vaults.count : 1 }
     private var availableVaultCount: Int { vault.isEmpty ? model.catalogs.count : model.catalogs[vault] == nil ? 0 : 1 }
@@ -150,8 +133,5 @@ struct SecurityHealthView: View {
             (vault.isEmpty || $0.vaultID == vault) && (kind == nil || $0.kinds.contains(kind!))
         }.count
     }
-    private var backupCount: Int {
-        model.catalogs.keys.filter { vault.isEmpty || $0 == vault }.flatMap { model.credentialAccounts(in: $0) }.filter { !$0.hasConfirmedAlternate }.count +
-        model.localIdentities.filter { identity in !model.catalogs.values.contains { $0.security?.accounts.contains { $0.registrations.contains { $0.localIdentityID == identity.id } } == true } }.count
-    }
+
 }

@@ -219,22 +219,15 @@ func rejectsInvalidDotenv(_ input: String) {
     #expect(throws: MopError.invalidReference) { try SecretReference(vault: "personal", relativePath: "item/%74oken") }
 }
 
-@Test func legacyReferencesResolveAlongsideSPReferences() throws {
+@Test func retiredReferencesAreRejectedBeforeExpansion() throws {
     let expected = try SecretReference("sp://personal/item/token")
-    #expect(try SecretReference("mop://personal/item/token") == expected)
-    #expect(try SecretReference("mop://personal/item/token").description == expected.description)
-    let environment = ["VAULT": SecretBytes(utf8: "personal"),
-                       "OLD": SecretBytes(utf8: "mop://${VAULT}/item/token"),
-                       "NEW": SecretBytes(utf8: "sp://${VAULT}/item/token")]
-    let references = try SecretParsing.references(in: environment)
-    #expect(references["OLD"] == expected)
-    #expect(references["NEW"] == expected)
-    let template = SecretBytes(utf8: "{{ mop://${VAULT}/item/token }} {{ sp://${VAULT}/item/token }}")
-    let placeholders = try SecretParsing.placeholders(template, variables: ["VAULT": "personal"])
-    #expect(placeholders.count == 2)
-    #expect(placeholders.allSatisfy { $0.1 == expected })
-    #expect(throws: MopError.invalidTemplate) {
-        try SecretParsing.placeholders(SecretBytes(utf8: "{{ mop://personal/item/token"), variables: [:])
+    #expect(throws: MopError.invalidReference) { try SecretReference("mop://personal/item/token") }
+    #expect(throws: MopError.invalidReference) {
+        try SecretParsing.references(in: ["VAULT": "personal", "OLD": "mop://${VAULT}/item/token"])
+    }
+    #expect(try SecretParsing.references(in: ["VAULT": "personal", "NEW": "sp://${VAULT}/item/token"])["NEW"] == expected)
+    for template in ["{{ mop://${VAULT}/item/token }}", "{{ mop://personal/item/token"] {
+        #expect(throws: MopError.invalidTemplate) { try SecretParsing.placeholders(SecretBytes(utf8: template), variables: ["VAULT": "personal"]) }
     }
     #expect(throws: MopError.invalidReference) { try SecretReference("2sp://personal/item/token") }
 }

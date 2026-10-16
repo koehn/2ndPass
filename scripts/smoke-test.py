@@ -39,18 +39,21 @@ run(['completion'], code=2, output=b'')
 run(['completion', 'unsupported'], code=2, output=b'')
 for command in ("read", "write", "list", "delete", "run", "inject", "vault", "device", "completion"):
     run([command, "--help"])
-for command in ("fingerprint", "rename", "delete", "list", "sync", "import", "export", "members", "invite", "accept", "approve", "remove-device", "remove-member", "role", "recovery", "reconcile-share"):
+for command in ("rename", "delete", "list", "sync", "backup", "restore-backup", "devices", "remove-device", "recovery"):
     run(["vault", command, "--help"])
-run(["device", "request", "--help"])
+for command in ("fingerprint", "import", "export", "members", "invite", "accept", "approve", "remove-member", "role", "reconcile-share"):
+    run(["vault", command], code=2, output=b"")
+run(["device", "request"], code=2, output=b"")
+run(["item", "import", "unused.csv"], code=2, output=b"")
 run(["vault", "init", "personal", "--recovery-file", "/unused"], code=2, output=b"")
 run(["vault", "init", "Invalid"], code=23, output=b"")
 run(["vault", "rename", "Invalid", "--vault", "personal"], code=23, output=b"")
-run(["vault", "rename", "private", "--vault", "personal", "--offline"], code=2, output=b"")
+run(["vault", "rename", "private", "--vault", "personal", "--offline"], code=8, output=b"")
 run(["vault", "delete", "--vault", "personal", "--confirm", "personal"], code=2, output=b"")
 run(["list", "--cloud-vault", str(uuid.uuid4())], code=2, output=b"")
 run(["read", "sp://v/i/f", "--vault-file", "/unused"], code=2, output=b"")
-run(["write", "sp://v/i/f", "--offline"], code=2, output=b"")
-run(["delete", "sp://v/i/f", "--offline"], code=2, output=b"")
+run(["write", "sp://v/i/f", "--offline"], code=8, output=b"")
+run(["delete", "sp://v/i/f", "--offline"], code=8, output=b"")
 run(["read", "invalid"], code=2, output=b"")
 run(["read"], code=2, output=b"")
 run(["unknown"], code=2, output=b"")
@@ -88,6 +91,10 @@ with tempfile.TemporaryDirectory(prefix="sp-smoke-") as directory:
     result = run(["run", "--env-file", str(bad), "--", "/bin/true"], code=2, output=b"")
     assert b"disposable-value-must-not-leak" not in result.stderr
     marker = root / "must-not-exist"
+    run(["run", "--", "/usr/bin/touch", str(marker)],
+        env={"TOKEN": "mop://test/item/field"}, code=2, output=b"")
+    assert not marker.exists()
+    run(["inject"], data=b"{{ mop://test/item/field }}", code=2, output=b"")
     run(["run", "--", "/usr/bin/touch", str(marker)],
         env={"TOKEN": "sp://test/item/field"}, code=8, output=b"")
     assert not marker.exists()
@@ -140,11 +147,11 @@ with tempfile.TemporaryDirectory(prefix="sp-output-smoke-") as directory:
     run(["inject", "--vault-file", str(destination), "-o", str(destination), "-f"], data=b"bad", code=2, output=b"")
     history = root / "vault.history"
     history.mkdir()
-    run(["inject", "--state-directory", str(root / "vault"), "-o", str(root / "vault" / "revision")], data=b"bad", code=15, output=b"")
+    run(["inject", "--state-directory", str(root / "vault"), "-o", str(root / "vault" / "revision")], data=b"bad", code=2, output=b"")
     state = root / "state"
     state.mkdir()
-    run(["inject", "--state-directory", str(state), "-o", str(state / "device.json")], data=b"bad", code=15, output=b"")
-    run(["inject", "--state-directory", str(state), "-o", str(state / "trust/pin.json")], data=b"bad", code=15, output=b"")
+    run(["inject", "--state-directory", str(state), "-o", str(state / "device.json")], data=b"bad", code=2, output=b"")
+    run(["inject", "--state-directory", str(state), "-o", str(state / "trust/pin.json")], data=b"bad", code=2, output=b"")
     assert destination.read_bytes() == b"second"
     assert not list(root.glob(".mop-output-*"))
 

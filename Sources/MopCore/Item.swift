@@ -123,8 +123,6 @@ public struct ItemCatalog: Codable, Sendable {
     public var usageScope: String? = nil
     public var security: VaultSecurityMetadata? = nil
     public var securityEnabled: Bool? = nil
-    public var canUpgradeSecurity: Bool? = nil
-    public var currentDeviceID: String? = nil
     public var sharingAudience: String? = nil
     public init(vault: String, revision: String, items: [VaultItem]) { self.vault = vault; self.revision = revision; self.items = items }
 }

@@ -3,7 +3,7 @@ import CryptoKit
 import MopCore
 
 /// Disposable per-item health evidence, independently signed, encrypted, and synchronized.
-public struct ItemHealthEnvelope: Codable, Equatable, Sendable {
+public struct LocalPasswordHealthEnvelope: Codable, Equatable, Sendable {
     public static func recordID(for item: UUID) -> UUID {
         let bytes = Array(SHA256.hash(data: Data(("2ndpass-item-health-id-1:" + item.uuidString).utf8)).prefix(16))
         return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -93,9 +93,9 @@ public struct ItemHealthEnvelope: Codable, Equatable, Sendable {
 
     /// Only decoding with all binding and signature checks can construct this value.
     public struct Verified: Sendable {
-        public let envelope: ItemHealthEnvelope
+        public let envelope: LocalPasswordHealthEnvelope
         private let membership: Membership
-        fileprivate init(envelope: ItemHealthEnvelope, membership: Membership) {
+        fileprivate init(envelope: LocalPasswordHealthEnvelope, membership: Membership) {
             self.envelope = envelope; self.membership = membership
         }
         public func open(device: any DeviceOperations) throws -> [CachedPasswordCheck] {

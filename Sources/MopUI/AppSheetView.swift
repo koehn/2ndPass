@@ -23,8 +23,6 @@ struct AppSheetView: View {
                 PortableBackupView(model: model, target: request.target)
             case .restoreBackup:
                 PortableBackupView(model: model, target: nil)
-            case .importItems:
-                PasswordImportView(model: model, controls: controls)
             case .createVault:
                 Text(model.vaults.isEmpty ? "Create Your First Vault" : "Create a Vault").font(.title2)
                 TextField("Vault name", text: $name)
@@ -42,8 +40,6 @@ struct AppSheetView: View {
                 }
             case .enrollDevice, .addDevice:
                 ItemEnrollmentView(model: model, approving: kind == .addDevice, target: request.target)
-            case .shareAccount:
-                Text("Sharing is not yet available for item vaults.")
             case .setupRecovery:
                 OfflineRecoveryView(model: model, recovering: false)
             case .recover:
@@ -57,7 +53,7 @@ struct AppSheetView: View {
                 Text("Delete cloud vault").font(.title2)
                 Text("Permanently delete cloud contents, history, and unsynced changes. Updated devices erase cached copies when they reconnect. Backups and older or offline clients may retain copies.")
                 Text(request.target?.name ?? "Unnamed vault").font(.headline)
-                Button("Export Backup First…") { model.chooseExportBackup(target: request.target) }.disabled(model.busy)
+                Button("Export Backup First…") { model.presentSheet(.portableBackup, target: request.target) }.disabled(model.busy)
                 Text(request.target?.id ?? "").font(.caption).textSelection(.enabled)
                 TextField("Type the vault name to confirm", text: $confirmation)
 
@@ -77,7 +73,7 @@ struct AppSheetView: View {
                     Button(title) { controls.secondarySubmit?() }.disabled(model.busy)
                 }
                 Spacer()
-                Button(submitted || [.enrollDevice, .addDevice, .setupRecovery, .recover, .shareAccount].contains(kind) ? "Close" : "Cancel") { dismissOrConfirm() }
+                Button(submitted || [.enrollDevice, .addDevice, .setupRecovery, .recover].contains(kind) ? "Close" : "Cancel") { dismissOrConfirm() }
                     .keyboardShortcut(.cancelAction)
                     .disabled(kind == .recover && model.recoveryInProgress)
                 if kind == .createVault {
@@ -99,7 +95,6 @@ struct AppSheetView: View {
             }.padding()
         }.mopSheetWidth(640)
         .interactiveDismissDisabled((dirty && !submitted) || (kind == .recover && model.recoveryInProgress))
-        .documentTransfers(model: model, inSheet: true)
         .onAppear {
             if kind == .renameVault { name = request.target?.name ?? "" }
             initialName = name
@@ -116,7 +111,6 @@ struct AppSheetView: View {
     }
     private var dirty: Bool { name != initialName || !confirmation.isEmpty || controls.dirty }
     private func dismissOrConfirm(next: AppSheet? = nil) {
-        if kind == .createVault { model.importAfterCreation = false }
         nextSheet = next
         if dirty && !submitted { confirmDiscard = true } else { finishDismissal() }
     }

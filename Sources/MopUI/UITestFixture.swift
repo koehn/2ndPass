@@ -83,10 +83,6 @@ final class UITestVaultService: VaultService, Sendable {
                 state.catalog.items.append(item)
                 state.catalog.revision = UUID().uuidString
             case .passwordQuality: return result
-            case .members: return result
-            case .manage(.requestEnrollment), .manage(.restartEnrollment), .manage(.cancelEnrollment):
-                state.authenticatedAt = ProcessInfo.processInfo.systemUptime
-                return result
             case .manage(.devices), .manage(.automaticEnrollment): return result
             case .recentlyDeleted: break
             default: throw MopError.invalidProcess

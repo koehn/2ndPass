@@ -81,6 +81,7 @@ public struct CloudCoordinationTransport: Sendable {
 }
 
 public struct CloudContentReception: Sendable {
+    public let prepareGrantRouting: (@Sendable (any RepositoryWritePermit) async throws -> [String])?
     public let coordination: CloudCoordinationTransport?
     public let publicationValidator: ContentPublicationValidator?
     public let authorizedWork: (@Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome)?
@@ -90,7 +91,9 @@ public struct CloudContentReception: Sendable {
                 dependencyAvailable: @escaping @Sendable (SyncDependency) async throws -> Bool,
                 publicationValidator: ContentPublicationValidator? = nil,
                 coordination: CloudCoordinationTransport? = nil,
-                authorizedWork: (@Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome)? = nil) {
+                authorizedWork: (@Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome)? = nil,
+                prepareGrantRouting: (@Sendable (any RepositoryWritePermit) async throws -> [String])? = nil) {
+        self.prepareGrantRouting = prepareGrantRouting
         self.coordination = coordination
         self.apply = apply; self.dependencyAvailable = dependencyAvailable
         self.publicationValidator = publicationValidator; self.authorizedWork = authorizedWork
@@ -133,8 +136,19 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     private var addresses: [String: VaultCloudAddress]
     private var pendingAddressRegistration: UUID?
     private var coordinationZoneID: CKRecordZone.ID { CKRecordZone.ID(zoneName: SyncStoreLayout.contentCoordinationZone, ownerName: CKCurrentUserDefaultName) }
+    private var recipientZoneIDs: [CKRecordZone.ID] = []
     private var receiveZoneIDs: [CKRecordZone.ID] {
-        addresses.values.map(\.zoneID) + (contentReception?.coordination == nil ? [] : [coordinationZoneID])
+        addresses.values.map(\.zoneID) + recipientZoneIDs + (contentReception?.coordination == nil ? [] : [coordinationZoneID])
+    }
+
+    private func refreshGrantRouting() async throws {
+        guard let prepare = contentReception?.prepareGrantRouting, let contentPermit else { return }
+        let names = try await prepare(contentPermit)
+        recipientZoneIDs = try names.map { name in
+            let zone = try RecipientGrantZone(name: name)
+            guard addresses.values.contains(where: { $0.vaultID == zone.vault }) else { throw CloudSyncAdapterError.invalidBinding }
+            return CKRecordZone.ID(zoneName: name, ownerName: CKCurrentUserDefaultName)
+        }
     }
 
     /// Adding independently trusted addresses updates the existing engine. Cloud
@@ -165,11 +179,12 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     public func removeContentAddress(_ address: VaultCloudAddress) async throws {
         guard contentReception != nil, address.zoneName == SyncStoreLayout.contentZone(vault: address.vaultID) else { throw CloudSyncAdapterError.invalidBinding }
         addresses.removeValue(forKey: address.storageKey)
+        recipientZoneIDs.removeAll { ContentZoneRouting.belongs($0, to: address) }
         if let engine {
-            let changes = engine.state.pendingRecordZoneChanges.filter {
-                switch $0 { case .saveRecord(let id), .deleteRecord(let id): return id.zoneID == address.zoneID; @unknown default: return false }
-            }
+            let changes = engine.state.pendingRecordZoneChanges.filter { ContentZoneRouting.belongs($0, to: address) }
+            let zones = engine.state.pendingDatabaseChanges.filter { ContentZoneRouting.belongs($0, to: address) }
             engine.state.remove(pendingRecordZoneChanges: changes)
+            engine.state.remove(pendingDatabaseChanges: zones)
         }
     }
 
@@ -214,9 +229,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
               Set(addresses.map { $0.ownerName + ":" + $0.zoneName }).count == addresses.count else {
             throw CloudSyncAdapterError.invalidBinding
         }
-        guard repository.layout == .contentPreview3 else {
-            throw ContentStoreError.wrongLayout
-        }
+
         do {
             guard database.databaseScope == .private,
                   addresses.allSatisfy({ $0.zoneName == SyncStoreLayout.contentZone(vault: $0.vaultID) }) else {
@@ -275,16 +288,33 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         configuration.subscriptionID = SyncStoreLayout.contentSubscriptionID
         lease = acquired
         if contentReception != nil { contentPermit = ConflictPublicationPermit(lease: acquired, authorization: accountAuthorization) }
+        try await refreshGrantRouting()
+        let deletedAddresses = try await repository.deletions(account: account).map {
+            VaultCloudAddress(vaultID: $0.scope.vaultID, zoneName: SyncStoreLayout.contentZone(vault: $0.scope.vaultID), ownerName: $0.scope.zoneOwner)
+        }
         let startedEngine = CKSyncEngine(configuration)
+        // Scrub restored transport work before yielding to any engine callback.
+        // Keep the account coordination zone and its signed deletion notices.
+        for address in deletedAddresses {
+            addresses.removeValue(forKey: address.storageKey)
+            recipientZoneIDs.removeAll { ContentZoneRouting.belongs($0, to: address) }
+            startedEngine.state.remove(pendingRecordZoneChanges: startedEngine.state.pendingRecordZoneChanges.filter { ContentZoneRouting.belongs($0, to: address) })
+            startedEngine.state.remove(pendingDatabaseChanges: startedEngine.state.pendingDatabaseChanges.filter { ContentZoneRouting.belongs($0, to: address) })
+        }
         engine = startedEngine
         Self.logger.notice("Sync trace: engine created; checkpointRestored=\(state != nil) zones=\(self.addresses.count) automaticallySync=\(automaticallySync)")
         if contentReception?.coordination != nil { startedEngine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: coordinationZoneID))]) }
         do {
-            if let coordination = contentReception?.coordination,
-               try await repository.engineState(account: account, database: stateNamespace + ":inventory") == nil {
+            // A restored checkpoint is not a current inventory. Zone-scoped
+            // fetches need not rediscover vaults created since this device last
+            // participated. Refresh routing hints once per engine startup; this
+            // lists zone metadata only, never other recipients' grant records.
+            if let coordination = contentReception?.coordination {
                 let zones = try await database.allRecordZones()
                 try await validateAccount(generation: expectedGeneration)
-                try await coordination.discovered(Self.contentAddressHints(zones.map(\.zoneID)))
+                let hints = Self.contentAddressHints(zones.map(\.zoneID))
+                try await coordination.discovered(hints)
+                Self.logger.notice("Sync trace: cloud vault inventory refreshed; candidates=\(hints.count)")
                 try await validateAccount(generation: expectedGeneration)
                 try await repository.saveEngineState(Data([1]), account: account, database: stateNamespace + ":inventory")
             }
@@ -365,6 +395,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         try await validateAccount(generation: expectedGeneration)
         guard self.engine === engine else { throw CloudSyncAdapterError.operationInterrupted }
         try Task.checkCancellation()
+        // Refresh BEFORE constructing the explicit scope. The delegate can
+        // narrow that scope but cannot add an identity absent from it.
+        try await refreshGrantRouting()
+        guard self.engine === engine, expectedGeneration == identityGeneration else { throw CloudSyncAdapterError.operationInterrupted }
         let pendingCount = try await repository.pendingScopes(account: account).count
         let conflictCount = try await repository.conflictedScopes(account: account).count
         Self.logger.notice("Sync trace: fetch starting; zones=\(self.addresses.count) pendingItems=\(pendingCount) conflicts=\(conflictCount) uploadsAllowed=\(self.uploadsAllowed)")
@@ -408,6 +442,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         }
             guard let engine else { throw CloudSyncAdapterError.engineNotStarted }
             let expected = identityGeneration
+            try await refreshGrantRouting()
             let candidates = try await repository.contentPublications(account: account)
             guard expected == identityGeneration, self.engine === engine, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
             let coordination = contentReception?.coordination == nil ? [] : try await repository.coordinationPublications(account: account)
@@ -423,6 +458,8 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             if ids != registered {
                 Self.logger.notice("Sync trace: upload registration; contentCandidates=\(candidates.count) coordinationCandidates=\(coordination.count) untrustedZoneCandidates=\(candidates.filter { address(for: $0.scope) == nil }.count) added=\(ids.subtracting(registered).count) removed=\(registered.subtracting(ids).count)")
             }
+            let grantZones = Set(candidates.filter { $0.grant != nil && address(for: $0.scope) != nil }.map { $0.recordID.zoneID })
+            engine.state.add(pendingDatabaseChanges: grantZones.map { .saveZone(CKRecordZone(zoneID: $0)) })
             engine.state.add(pendingRecordZoneChanges: ids.subtracting(registered).map { .saveRecord($0) })
             engine.state.remove(pendingRecordZoneChanges: registered.subtracting(ids).map { .saveRecord($0) })
 
@@ -491,6 +528,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 do { try await receiveBatch(changes.modifications.map(\.record)) }
                 catch let error as CloudSyncAdapterError { suspend(error); throw error }
                 catch { suspend(cloudSyncFailure(error, fallback: .storageFailure)); throw error }
+                for deletion in changes.deletions where deletion.recordType == ContentRecordKind.grant.rawValue {
+                    if let zone = try? RecipientGrantZone(name: deletion.recordID.zoneID.zoneName),
+                       let address = try? ContentRecordAddress(recordType: deletion.recordType,
+                            zone: deletion.recordID.zoneID.zoneName, record: deletion.recordID.recordName) {
+                        try await repairGrantDestination(deletion.recordID.zoneID, zone: zone, identifier: address.identity)
+                    }
+                }
                 for deletion in changes.deletions where deletion.recordType == NativeVaultProvisioningTransport.recordType {
                     try await validateAccount(generation: expectedGeneration)
                     try await blockZone(deletion.recordID.zoneID)
@@ -507,6 +551,15 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                     lastFailure = .unexpectedRemoteDeletion
                 }
             case .didFetchRecordZoneChanges(let completion):
+                if let error = completion.error, error.code == .zoneNotFound || error.code == .userDeletedZone,
+                   let zone = try? RecipientGrantZone(name: completion.zoneID.zoneName) {
+                    try await repairGrantDestination(completion.zoneID, zone: zone)
+                }
+                if completion.error == nil, recipientZoneIDs.contains(completion.zoneID), let contentPermit {
+                    try await validateAccount(generation: expectedGeneration)
+                    try await repository.saveEngineState(Data([1]), account: account,
+                        database: "grant-initial-fetch4:" + completion.zoneID.zoneName, permit: contentPermit)
+                }
                 if contentReception != nil, completion.error == nil,
                    let address = addresses.values.first(where: { $0.zoneID == completion.zoneID }), let contentPermit {
                     try await validateAccount(generation: expectedGeneration)
@@ -556,7 +609,12 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                         guard expectedGeneration == identityGeneration, engine === syncEngine, !suspended else {
                             throw CloudSyncAdapterError.operationInterrupted
                         }
-                        try await receive(remote)
+                        if failure.record.recordType == ContentRecordKind.grant.rawValue {
+                            let sent = try ContentRecordTransport.materialize(failure.record, account: account)
+                            let fetched = try ContentRecordTransport.materialize(remote, account: account)
+                            guard sent.bytes == fetched.bytes else { throw ContentStoreError.identityCollision }
+                            try await acknowledge(remote)
+                        } else { try await receive(remote) }
                     } else if failure.error.code == .unknownItem || failure.error.code == .zoneNotFound {
                         try await blockZone(failure.record.recordID.zoneID)
                         lastFailure = .unexpectedRemoteDeletion
@@ -618,6 +676,8 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                                         syncEngine: CKSyncEngine) async -> CKSyncEngine.FetchChangesOptions {
         guard engine === syncEngine, !suspended else { return .init(scope: .zoneIDs([])) }
         var options = context.options
+        do { try await refreshGrantRouting() } catch { return .init(scope: .zoneIDs([])) }
+        guard engine === syncEngine, !suspended, !stopping else { return .init(scope: .zoneIDs([])) }
         options.scope = .zoneIDs(receiveZoneIDs.filter { context.options.scope.contains($0) })
         return options
     }
@@ -999,7 +1059,15 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     }
 
     private func acknowledge(_ record: CKRecord) async throws {
-        try await receive(record)
+        if record.recordType == ContentRecordKind.grant.rawValue {
+            try await validateAccount(generation: identityGeneration)
+            // A send receipt is targeted evidence, not a subscription to the
+            // recipient's history. Apply the normal strict inbox verification.
+            guard let contentPermit else { throw CloudSyncAdapterError.engineNotStarted }
+            let incoming = try ContentRecordTransport.materialize(record, account: account)
+            guard addresses.values.contains(where: { $0.vaultID == incoming.vaultID && $0.ownerName == incoming.zoneOwner }) else { throw CloudSyncAdapterError.invalidBinding }
+            try await repository.stageIncoming(incoming, permit: contentPermit)
+        } else { try await receive(record) }
     }
 
     private func checkSuspension() throws {
@@ -1055,7 +1123,21 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         else { try checkSuspension() }
     }
 
+    private func repairGrantDestination(_ id: CKRecordZone.ID, zone: RecipientGrantZone, identifier: String? = nil) async throws {
+        guard let contentPermit, let engine,
+              let address = addresses.values.first(where: { $0.vaultID == zone.vault && $0.ownerName == id.ownerName }) else { return }
+        try await validateAccount(generation: identityGeneration)
+        let scope = VaultScope(account: account, vaultID: zone.vault, database: databaseName, zoneOwner: address.ownerName)
+        try await repository.invalidateGrantDestination(scope: scope, recipient: zone.recipient, identifier: identifier, permit: contentPermit)
+        if identifier == nil { engine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: id))]) }
+        _ = try await repository.requestSync(account: account, database: databaseName, reason: .manual)
+    }
+
     private func blockZone(_ zone: CKRecordZone.ID) async throws {
+        if let recipient = try? RecipientGrantZone(name: zone.zoneName) {
+            try await repairGrantDestination(zone, zone: recipient)
+            return
+        }
         for address in addresses.values where address.zoneID == zone {
             let scope = VaultScope(account: account, vaultID: address.vaultID, database: databaseName, zoneOwner: address.ownerName)
             // A newly created vault may be discovered locally before its
@@ -1095,6 +1177,5 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             }
         }
     }
-
 
 }

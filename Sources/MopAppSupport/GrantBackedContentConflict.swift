@@ -12,11 +12,12 @@ extension GrantBackedContentSession {
         return value
     }
     func conflictPreview(_ expected: EncryptedItemConflict) async throws -> ItemVaultConflictPreview {
+        try permit.check()
         _ = try await repository.reviewedContentConflict(expected)
         let local = try conflictContent(expected.local), remote = try conflictContent(expected.remote)
-        func catalog(_ content: ContentEnvelope) async throws -> ItemEnvelopeCatalog {
+        func catalog(_ content: ContentEnvelope) async throws -> ItemContentCatalog {
             if content.header.item == ItemVaultSession.metadataRecordID {
-                return ItemEnvelopeCatalog(item: VaultItem(name: "Vault settings", fields: []), references: [:])
+                return ItemContentCatalog(item: VaultItem(name: "Vault settings", fields: []), references: [:])
             }
             if content.header.isTombstone {
                 let other = content.header.version == local.header.version ? remote : local
@@ -29,7 +30,7 @@ extension GrantBackedContentSession {
                             item: other.header.item, componentNames: Set(other.components.keys)).item.name
                     }
                 }
-                return ItemEnvelopeCatalog(item: VaultItem(name: name, fields: []), references: [:])
+                return ItemContentCatalog(item: VaultItem(name: name, fields: []), references: [:])
             }
             let grant = try await grant(for: content)
             return try permit.withDevice { device in
@@ -37,19 +38,27 @@ extension GrantBackedContentSession {
                     history: history, device: device), item: content.header.item, componentNames: Set(content.components.keys))
             }
         }
-        return try await ItemVaultConflictPreview(conflict: expected, local: catalog(local), remote: catalog(remote))
+        let name = await ItemVaultSession.editingDeviceName()
+        let preview = try await ItemVaultConflictPreview(conflict: expected, local: catalog(local), remote: catalog(remote),
+            localAuthorName: local.header.author == identity.fingerprint ? name : nil,
+            remoteAuthorName: remote.header.author == identity.fingerprint ? name : nil)
+        try permit.check()
+        return preview
     }
     func revealConflict(_ expected: EncryptedItemConflict, side: ItemVaultConflictSide, recordID: String) async throws -> SecretBytes {
+        try permit.check()
         _ = try await repository.reviewedContentConflict(expected)
         let content = try conflictContent(side == .local ? expected.local : expected.remote), grant = try await grant(for: content)
         return try permit.withDevice { try content.open(component: recordID, grant: grant, history: history, device: $0) }
     }
     func isDuplicateConflict(_ expected: EncryptedItemConflict) async throws -> Bool {
+        try permit.check()
         _ = try await repository.reviewedContentConflict(expected)
         return try await comparison().identical(conflictContent(expected.local), conflictContent(expected.remote))
     }
-    private func prepareConflictResolution(_ expected: EncryptedItemConflict, catalog: ItemEnvelopeCatalog,
+    private func prepareConflictResolution(_ expected: EncryptedItemConflict, catalog: ItemContentCatalog,
                                           changedRecords: [String: SecretBytes], removedRecords: Set<String>) async throws -> PreparedContentPublication {
+        try permit.check()
         _ = try await repository.reviewedContentConflict(expected)
         let local = try conflictContent(expected.local), remote = try conflictContent(expected.remote)
         var values: [String: SecretBytes]
@@ -71,7 +80,7 @@ extension GrantBackedContentSession {
         return try GrantBackedContentStorage.prepare(resolved, scope: expected.local.scope, history: history)
 
     }
-    func queueConflictChoice(_ expected: EncryptedItemConflict, catalog: ItemEnvelopeCatalog?,
+    func queueConflictChoice(_ expected: EncryptedItemConflict, catalog: ItemContentCatalog?,
                              changedRecords: [String: SecretBytes] = [:], removedRecords: Set<String> = []) async throws {
         try permit.check()
         if let pending = try await repository.pendingContentConflictDecision(expected) {
@@ -81,6 +90,7 @@ extension GrantBackedContentSession {
         let replacement: PreparedContentPublication?
         if let catalog { replacement = try await prepareConflictResolution(expected, catalog: catalog, changedRecords: changedRecords, removedRecords: removedRecords) }
         else {
+            try permit.check()
             _ = try await repository.reviewedContentConflict(expected)
             try conflictContent(expected.remote).verifyForPublication(history: history)
             replacement = nil

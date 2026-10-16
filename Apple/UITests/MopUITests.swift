@@ -93,8 +93,8 @@ import XCTest
         app.launchEnvironment["MOP_UI_TESTING"] = "1"
         app.launchEnvironment["MOP_UI_ENROLLMENT"] = "1"
         app.launch()
-        XCTAssertTrue(app.staticTexts["Connecting securely…"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.buttons["Unlock to Connect"].exists)
+        XCTAssertTrue(app.buttons["Unlock 2ndPass"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["Unlock to Connect"].exists)
         XCTAssertFalse(app.textFields["Item search"].exists)
     }
 
@@ -295,15 +295,21 @@ import XCTest
 
     func testVaultSettingsAndFieldActions() {
         let app = launch()
-        openItems(app)
-        app.buttons["Vault Details"].firstMatch.tap()
-        XCTAssertTrue(app.buttons["Export Encrypted Backup…"].waitForExistence(timeout: 5), app.debugDescription)
+        // Compact navigation starts in All Items; return to the vault sidebar.
+        let back = app.buttons["BackButton"]
+        if back.waitForExistence(timeout: 5) { back.tap() }
+        let vault = app.staticTexts["personal"].firstMatch
+        let sidebar = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'sidebar'")).firstMatch
+        if !vault.isHittable, sidebar.exists { sidebar.tap() }
+        XCTAssertTrue(vault.waitForExistence(timeout: 10), app.debugDescription)
+        vault.press(forDuration: 1)
+        app.buttons["Vault Details…"].tap()
+        XCTAssertTrue(app.buttons["Export Portable Backup…"].waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertTrue(app.buttons["Rename Vault…"].exists)
         let settingsImage = XCTAttachment(screenshot: app.screenshot())
         settingsImage.name = "Vault Details"; settingsImage.lifetime = .keepAlways
         add(settingsImage)
-        app.buttons["Back to Items"].tap()
-        if app.buttons["Back"].exists { app.buttons["Back"].tap() }
+        app.buttons["Done"].firstMatch.tap()
         openItems(app)
         app.staticTexts["Example Login"].firstMatch.tap()
         let actions = app.buttons["Actions for password"]
@@ -421,21 +427,6 @@ import XCTest
         XCTAssertFalse(alert.waitForExistence(timeout: 3))
         XCTAssertFalse(app.buttons["Reset Connection"].exists)
     }
-    func testTrustFailureDoesNotAutomaticallyRetry() {
-        let app = XCUIApplication()
-        app.launchEnvironment["MOP_UI_TESTING"] = "1"
-        app.launchEnvironment["MOP_UI_VAULT_TRUST_FAILURE"] = "1"
-        app.launch()
-        let alert = app.alerts["Operation not completed"]
-        XCTAssertTrue(alert.waitForExistence(timeout: 10))
-        alert.buttons["OK"].tap()
-        app.buttons["Settings"].firstMatch.tap()
-        XCTAssertTrue(app.descendants(matching: .any)["inactivity-timeout"].firstMatch.waitForExistence(timeout: 5), app.debugDescription)
-        app.buttons["Done"].tap()
-        XCUIDevice.shared.press(.home)
-        app.activate()
-        XCTAssertFalse(alert.waitForExistence(timeout: 3))
-    }
     func testSettingsAndTemporarySystemInterruption() {
         let app = launch()
         openItems(app)
@@ -486,8 +477,8 @@ extension MopUITests {
         XCTAssertTrue(alert.waitForExistence(timeout: 10))
         XCTAssertTrue(alert.staticTexts.matching(NSPredicate(format: "label CONTAINS 'no usable enrolled hardware identity'")).firstMatch.exists)
         alert.buttons["OK"].tap()
-        app.buttons["Settings"].firstMatch.tap()
-        app.buttons["Done"].tap()
+        XCTAssertTrue(app.buttons["Unlock 2ndPass"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Settings"].exists)
         XCUIDevice.shared.press(.home)
         app.activate()
         XCTAssertFalse(alert.waitForExistence(timeout: 3))
@@ -508,10 +499,10 @@ extension MopUITests {
         app.activate()
         XCTAssertTrue(field.waitForExistence(timeout: 5))
         XCTAssertEqual(field.value as? String, editedValue)
-        XCTAssertTrue(app.secureTextFields["password value"].exists)
+        XCTAssertTrue(app.textFields["password value"].exists)
         app.buttons["Lock"].firstMatch.tap()
         XCTAssertFalse(field.exists)
-        let unlock = app.buttons["Unlock"].firstMatch
+        let unlock = app.buttons["Unlock 2ndPass"].firstMatch
         XCTAssertTrue(unlock.waitForExistence(timeout: 5))
         unlock.tap()
         XCTAssertTrue(app.staticTexts["Example Login"].firstMatch.waitForExistence(timeout: 5))
@@ -570,8 +561,8 @@ extension MopUITests {
         app.launchEnvironment["MOP_UI_TESTING"] = "1"
         app.launchEnvironment["MOP_UI_ENROLLMENT"] = "1"
         app.launch()
-        XCTAssertTrue(app.staticTexts["Connecting securely…"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.buttons["Unlock to Connect"].exists)
+        XCTAssertTrue(app.buttons["Unlock 2ndPass"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["Unlock to Connect"].exists)
         XCTAssertFalse(app.textFields["Item search"].exists)
     }
 

@@ -97,7 +97,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             catch MopError.cloudAccount { account = try await NativeItemCloudAccount.connect() }
         }
         let root = account.directory
-        let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
         let runtime = try ItemVaultSyncRuntime(account: account, repository: repository)
         let context = Context(account: account, repository: repository, runtime: runtime, recovery: try ContentRecoveryCoordinator(account: account, repository: repository, runtime: runtime))
         let accepted = state.withLock { value in
@@ -116,7 +116,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             }
         }
         state.withLock { $0.changePump = pump }
-        try await runtime.setSessionLoader { [weak self] record in
+        await runtime.setSessionLoader { [weak self] record in
             guard let self else { return nil }
             return try await self.loadWithoutPrompt(record, account: account, repository: repository)
         }
@@ -146,9 +146,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         guard let context = state.withLock({ $0.context }) else { return nil }
         return try? await context.runtime.session(vaultID: vaultID)
     }
-    public func invalidateDiscovery() {
 
-    }
     public var vaultDeletionAvailable: Bool {
         guard let configuration = try? SigningIdentity.cloudConfiguration() else { return false }
         if configuration.environment == "Development" { return true }
@@ -164,7 +162,6 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         let scope = try context.account.setupScope(vaultID: vaultID)
         if try await context.repository.deletion(scope.repositoryScope) == nil { _ = try await open(vaultID) }
         let phase = try await context.runtime.deleteVault(vaultID)
-        invalidateDiscovery()
         return phase
     }
     public func deletionStates() async throws -> [UUID: VaultDeletionPhase] {
@@ -253,7 +250,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                 if let existing = try? await context.runtime.session(vaultID: id), existing.isUnlocked { session = existing }
                 else {
                     let device = try await device(context, vaultID: id, create: false)
-                    let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: record.scope, device: device)
+                    let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: record.scope, device: device)
                     session = try await context.runtime.register(session: bootstrap.open(), synchronize: !offline)
                 }
                 if try await session.vaultMetadata().value.name == name { matches.append(id) }
@@ -278,8 +275,9 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     private func enrollment(_ action: VaultManagement, vaultID: UUID, allowPrompt: Bool) async throws -> VaultResult {
         let context = try await serialized { try await self.connected() }
         var result = VaultResult()
+
         if case .removeDevice(let id) = action {
-            let session = try await open(vaultID), content = session.contentSession!
+            let session = try await open(vaultID), content = session.contentSession
             let current = content.history.current.membership
             guard let member = current.accounts.first, current.accounts.count == 1,
                   member.devices.count > 1, member.devices.contains(where: { $0.device == id }) else { throw MopError.cloudPermission }
@@ -300,7 +298,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             return result
         }
         switch action {
-        case .automaticEnrollment, .requestEnrollment, .checkEnrollment: break
+        case .automaticEnrollment: break
         default: throw ItemVaultServiceFailure.unavailable
         }
         if try await context.repository.vaultInitialization(context.account.setupScope(vaultID: vaultID).repositoryScope) != nil {
@@ -324,14 +322,14 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             guard let request = requests.first(where: { $0.id == approval.request.id }) else { return }
             guard approval.request == request else { throw MopError.vaultUntrusted }
             let provider = try await device(context, vaultID: vault, create: false, allowPrompt: allowPrompt)
-            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3),
+            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(),
                 scope: context.account.setupScope(vaultID: vault), device: provider)
             var session = try await bootstrap.acceptContentEnrollment(approval: approval, request: request)
             do {
                 try checkEnrollment(context, generation: generation, requireAuthorization: true)
                 session = try await context.runtime.register(session: session, synchronize: true)
                 let acknowledgment = EnrollmentAcknowledgment(request: request.id, approvalDigest: setupHash(record.bytes))
-                _ = try await session.contentSession!.coordination(kind: .enrollmentAcknowledgment, scope: scope, identity: request.id,
+                _ = try await session.contentSession.coordination(kind: .enrollmentAcknowledgment, scope: scope, identity: request.id,
                     payload: setupEncode(acknowledgment), owner: permit)
             } catch { session.invalidate(); throw error }
             return
@@ -408,7 +406,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             if let session = try? await context.runtime.session(vaultID: vaultID), session.isUnlocked { return session }
             let scope = try context.account.setupScope(vaultID: vaultID)
             if let deletion = try await context.repository.deletion(scope.repositoryScope), deletion.phase != .prepared { throw VaultDeletionFailure.deleted }
-            let trust = try KeychainItemVaultTrustStore(namespace: .contentPreview3)
+            let trust = try KeychainItemVaultTrustStore()
             guard try trust.load(scope: scope) != nil else { throw MopError.vaultMissing }
             let device = try await device(context, vaultID: vaultID, create: false)
             let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: trust, scope: scope, device: device)
@@ -424,14 +422,14 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             guard !recoveryConfiguration.incomplete else { throw ItemRecoveryFailure.configurationBusy }
             guard try await context.repository.deletion(scope.repositoryScope) == nil else { throw VaultDeletionFailure.deleted }
             let device = try await device(context, vaultID: id, create: true)
-            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: scope, device: device, recovery: recoveryConfiguration.active)
+            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: scope, device: device, recovery: recoveryConfiguration.active)
             var session: ItemVaultSession
             if let archiveData, let recoveryKey { session = try await bootstrap.restore(archiveData: archiveData, recoveryKey: recoveryKey, name: name) }
             else if archiveData == nil, recoveryKey == nil { session = try await bootstrap.create(name: name) }
             else { throw PortableArchiveFailure.invalid }
             do {
                 session = try await context.runtime.register(session: session, synchronize: true)
-                _ = try await session.contentSession!.coordination(kind: .discovery, scope: enrollmentScope(context.account, vaultID: id),
+                _ = try await session.contentSession.coordination(kind: .discovery, scope: enrollmentScope(context.account, vaultID: id),
                     identity: id, payload: Data(id.uuidString.utf8), owner: context.account)
             }
             catch {
@@ -517,7 +515,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         }) else { return nil }
         try account.withWritePermission {}
         let device = try openDevice(account, vaultID: record.scope.binding.vaultID, context: snapshot.1.context, create: false)
-        let bootstrap = try ItemVaultBootstrap(repository: repository, trustStore: KeychainItemVaultTrustStore(namespace: .contentPreview3), scope: record.scope, device: device)
+        let bootstrap = try ItemVaultBootstrap(repository: repository, trustStore: KeychainItemVaultTrustStore(), scope: record.scope, device: device)
         let session = try await bootstrap.open()
         guard state.withLock({ $0.generation == snapshot.0 }) else { session.lock(); return nil }
         return session
@@ -559,7 +557,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             var removals: [SyncOperation] = []
             for record in records {
                 let session = try await open(record.scope.binding.vaultID)
-                guard let content = session.contentSession else { throw MopError.vaultUntrusted }
+                let content = session.contentSession
                 let current = content.history.current.membership, id = try session.currentDeviceID
                 let membership = try DebugEnrollmentResetFailure.removing(id, from: current)
                 removals.append(try await content.prepareMembership(membership, owner: context.account))
@@ -608,7 +606,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         // Recheck pending work inside the clearing transaction before deleting keys.
         // The durable manifest makes a crash during subsequent Keychain cleanup resumable.
         try await context.repository.debugClearEnrollmentStore(authorization: context.account)
-        let trust = try KeychainItemVaultTrustStore(namespace: .contentPreview3)
+        let trust = try KeychainItemVaultTrustStore()
         for scope in reset.scopes {
             let vault = scope.binding.vaultID
             let keyScope = context.account.containerIdentifier + "/" + context.account.environment + "/content3/" + reset.account + "/" + vault.uuidString

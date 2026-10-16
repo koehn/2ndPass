@@ -56,7 +56,7 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
 @Test func contentMembershipRecoversLostAcknowledgmentWhileLockedWithoutRewritingItems() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("mop-content-membership-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let trust = MemoryItemInventory(), owner = try SessionDevice()
     let scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development",
         binding: ItemVaultBinding(account: "content-membership", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
@@ -140,7 +140,7 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
 @Test func contentMembershipInboxPinsOnlyACommittedHeadAndReplaysOutOfOrder() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("membership-inbox-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let owner = try SessionDevice(), one = try SessionDevice(member: owner.identity.member), two = try SessionDevice(member: owner.identity.member)
     let trust = MemoryItemInventory(), scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development",
         binding: ItemVaultBinding(account: "membership-inbox", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
@@ -196,7 +196,7 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
 @Test func concurrentSessionLoadsReuseAuthorityWithoutLockingForegroundSession() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root), layout: .contentPreview3)
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
     let owner = try SessionDevice(), trust = MemoryItemInventory()
     let scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development",
         binding: ItemVaultBinding(account: "session-reuse", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
@@ -225,14 +225,14 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
             devices: [owner.identity, added.identity])]), owner: owner)
     var newer = history
     try newer.append(successor)
-    let changed = try ItemVaultSession(repository: repository, binding: scope.binding, history: newer,
+    let changed = try await currentTestSession(repository: repository, binding: scope.binding, history: newer,
         device: SessionDevice(copying: owner))
     #expect(try registry.install(changed, authority: successor.digest()) === changed)
     #expect(!next.isUnlocked && changed.isUnlocked)
     #expect(changed.displayContinuityID == next.displayContinuityID)
     #expect(changed.isAuthorized(by: newer))
     #expect(try await changed.vaultMetadata().value.name == "test")
-    let stale = try ItemVaultSession(repository: repository, binding: scope.binding, history: history,
+    let stale = try await currentTestSession(repository: repository, binding: scope.binding, history: history,
         device: SessionDevice(copying: owner))
     #expect(throws: CloudSyncAdapterError.untrustedRecord) { try registry.install(stale, authority: successor.digest()) }
     #expect(registry.get(scope.binding.vaultID) === changed && changed.isUnlocked)

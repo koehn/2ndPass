@@ -44,13 +44,13 @@ import MopSync
     let scope = ItemScope(account: "same-account", vaultID: UUID(), itemID: UUID())
     for (index, directory) in [development, production, otherContainer].enumerated() {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
-        #expect(try await repository.item(scope) == nil)
-        _ = try await repository.commitLocalMutation(EncryptedItemVersion(scope: scope, baseVersionID: nil, ciphertext: Data([UInt8(index)])))
+        let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
+        #expect(try await repository.engineState(account: scope.account, database: "namespace-test") == nil)
+        try await repository.saveEngineState(Data([UInt8(index)]), account: scope.account, database: "namespace-test")
     }
     for (index, directory) in [development, production, otherContainer].enumerated() {
-        let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite"))
-        #expect(try await repository.item(scope)?.ciphertext == Data([UInt8(index)]))
+        let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
+        #expect(try await repository.engineState(account: scope.account, database: "namespace-test") == Data([UInt8(index)]))
     }
     #expect(throws: MopError.signing) { try AppStorageLocation.itemSyncDirectory(root: root, container: "", environment: "Production") }
     #expect(throws: MopError.signing) { try AppStorageLocation.itemSyncDirectory(root: root, container: "iCloud.example", environment: "unknown") }

@@ -1,9 +1,13 @@
-# Import and restore
+# Document import requirements and supported restore
 
-General password-manager document import is not connected to the current vault service. CSV, Bitwarden JSON and 1Password 1PUX parsers exist in the source, but their presence does not make application import available. See [import mappings](IMPORT-MAPPINGS.md) for parser details, not a supported end-to-end workflow.
+General CSV, JSON and 1PUX document import is unimplemented. Its parsers, planning
+models, UI and commands have been removed. The [mapping requirements](IMPORT-MAPPINGS.md)
+remain a future design reference; they are not evidence of an implemented feature.
 
-The supported restore path uses an encrypted portable archive and its separate generated key. See [backup and restore](BACKUPS.md) for dry-run validation, resumable restore IDs, preservation rules and limits. Restoring creates an independent owned vault; connecting another device uses automatic same-account enrollment instead.
+Portable archive v2 restore is supported and creates an independent owned vault.
+See [backups](BACKUPS.md). Automatic same-account enrollment connects another device
+to an existing vault. SSH file import and explicit text-key conversion remain
+supported separately; see [cloud credentials](CLOUD-KEY-CREDENTIALS.md).
 
-Portable restore preserves transferable fields, metadata, retained history, trash and attachment bytes. Device-local hardware keys cannot be imported or restored. Source password-manager exports contain plaintext secrets; retain access to the source until an integrated import workflow is available and verified.
-
-Attachments in current items are encrypted inside the item envelope and synchronize with it, rather than downloading on demand. Opening/exporting decrypts local bytes after authentication. Independent attachment transport is planned.
+Current attachments are encrypted item components. Opening or exporting decrypts
+local bytes after authentication. Independent attachment transport remains planned.

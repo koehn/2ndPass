@@ -19,7 +19,7 @@ extension EncryptedItemRepository {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = SyncStoreLayout.contentPreviewURL(in: root)
-        let repository = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let repository = try EncryptedItemRepository(storeURL: url)
         let bulk = record("bulk", bytes: 100)
         _ = try await repository.stageIncoming(bulk, budget: 100)
         let version = record("version"), head = record("head"), membership = record("membership")
@@ -33,7 +33,7 @@ extension EncryptedItemRepository {
         await #expect(throws: SyncJournalError.inboxFull) { try await repository.stageIncoming(record("more-bulk"), budget: 100) }
         // Replays reuse the durable row and do not consume reserve twice.
         try await repository.reserveForTest([version], kind: .fetchContentVersion, budget: 100)
-        let reopened = try EncryptedItemRepository(storeURL: url, layout: .contentPreview3)
+        let reopened = try EncryptedItemRepository(storeURL: url)
         #expect(try await !reopened.prerequisiteInboxReadyToResume(account: "a", kind: .fetchContentVersion))
         #expect(try await reopened.incomingRecords(account: "a", database: "private").count == 4)
         for id in [membership.id, version.id, head.id, bulk.id] {
@@ -47,7 +47,7 @@ extension EncryptedItemRepository {
     @Test func prerequisiteBatchIsAtomicAndOversizedReplayDoesNotConsumeCapacity() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
         let oversized = record("large-membership", bytes: 120)
         try await repository.reserveForTest([oversized], kind: .fetchMembership, budget: 100)
         try await repository.reserveForTest([oversized], kind: .fetchMembership, budget: 100)
@@ -68,7 +68,7 @@ extension EncryptedItemRepository {
     @Test func capacityWaitDoesNotSpinAndStoreDrainReleasesIt() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
         let full = record("full")
         _ = try await repository.stageIncoming(full, budget: 100)
         let recovery = try await repository.enqueue(SyncOperation(account: "a", kind: .recoverTransport))
@@ -96,7 +96,7 @@ extension EncryptedItemRepository {
     @Test func legacyRecoveryProbeDoesNotSpinOnRealStorageFailure() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
         let now = Date()
         let operation = try await repository.enqueue(SyncOperation(account: "a", kind: .recoverTransport))
         _ = try await repository.transition(operation, to: .retryScheduled, failure: .storagePressure,
@@ -121,7 +121,7 @@ extension EncryptedItemRepository {
     func legacyRecoveryBypassesBackoffAfterDrainButHonorsServerFloor(serverFloor: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite"))
+        let repository = try EncryptedItemRepository(storeURL: root.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
         let now = Date(), later = now.addingTimeInterval(600)
         let operation = try await repository.enqueue(SyncOperation(account: "a", kind: .recoverTransport))
         _ = try await repository.transition(operation, to: .retryScheduled, failure: .storagePressure,
