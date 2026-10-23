@@ -159,7 +159,7 @@ func loginDestinationsUseCurrentMetadataWithoutReadingLoginItems(itemCount: Int)
 }
 
 @Test(arguments: [false, true])
-func conflictReviewDoesNotExecuteSynchronizationWork(different: Bool) async throws {
+func conflictReviewRetiresVerifiedAncestorWithoutDroppingLocalEdit(different: Bool) async throws {
     let directory = try serviceLocation()
     defer { try? FileManager.default.removeItem(at: directory) }
     let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
@@ -182,11 +182,15 @@ func conflictReviewDoesNotExecuteSynchronizationWork(different: Bool) async thro
     try await repository.stageIncomingBatch([incoming], checkpoint: Data([1]), account: "service", database: "private", permit: DomainAccountAuthorization())
     try await repository.receiveContent(content, from: incoming, action: .branch, expectedHead: repository.item(original.scope)?.versionID,
         expectedPolicy: policy, permit: DomainAccountAuthorization())
+    let head = try await repository.item(original.scope)
+    let pending = try await repository.pendingMutations(account: "service")
     let service = ItemVaultService(backend: backend)
     let report = try await service.checkConflicts(vault: id.uuidString)
-    #expect(report.choices.count == 1)
-    #expect(report.pending == 0)
-    #expect(try await repository.contentConflicts(account: "service").count == 1)
+    #expect(report.choices.isEmpty)
+    #expect(try await repository.contentConflicts(account: "service", includePendingDecisions: true).isEmpty)
+    #expect(try await repository.operations(account: "service", database: "private").filter { $0.kind == .resolveConflict }.isEmpty)
+    #expect(try await repository.item(original.scope) == head)
+    #expect(try await repository.pendingMutations(account: "service") == pending)
 }
 
 private func serviceLocation() throws -> URL {
@@ -1222,6 +1226,7 @@ private actor RestartHealthBreach: BreachChecking {
     #expect(waiting.catalog?.items.map(\.storageID) == before.items.map(\.storageID))
     #expect(waiting.catalog?.revision == before.revision)
     #expect(waiting.catalogLoadedCount == 0)
+    #expect(waiting.catalog?.healthEvidenceLoading == true)
     let recipientGrant = try #require(rotated.grants.first { $0.recipient == contentSession.identity.fingerprint })
     let preparedGrant = try PreparedContentGrant(scope: scope, keyGeneration: recipientGrant.keyGeneration,
         recipient: recipientGrant.recipient, identifier: recipientGrant.identifier, bytes: recipientGrant.encoded())
@@ -1233,6 +1238,7 @@ private actor RestartHealthBreach: BreachChecking {
     let ready = try await waitForDisplay(service, vault: id) { $0.catalogTotalCount == nil }.requireCatalog()
     #expect(ready.items.map(\.storageID) == before.items.map(\.storageID))
     #expect(ready.revision != before.revision)
+    #expect(ready.healthEvidenceLoading == false)
 }
 
 @Test func authorizedSessionReplacementKeepsCompleteDisplayWithoutRehydratingRows() async throws {
@@ -1254,4 +1260,14 @@ private actor RestartHealthBreach: BreachChecking {
     #expect(after.revision == before.revision)
     #expect(result.catalogTotalCount == nil)
     #expect(backend.unwrapCount == unwraps)
+}
+
+@Test func dateScopedDiscardRequiresAnAuthenticatedSession() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("discard-authorization-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = try EncryptedItemRepository(storeURL: directory.appendingPathComponent("items.sqlite/ContentPreview3/Content3.sqlite"))
+    let service = ItemVaultService(backend: try SoftwareItemBackend(repository: repository))
+    await #expect(throws: MopError.authentication) {
+        _ = try await service.discardSynchronizationWork(on: Date())
+    }
 }

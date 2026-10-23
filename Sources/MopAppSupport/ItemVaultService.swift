@@ -34,15 +34,23 @@ public protocol ItemVaultServiceBackend: Sendable {
     func requestSync(refreshPrerequisites: Bool) async throws
     func enrollmentProgress() async throws -> [String: VaultEnrollmentProgress]
     func synchronizationHealth() async throws -> SyncHealthSnapshot?
+    func discardSynchronizationWork(on day: Date) async throws -> Int
+    func synchronizationDiagnostics() async throws -> [SyncOperationDiagnostic]
     func waitForDelivery(_ mutationIDs: [UUID], timeout: Duration) async throws -> Bool
     func creationMutations(_ vaultID: UUID) async throws -> [UUID]
     func pendingDeliveryReceipts(vault: UUID?) async throws -> [UUID]
+    func reauthenticate() async throws
+    var requiresLocalAuthentication: Bool { get }
     func lock()
     func changes() async -> AsyncStream<Void>
     func existing(_ vaultID: UUID) async -> ItemVaultSession?
+    func checkConflicts(_ session: ItemVaultSession) async throws -> ItemVaultConflictCheck
     func resolveVault(named name: String, offline: Bool) async throws -> UUID?
 }
 public extension ItemVaultServiceBackend {
+    func checkConflicts(_ session: ItemVaultSession) async throws -> ItemVaultConflictCheck { try await session.checkConflicts() }
+    func reauthenticate() async throws { throw ItemVaultServiceFailure.unavailable }
+    var requiresLocalAuthentication: Bool { false }
     var enrollmentAuthorizedAt: TimeInterval? { nil }
     func requestSync(refreshPrerequisites: Bool) async throws { try await requestSync() }
     #if DEBUG
@@ -75,6 +83,8 @@ public extension ItemVaultServiceBackend {
     func changes() async -> AsyncStream<Void> { AsyncStream { $0.finish() } }
     func enrollmentProgress() async throws -> [String: VaultEnrollmentProgress] { [:] }
     func synchronizationHealth() async throws -> SyncHealthSnapshot? { nil }
+    func discardSynchronizationWork(on day: Date) async throws -> Int { throw ItemVaultServiceFailure.unavailable }
+    func synchronizationDiagnostics() async throws -> [SyncOperationDiagnostic] { [] }
 }
 
 public enum ItemVaultServiceFailure: Error, LocalizedError, Equatable {
@@ -107,6 +117,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private let autoFillDirectory: URL?
     private let idleWork: IdleWorkQueue
     private let localHealthSessions = Mutex<[UUID: ObjectIdentifier]>([:])
+    private let renewal = Mutex<(id: UUID, task: Task<Void, Error>)?>(nil)
     private let catalogGate = OperationGate()
     private let publicationGate = OperationGate()
     private struct PublishedCatalog: Sendable {
@@ -247,6 +258,19 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         try await backend.requestSync(refreshPrerequisites: refreshPrerequisites)
         try checked(token)
     }
+    public func discardSynchronizationWork(on day: Date) async throws -> Int {
+        guard authenticatedAt != nil || enrollmentAuthorizedAt != nil else { throw MopError.authentication }
+        let token = sessionGeneration
+        let count = try await backend.discardSynchronizationWork(on: day)
+        try checked(token)
+        return count
+    }
+    public func synchronizationDiagnostics() async throws -> [SyncOperationDiagnostic] {
+        let token = sessionGeneration
+        let result = try await backend.synchronizationDiagnostics()
+        try checked(token)
+        return result
+    }
     public func synchronizationHealth() async throws -> SyncHealthSnapshot? {
         let token = sessionGeneration
         let result = try await backend.synchronizationHealth()
@@ -293,7 +317,40 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     private func displayChanged(_ vault: UUID) {
         displayListeners.withLock { Array($0.values) }.forEach { Self.emitChange(.display(vault: vault.uuidString), to: $0) }
     }
+    public var requiresLocalAuthentication: Bool { backend.requiresLocalAuthentication }
+    public func reauthenticate() async throws {
+        let task = renewal.withLock { current -> Task<Void, Error> in
+            if let current { return current.task }
+            let id = UUID()
+            let task = Task {
+                defer { self.renewal.withLock { if $0?.id == id { $0 = nil } } }
+                try await self.renewSession()
+            }
+            current = (id, task)
+            return task
+        }
+        try await task.value
+    }
+    private func renewSession() async throws {
+        let token = sessionGeneration
+        try await backend.reauthenticate()
+        try checked(token)
+        try state.withLock { value in
+            guard value.generation == token else { throw CancellationError() }
+            value.generation += 1
+            if value.authenticated != nil { value.authenticated = ProcessInfo.processInfo.systemUptime }
+            catalogCache.withLock { $0.removeAll() }
+            publishedCatalogs.withLock { $0.removeAll() }
+        }
+        let loads = catalogUpdates.withLock { values in
+            let loads = Array(values.values); values.removeAll(); return loads
+        }
+        loads.forEach { $0.task.cancel() }
+        catalogUpdateFailures.withLock { $0.removeAll() }
+        try await backend.requestSync()
+    }
     public func lock() {
+        renewal.withLock { $0?.task.cancel(); $0 = nil }
         idleWork.activity()
         state.withLock { value in
             value.generation += 1; value.authenticated = nil
@@ -334,9 +391,9 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     public func checkConflicts(vault: String) async throws -> ItemVaultConflictCheck {
         let token = sessionGeneration
         guard let id = UUID(uuidString: vault), let session = await backend.existing(id), session.isUnlocked else { return ItemVaultConflictCheck(choices: [], pending: 0) }
-        let previews = try await session.conflictPreviews()
+        let report = try await backend.checkConflicts(session)
         try checked(token)
-        return ItemVaultConflictCheck(choices: previews, pending: 0)
+        return report
     }
 
     public func revealConflict(_ preview: ItemVaultConflictPreview, side: ItemVaultConflictSide, path: String) async throws -> SecretBytes {
@@ -538,7 +595,12 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
         var changed = previous?.versions != cached.versions || previous?.waiting != cached.waiting
         if settled {
             let snapshot = try cached.projection.catalog()
-            let enriched = try await withHealth(snapshot, session: session)
+            let downloading = try await session.initialDownloadExpectedCount() != nil
+            // Waiting for access is settled for display, not complete for health.
+            // Publish usable items now; enrichment resumes on the final arrival.
+            var enriched = snapshot
+            if complete && !downloading { enriched = try await withHealth(snapshot, session: session) }
+            else { enriched.healthEvidenceLoading = true }
             try checked(token)
             changed = changed || enriched.security != snapshot.security || enriched.healthEvidenceLoading != snapshot.healthEvidenceLoading
             try state.withLock { state in
@@ -548,7 +610,6 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
                     cached.projection.installHealth(enriched)
                 }
             }
-            let downloading = try await session.initialDownloadExpectedCount() != nil
             _ = await publish(enriched, session: session, token: token, complete: complete && !downloading)
         } else if publishPartial {
             let published = publishedCatalogs.withLock { $0[session.binding.vaultID] }
@@ -961,6 +1022,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
     }
     private static let catalogSignposter = OSSignposter(subsystem: "com.koehn.mop", category: "Catalog")
     private func projectCatalog(_ session: ItemVaultSession, limit: Int?) async throws -> CachedCatalog {
+        let started = ContinuousClock.now
         let interval = Self.catalogSignposter.beginInterval("Build display catalog")
         defer { Self.catalogSignposter.endInterval("Build display catalog", interval) }
         let token = sessionGeneration
@@ -1075,6 +1137,7 @@ public final class ItemVaultService: VaultService, @unchecked Sendable {
             guard current.generation == token, session.isUnlocked else { throw MopError.authentication }
             catalogCache.withLock { $0[session.binding.vaultID] = prepared }
         }
+        AccessSyncTrace.elapsed("catalog projection", since: started, detail: "vault=\(AccessSyncTrace.token(session.binding.vaultID.uuidString)) attempted=\(changed.count) ready=\(entries.count) total=\(itemIDs.count) waiting=\(waiting.count) pending=\(remaining.count)")
         return prepared
     }
     private func withHealth(_ catalog: ItemCatalog, session: ItemVaultSession) async throws -> ItemCatalog {

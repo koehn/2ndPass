@@ -50,6 +50,15 @@ struct LockedView: View {
             Self.icon
                 .resizable().scaledToFit().frame(width: 128, height: 128)
                 .accessibilityLabel("2ndPass")
+            if model.updateAuthenticationState != .ready {
+                Text(model.updateAuthenticationMessage).multilineTextAlignment(.center)
+                Button(model.updateAuthenticationButton) { model.resumeUpdates() }
+                    .disabled(!model.canResumeUpdates)
+                    .accessibilityIdentifier("resume-authenticated-enrollment")
+                if model.updateAuthenticationState == .failed {
+                    Button("Details…") { model.showUpdateAuthenticationDetails() }
+                }
+            }
             if model.rootPresentation == .starting {
                 ProgressView("Opening 2ndPass…")
             } else if model.rootPresentation == .setup {

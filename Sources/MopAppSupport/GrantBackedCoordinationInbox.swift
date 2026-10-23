@@ -47,13 +47,38 @@ public struct GrantBackedCoordinationInbox: Sendable {
                                permit: any RepositoryWritePermit) async throws -> Bool {
         guard operation.account == account, operation.database == "private",
               operation.zoneOwner == "__defaultOwner__", operation.kind == .enrollment,
-              operation.state == .needsAttention, operation.failure == .invalidAuthority,
+              operation.state != .completed,
               let record = try? JSONDecoder().decode(PreparedCoordinationRecord.self, from: operation.payload),
               record.vault == operation.vaultID,
               (try? obsoleteGrantRequest(record, history: history)) == true else { return false }
-        try await repository.retireObsoleteCoordination(operation, permit: permit)
+        try await repository.resolveSyncOperation(operation, reason: .obsoleteGrantRequester, permit: permit)
         AccessSyncTrace.event("persisted obsolete grant request retired", operation: operation.id, record: record.recordName)
         return true
+    }
+
+    /// Reconsider terminal failures only after strict request authority succeeds.
+    /// Normal prerequisites retain missing work; verified ancestry retires old work.
+    func recoverFailedGrantRequest(_ operation: SyncOperation, history: TrustedMembershipHistory?,
+                                   permit: any RepositoryWritePermit) async throws -> Bool {
+        guard operation.account == account, operation.database == "private", operation.zoneOwner == "__defaultOwner__",
+              operation.kind == .enrollment, operation.state == .needsAttention, operation.failure == .invalidAuthority,
+              let history, let record = try? JSONDecoder().decode(PreparedCoordinationRecord.self, from: operation.payload),
+              record.vault == operation.vaultID, record.kind == .grantRequest else { return false }
+        let envelope = try verify(record, history: history)
+        let request = try JSONDecoder().decode(ContentGrantRequest.self, from: envelope.payload)
+        let scope = ItemScope(account: account, vaultID: record.vault, itemID: request.item)
+        let state = try await repository.contentState(scope: scope)
+        let observation = try history.current.digest() + ":" + (state?.versionID.uuidString ?? "missing")
+        let outcome = try await GrantRequestPrerequisites(repository: repository).reconcile(request: request,
+            scope: scope, history: history, permit: permit)
+        if case .completed = outcome, let state, state.keyGeneration != request.keyGeneration {
+            try await repository.resolveSyncOperation(operation, reason: .obsoleteGrantGeneration, permit: permit)
+            AccessSyncTrace.event("obsolete enrollment grant generation retired", operation: operation.id, item: request.item)
+            return true
+        }
+        let resumed = try await repository.resumeVerifiedGrantRequest(operation, observation: observation, outcome: outcome, permit: permit)
+        if resumed { AccessSyncTrace.event("verified enrollment grant request resumed", operation: operation.id, item: request.item) }
+        return resumed
     }
 
     func retireQuarantinedRequest(_ candidate: QuarantinedSyncRecord, history: TrustedMembershipHistory?,

@@ -372,6 +372,19 @@ struct DomainAccountAuthorization: RepositoryWritePermit {
     #expect(try await reopened.healthChecks() == [check])
     #expect(unwraps.value.withLock { $0 } == 1)
     reopened.lock()
+    await #expect(throws: MopError.authentication) { try await reopened.healthChecks() }
+    // Authentication failures must not be mistaken for disposable-cache damage.
+    let deniedUnwraps = SessionUnwrapCounter()
+    let denied = try await currentTestSession(repository: repository, binding: binding, history: history,
+        device: SessionDevice(copying: owner, unwrapCounter: deniedUnwraps))
+    deniedUnwraps.failure.withLock { $0 = .authentication }
+    await #expect(throws: MopError.authentication) {
+        try await denied.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID)
+    }
+    #expect(try await repository.localHealthItem(saved.scope)?.versionID == saved.versionID)
+    deniedUnwraps.failure.withLock { $0 = nil }
+    _ = try await denied.saveHealthChecks([check], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID)
+    #expect(try await denied.healthChecks() == [check])
     // A damaged derived cache is unknown and replaceable, never a secret failure.
     let damaged = EncryptedItemVersion(scope: saved.scope, baseVersionID: saved.versionID,
         ciphertext: Data([0]), generation: saved.generation + 1, healthItemID: saved.healthItemID)
@@ -1200,12 +1213,12 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     let outcome = await provisioner.handle(operation, permit: ContentStorageTestPermit())
     guard case .completed = outcome else { Issue.record("Prepared commissioning did not complete while locked"); return }
     #expect(try await repository.operationIsDelivered(operation.id, account: binding.account))
-    #expect(try await repository.contentPublications(account: binding.account).count == 2) // metadata immutable version and independent grant
+    #expect(try await repository.contentPublications(account: binding.account).count == 1) // grant waits for its metadata source
     #expect(await server.creates == 1)
     let receipt = try #require(await repository.vaultInitialization(scope.repositoryScope))
     try await repository.pruneCompletedOperations(account: binding.account, database: "private", now: Date().addingTimeInterval(31 * 24 * 60 * 60))
     #expect(try await repository.operationIsDelivered(operation.id, account: binding.account))
-    #expect(try await repository.contentPublications(account: binding.account).count == 2)
+    #expect(try await repository.contentPublications(account: binding.account).count == 1)
     #expect(try await repository.vaultInitialization(scope.repositoryScope) == receipt)
 }
 
@@ -1524,7 +1537,16 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
         #expect(saved.state == (retired ? .completed : .needsAttention))
         #expect(saved.failure == (retired ? nil : .invalidAuthority))
         #expect(saved.attempts == 1 && saved.deliveredAt == nil)
+        #expect(saved.resolution == (retired ? .obsoleteGrantRequester : nil))
         if retired {
+            for state in [SyncOperationState.ready, .waitingForDependency] {
+                let fresh = try await repository.enqueue(SyncOperation(account: scope.account, vaultID: scope.vaultID,
+                    kind: .enrollment, payload: JSONEncoder().encode(record)))
+                let pending = try await repository.transition(fresh, to: state,
+                    dependencies: state == .waitingForDependency ? [.init(.membership, identifier: "missing")] : [])
+                #expect(try await inbox.retireObsoleteFailure(pending, history: revoked, permit: ContentStorageTestPermit()))
+                #expect(try await repository.operations(account: scope.account, database: "private").first { $0.id == pending.id }?.resolution == .obsoleteGrantRequester)
+            }
             await #expect(throws: SyncJournalError.staleOperation) {
                 _ = try await inbox.retireObsoleteFailure(failed, history: revoked, permit: ContentStorageTestPermit())
             }
@@ -1553,7 +1575,8 @@ private func preparedInboxGrant(_ grant: ContentKeyGrant, scope: ItemScope) thro
     let retiredIncoming = try #require(await repository.operations(account: scope.account, database: "private").first { $0.id == incoming.operationID })
     #expect(retiredIncoming.state == .completed && retiredIncoming.failure == nil && retiredIncoming.deliveredAt == nil)
     #expect(try await repository.quarantinedRecords(account: scope.account) == [badCandidate])
-    #expect(try await repository.quarantineSummary(account: scope.account).records == 2) // evidence retained
+    #expect(try await repository.quarantineSummary(account: scope.account).records == 1)
+    #expect(try await repository.quarantineSummary(account: scope.account).retiredRecords == 1) // evidence retained
     await #expect(throws: SyncJournalError.staleOperation) {
         _ = try await inbox.retireQuarantinedRequest(candidate, history: revoked, permit: ContentStorageTestPermit())
     }
@@ -1655,7 +1678,15 @@ func contentConflictChoiceSurvivesNonOwnerExitAndCommitsWhileLocked(keepLocal: B
     #expect(try await reopened.item(scope)?.versionID == (replacement?.content.version.versionID ?? expected.remote.versionID))
     if let replacement {
         let publications = try await reopened.contentPublications(account: scope.account)
-        #expect(publications.filter { $0.grant?.keyGeneration == replacement.content.keyGeneration }.count == replacement.grants.count)
+        #expect(publications.contains { $0.kind == .version && $0.content.version.versionID == replacement.content.version.versionID })
+        #expect(!publications.contains { $0.grant?.keyGeneration == replacement.content.keyGeneration })
+        let source = try #require(publications.first { $0.kind == .version && $0.content.version.versionID == replacement.content.version.versionID })
+        let event = try ContentRecordTransport.materialize(source.record(assetDirectory: root), account: scope.account)
+        try await reopened.stageIncoming(event, permit: ContentStorageTestPermit())
+        try await reopened.receiveContent(replacement.content, from: event, action: .archive, expectedHead: nil,
+            expectedPolicy: GrantBackedContentStorage.recipientPolicy(history: history), permit: ContentStorageTestPermit())
+        let afterSource = try await reopened.contentPublications(account: scope.account)
+        #expect(afterSource.filter { $0.grant?.keyGeneration == replacement.content.keyGeneration }.count == replacement.grants.count)
     }
     await #expect(throws: SyncJournalError.staleOperation) { try await reopened.contentConflictDecision(decision) }
 }
@@ -2193,4 +2224,598 @@ private final class SimultaneousGrantSigner: DeviceOperations {
     #expect(try await reopened.deletion(VaultScope(scope))?.notice == record.bytes)
     #expect(try await reopened.engineState(account: scope.account, database: "test-checkpoint") == Data([8]))
 
+}
+
+@MainActor @Test func comparisonWaitsForExactGrantThenResumes() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try ContentEnvelope.seal(["password": "base"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let grant = try #require(first.grants.first { $0.recipient == owner.identity.fingerprint })
+    let storage = GrantBackedContentStorage(repository: repository)
+    _ = try await storage.commit(first.content, scope: scope, history: history, authorization: ContentStorageTestPermit())
+    let local = try first.content.editing(["password": "same"], grant: grant, history: history, device: owner)
+    _ = try await storage.commit(local, scope: scope, history: history, authorization: ContentStorageTestPermit())
+    let remote = try first.content.editing(["password": "same"], grant: grant, history: history, device: owner)
+    let incoming = try ContentRecordTransport.materialize(ContentRecordTransport.content(preparedInboxContent(remote, scope: scope, history: history), kind: .head), account: "a")
+    _ = try await repository.stageIncoming(incoming)
+    let binding = ItemVaultBinding(account: scope.account, database: scope.database, zoneOwner: scope.zoneOwner, vaultID: scope.vaultID)
+    let session = try GrantBackedContentSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: owner))
+    let inbox = GrantBackedContentInbox(repository: repository, account: "a")
+    guard case .waiting(let dependencies) = try await inbox.process(id: incoming.id, history: history, permit: ContentStorageTestPermit(), comparison: session.comparison()),
+          let dependency = dependencies.first, let wait = GrantRequestWait(dependency: dependency) else {
+        Issue.record("Missing comparison grant must persist an exact wait"); return
+    }
+    #expect(dependencies.count == 1)
+    #expect(wait.keyGeneration == first.content.header.keyGeneration)
+    #expect(wait.recipient == owner.identity.fingerprint)
+    let query = ContentReadinessQuery(scope: scope, observedVersion: wait.version, recipient: wait.recipient,
+        keyGeneration: wait.keyGeneration, missingVersion: wait.missingVersion)
+    #expect(try await repository.contentReadiness([query]) == [false])
+    #expect(try await !wait.available(repository: repository, scope: scope, history: history))
+    #expect(try await repository.item(scope)?.versionID == local.header.version)
+    let prepared = try PreparedContentGrant(scope: scope, keyGeneration: grant.keyGeneration, recipient: grant.recipient, identifier: grant.identifier, bytes: grant.encoded())
+    let delivery = try ContentRecordTransport.materialize(ContentRecordTransport.grant(prepared), account: "a")
+    _ = try await repository.stageIncoming(delivery)
+    _ = try await inbox.process(id: delivery.id, history: history, permit: ContentStorageTestPermit())
+    #expect(try await wait.available(repository: repository, scope: scope, history: history))
+    #expect(try await repository.contentReadiness([query]) == [true])
+    _ = try await inbox.process(id: incoming.id, history: history, permit: ContentStorageTestPermit(), comparison: session.comparison())
+    #expect(try await repository.item(scope)?.versionID == remote.header.version)
+}
+
+@Test func healthMembershipCacheRetainsFailuresOnlyWithinItsSession() throws {
+    let owner = try SessionDevice()
+    let root = try sessionAuthority(owner: owner)
+    let genesis = try MembershipEnvelope.genesis(vault: root.id, membership: root.membership, owner: owner)
+    let digest = try genesis.digest()
+    let cache = HealthMembershipReadCache()
+    var attempts = 0
+    for _ in 0..<100 {
+        #expect(throws: MopError.vaultUntrusted) {
+            try cache.read(digest) { attempts += 1; throw MopError.vaultUntrusted }
+        }
+    }
+    #expect(attempts == 1)
+    // A new session must verify afresh; a cached denial never becomes authority.
+    let replacement = HealthMembershipReadCache()
+    #expect(try replacement.read(digest) { attempts += 1; return genesis } == genesis)
+    #expect(attempts == 2)
+    #expect(try replacement.read(digest) { Issue.record("Repeated immutable membership check"); return genesis } == genesis)
+    let pending = HealthMembershipReadCache()
+    for _ in 0..<100 {
+        #expect(throws: ItemVaultSessionFailure.pendingAdmission) {
+            try pending.read(digest) { throw ItemVaultSessionFailure.pendingAdmission }
+        }
+    }
+}
+
+@MainActor @Test func targetedReconciliationPreservesUnfinishedWorkAndRecoversMissingMembership() async throws {
+    let (root, repository, _, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit()
+    let digest = try history.current.digest()
+    let request = try #require(ContentMembershipFetch(dependency: .init(.membership, identifier: scope.vaultID.uuidString + ":" + digest)))
+    let queued = try await repository.enqueue(request.operation(account: "a", owner: scope.zoneOwner))
+    let failed = try await repository.transition(queued, to: .needsAttention, failure: .transport, attempted: true)
+    let dependent = try await repository.enqueue(SyncOperation(account: "a", vaultID: scope.vaultID, kind: .prepareGrant, dependencies: [request.dependency]))
+    let upload = try await repository.enqueue(SyncOperation(account: "a", vaultID: scope.vaultID, kind: .publishItem, payload: Data("preserve edit".utf8)))
+    let unknown = try #require(ContentMembershipFetch(dependency: .init(.membership, identifier: scope.vaultID.uuidString + ":" + String(repeating: "0", count: 64))))
+    let missing = try await repository.enqueue(unknown.operation(account: "a", owner: scope.zoneOwner))
+    let missingFailed = try await repository.transition(missing, to: .needsAttention, failure: .transport)
+    let otherOwner = try await repository.enqueue(request.operation(account: "a", owner: "other-owner"))
+    let throttledRequest = try #require(ContentMembershipFetch(dependency: .init(.membership, identifier: scope.vaultID.uuidString + ":" + String(repeating: "1", count: 64))))
+    let throttled = try await repository.enqueue(throttledRequest.operation(account: "a", owner: scope.zoneOwner))
+    let deadline = Date().addingTimeInterval(3600)
+    _ = try await repository.transition(throttled, to: .needsAttention, failure: .transport, retryNotBefore: deadline)
+    let reconciliation = TargetedSyncReconciliation(repository: repository, account: "a", history: { _ in history })
+    try await TargetedSyncReconciliation(repository: repository, account: "a", history: { _ in nil }).reconcile(permit: permit)
+    #expect(try await repository.operations(account: "a", database: "private").contains(failed))
+    try await reconciliation.reconcile(permit: permit)
+    let saved = try await repository.operations(account: "a", database: "private")
+    #expect(saved.first { $0.id == failed.id }?.resolution == .verifiedMembershipAvailable)
+    #expect(saved.first { $0.id == failed.id }?.deliveredAt == nil)
+    #expect(saved.contains(dependent) && saved.contains(upload) && saved.contains(missingFailed) && saved.contains(otherOwner))
+    try await reconciliation.reconcile(permit: permit, retryMissing: true)
+    #expect(try await repository.operations(account: "a", database: "private").first { $0.id == missing.id }?.state == .ready)
+    let retried = try #require(await repository.operations(account: "a", database: "private").first { $0.id == throttled.id })
+    #expect(retried.state == .retryScheduled && retried.retryNotBefore == deadline && retried.nextAttempt == deadline)
+    await #expect(throws: SyncJournalError.staleOperation) {
+        try await repository.resolveSyncOperation(failed, reason: .verifiedMembershipAvailable, permit: permit)
+    }
+    await #expect(throws: SyncJournalError.invalidOperation) {
+        try await repository.resolveSyncOperation(upload, reason: .verifiedContentAvailable, permit: permit)
+    }
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+    let diagnostics = try await reopened.syncOperationDiagnostics(account: "a", database: "private")
+    #expect(diagnostics.first { $0.id == failed.id }?.resolution == .verifiedMembershipAvailable)
+    #expect(diagnostics.first { $0.id == missing.id }?.resolution == nil)
+    #expect(try await reopened.syncOperationDiagnostics(account: "other", database: "private").isEmpty)
+}
+
+@MainActor @Test func targetedReconciliationRequiresExactVerifiedContentAndPreservesMutableHead() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit()
+    let content = try ContentEnvelope.seal(["password": "secret"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let request = try #require(ContentVersionFetch(dependency: .init(.content, identifier: scope.vaultID.uuidString + ":" + scope.itemID.uuidString + ":" + content.content.header.version.uuidString)))
+    let queued = try await repository.enqueue(request.operation(account: "a", owner: scope.zoneOwner))
+    let head = try await repository.enqueue(ContentHeadFetch(vault: scope.vaultID, item: scope.itemID, observedVersion: nil, membership: history.current.digest()).operation(account: "a", owner: scope.zoneOwner))
+    let malformed = try await repository.enqueue(SyncOperation(account: "a", vaultID: scope.vaultID, kind: .fetchContentVersion, payload: Data([0])))
+    let reconciliation = TargetedSyncReconciliation(repository: repository, account: "a", history: { _ in history })
+    try await reconciliation.reconcile(permit: permit)
+    #expect(try await repository.operations(account: "a", database: "private").contains(queued))
+    _ = try await GrantBackedContentStorage(repository: repository).commit(content.content, grants: content.grants, scope: scope, history: history, authorization: permit)
+    try await reconciliation.reconcile(permit: permit)
+    try await reconciliation.reconcile(permit: permit) // idempotent
+    let saved = try await repository.operations(account: "a", database: "private")
+    #expect(saved.first { $0.id == queued.id }?.resolution == .verifiedContentAvailable)
+    #expect(saved.contains(head) && saved.contains(malformed))
+}
+
+@MainActor @Test func targetedFetchDiagnosticsRetainSafeCloudErrorAndRecover() async throws {
+    let (root, repository, _, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit()
+    let request = try #require(ContentMembershipFetch(dependency: .init(.membership, identifier: scope.vaultID.uuidString + ":" + history.current.digest())))
+    let operation = try await repository.enqueue(request.operation(account: "a", owner: scope.zoneOwner))
+    let fetcher = ContentMembershipFetcher(repository: repository, account: "a", fetch: { _ in
+        throw CKError(.unknownItem, userInfo: [NSLocalizedDescriptionKey: "sensitive server detail"])
+    }, available: { _ in false })
+    guard case .retry(.transport, _) = await fetcher.handle(operation, permit: permit) else {
+        Issue.record("Missing records must remain recoverable"); return
+    }
+    let details = try #require(await repository.syncOperationDiagnostics(account: "a", database: "private").first)
+    #expect(details.transport?.code == CKError.Code.unknownItem.rawValue)
+    #expect(details.transport?.category == "Required cloud record is missing")
+    #expect(details.state != .completed)
+    #expect(details.records == request.records(owner: scope.zoneOwner).map(\.recordName))
+    try await TargetedSyncReconciliation(repository: repository, account: "a", history: { _ in history }).reconcile(permit: permit)
+    try await repository.recordSyncTransportFailure(operation, error: CKError(.networkFailure)) // stale completion cannot overwrite audit
+    let recovered = try #require(await repository.syncOperationDiagnostics(account: "a", database: "private").first)
+    #expect(recovered.resolution == .verifiedMembershipAvailable)
+    #expect(recovered.transport?.code == CKError.Code.unknownItem.rawValue)
+    var legacy = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(operation)) as? [String: Any])
+    legacy.removeValue(forKey: "resolution")
+    #expect(try JSONDecoder().decode(SyncOperation.self, from: JSONSerialization.data(withJSONObject: legacy)).resolution == nil)
+}
+
+@MainActor @Test func membershipFetchWaitsForTrustedZoneAndRecoversWithoutInstallingTrust() async throws {
+    let (root, repository, _, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dependency = SyncDependency(.membership, identifier: scope.vaultID.uuidString + ":" + (try history.current.digest()))
+    let request = try #require(ContentMembershipFetch(dependency: dependency))
+    let operation = try await repository.enqueue(request.operation(account: "a", owner: scope.zoneOwner))
+    let available = Mutex(false), trusted = Mutex(false), calls = Mutex(0)
+    let bytes = try history.current.encoded()
+    let fetcher = ContentMembershipFetcher(repository: repository, account: "a", fetch: { id in
+        calls.withLock { $0 += 1 }
+        guard trusted.withLock({ $0 }) else { throw CloudSyncAdapterError.contentZoneUnavailable(scope.vaultID) }
+        let record = CKRecord(recordType: NativeVaultProvisioningTransport.recordType, recordID: id)
+        record["membership"] = bytes as CKRecordValue
+        return record
+    }, available: { _ in available.withLock { $0 } })
+    guard case .waiting(let dependencies) = await fetcher.handle(operation, permit: ContentStorageTestPermit()) else {
+        Issue.record("Untrusted routing must wait, not retry transport"); return
+    }
+    #expect(dependencies == [.init(.trustedContentZone, identifier: scope.vaultID.uuidString)])
+    #expect(try await repository.incomingRecords(account: "a", database: "private").isEmpty)
+    trusted.withLock { $0 = true }
+    guard case .retry(.dependency, _) = await fetcher.handle(operation, permit: ContentStorageTestPermit()) else {
+        Issue.record("Reception must still wait for independently pinned authority"); return
+    }
+    #expect(calls.withLock { $0 } == 3)
+    available.withLock { $0 = true }
+    guard case .completed = await fetcher.handle(operation, permit: ContentStorageTestPermit()) else {
+        Issue.record("Verified membership must recover the original operation"); return
+    }
+    #expect(calls.withLock { $0 } == 3)
+    let invalid = ContentMembershipFetcher(repository: repository, account: "a", fetch: { _ in throw CloudSyncAdapterError.invalidBinding }, available: { _ in false })
+    guard case .attention(.invalidAuthority) = await invalid.handle(operation, permit: ContentStorageTestPermit()) else {
+        Issue.record("Malformed bindings must not be retried as network failures"); return
+    }
+}
+
+@MainActor @Test func explicitDiscardCancelsUnsentEditsWithoutErasingEncryptedLocalCopy() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let start = Date().addingTimeInterval(-1)
+    let publication = try ContentEnvelope.seal(["password": "retained encrypted"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    _ = try await GrantBackedContentStorage(repository: repository).commit(publication.content, grants: publication.grants, scope: scope, history: history, authorization: ContentStorageTestPermit())
+    #expect(try await !repository.pendingMutations(account: "a").isEmpty)
+    let interval = DateInterval(start: start, end: Date().addingTimeInterval(1))
+    #expect(try await repository.discardSyncWork(account: "a", interval: interval, permit: ContentStorageTestPermit()) > 0)
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+    #expect(try await reopened.pendingMutations(account: "a").isEmpty)
+    #expect(try await reopened.contentPublications(account: "a").isEmpty)
+    #expect(try await reopened.item(scope)?.versionID == publication.content.header.version)
+    let records = try await reopened.syncOperationDiagnostics(account: "a", database: "private")
+    #expect(!records.isEmpty && records.allSatisfy { $0.resolution == .discardedByUser })
+    #expect(try await reopened.operations(account: "a", database: "private").allSatisfy { $0.deliveredAt == nil })
+}
+
+extension EncryptedItemRepository {
+    fileprivate func simulateSupersededUnpublishedSource(_ scope: ItemScope) throws {
+        try transaction { try supersedePending(scope: scope) }
+    }
+}
+
+@MainActor @Test func orphanedGrantSourceRepairPublishesImmutableBeforeGrantAndRecoversReceiver() async throws {
+    let (root, sender, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit()
+    let publication = try ContentEnvelope.seal(["password": "source"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    _ = try await GrantBackedContentStorage(repository: sender).commit(publication.content, grants: publication.grants, scope: scope, history: history, authorization: permit)
+    let grant = try preparedInboxGrant(#require(publication.grants.first), scope: scope)
+    // Reproduce the previous grant-first publication followed by local supersession.
+    try await sender.acknowledgeContentGrant(grant, serverSystemFields: Data([1]))
+    try await sender.simulateSupersededUnpublishedSource(scope)
+    let receiver = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root.appendingPathComponent("receiver")))
+    let storage = GrantBackedContentStorage(repository: receiver)
+    try await storage.setAuthority(scope: VaultScope(scope), expected: nil, history: history, authorization: permit)
+    let competing = try ContentEnvelope.seal(["password": "other branch"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    _ = try await storage.commit(competing.content, grants: competing.grants, scope: scope, history: history, authorization: permit)
+    let incomingGrant = try ContentRecordTransport.materialize(ContentRecordTransport.grant(grant), account: "a")
+    try await receiver.stageIncoming(incomingGrant, permit: permit)
+    let inbox = GrantBackedContentInbox(repository: receiver, account: "a")
+    guard case .waiting = try await inbox.process(id: incomingGrant.id, history: history, permit: permit) else {
+        Issue.record("Grant without verified source must wait"); return
+    }
+    let fetch = try #require(await receiver.operations(account: "a", database: "private").first { $0.kind == .fetchContentVersion })
+    let missing = ContentVersionFetcher(repository: receiver, account: "a") { _ in throw CKError(.unknownItem) }
+    guard case .waitingUntil(let dependencies, let deadline) = await missing.handle(fetch, permit: permit) else {
+        Issue.record("Missing cloud source must retain bounded recovery wait"); return
+    }
+    #expect(!dependencies.isEmpty && deadline > Date().addingTimeInterval(250))
+    #expect(try await sender.repairUnpublishedGrantSources(account: "a", permit: permit) == 1)
+    #expect(try await sender.repairUnpublishedGrantSources(account: "a", permit: permit) == 0)
+    let source = try #require(await sender.contentPublications(account: "a").first)
+    #expect(source.kind == .version && source.grant == nil)
+    try GrantBackedContentStorage.validatePublication(source, history: history)
+    let sourceRecord = try ContentRecordTransport.materialize(source.record(assetDirectory: root), account: "a")
+    for repository in [sender, receiver] {
+        try await repository.stageIncoming(sourceRecord, permit: permit)
+        _ = try await GrantBackedContentInbox(repository: repository, account: "a").process(id: sourceRecord.id, history: history, permit: permit)
+    }
+    #expect(try await sender.contentPublications(account: "a").contains { $0.kind == .grant })
+    try await sender.acknowledgeContentGrant(grant, serverSystemFields: Data([1]))
+    #expect(try await sender.contentPublications(account: "a").isEmpty)
+    guard case .completed = try await inbox.process(id: incomingGrant.id, history: history, permit: permit) else {
+        Issue.record("Verified source must release retained grant"); return
+    }
+    #expect(try await receiver.item(scope)?.versionID == competing.content.header.version)
+    try await TargetedSyncReconciliation(repository: receiver, account: "a", history: { _ in history }).reconcile(permit: permit)
+    #expect(try await receiver.operations(account: "a", database: "private").first { $0.id == fetch.id }?.state == .completed)
+    #expect(try await sender.repairUnpublishedGrantSources(account: "a", permit: permit) == 0)
+}
+
+@MainActor @Test func grantSourceRepairDoesNotRepublishExplicitlyDiscardedEdit() async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit(), start = Date().addingTimeInterval(-1)
+    let publication = try ContentEnvelope.seal(["password": "cancelled"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    _ = try await GrantBackedContentStorage(repository: repository).commit(publication.content, grants: publication.grants, scope: scope, history: history, authorization: permit)
+    let grant = try preparedInboxGrant(#require(publication.grants.first), scope: scope)
+    // A prior grant receipt is not permission to restore an explicitly discarded edit.
+    try await repository.acknowledgeContentGrant(grant, serverSystemFields: Data([1]))
+    _ = try await repository.discardSyncWork(account: "a", interval: DateInterval(start: start, end: Date().addingTimeInterval(1)), permit: permit)
+    #expect(try await repository.repairUnpublishedGrantSources(account: "a", permit: permit) == 0)
+    #expect(try await repository.contentPublications(account: "a").isEmpty)
+}
+
+@Test func healthEvidenceRebuildsAfterDeviceReplacementWithoutTrustingOldEvidence() async throws {
+    #expect((MopError.vaultUntrusted as NSError).code == 36)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+    let oldDevice = try SessionDevice(), newDevice = try SessionDevice(member: oldDevice.identity.member)
+    let vault = UUID()
+    let genesis = try MembershipEnvelope.genesis(vault: vault,
+        membership: Membership(accounts: [.init(id: oldDevice.identity.member, role: .owner, devices: [oldDevice.identity])]), owner: oldDevice)
+    var history = try TrustedMembershipHistory(genesis: genesis, vault: vault, pinnedDigest: genesis.digest())
+    let admission = try MembershipEnvelope.successor(of: genesis,
+        membership: Membership(accounts: [.init(id: oldDevice.identity.member, role: .owner, devices: [oldDevice.identity, newDevice.identity])]), owner: oldDevice)
+    try history.append(admission)
+    try history.append(MembershipEnvelope.successor(of: admission,
+        membership: Membership(accounts: [.init(id: oldDevice.identity.member, role: .owner, devices: [newDevice.identity])], removedDevices: [oldDevice.identity.device]), owner: newDevice))
+    let binding = ItemVaultBinding(account: "health-replacement", database: "private", zoneOwner: "__defaultOwner__", vaultID: vault)
+    let session = try await currentTestSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: newDevice))
+    let archive = try sessionArchive()
+    let item = try await session.save(archive, expectedBase: nil)
+    let record = try #require(archive.references.values.first)
+    let oldCheck = CachedPasswordCheck(record: record, context: ["old", ""], weak: true, exposed: true,
+        checkedAt: Date(), breachCheckedAt: Date(), reuseGroup: nil, scope: String(repeating: "a", count: 64), batch: UUID())
+    let old = try LocalPasswordHealthEnvelope.seal([oldCheck], vault: vault, item: item.version.scope.itemID,
+        generation: 1, membership: genesis.membership, membershipStateDigest: genesis.digest(), signer: oldDevice)
+    let previous = EncryptedItemVersion(scope: binding.item(LocalPasswordHealthEnvelope.recordID(for: item.version.scope.itemID)),
+        versionID: old.header.version, baseVersionID: nil, ciphertext: try old.encoded(), generation: 1, healthItemID: item.version.scope.itemID)
+    try await repository.saveLocalHealth(previous, expectedParent: item.version.versionID, authorization: DomainAccountAuthorization())
+    #expect(throws: MopError.vaultUntrusted) { try history.verifyAccountPath(from: genesis.digest()) }
+    #expect(try await session.healthChecks().isEmpty)
+    let fresh = CachedPasswordCheck(record: record, context: ["new", ""], weak: false, exposed: false,
+        checkedAt: Date(), breachCheckedAt: nil, reuseGroup: nil, scope: String(repeating: "b", count: 64), batch: UUID())
+    _ = try await session.saveHealthChecks([fresh], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID)
+    #expect(try await session.healthChecks() == [fresh])
+    #expect(try await repository.item(item.version.scope) == item.version)
+    let reopened = try await currentTestSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: newDevice))
+    #expect(try await reopened.healthChecks() == [fresh])
+    reopened.lock()
+    await #expect(throws: MopError.authentication) {
+        try await reopened.saveHealthChecks([fresh], itemID: item.version.scope.itemID, expectedItemVersion: item.version.versionID)
+    }
+}
+
+@MainActor @Test(arguments: ["retire", "pendingEdit", "missingReplacement", "otherConsumer", "conflict", "badSignature", "networkFailure"])
+func missingGrantSourceCleanupPreservesNeededWorkAndCanRecover(scenario: String) async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit()
+    let orphan = try ContentEnvelope.seal(["password": "old"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let current = try ContentEnvelope.seal(["password": "current"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let storage = GrantBackedContentStorage(repository: repository)
+    let mutation = try await storage.commit(current.content, grants: scenario == "missingReplacement" ? [] : current.grants,
+        scope: scope, history: history, authorization: permit)
+    if scenario != "pendingEdit" { try await confirmCurrentMutation(mutation, repository: repository) }
+    let grant = try preparedInboxGrant(#require(orphan.grants.first), scope: scope)
+    let incoming = try ContentRecordTransport.materialize(ContentRecordTransport.grant(grant), account: scope.account)
+    try await repository.stageIncoming(incoming, permit: permit)
+    let inbox = GrantBackedContentInbox(repository: repository, account: scope.account)
+    guard case .waiting = try await inbox.process(id: incoming.id, history: history, permit: permit) else {
+        Issue.record("Missing source must remain untrusted"); return
+    }
+    let fetch = try #require(await repository.activeOperations(account: scope.account, database: scope.database).first { $0.kind == .fetchContentVersion })
+    _ = await ContentVersionFetcher(repository: repository, account: scope.account) { _ in
+        throw CKError(scenario == "networkFailure" ? .networkFailure : .unknownItem)
+    }.handle(fetch, permit: permit)
+    if scenario == "badSignature" {
+        var object = try #require(JSONSerialization.jsonObject(with: incoming.bytes) as? [String: Any])
+        object["signature"] = Data(repeating: 0, count: 64).base64EncodedString()
+        let forged = IncomingRecord(id: UUID().uuidString, account: incoming.account, database: incoming.database,
+            zoneName: incoming.zoneName, zoneOwner: incoming.zoneOwner, recordName: incoming.recordName,
+            recordType: incoming.recordType, bytes: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]),
+            systemFields: incoming.systemFields, vaultID: incoming.vaultID)
+        try await repository.stageIncoming(forged, permit: permit)
+    }
+    if scenario == "otherConsumer" {
+        _ = try await repository.enqueue(SyncOperation(account: scope.account, vaultID: scope.vaultID, kind: .reconcile,
+            dependencies: [.init(.operation, identifier: fetch.id.uuidString)]))
+    }
+    if scenario == "conflict" {
+        let branch = try ContentEnvelope.seal(["password": "branch"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+        _ = try await branchCurrentPublication(branch, repository: repository, scope: scope, history: history, fields: Data([1]))
+    }
+    let reconciliation = TargetedSyncReconciliation(repository: repository, account: scope.account, history: { _ in history })
+    try await reconciliation.reconcile(permit: permit)
+    let after = try #require(await repository.operations(account: scope.account, database: scope.database).first { $0.id == fetch.id })
+    #expect(try await repository.item(scope)?.versionID == mutation.version.versionID)
+    if scenario != "retire" {
+        #expect(after.state != .completed)
+        #expect(try await repository.incomingRecord(id: incoming.id, account: scope.account, database: scope.database) != nil)
+        return
+    }
+    #expect(after.resolution == .unneededGrantSource && after.deliveredAt == nil)
+    #expect(try await repository.incomingRecord(id: incoming.id, account: scope.account, database: scope.database) == nil)
+    try await repository.stageIncoming(incoming, permit: permit)
+    #expect(try await repository.incomingRecord(id: incoming.id, account: scope.account, database: scope.database) == nil)
+    // A genuinely new consumer can request the source later; cancellation is not
+    // proof of delivery and must not permanently poison the deterministic fetch ID.
+    let request = try JSONDecoder().decode(ContentVersionFetch.self, from: fetch.payload)
+    let rearmed = try await repository.enqueue(request.operation(account: scope.account, owner: scope.zoneOwner))
+    #expect(rearmed.state == .ready && rearmed.resolution == nil && rearmed.deliveredAt == nil)
+    let sender = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root.appendingPathComponent("sender")))
+    let sourceStorage = GrantBackedContentStorage(repository: sender)
+    try await sourceStorage.setAuthority(scope: VaultScope(scope), expected: nil, history: history, authorization: permit)
+    _ = try await sourceStorage.commit(orphan.content, grants: orphan.grants, scope: scope, history: history, authorization: permit)
+    let upload = try #require(await sender.contentPublications(account: scope.account).first)
+    let source = try ContentRecordTransport.materialize(upload.record(assetDirectory: root), account: scope.account)
+    try await repository.stageIncoming(source, permit: permit)
+    _ = try await inbox.process(id: source.id, history: history, permit: permit)
+    try await repository.stageIncoming(incoming, permit: permit)
+    guard case .completed = try await inbox.process(id: incoming.id, history: history, permit: permit) else {
+        Issue.record("A later verified source must permit normal grant recovery"); return
+    }
+    try await reconciliation.reconcile(permit: permit)
+    #expect(try await repository.operations(account: scope.account, database: scope.database).first { $0.id == fetch.id }?.resolution == .verifiedContentAvailable)
+    #expect(try await repository.item(scope)?.versionID == mutation.version.versionID)
+}
+
+@MainActor @Test(arguments: ["ancestor", "current", "unknownGeneration", "missingHistory", "badSignature", "wrongRecipient"])
+func failedEnrollmentGrantRequestsReverifyBeforeRecovery(scenario: String) async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permit = ContentStorageTestPermit(), storage = GrantBackedContentStorage(repository: repository)
+    let first = try ContentEnvelope.seal(["password": "value"], vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    _ = try await storage.commit(first.content, grants: first.grants, scope: scope, history: history, authorization: permit)
+    if scenario == "ancestor" {
+        let successor = try first.content.rotateKey(grant: #require(first.grants.first), history: history, decryptor: owner, signer: owner)
+        _ = try await storage.commit(successor.content, grants: successor.grants, scope: scope, history: history, authorization: permit)
+    }
+    let enrollment = EnrollmentScope(container: "test", environment: "Development", account: scope.account, vault: scope.vaultID, member: owner.identity.member)
+    let inbox = GrantBackedCoordinationInbox(repository: repository, container: enrollment.container,
+        environment: enrollment.environment, account: scope.account, member: owner.identity.member)
+    let request = ContentGrantRequest(item: scope.itemID, keyGeneration: scenario == "unknownGeneration" ? UUID() : first.content.header.keyGeneration,
+        recipient: scenario == "wrongRecipient" ? String(repeating: "f", count: 64) : owner.identity.fingerprint)
+    let envelope = try CoordinationEnvelope.sign(kind: .grantRequest, scope: enrollment, identity: UUID(),
+        payload: JSONEncoder().encode(request), history: history, device: owner)
+    var bytes = try envelope.encoded()
+    if scenario == "badSignature" {
+        var object = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        object["signature"] = Data(repeating: 0, count: 64).base64EncodedString()
+        bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+    }
+    let record = try PreparedCoordinationRecord(account: scope.account, vault: scope.vaultID, kind: .grantRequest, identity: envelope.identity, bytes: bytes)
+    let queued = try await repository.enqueue(SyncOperation(account: scope.account, vaultID: scope.vaultID, kind: .enrollment, payload: JSONEncoder().encode(record)))
+    let failed = try await repository.transition(queued, to: .needsAttention, failure: .invalidAuthority, attempted: true)
+    if ["badSignature", "wrongRecipient"].contains(scenario) {
+        await #expect(throws: (any Error).self) { try await inbox.recoverFailedGrantRequest(failed, history: history, permit: permit) }
+    } else {
+        let changed = try await inbox.recoverFailedGrantRequest(failed, history: scenario == "missingHistory" ? nil : history, permit: permit)
+        #expect(changed == (scenario != "missingHistory"))
+    }
+    let after = try #require(await repository.operations(account: scope.account, database: scope.database).first { $0.id == failed.id })
+    #expect(after.deliveredAt == nil && after.attempts == failed.attempts)
+    switch scenario {
+    case "ancestor": #expect(after.state == .completed && after.resolution == .obsoleteGrantGeneration)
+    case "unknownGeneration": #expect(after.state == .waitingForDependency && !after.dependencies.isEmpty)
+    case "current":
+        #expect(after.state == .ready && after.resolution == nil)
+        // A persistent failure gets only one retry for this same verified state,
+        // including across process restart.
+        let again = try await repository.transition(after, to: .needsAttention, failure: .invalidAuthority, attempted: true)
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+        let restarted = GrantBackedCoordinationInbox(repository: reopened, container: enrollment.container,
+            environment: enrollment.environment, account: scope.account, member: owner.identity.member)
+        #expect(try await !restarted.recoverFailedGrantRequest(again, history: history, permit: permit))
+        #expect(try await reopened.operations(account: scope.account, database: scope.database).first { $0.id == failed.id } == again)
+    default: #expect(after == failed)
+    }
+}
+
+@MainActor @Test(arguments: [false, true])
+func storedEquivalentConflictRecoveryPreservesEditsAndSurvivesRestart(different: Bool) async throws {
+    let (root, repository, owner, history, originalScope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let scope = ItemScope(account: originalScope.account, vaultID: originalScope.vaultID, itemID: ItemVaultSession.metadataRecordID)
+    let binding = ItemVaultBinding(account: scope.account, database: "private", zoneOwner: scope.zoneOwner, vaultID: scope.vaultID)
+    let session = try GrantBackedContentSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: owner))
+    let local = try await session.create(item: scope.itemID, components: [ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultMetadata(name: "vault"))])
+    let remote = try ContentEnvelope.seal([ContentItemArchive.metadataComponent: ContentItemArchive.encode(VaultMetadata(name: different ? "edited" : "vault"))],
+        vault: history.vault, item: scope.itemID, history: history, signer: owner)
+    let conflict = try await branchCurrentPublication(remote, repository: repository, scope: scope, history: history, fields: Data([2]))
+    #expect(try await session.recoverStoredConflict(conflict) == !different)
+    #expect(try await repository.item(scope) == local.version)
+    let decisions = try await repository.operations(account: scope.account, database: "private").filter { $0.kind == .resolveConflict }
+    if different {
+        #expect(decisions.isEmpty)
+        #expect(try await repository.contentConflicts(account: scope.account) == [conflict])
+    } else {
+        let decision = try #require(decisions.first)
+        #expect(decisions.count == 1)
+        #expect(try await session.recoverEquivalentConflict(conflict))
+        #expect(try await repository.operations(account: scope.account, database: "private").filter { $0.kind == .resolveConflict }.count == 1)
+        let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+        let (reviewed, replacement) = try await reopened.contentConflictDecision(decision)
+        #expect(replacement == nil)
+        _ = try await reopened.resolveContentConflict(reviewed, replacement: replacement, serverSystemFields: Data([3]),
+            policy: GrantBackedContentStorage.recipientPolicy(history: history), decision: decision, permit: ContentStorageTestPermit())
+        #expect(try await reopened.item(scope) == conflict.remote)
+        #expect(try await reopened.contentConflicts(account: scope.account).isEmpty)
+        #expect(try await !reopened.operationIsDelivered(decision.id, account: scope.account))
+    }
+    session.lock()
+    await #expect(throws: (any Error).self) { try await session.recoverEquivalentConflict(conflict) }
+    owner.close()
+}
+
+@Test func equivalentConflictComparisonPreservesEditAttributionAndDates() throws {
+    var archive = try sessionArchive()
+    archive.items[0].metadata = ItemMetadata(updatedAt: Date(timeIntervalSince1970: 1))
+    let origin = ItemEditOrigin(deviceID: UUID(), deviceName: "device", updatedAt: Date(timeIntervalSince1970: 1))
+    let left = try ContentItemArchive.components(archive, editOrigin: origin)
+    archive.items[0].metadata?.updatedAt = Date(timeIntervalSince1970: 2)
+    let right = try ContentItemArchive.components(archive, editOrigin: origin)
+    #expect(try !ContentItemArchive.identical(left.values, right.values, item: left.item, preservingEditMetadata: true))
+    archive.items[0].metadata?.updatedAt = Date(timeIntervalSince1970: 1)
+    let changedAuthor = try ContentItemArchive.components(archive, editOrigin: ItemEditOrigin(deviceID: UUID(), deviceName: "other", updatedAt: origin.updatedAt))
+    #expect(try !ContentItemArchive.identical(left.values, changedAuthor.values, item: left.item, preservingEditMetadata: true))
+    #expect(try ContentItemArchive.identical(left.values, left.values, item: left.item, preservingEditMetadata: true))
+}
+
+@MainActor @Test(arguments: [false, true], [false, true])
+func conflictKeyRecoveryWaitsDurablyAndRecoversLegacyGrant(revoked: Bool, grantArrives: Bool) async throws {
+    let (root, repository, owner, originalHistory, originalScope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let scope = ItemScope(account: originalScope.account, vaultID: originalScope.vaultID, itemID: ItemVaultSession.metadataRecordID)
+    let binding = ItemVaultBinding(account: scope.account, database: scope.database, zoneOwner: scope.zoneOwner, vaultID: scope.vaultID)
+    let original = try GrantBackedContentSession(repository: repository, binding: binding, history: originalHistory, device: SessionDevice(copying: owner))
+    let values = [ContentItemArchive.metadataComponent: try ContentItemArchive.encode(VaultMetadata(name: "preserve"))]
+    _ = try await original.create(item: scope.itemID, components: values)
+    let differentLegacyEdit = revoked && grantArrives
+    let remoteValues = differentLegacyEdit
+        ? [ContentItemArchive.metadataComponent: try ContentItemArchive.encode(VaultMetadata(name: "genuine legacy edit"))] : values
+    let remote = try ContentEnvelope.seal(remoteValues, vault: scope.vaultID, item: scope.itemID, history: originalHistory, signer: owner)
+    let conflict = try await branchCurrentPublication(remote, repository: repository, scope: scope, history: originalHistory, fields: Data([2]))
+    let replacement = try SessionDevice(member: owner.identity.member)
+    var history = originalHistory
+    try history.append(MembershipEnvelope.successor(of: history.current, membership: Membership(accounts: [
+        .init(id: owner.identity.member, role: .owner, devices: [owner.identity, replacement.identity])]), owner: owner))
+    if revoked {
+        try history.append(MembershipEnvelope.successor(of: history.current, membership: Membership(accounts: [
+            .init(id: owner.identity.member, role: .owner, devices: [replacement.identity])], removedDevices: [owner.identity.device]), owner: replacement))
+    }
+    try await GrantBackedContentStorage(repository: repository).setAuthority(scope: VaultScope(scope), expected: originalHistory,
+        history: history, authorization: ContentStorageTestPermit())
+    let session = try GrantBackedContentSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: replacement))
+    let requestScope = EnrollmentScope(container: "iCloud.test", environment: "Development", account: scope.account, vault: scope.vaultID, member: owner.identity.member)
+    #expect(try await session.recoverStoredConflict(conflict, requestScope: requestScope))
+    let requests = try await repository.operations(account: scope.account, database: scope.database).filter { $0.kind == .publishCoordination }
+    #expect(requests.count == (revoked ? 0 : 2))
+    #expect(try await repository.contentConflicts(account: scope.account) == [conflict])
+    let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+    let resumed = try GrantBackedContentSession(repository: reopened, binding: binding, history: history, device: SessionDevice(copying: replacement))
+    #expect(try await resumed.recoverStoredConflict(conflict, requestScope: requestScope))
+    #expect(try await reopened.operations(account: scope.account, database: scope.database).filter { $0.kind == .publishCoordination } == requests)
+    // Either a newly received grant or an available legacy key wakes the wait.
+    if grantArrives && !revoked {
+        for version in [conflict.local, conflict.remote] {
+            let preparation = try ContentGrantPreparation(bytes: version.ciphertext, item: scope.itemID, history: history)
+            let source = try #require(await reopened.contentGrants(scope: scope, keyGeneration: preparation.content.header.keyGeneration,
+                recipient: owner.identity.fingerprint).first)
+            let publication = try preparation.extendingAccess(to: replacement.identity, sourceGrantBytes: source.bytes, decryptor: owner, signer: replacement)
+            let prepared = try preparedInboxGrant(publication.grant, scope: scope)
+            let incoming = try ContentRecordTransport.materialize(ContentRecordTransport.grant(prepared), account: scope.account)
+            try await reopened.stageIncomingBatch([incoming], checkpoint: Data([1]), account: scope.account, database: scope.database, permit: ContentStorageTestPermit())
+            try await reopened.receiveContentGrant(prepared, from: incoming,
+                expectedPolicy: GrantBackedContentStorage.recipientPolicy(history: history), permit: ContentStorageTestPermit())
+        }
+        #expect(try await resumed.recoverStoredConflict(conflict, requestScope: requestScope))
+    } else {
+        #expect(try await resumed.recoverStoredConflict(conflict, requestScope: requestScope, legacy: owner))
+    }
+    let decisions = try await reopened.operations(account: scope.account, database: scope.database).filter { $0.kind == .resolveConflict }
+    #expect(decisions.count == (differentLegacyEdit ? 0 : 1))
+    if revoked && !differentLegacyEdit {
+        let decision = try #require(decisions.first)
+        let (_, replacementPublication) = try await reopened.contentConflictDecision(decision)
+        let publication = try #require(replacementPublication)
+        #expect(try publication.content.keyAuthority == GrantBackedContentStorage.recipientPolicy(history: history).keyAuthority)
+        #expect(publication.content.keyGeneration != remote.content.header.keyGeneration)
+        #expect(try await reopened.contentGrants(scope: scope, keyGeneration: remote.content.header.keyGeneration,
+            recipient: replacement.identity.fingerprint).isEmpty)
+    }
+    #expect(try await reopened.contentConflicts(account: scope.account, includePendingDecisions: true) == [conflict])
+    if !revoked {
+        #expect(try await resumed.isDuplicateConflict(conflict))
+    }
+    resumed.lock()
+    await #expect(throws: MopError.authentication) { try await resumed.recoverStoredConflict(conflict, requestScope: requestScope, legacy: owner) }
+    owner.close(); replacement.close(); original.lock(); session.lock()
+}
+
+@MainActor @Test(arguments: [false, true]) func obsoleteConflictAncestryRetirementPreservesPendingEdit(otherBranch: Bool) async throws {
+    let (root, repository, owner, history, scope) = try await previewInboxFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let binding = ItemVaultBinding(account: scope.account, database: scope.database, zoneOwner: scope.zoneOwner, vaultID: scope.vaultID)
+    let session = try GrantBackedContentSession(repository: repository, binding: binding, history: history, device: SessionDevice(copying: owner))
+    let initial = try await session.create(item: scope.itemID, components: ["secret": SecretBytes(utf8: "original")])
+    let publication = try await currentPublication(initial.version, repository: repository, history: history)
+    let edited = try await session.edit(item: scope.itemID, expected: initial.version.versionID, components: ["secret": SecretBytes(utf8: "genuine edit")])
+    let conflict = try await branchCurrentPublication(publication, repository: repository, scope: scope, history: history, fields: Data([2]))
+    if otherBranch {
+        let divergent = try ContentEnvelope.seal(["secret": SecretBytes(utf8: "other genuine edit")], vault: scope.vaultID, item: scope.itemID, history: history, signer: owner)
+        _ = try await branchCurrentPublication(divergent, repository: repository, scope: scope, history: history, fields: Data([3]))
+    }
+    let policy = try GrantBackedContentStorage.recipientPolicy(history: history)
+    let rotationID = await repository.contentOperationID("rotate:" + scope.storageKey + ":" + policy.keyAuthority)
+    let rotation = try await repository.enqueuePrerequisite(SyncOperation(id: rotationID, account: scope.account,
+        vaultID: scope.vaultID, kind: .rotateContent, payload: setupEncode(scope)), permit: ContentStorageTestPermit())
+    _ = try await repository.transition(rotation, to: .needsAttention, failure: .conflict)
+    let pending = try await repository.pendingMutations(account: scope.account)
+    #expect(try await session.recoverStoredConflict(conflict))
+    #expect(try await repository.contentConflicts(account: scope.account).count == (otherBranch ? 1 : 0))
+    #expect(try await repository.item(scope) == edited.version)
+    #expect(try await repository.pendingMutations(account: scope.account) == pending)
+    #expect(try await repository.contentVersion(scope: scope, version: initial.version.versionID) != nil)
+    #expect(try await repository.operations(account: scope.account, database: scope.database).first { $0.id == rotationID }?.state == (otherBranch ? .needsAttention : .ready))
+    await #expect(throws: ItemRepositoryError.staleConflict) { try await session.recoverStoredConflict(conflict) }
+    session.lock(); owner.close()
 }

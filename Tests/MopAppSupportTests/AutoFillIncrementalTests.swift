@@ -336,3 +336,21 @@ private actor PublicationBarrier {
     try await first.prune(keeping: [kept])
     #expect(Set(try AutoFillIndex(directory: root).load().map(\.username)) == ["kept"])
 }
+
+@Test func rememberedWebsiteRefreshesPickerAndSystemSuggestionsAfterFill() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SuggestionStore(), publisher = publisher(root, store), vault = UUID().uuidString
+    var item = suggestionItem(UUID(), user: "alice")
+    try await publisher.publish(catalog: suggestionCatalog([(item, UUID())]), vaultID: vault)
+    let original = Set(await store.rows.keys)
+    item.fields.append(ItemField(path: "website2", type: .website, value: "remembered.test"))
+    try await publisher.stage(catalog: suggestionCatalog([(item, UUID())]), vaultID: vault)
+    let picker = try AutoFillIndex(directory: root).load()
+    #expect(picker.contains { $0.website == "remembered.test" })
+    #expect(Set(await store.rows.keys) == original)
+    // The completion callback publishes the durable metadata after filling.
+    try await publisher.refresh()
+    #expect(await store.rows.values.contains { $0.website == "remembered.test" })
+    #expect(original.isSubset(of: Set(await store.rows.keys)))
+}

@@ -27,19 +27,7 @@ extension EncryptedItemRepository {
         try permit.withWritePermission {
             try transaction {
                 for grant in try recipientGrants(scope: scope, recipient: recipient) where identifier == nil || identifier == grant.identifier {
-                    let key = contentGrantKey(scope: grant.scope, keyGeneration: grant.keyGeneration, suffix: grant.identifier)
-                    if let receipt = try fetchOne("StateBlob", key: "content-grant-delivery4:" + key) { context.delete(receipt) }
-                    try writeJournal(true, entity: "StateBlob", key: "grant-repair4:" + key)
-                    let operation = SyncOperation(id: contentOperationID("publish:" + key), account: scope.account,
-                        database: scope.database, vaultID: scope.vaultID, zoneOwner: scope.zoneOwner,
-                        kind: .grant, payload: try contentEncode(grant))
-                    let operationKey = journalKey(scope.account, scope.database, operation.id.uuidString)
-                    if let old: SyncOperation = try journalValue("SyncOperation", key: operationKey) {
-                        guard old.kind == operation.kind, old.payload == operation.payload else { throw SyncJournalError.identityCollision }
-                        if old.state == .completed {
-                            try writeJournal(operation, entity: "SyncOperation", key: operationKey, account: scope.account, database: scope.database)
-                        }
-                    } else { _ = try enqueueInTransaction(operation) }
+                    try requeueGrantInTransaction(grant)
                 }
                 try touchVaultBoundary(scope)
                 let key = blobKey(scope.account, "grant-initial-fetch4:" + zone.name)
@@ -48,4 +36,36 @@ extension EncryptedItemRepository {
             }
         }
     }
+    /// Queue one immutable repair without scanning every grant in the vault or
+    /// doing per-item network I/O. The normal publisher validates current authority.
+    public func repairGrantDelivery(_ grant: PreparedContentGrant, permit: any RepositoryWritePermit) throws {
+        try permit.withWritePermission {
+            try transaction {
+                guard try contentGrants(scope: grant.scope, keyGeneration: grant.keyGeneration,
+                    recipient: grant.recipient).contains(grant) else { throw ContentStoreError.invalidRecord }
+                try requeueGrantInTransaction(grant)
+                try touchVaultBoundary(VaultScope(account: grant.scope.account, vaultID: grant.scope.vaultID,
+                    database: grant.scope.database, zoneOwner: grant.scope.zoneOwner))
+            }
+        }
+    }
+
+    private func requeueGrantInTransaction(_ grant: PreparedContentGrant) throws {
+        let scope = VaultScope(account: grant.scope.account, vaultID: grant.scope.vaultID,
+            database: grant.scope.database, zoneOwner: grant.scope.zoneOwner)
+        let key = contentGrantKey(scope: grant.scope, keyGeneration: grant.keyGeneration, suffix: grant.identifier)
+        if let receipt = try fetchOne("StateBlob", key: "content-grant-delivery4:" + key) { context.delete(receipt) }
+        try writeJournal(true, entity: "StateBlob", key: "grant-repair4:" + key)
+        let operation = SyncOperation(id: contentOperationID("publish:" + key), account: scope.account,
+            database: scope.database, vaultID: scope.vaultID, zoneOwner: scope.zoneOwner,
+            kind: .grant, payload: try contentEncode(grant))
+        let operationKey = journalKey(scope.account, scope.database, operation.id.uuidString)
+        if let old: SyncOperation = try journalValue("SyncOperation", key: operationKey) {
+            guard old.kind == operation.kind, old.payload == operation.payload else { throw SyncJournalError.identityCollision }
+            if old.state == .completed {
+                try writeJournal(operation, entity: "SyncOperation", key: operationKey, account: scope.account, database: scope.database)
+            }
+        } else { _ = try enqueueInTransaction(operation) }
+    }
+
 }

@@ -86,6 +86,7 @@ public final class ItemVaultSession: @unchecked Sendable {
     private let identity: DevicePublicKey
     private let permit: ItemVaultPermit
     private let authorityValid = ItemVaultAuthority()
+    private let healthMembershipReads = HealthMembershipReadCache()
     let contentSession: GrantBackedContentSession
 
     public convenience init(repository: EncryptedItemRepository, binding: ItemVaultBinding,
@@ -353,12 +354,14 @@ public final class ItemVaultSession: @unchecked Sendable {
     }
 
     private func readableState(_ digest: String) throws -> MembershipEnvelope {
-        let state = try history.state(forDigest: digest)
-        guard state.membership.role(of: identity) != nil else {
-            try history.verifyAccountPath(from: digest)
-            throw ItemVaultSessionFailure.pendingAdmission
+        try healthMembershipReads.read(digest) {
+            let state = try history.state(forDigest: digest)
+            guard state.membership.role(of: identity) != nil else {
+                try history.verifyAccountPath(from: digest)
+                throw ItemVaultSessionFailure.pendingAdmission
+            }
+            return state
         }
-        return state
     }
 
     /// A bounded projection for progressive UI loading. The caller supplies a
@@ -478,6 +481,31 @@ public final class ItemVaultSession: @unchecked Sendable {
         return result
     }
 
+    public func checkConflicts(requestScope: EnrollmentScope? = nil, legacy: (any DeviceOperations)? = nil,
+                               isolation: isolated (any Actor)? = #isolation) async throws -> ItemVaultConflictCheck {
+        try permit.check()
+        let conflicts = try await repository.contentConflicts(account: binding.account)
+        var choices: [ItemVaultConflictPreview] = []
+        var pending = 0
+        for conflict in conflicts where binding.contains(conflict.local.scope) && conflict.local.healthItemID == nil {
+            try Task.checkCancellation()
+            try permit.check()
+            do {
+                if try await contentSession.recoverStoredConflict(conflict, requestScope: requestScope, legacy: legacy) { pending += 1 }
+                else { choices.append(try await conflictPreview(conflict)) }
+            } catch {
+                // A missing grant, stale branch or unverifiable authority must
+                // not discard work or prevent independent branches recovering.
+                try Task.checkCancellation()
+                try permit.check()
+                pending += 1
+                AccessSyncTrace.failure("conflict recovery deferred", operation: conflict.id, error: error)
+            }
+        }
+        try permit.check()
+        return ItemVaultConflictCheck(choices: choices, pending: pending)
+    }
+
     /// Re-encryption changes ciphertext and version IDs, not retained contents.
     /// Compare all records, history, metadata and edit attribution before treating
     /// a conflict as a duplicate; matching visible fields alone is insufficient.
@@ -567,20 +595,39 @@ public final class ItemVaultSession: @unchecked Sendable {
         }
         let scope = binding.item(LocalPasswordHealthEnvelope.recordID(for: itemID))
         var previous = try await repository.localHealthItem(scope)
-        if let invalid = previous, (try? healthEnvelope(invalid)) == nil {
-            try await repository.discardLocalHealth(scope, expectedVersion: invalid.versionID, authorization: permit)
-            previous = nil
-        }
         let contentCatalog = try await contentSession.catalog(itemID: itemID)
         if contentCatalog.versionID != expectedItemVersion { throw ItemRepositoryError.staleLocalVersion }
+        var existingChecks: [CachedPasswordCheck]?
+        if let cached = previous {
+            if (try? healthEnvelope(cached)) != nil {
+                do {
+                    existingChecks = try permit.withHealth(cached) { device in
+                        let verified = try verifiedHealthEnvelope(cached)
+                        _ = try readableState(verified.envelope.header.membership)
+                        return try verified.open(device: device)
+                    }
+                } catch MopError.vaultUntrusted {
+                    // A replacement identity cannot follow every historical
+                    // membership path. Recompute disposable evidence; never
+                    // relax that path check or merge unverified old results.
+                } catch MopError.notVaultMember {
+                    // The old local cache may have no envelope for this device.
+                } catch ItemVaultSessionFailure.pendingAdmission {
+                    // Current content access above is independently authorized.
+                }
+            }
+            if existingChecks == nil {
+                try permit.check()
+                try await repository.discardLocalHealth(scope, expectedVersion: cached.versionID, authorization: permit)
+                previous = nil
+            }
+        }
         let version: EncryptedItemVersion? = try permit.withDevice { device in
             let catalog = contentCatalog.catalog
             guard Set(checks.map(\.record)).isSubset(of: Set(catalog.references.values)) else { throw MopError.invalidVault }
             var ordered = checks.sorted { $0.record < $1.record }
-            if let previous {
-                let old = try healthEnvelope(previous)
-                let oldState = try readableState(old.header.membership)
-                let existing = try old.open(device: device, membership: oldState.membership, membershipStateDigest: old.header.membership)
+            if previous != nil {
+                guard let existing = existingChecks else { throw MopError.vaultUntrusted }
                 // Re-read and merge at the commit boundary as well: another
                 // publisher can have added evidence since the service snapshot.
                 let live = Set(catalog.item.fields.filter {
@@ -669,32 +716,39 @@ final class ItemVaultPermit: RepositoryWritePermit, @unchecked Sendable {
     private let state: Mutex<State>
     init(device: any DeviceOperations) { state = Mutex(State(device: device)) }
     deinit { invalidate() }
-    var isValid: Bool { state.withLock { $0.device != nil } }
+    var isValid: Bool { state.withLock { value in
+        guard let device = value.device else { return false }
+        do { try device.checkAuthorization(); return true } catch { return false }
+    } }
     func invalidate() {
         state.withLock { value in value.displayKey = nil; value.health.removeAll(); value.healthProjection = nil; value.device?.close(); value.device = nil }
     }
     func check() throws { try withWritePermission {} }
     func withWritePermission<T>(_ body: () throws -> T) throws -> T {
         try state.withLock { value in
-            guard value.device != nil else { throw MopError.authentication }
+            guard let device = value.device else { throw MopError.authentication }
+            try device.checkAuthorization()
             return try body()
         }
     }
     func cachedHealthProjection(_ versions: [UUID: UUID]) throws -> [CachedPasswordCheck]? {
         try state.withLock { value in
-            guard value.device != nil else { throw MopError.authentication }
+            guard let device = value.device else { throw MopError.authentication }
+            try device.checkAuthorization()
             return value.healthProjection.flatMap { $0.versions == versions ? $0.checks : nil }
         }
     }
     func cacheHealthProjection(_ versions: [UUID: UUID], checks: [CachedPasswordCheck]) throws {
         try state.withLock { value in
-            guard value.device != nil else { throw MopError.authentication }
+            guard let device = value.device else { throw MopError.authentication }
+            try device.checkAuthorization()
             value.healthProjection = (versions, checks)
         }
     }
     func withHealth(_ version: EncryptedItemVersion, _ read: (any DeviceOperations) throws -> [CachedPasswordCheck]) throws -> [CachedPasswordCheck] {
         try state.withLock { value in
             guard let device = value.device else { throw MopError.authentication }
+            try device.checkAuthorization()
             if let cached = value.health[version.scope.itemID], cached.version == version.versionID { return cached.checks }
             let checks = try read(device)
             value.health[version.scope.itemID] = (version.versionID, checks)
@@ -712,6 +766,7 @@ final class ItemVaultPermit: RepositoryWritePermit, @unchecked Sendable {
     func withDisplayKey<T>(envelope: Data, context: Data, _ body: (LocalDisplayCatalogKey) throws -> T) throws -> T {
         try state.withLock { value in
             guard let device = value.device else { throw MopError.authentication }
+            try device.checkAuthorization()
             if value.displayKey?.envelope != envelope {
                 value.displayKey = (envelope, try LocalDisplayCatalogKey.open(envelope, context: context, device: device))
             }
@@ -722,6 +777,7 @@ final class ItemVaultPermit: RepositoryWritePermit, @unchecked Sendable {
     func withDevice<T>(_ body: (any DeviceOperations) throws -> T) throws -> T {
         try state.withLock { value in
             guard let device = value.device else { throw MopError.authentication }
+            try device.checkAuthorization()
             return try body(device)
         }
     }
@@ -741,4 +797,19 @@ private final class ItemVaultAuthority: @unchecked Sendable {
 public enum ItemConflictChoice: Sendable {
     case local, remote
     case combine(metadata: ItemVaultConflictSide, fields: [String: ItemVaultConflictSide])
+}
+
+/// Public membership results only, scoped to one immutable session history and
+/// identity. Authorization and envelope verification remain outside this cache.
+final class HealthMembershipReadCache: Sendable {
+    private let values = Mutex<[String: Result<MembershipEnvelope, any Error>]>([:])
+    func read(_ digest: String, verify: () throws -> MembershipEnvelope) throws -> MembershipEnvelope {
+        try values.withLock { cache in
+            if let result = cache[digest] { return try result.get() }
+            let result = Result { try verify() }
+            if cache.count >= 256 { cache.removeAll() }
+            cache[digest] = result
+            return try result.get()
+        }
+    }
 }

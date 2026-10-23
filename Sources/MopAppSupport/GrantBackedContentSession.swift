@@ -121,7 +121,7 @@ public final class GrantBackedContentSession: @unchecked Sendable {
 
     /// Passed only the public account/lease permit. The session adds its own
     /// secret-key gate and checks it again at the final durable commit.
-    public func handle(_ operation: SyncOperation, owner: any RepositoryWritePermit, recovery: (any DeviceOperations)? = nil, grantRequestScope: EnrollmentScope? = nil, now: Date = Date()) async -> SyncOperationOutcome {
+    public func handle(_ operation: SyncOperation, owner: any RepositoryWritePermit, recovery: (any DeviceOperations)? = nil, migration: (any DeviceOperations)? = nil, grantRequestScope: EnrollmentScope? = nil, now: Date = Date()) async -> SyncOperationOutcome {
         guard operation.account == binding.account, operation.database == binding.database,
               operation.vaultID == binding.vaultID, operation.zoneOwner == binding.zoneOwner else { return .attention(.invalidAuthority) }
         do {
@@ -165,12 +165,18 @@ public final class GrantBackedContentSession: @unchecked Sendable {
                 let decryptor: (any DeviceOperations)?
                 do { grant = try await self.grant(for: content); decryptor = nil }
                 catch CloudSyncAdapterError.membershipUnavailable {
-                    guard let recovery, history.current.membership.offlineRecovery == recovery.identity,
+                    let sourceDevice: (any DeviceOperations)?
+                    if let recovery, history.current.membership.offlineRecovery == recovery.identity { sourceDevice = recovery }
+                    else if let migration, WrappedDeviceMigration.canUseLegacySource(migration.identity, replacement: identity, history: history) {
+                        sourceDevice = migration
+                    }
+                    else { sourceDevice = nil }
+                    guard let sourceDevice,
                           let source = try await repository.contentGrants(scope: scope, keyGeneration: content.header.keyGeneration)
-                            .first(where: { $0.recipient == recovery.identity.fingerprint }) else {
+                            .first(where: { $0.recipient == sourceDevice.identity.fingerprint }) else {
                         return try await waitForOwnGrant(operation, item: scope, requestScope: grantRequestScope, owner: owner, now: now)
                     }
-                    grant = try ContentKeyGrant.decode(source.bytes, content: content, history: history); decryptor = recovery
+                    grant = try ContentKeyGrant.decode(source.bytes, content: content, history: history); decryptor = sourceDevice
                 }
                 let acceptedVersion = try await repository.acceptedVersion(scope)
                 let accepted = try acceptedVersion.map { try ContentEnvelope.decode($0.ciphertext, history: history, item: scope.itemID) }
@@ -259,9 +265,20 @@ public final class GrantBackedContentSession: @unchecked Sendable {
         return record
     }
 
+    private func comparisonGrant(for content: ContentEnvelope) async throws -> ContentKeyGrant {
+        do { return try await grant(for: content) }
+        catch CloudSyncAdapterError.membershipUnavailable {
+            let current = try await repository.contentState(scope: binding.item(content.header.item))
+            let dependency = try GrantRequestWait(vault: binding.vaultID, item: content.header.item,
+                version: current?.versionID, membership: history.current.digest(),
+                recipient: identity.fingerprint, keyGeneration: content.header.keyGeneration).dependency()
+            throw ContentComparisonMissingGrant(dependency: dependency)
+        }
+    }
+
     public func comparison() -> ContentComparisonSession {
         ContentComparisonSession(authorization: permit, identical: { [self] local, remote in
-            let localGrant = try await grant(for: local), remoteGrant = try await grant(for: remote)
+            let localGrant = try await comparisonGrant(for: local), remoteGrant = try await comparisonGrant(for: remote)
             return try permit.withDevice { device in
                 guard local.header.isTombstone == remote.header.isTombstone else { return false }
                 let left = try local.open(components: Set(local.components.keys), grant: localGrant, history: history, device: device)
@@ -280,7 +297,7 @@ public final class GrantBackedContentSession: @unchecked Sendable {
                 }
             }
             guard let common else { return nil }
-            let localGrant = try await grant(for: local), remoteGrant = try await grant(for: remote), baseGrant = try await grant(for: common)
+            let localGrant = try await comparisonGrant(for: local), remoteGrant = try await comparisonGrant(for: remote), baseGrant = try await comparisonGrant(for: common)
             // A different server plaintext is a real content conflict. Never
             // treat matching logical revision IDs alone as access-only proof.
             let accessOnly = try permit.withDevice {
@@ -302,7 +319,7 @@ public final class GrantBackedContentSession: @unchecked Sendable {
 
 extension GrantBackedContentSession {
     func coordination(kind: CoordinationEnvelope.Kind, scope: EnrollmentScope, identity: UUID, payload: Data,
-                      owner: any RepositoryWritePermit) async throws -> PreparedCoordinationRecord {
+                      owner: (any RepositoryWritePermit)? = nil) async throws -> PreparedCoordinationRecord {
         guard let recordKind = CoordinationRecordKind(rawValue: kind.rawValue), scope.vault == binding.vaultID,
               scope.account == binding.account else { throw MopError.vaultUntrusted }
         if let existing = try await repository.preparedCoordination(account: binding.account, vault: binding.vaultID, kind: recordKind, identity: identity) {
@@ -315,7 +332,10 @@ extension GrantBackedContentSession {
             payload: payload, history: history, device: $0) }
         let record = try PreparedCoordinationRecord(account: binding.account, vault: binding.vaultID, kind: recordKind,
             identity: identity, bytes: envelope.encoded())
-        do { _ = try await repository.enqueueCoordination(record, authorization: ContentWorkPermit(owner: owner, session: permit)) }
+        let authorization: any RepositoryWritePermit
+        if let owner { authorization = ContentWorkPermit(owner: owner, session: permit) }
+        else { authorization = permit }
+        do { _ = try await repository.enqueueCoordination(record, authorization: authorization) }
         catch SyncJournalError.identityCollision where kind == .grantRequest {
             // Two app-group workers can sign the same deterministic request
             // before either commits. Keep the authenticated durable winner.

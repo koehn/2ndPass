@@ -14,6 +14,19 @@ public enum SyncOperationOutcome: Sendable {
     case authorization
     case retry(SyncFailure, retryAfter: TimeInterval? = nil)
     case attention(SyncFailure)
+
+    // Never log associated dependency identifiers or payloads.
+    var diagnosticSummary: String {
+        switch self {
+        case .completed: "completed"
+        case .transportOwned: "transportOwned"
+        case .waiting: "waiting"
+        case .waitingUntil: "waitingUntil"
+        case .authorization: "authorization"
+        case .retry(let failure, _): "retry:\(failure.rawValue)"
+        case .attention(let failure): "attention:\(failure.rawValue)"
+        }
+    }
 }
 
 public struct SyncClock: Sendable {
@@ -45,7 +58,9 @@ public actor DurableSyncCoordinator {
     public typealias RotationBatchHandler = @Sendable ([SyncOperation]) async -> [SyncOperationOutcome]
     public static let rotationBatchLimit = 16
     private let rotationBatchHandler: RotationBatchHandler?
+    private let afterDrain: @Sendable () async throws -> Void
     private let handler: Handler
+    private let dependenciesAvailable: (@Sendable ([SyncDependency]) async throws -> [SyncDependency: Bool])?
     private let dependencyAvailable: @Sendable (SyncDependency) async throws -> Bool
     private var observer: Task<Void, Never>?
     private var timer: Task<Void, Never>?
@@ -63,12 +78,30 @@ public actor DurableSyncCoordinator {
                 kinds: Set<SyncOperation.Kind>, clock: SyncClock = SyncClock(),
                 allowsConcurrentReconciliation: Bool = false, coalescesPublicationRegistration: Bool = false,
                 dependencyAvailable: @escaping @Sendable (SyncDependency) async throws -> Bool,
-                rotationBatchHandler: RotationBatchHandler? = nil, handler: @escaping Handler) {
+                dependenciesAvailable: (@Sendable ([SyncDependency]) async throws -> [SyncDependency: Bool])? = nil,
+                rotationBatchHandler: RotationBatchHandler? = nil,
+                afterDrain: @escaping @Sendable () async throws -> Void = {}, handler: @escaping Handler) {
+        self.dependenciesAvailable = dependenciesAvailable
+        self.afterDrain = afterDrain
         self.rotationBatchHandler = rotationBatchHandler
         self.repository = repository; self.account = account; self.database = database
         self.coalescesPublicationRegistration = coalescesPublicationRegistration
         self.allowsConcurrentReconciliation = allowsConcurrentReconciliation
         self.kinds = kinds; self.clock = clock; self.handler = handler; self.dependencyAvailable = dependencyAvailable
+    }
+
+    private var lastQueueReportAt: Date?
+    private var previousQueueCounts: [SyncOperation.Kind: Int] = [:]
+
+    private func reportQueue(_ operations: [SyncOperation]) {
+        let now = clock.now()
+        guard lastQueueReportAt == nil || now.timeIntervalSince(lastQueueReportAt!) >= 15 else { return }
+        let counts = Dictionary(grouping: operations, by: \.kind).mapValues(\.count)
+        let kinds = Set(counts.keys).union(previousQueueCounts.keys).sorted { $0.rawValue < $1.rawValue }
+        let totals = kinds.map { "\($0.rawValue):\(counts[$0, default: 0])" }.joined(separator: ",")
+        let deltas = kinds.map { "\($0.rawValue):\(counts[$0, default: 0] - previousQueueCounts[$0, default: 0])" }.joined(separator: ",")
+        AccessSyncTrace.event("queue progress", detail: "pending=\(operations.count) elapsedSeconds=\(lastQueueReportAt.map { now.timeIntervalSince($0) } ?? 0) counts=\(totals) deltas=\(lastQueueReportAt == nil ? "baseline" : deltas)")
+        previousQueueCounts = counts; lastQueueReportAt = now
     }
 
     public func start() async {
@@ -109,6 +142,7 @@ public actor DurableSyncCoordinator {
             finishIdleWaiters()
         }
         var retriedBulkThisDrain: Set<UUID> = []
+        var registeredThisDrain: Set<UUID> = []
         while running, !wakes.isEmpty {
             let reasons = wakes; wakes = []
             let token = generation
@@ -116,9 +150,22 @@ public actor DurableSyncCoordinator {
                 let resetRetry = reasons.contains { [.foreground, .networkRestored, .ownerReleased].contains($0) }
                 let authorization = reasons.contains { [.unlocked, .startup].contains($0) }
                 let candidates = try await repository.activeOperations(account: account, database: database)
-                    .sorted { priority($0) < priority($1) }
+                reportQueue(candidates)
+                var readiness: [SyncDependency: Bool] = [:]
+                if let dependenciesAvailable {
+                    let waits = Array(Set(candidates.filter {
+                        kinds.contains($0.kind) && $0.state == .waitingForDependency && ($0.nextAttempt == nil || $0.nextAttempt! > clock.now())
+                    }.flatMap(\.dependencies)))
+                    for offset in stride(from: 0, to: waits.count, by: 64) {
+                        let batch = Array(waits[offset..<min(offset + 64, waits.count)])
+                        readiness.merge(try await dependenciesAvailable(batch), uniquingKeysWith: { _, new in new })
+                    }
+                }
                 var eligible: [SyncOperation] = []
                 for operation in candidates where kinds.contains(operation.kind) {
+                    // Local commits wake this drain while CloudKit still owns these
+                    // publications. Do not repeatedly register unchanged ready work.
+                    if operation.state == .ready && registeredThisDrain.contains(operation.id) { continue }
                     guard running, generation == token, !Task.isCancelled else { return }
                     let resetOperationRetry = !retriedBulkThisDrain.contains(operation.id) && (resetRetry || (reasons.contains(.unlocked)
                         && (operation.failure == .authorization || operation.failure == .dependency)))
@@ -142,7 +189,10 @@ public actor DurableSyncCoordinator {
                         if let deadline = operation.nextAttempt, deadline <= clock.now() { break }
                         var ready = true
                         for dependency in operation.dependencies {
-                            if try await !dependencyAvailable(dependency) { ready = false; break }
+                            let available: Bool
+                            if let observed = readiness[dependency] { available = observed }
+                            else { available = try await dependencyAvailable(dependency) }
+                            if !available { ready = false; break }
                         }
                         if !ready { continue }
                     case .ready: break
@@ -151,6 +201,11 @@ public actor DurableSyncCoordinator {
                 }
                 let operations = interleavingInbox(eligible)
                 var publicationRegistration: SyncOperationOutcome?
+                // Finish one inbox/outgoing round before a store wake restarts
+                // the snapshot; otherwise the inbox prefix starves outgoing work.
+                // Unlock still interrupts immediately and rotation batches stay <=16.
+                let bulkYieldLimit = operations.contains { $0.kind == .applyIncoming }
+                    && operations.contains { priority($0) > 2 } ? 32 : 16
                 var attemptedBulk = 0
                 var batchOutcomes: [UUID: SyncOperationOutcome] = [:]
                 for (index, operation) in operations.enumerated() {
@@ -178,7 +233,7 @@ public actor DurableSyncCoordinator {
                         if batchOutcomes.isEmpty {
                             // Only already-eligible consecutive rotations share a barrier.
                             // Finish and journal the bounded batch before yielding to a wake.
-                            let budget = max(1, Self.rotationBatchLimit - attemptedBulk)
+                            let budget = max(1, Self.rotationBatchLimit - (attemptedBulk % Self.rotationBatchLimit))
                             let batch = Array(operations[index...].prefix(budget).prefix { $0.kind == .rotateContent })
                             let results = await rotationBatchHandler(batch)
                             for (offset, member) in batch.enumerated() {
@@ -195,17 +250,21 @@ public actor DurableSyncCoordinator {
                         if operation.kind == .recoverTransport, operation.failure == .storagePressure {
                             legacyCapacityRetries.insert(operation.id)
                         }
+                        let started = ContinuousClock.now
                         outcome = await handler(operation)
+                        AccessSyncTrace.elapsed("operation handled", since: started, operation: operation.id,
+                            detail: "kind=\(operation.kind.rawValue) outcome=\(outcome.diagnosticSummary)")
                         if coalescesPublicationRegistration, publication { publicationRegistration = outcome }
                     }
                     guard running, generation == token, !Task.isCancelled else { return }
+                    if case .transportOwned = outcome { registeredThisDrain.insert(operation.id) }
                     do { try await commit(outcome, operation: operation, resetRetry: resetOperationRetry) }
                     catch SyncJournalError.staleOperation { /* another authorized worker advanced it */ }
                     if [.rotateContent, .applyIncoming].contains(operation.kind) {
                         attemptedBulk += 1
                         if case .retry = outcome { retriedBulkThisDrain.insert(operation.id) }
                     }
-                    if batchOutcomes.isEmpty && (wakes.contains(.unlocked) || (attemptedBulk >= 16 && !wakes.isEmpty)) {
+                    if batchOutcomes.isEmpty && (wakes.contains(.unlocked) || (attemptedBulk >= bulkYieldLimit && !wakes.isEmpty)) {
                         // Unlock can arrive while a handler or its commit awaits.
                         // Re-read and prioritize durable work now, so enrollment
                         // blocked earlier in this batch does not wait behind bulk
@@ -218,10 +277,12 @@ public actor DurableSyncCoordinator {
                         for reason in reasons where !wakes.contains(reason) { wakes.append(reason) }
                         break
                     }
-                    if attemptedBulk >= Self.rotationBatchLimit && batchOutcomes.isEmpty { attemptedBulk = 0 }
+                    if attemptedBulk >= bulkYieldLimit && batchOutcomes.isEmpty { attemptedBulk = 0 }
                 }
+                // Coalesce whole-vault maintenance after all currently runnable work.
+                if wakes.isEmpty { try await afterDrain() }
                 storageFailure = false
-                try await scheduleNext(token: token)
+                if wakes.isEmpty { try await scheduleNext(token: token) }
             } catch {
                 guard running, generation == token else { return }
                 storageFailure = true
@@ -253,18 +314,24 @@ public actor DurableSyncCoordinator {
     /// Recovery and membership dependencies retain priority. Access requests and
     /// inbox application take bounded turns, including failed requests: a retry
     /// must not keep the very records it depends on at the back of the queue.
+    /// Outgoing edits and rotations also get a turn before a continuously arriving
+    /// inbox can force another snapshot and restart the access/inbox prefix.
     private func interleavingInbox(_ operations: [SyncOperation]) -> [SyncOperation] {
-        let urgent = operations.filter { priority($0) < 1 }
-        let access = operations.filter { priority($0) == 1 }
-        let inbox = operations.filter { $0.kind == .applyIncoming }
-        var result = urgent
-        var a = 0, i = 0
-        while a < access.count || i < inbox.count {
+        // Stable linear partition replaces repeated comparison sorting and scans.
+        // Urgent lanes retain their exact recovery/reconcile/membership ordering.
+        var lanes = Array(repeating: [SyncOperation](), count: 6)
+        for operation in operations { lanes[priority(operation) + 2].append(operation) }
+        let access = lanes[3], inbox = lanes[4], outgoing = lanes[5]
+        var result = lanes[0] + lanes[1] + lanes[2]
+        result.reserveCapacity(operations.count)
+        var a = 0, i = 0, o = 0
+        while a < access.count || i < inbox.count || o < outgoing.count {
             let endA = min(a + 16, access.count), endI = min(i + 16, inbox.count)
             result.append(contentsOf: access[a..<endA]); a = endA
             result.append(contentsOf: inbox[i..<endI]); i = endI
+            let endO = min(o + 16, outgoing.count)
+            result.append(contentsOf: outgoing[o..<endO]); o = endO
         }
-        result.append(contentsOf: operations.filter { priority($0) > 2 })
         return result
     }
 

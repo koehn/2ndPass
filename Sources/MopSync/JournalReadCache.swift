@@ -14,6 +14,7 @@ final class JournalReadCache: @unchecked Sendable {
         var derivedBuilds = 0
         var summaryUpdates = 0
         var resultBuilds = 0
+        var storeResultBuilds = 0
     }
     private struct Query: Hashable {
         let prefix: String
@@ -43,11 +44,16 @@ final class JournalReadCache: @unchecked Sendable {
     }
     private var projections: [Query: Projection] = [:]
     private var results: [String: Any] = [:]
+    private struct StoreResult {
+        let value: Any
+        let deadline: Date?
+    }
+    private var storeResults: [String: StoreResult] = [:]
     private var token: NSPersistentHistoryToken?
     private var checkpointAt = Date()
     private(set) var metrics = Metrics()
 
-    func reset() { projections.removeAll(); results.removeAll(); token = nil }
+    func reset() { projections.removeAll(); results.removeAll(); storeResults.removeAll(); token = nil }
 
     func begin(in context: NSManagedObjectContext, persistent: Bool) throws {
         guard !projections.isEmpty else { return }
@@ -59,6 +65,9 @@ final class JournalReadCache: @unchecked Sendable {
                   let transactions = result.result as? [NSPersistentHistoryTransaction] else {
                 throw ItemRepositoryError.corruptStore
             }
+            // Publication candidates depend on content rows as well as journal
+            // rows. Every persisted transaction invalidates this separate cache.
+            if !transactions.isEmpty { storeResults.removeAll() }
             let ids = Set(transactions.flatMap { $0.changes ?? [] }.map(\.changedObjectID)
                 .filter { $0.entity.name == "StateBlob" })
             if !ids.isEmpty { results.removeAll() }
@@ -206,6 +215,19 @@ final class JournalReadCache: @unchecked Sendable {
         metrics.resultBuilds += 1
         if !context.hasChanges { results[key] = result }
         return result
+    }
+
+    /// Candidate selection only; never an authorization or delivery decision.
+    /// Retry deadlines invalidate even without a store event. Unsaved overlays
+    /// are neither read from nor written to the committed-result cache.
+    func storeResult<R>(key: String, in context: NSManagedObjectContext, now: Date,
+                        build: () throws -> (R, Date?)) rethrows -> R {
+        if !context.hasChanges, let cached = storeResults[key],
+           cached.deadline.map({ now < $0 }) ?? true, let value = cached.value as? R { return value }
+        let (value, deadline) = try build()
+        metrics.storeResultBuilds += 1
+        if !context.hasChanges { storeResults[key] = StoreResult(value: value, deadline: deadline) }
+        return value
     }
 
     private func update(_ row: NSManagedObject) throws {

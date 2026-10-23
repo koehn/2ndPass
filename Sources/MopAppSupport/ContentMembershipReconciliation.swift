@@ -37,10 +37,24 @@ extension GrantBackedContentSession {
         } else {
             let current = history.current.membership, previous = parent.membership, desired = proposed.current.membership
             let removed = Set(previous.devices.map(\.device)).subtracting(desired.devices.map(\.device))
-            let accounts = current.accounts.map { AccountMember(id: $0.id, role: $0.role, devices: $0.devices.filter { !removed.contains($0.device) }) }
+            let added = desired.devices.filter { candidate in !previous.devices.contains(where: { $0.device == candidate.device }) }
+            guard added.allSatisfy({ candidate in
+                !(current.removedDevices ?? []).contains(candidate.device)
+                    && !current.devices.contains(where: { $0.device == candidate.device && $0 != candidate })
+                    && current.accounts.contains(where: { $0.id == candidate.member })
+            }) else { throw MopError.vaultUntrusted }
+            let accounts = current.accounts.map { account in
+                AccountMember(id: account.id, role: account.role,
+                    devices: account.devices.filter { !removed.contains($0.device) }
+                        + added.filter { $0.member == account.id && !account.devices.contains($0) })
+            }
             let target = try Membership(accounts: accounts,
                 offlineRecovery: previous.offlineRecovery == desired.offlineRecovery ? current.offlineRecovery : desired.offlineRecovery,
-                removedDevices: Array(Set(current.removedDevices ?? []).union(removed)))
+                removedDevices: removed.isEmpty ? current.removedDevices : Array(Set(current.removedDevices ?? []).union(removed)).sorted { $0.uuidString < $1.uuidString })
+            if target == current {
+                try await repository.rebaseUncommittedMembership(operation, payload: nil, approval: nil, permit: authorization)
+                return true
+            }
             let successor = try permit.withDevice { try MembershipEnvelope.successor(of: history.current, membership: target, owner: $0) }
             try await repository.rebaseUncommittedMembership(operation,
                 payload: setupEncode(ContentMembershipCommit(history: history.orderedStates, successor: successor)), approval: nil, permit: authorization)

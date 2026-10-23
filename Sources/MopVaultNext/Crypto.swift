@@ -10,7 +10,14 @@ enum Codec {
         return try encoder.encode(value)
     }
     static func digest(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let alphabet = Array("0123456789abcdef".utf8)
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(64)
+        for byte in SHA256.hash(data: data) {
+            bytes.append(alphabet[Int(byte >> 4)])
+            bytes.append(alphabet[Int(byte & 15)])
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
     static func hash(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }

@@ -11,7 +11,7 @@ public enum SyncOperationState: String, Codable, Sendable {
 }
 
 public struct SyncDependency: Hashable, Codable, Sendable {
-    public enum Kind: String, Codable, Sendable { case inboxCapacity, prerequisiteInboxCapacity, membership, grant, content, contentKeyGeneration, contentKeyState, contentHead, grantRequestState, operation, authorization }
+    public enum Kind: String, Codable, Sendable { case inboxCapacity, prerequisiteInboxCapacity, trustedContentZone, membership, grant, content, contentKeyGeneration, contentKeyState, contentHead, grantRequestState, operation, authorization }
     public let kind: Kind
     public let identifier: String
     public init(_ kind: Kind, identifier: String) { self.kind = kind; self.identifier = identifier }
@@ -38,6 +38,7 @@ public struct SyncOperation: Equatable, Codable, Sendable, Identifiable {
     public var nextAttempt: Date?
     public var retryNotBefore: Date?
     public var failure: SyncFailure?
+    public var resolution: SyncResolution?
     public var completedAt: Date?
     public var deliveredAt: Date?
     public var revision: UUID

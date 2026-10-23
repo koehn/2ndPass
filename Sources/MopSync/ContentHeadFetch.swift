@@ -74,7 +74,13 @@ public struct ContentHeadFetcher: Sendable {
         } catch SyncJournalError.staleOperation { return .retry(.dependency) }
         catch SyncJournalError.inboxFull { return .retry(.inboxFull) }
         catch CloudSyncAdapterError.operationInterrupted { return .retry(.authorization) }
+        catch CloudSyncAdapterError.contentZoneUnavailable(let vault) {
+            guard vault == operation.vaultID else { return .attention(.invalidAuthority) }
+            return .waiting([.init(.trustedContentZone, identifier: vault.uuidString)])
+        }
+        catch CloudSyncAdapterError.invalidBinding { return .attention(.invalidAuthority) }
         catch let error as CKError {
+            try? await repository.recordSyncTransportFailure(operation, error: error)
             // unknownItem can be publication ordering, never proof of deletion.
             return .retry(.transport, retryAfter: (error.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue)
         } catch let error as CloudSyncAdapterError {

@@ -83,3 +83,74 @@ private func newAutoFillLoginDoesNotReturnCredentialWhenSaveCannotComplete(outco
     #expect(service.state.withLock { $0.prompts } == 0)
     #expect(service.state.withLock { $0.saved } == nil)
 }
+
+private final class RememberWebsiteService: VaultService {
+    let vault = UUID().uuidString
+    let saved = Mutex<ItemEdit?>(nil)
+    var authenticatedAt: TimeInterval? { 1 }
+    let readOnly: Bool
+    let failSave: Bool
+    let item = VaultItem(name: "Login", type: .login, fields: [
+        ItemField(path: "username", type: .username, value: "alice"),
+        ItemField(path: "password", type: .password, value: nil),
+        ItemField(path: "website", type: .website, value: "https://old.test/login"),
+        ItemField(path: "website2", type: .text, value: "Keep this note")
+    ])
+    init(readOnly: Bool = false, failSave: Bool = false) { self.readOnly = readOnly; self.failSave = failSave }
+    func lock() {}
+    var catalog: ItemCatalog {
+        var result = ItemCatalog(vault: "personal", revision: "revision", items: [item])
+        result.canEdit = !readOnly
+        return result
+    }
+    var identity: AutoFillIdentity { AutoFillIdentity(entry: AutoFillEntry.entries(catalog: catalog, vaultID: vault)[0]) }
+    func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult {
+        #expect(vault == self.vault && !offline)
+        var result = VaultResult()
+        switch operation {
+        case .catalog: result.catalog = catalog
+        case .save(let edit):
+            if failSave { throw MopError.inputOutput }
+            saved.withLock { $0 = edit }
+            result.catalog = catalog
+        default: throw MopError.notFound
+        }
+        return result
+    }
+}
+
+@Test func autoFillRememberAddsHostPreservingExistingFieldsAndMakesItMatch() async throws {
+    let service = RememberWebsiteService()
+    try await AutoFillRememberWebsite.save(["https://NEW.test/login?private=value"], for: service.identity, service: service)
+    let edit = try #require(service.saved.withLock { $0 })
+    #expect(!edit.create && edit.originalName == "Login" && edit.revision == "revision")
+    #expect(Array(edit.item.fields.prefix(4)) == service.item.fields)
+    #expect(edit.item.fields.last?.path == "website3")
+    #expect(edit.item.fields.last?.value == "new.test")
+    var catalog = service.catalog; catalog.items = [edit.item]
+    #expect(Set(AutoFillEntry.entries(catalog: catalog, vaultID: service.vault).map(\.website)) == ["old.test", "new.test"])
+}
+
+@Test func autoFillRememberDoesNotDuplicateExistingHost() async throws {
+    let service = RememberWebsiteService()
+    try await AutoFillRememberWebsite.save(["https://old.test/another-path"], for: service.identity, service: service)
+    #expect(service.saved.withLock { $0 } == nil)
+}
+
+@Test func autoFillRememberPropagatesPermissionAndSaveFailures() async throws {
+    for service in [RememberWebsiteService(readOnly: true), RememberWebsiteService(failSave: true)] {
+        await #expect(throws: (any Error).self) {
+            try await AutoFillRememberWebsite.save(["new.test"], for: service.identity, service: service)
+        }
+        #expect(service.saved.withLock { $0 } == nil)
+    }
+}
+
+@MainActor @Test func autoFillRememberFailurePreventsCredentialDelivery() async throws {
+    let service = RememberWebsiteService(failSave: true)
+    let session = AutoFillRequestSession(service: service)
+    await #expect(throws: MopError.inputOutput) {
+        _ = try await session.password(service.identity, remembering: ["new.test"])
+    }
+    #expect(throws: AutoFillSessionError.ended) { try session.check() }
+}

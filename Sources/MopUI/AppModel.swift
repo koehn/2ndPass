@@ -51,9 +51,9 @@ final class AppModel {
     func reviewConflict(_ item: ItemRow.ID? = nil) {
         conflictReviewItem = item
         conflictReviewPresented = true
-        refreshConflicts()
+        refreshConflicts(immediate: true)
     }
-    func refreshConflicts() {
+    func refreshConflicts(immediate: Bool = false) {
         guard authenticated, isActive else {
             conflictRefreshGeneration += 1
             conflictRefreshTask?.cancel(); conflictRefreshTask = nil
@@ -71,7 +71,14 @@ final class AppModel {
         conflictRefreshTask = Task { [weak self, service] in
             guard let self else { return }
             defer { if self.conflictRefreshGeneration == token { self.conflictRefreshTask = nil; self.checkingConflicts = false } }
+            var delayRefresh = !immediate
             repeat {
+                do {
+                    if delayRefresh { try await self.conflictRefreshDelay() }
+                    try Task.checkCancellation()
+                } catch { return }
+                guard self.conflictRefreshGeneration == token, self.authenticated, self.isActive else { return }
+                delayRefresh = true
                 self.conflictRefreshAgain = false
                 let vaultIDs = self.catalogs.keys.sorted()
                 do {
@@ -221,6 +228,11 @@ final class AppModel {
     private var pendingDisplayVaults: Set<String> = []
     var authenticated = false { didSet { if oldValue != authenticated { if authenticated { reloadUsage(); refreshHealth() } else { clearHealth() }; refreshConflicts() } } }
     var revealed: SecretBytes?
+    @ObservationIgnored private var syncStatusTask: Task<Void, Never>?
+    @ObservationIgnored private let conflictRefreshDelay: @Sendable () async throws -> Void
+    @ObservationIgnored private let syncStatusDelay: @Sendable () async throws -> Void
+    private var syncStatusID: UUID?
+    private var syncStatusDirty = false
     @ObservationIgnored private var storeChangesTask: Task<Void, Never>?
     var busy = false { didSet { if oldValue != busy { updateHealthScheduling() } } }
     private(set) var localOperation = false
@@ -278,11 +290,9 @@ final class AppModel {
     private(set) var syncIssue: String?
     private(set) var synchronizationHealth: SyncHealthSnapshot?
     private var syncIssueDetails: String?
-    func showSyncIssue() {
-        guard let issue = syncIssue else { return }
-        error = issue
-        errorDetails = syncIssueDetails
-    }
+    var syncDiagnosticsPresented = false
+    func showSyncIssue() { syncDiagnosticsPresented = true }
+
     private(set) var requestingSynchronization = false
     @ObservationIgnored private var syncWakeTask: Task<Void, Never>?
     private var syncWakeID: UUID?
@@ -291,6 +301,37 @@ final class AppModel {
 
     /// Only lifecycle, push, explicit refresh and unlock call this. Store changes
     /// update the view without generating another cloud request feedback loop.
+    // Throttle status reads, not sync or authentication. A burst shares one read;
+    // events arriving during a read request a trailing refresh instead of being lost.
+    func requestSyncStatusRefresh() {
+        syncStatusDirty = true
+        guard syncStatusTask == nil else { return }
+        let id = UUID(), token = generation, delay = syncStatusDelay
+        syncStatusID = id
+        syncStatusTask = Task { [weak self] in
+            defer {
+                if let self, self.syncStatusID == id {
+                    self.syncStatusTask = nil; self.syncStatusID = nil
+                }
+            }
+            while !Task.isCancelled {
+                do { try await delay(); try Task.checkCancellation() } catch { return }
+                guard let self, self.generation == token, self.syncStatusID == id else { return }
+                self.syncStatusDirty = false
+                if let health = try? await self.service.synchronizationHealth() {
+                    guard self.generation == token, !Task.isCancelled else { return }
+                    self.applySyncHealth(health)
+                }
+                guard self.generation == token, !Task.isCancelled else { return }
+                if let count = try? await self.service.pendingVaultDeletionCount() {
+                    guard self.generation == token, !Task.isCancelled else { return }
+                    self.updatePendingVaultDeletion(count > 0)
+                }
+                if !self.syncStatusDirty { return }
+            }
+        }
+    }
+
     func requestBackgroundSynchronization(refreshPrerequisites: Bool = false) {
         Self.logger.notice("Sync trace: UI wake; active=\(self.isActive) authenticated=\(self.authenticated) serviceAuthenticated=\(self.service.isAuthenticated)")
         guard isActive, hasConnectionAuthorization else { return }
@@ -332,14 +373,13 @@ final class AppModel {
         }
     }
     func applySyncHealth(_ health: SyncHealthSnapshot) {
-        // Pending work alone is not activity: only advancing an existing backlog
-        // may renew a live foreground session. A stalled queue still times out.
-        let keyWork: Set<SyncOperation.Kind> = [.prepareGrant, .rotateContent, .enrollment, .membership, .recovery, .grant]
-        if isActive, service.isAuthenticated, let previous = synchronizationHealth,
-           !previous.pendingKinds.isDisjoint(with: keyWork),
-           health.pendingCount < previous.pendingCount ||
-            (health.lastDeliveryAt != nil && health.lastDeliveryAt! > (previous.lastDeliveryAt ?? .distantPast)) {
-            lastActivity = now()
+        if service.requiresLocalAuthentication, updateAuthenticationState != .authenticating {
+            updateAuthenticationState = awaitingAuthenticatedProgress ? .failed : .required
+        }
+        if awaitingAuthenticatedProgress, !service.requiresLocalAuthentication,
+           let previous = synchronizationHealth, health.pendingCount < previous.pendingCount {
+            updateAuthenticationState = .ready
+            awaitingAuthenticatedProgress = false
         }
         if let delivered = health.lastDeliveryAt, delivered != synchronizationHealth?.lastDeliveryAt {
             connectionLastProgress = delivered
@@ -401,10 +441,67 @@ final class AppModel {
     private(set) var catalogLoadProgress: [String: CatalogLoadProgress] = [:] { didSet { updateHealthScheduling() } }
     private(set) var catalogUpdatePaused = false
     private var catalogIssueDetails: String?
+    enum UpdateAuthenticationState { case ready, required, authenticating, failed }
+    private(set) var updateAuthenticationState: UpdateAuthenticationState = .ready
+    private var reauthenticationTask: Task<Void, Never>?
+    private var awaitingAuthenticatedProgress = false
+    var canResumeUpdates: Bool { isActive && !busy && !refreshing && itemDraft == nil && sheet == nil && updateAuthenticationState != .authenticating }
+    private var updateAuthenticationDetails: String?
+    func showUpdateAuthenticationDetails() {
+        error = "Couldn’t resume updates. Your progress is saved."
+        errorDetails = updateAuthenticationDetails
+    }
+    private var authenticationIsForEnrollment: Bool {
+        connectionProgress != nil || isConnectingVaults || outgoingAccessStatus != nil || !authenticated
+    }
+    var updateAuthenticationButton: String {
+        if updateAuthenticationState == .failed { return "Retry" }
+        return authenticationIsForEnrollment ? "Authenticate and continue" : "Resume updates"
+    }
+    var updateAuthenticationMessage: String {
+        if updateAuthenticationState == .failed { return "Couldn’t resume. Authenticate to retry; your progress is saved." }
+        if updateAuthenticationState == .authenticating { return "Authenticating…" }
+        return authenticationIsForEnrollment
+            ? "Authenticate to continue enrollment. Your progress is saved."
+            : "Some updates are paused. Authenticate to resume."
+    }
+    func resumeUpdates() {
+        guard canResumeUpdates else { return }
+        let token = generation
+        conceal()
+        updateAuthenticationState = .authenticating
+        cancelCatalogLoading()
+        conflictRefreshTask?.cancel()
+        busy = true
+        reauthenticationTask = Task {
+            defer { if generation == token { busy = false } }
+            do {
+                try await service.reauthenticate()
+                guard current(token), !Task.isCancelled else { return }
+                lastActivity = now()
+                enrollmentAuthorizedAt = service.enrollmentAuthorizedAt
+                awaitingAuthenticatedProgress = true
+                catalogNeedsAuthentication = false
+                updateAuthenticationState = .required
+                cloudRefreshPending = true
+                busy = false
+                refreshCloudIfNeeded()
+            } catch is CancellationError {
+                guard current(token) else { return }
+                updateAuthenticationState = .required
+            } catch {
+                guard current(token) else { return }
+                updateAuthenticationState = .failed
+                recordError(error, operation: "Resume updates")
+                let native = error as NSError
+                updateAuthenticationDetails = "Resume updates: " + native.domain + " (" + String(native.code) + ")"
+            }
+        }
+    }
     private var catalogNeedsAuthentication = false
     private var catalogPauseMessage: String {
         catalogNeedsAuthentication
-            ? "Some updates need device authentication. Lock and unlock 2ndPass to resume them."
+            ? "Some updates are paused. Authenticate to resume."
             : "Local catalog is temporarily unavailable. It will update automatically."
     }
     func showCatalogIssue() {
@@ -436,10 +533,14 @@ final class AppModel {
         if values.contains(where: { $0.downloading }) {
             return offline ? "Connected vault · Download paused while offline" : "Connected to iCloud · \(values.reduce(0) { $0 + $1.loaded }) of \(values.reduce(0) { $0 + $1.total }) items ready · Downloading remaining items"
         }
-        if values.contains(where: { $0.waiting > 0 }) { return "Connecting encrypted items · \(values.reduce(0) { $0 + $1.loaded }) of \(values.reduce(0) { $0 + $1.total }) ready · Waiting for another device to sync" }
+        if values.contains(where: { $0.waiting > 0 }) { return "Connecting encrypted items · \(values.reduce(0) { $0 + $1.loaded }) of \(values.reduce(0) { $0 + $1.total }) ready · Waiting for verified data or secure access" }
         return nil
     }
     private func recordCatalogProgress(_ result: VaultResult, vaultID: String) {
+        if !service.requiresLocalAuthentication && updateAuthenticationState != .authenticating {
+            updateAuthenticationState = .ready
+            awaitingAuthenticatedProgress = false
+        }
         catalogUpdatePaused = false
         catalogNeedsAuthentication = false
         catalogIssueDetails = nil
@@ -703,6 +804,8 @@ final class AppModel {
          documents: any DocumentAccessing = SystemDocumentAccess(),
          usageStore: any ItemUsageStoring = ItemUsageStore(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         conflictRefreshDelay: @escaping @Sendable () async throws -> Void = { try await Task.sleep(for: .milliseconds(500)) },
+         syncStatusDelay: @escaping @Sendable () async throws -> Void = { try await Task.sleep(for: .milliseconds(500)) },
          automaticTimer: Bool = true, unlockOnActivation: Bool = AppModel.defaultUnlockOnActivation, wallNow: @escaping () -> Date = Date.init,
          localService: (any LocalVaultServing)? = nil,
          authorizeApplication: @escaping () async throws -> Void = {
@@ -710,6 +813,8 @@ final class AppModel {
              context.invalidate()
          },
          authorizeLocal: @escaping (String, Set<UUID>, Set<LocalIdentityProtocol>, Set<LocalKeyOperation>) async throws -> LocalAuthorization = { try await LocalAuthorization.authorizeAsync(reason: $0, ids: $1, purposes: $2, operations: $3) }) {
+        self.conflictRefreshDelay = conflictRefreshDelay
+        self.syncStatusDelay = syncStatusDelay
         self.unlockOnActivation = unlockOnActivation
         self.authorizeApplication = authorizeApplication
         self.breachClient = breachClient
@@ -736,13 +841,10 @@ final class AppModel {
                 guard !Task.isCancelled else { return }
                 switch event {
                 case .store:
-                    let token = self?.generation
-                    if let health = try? await service.synchronizationHealth(), self?.generation == token {
-                        self?.applySyncHealth(health)
+                    if let self, self.service.requiresLocalAuthentication, self.updateAuthenticationState != .authenticating {
+                        self.updateAuthenticationState = self.awaitingAuthenticatedProgress ? .failed : .required
                     }
-                    if let count = try? await service.pendingVaultDeletionCount(), self?.generation == token {
-                        self?.updatePendingVaultDeletion(count > 0)
-                    }
+                    self?.requestSyncStatusRefresh()
                     self?.cloudChanged()
                 case .display(let vault):
                     self?.pendingDisplayVaults.insert(vault)
@@ -762,8 +864,12 @@ final class AppModel {
             }
         }
     }
-    deinit { conflictRefreshTask?.cancel(); syncWakeTask?.cancel(); catalogLoadTask?.cancel(); usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); storeChangesTask?.cancel() }
+    deinit { syncStatusTask?.cancel(); conflictRefreshTask?.cancel(); syncWakeTask?.cancel(); catalogLoadTask?.cancel(); usageLoadTask?.cancel(); inactivityTask?.cancel(); automaticUnlockTask?.cancel(); storeChangesTask?.cancel() }
     func checkExpiration() {
+        if updateAuthenticationState == .authenticating {
+            if let lastActivity, now() - lastActivity >= Double(autoLockMinutes * 60) { lock(reason: .timeout) }
+            return
+        }
         enrollmentAuthorizedAt = service.enrollmentAuthorizedAt
         if let started = service.authenticatedAt ?? enrollmentAuthorizedAt ?? localSessionStarted {
             if lastActivity == nil { lastActivity = started }
@@ -781,6 +887,7 @@ final class AppModel {
         scheduleAutomaticUnlock()
     }
     private func scheduleAutomaticUnlock() {
+        guard updateAuthenticationState == .ready else { return }
         guard !enrollmentResetRequiresRestart else { return }
         if needsAccountDiscovery, isActive, !busy {
             needsAccountDiscovery = false
@@ -1012,6 +1119,9 @@ final class AppModel {
         }
         set {
             guard !busy, (newValue != selectedRow || vaultDetailsTarget != nil), allowTransition(.item(newValue)) else { return }
+            // An explicit list selection (including Back/deselection) supersedes
+            // launch restoration, even while the catalog is still arriving.
+            restoreLastSelection = false
             vaultDetailsTarget = nil
             cancelItemEditing(); selected = nil; passwordQualities = [:]; passwordQualitySource = nil
             selectedLocalIdentityID = nil
@@ -1415,6 +1525,7 @@ final class AppModel {
     }
     func shutdown() { isActive = false; lock(); inactivityTask?.cancel(); lifecycle.stop() }
     func background() {
+        if updateAuthenticationState == .authenticating { lock(clearClipboard: false) }
         deactivate()
         activationUnlockPending = true
         // A temporary app switch preserves the authenticated vault session.
@@ -1425,7 +1536,7 @@ final class AppModel {
     func deactivate() {
         // Biometric dialogs temporarily deactivate the app. Their dismissal is
         // not a new user visit and must not retry cancelled authentication.
-        if !unlocking { activationUnlockPending = true }
+        if !unlocking && updateAuthenticationState != .authenticating { activationUnlockPending = true }
         // A desktop app losing focus remains executable. Let downloaded items
         // continue through catalog/AutoFill preparation while the session is live.
         // iOS background execution remains controlled by its lifecycle policy.
@@ -1442,7 +1553,7 @@ final class AppModel {
         checkExpiration(); isActive = true
         let shouldUnlock = unlockOnActivation && activationUnlockPending
         activationUnlockPending = false
-        if shouldUnlock, !applicationUnlocked, !unlocking, !accessNeedsRepair, !deviceRemoved {
+        if shouldUnlock, updateAuthenticationState == .ready, !applicationUnlocked, !unlocking, !accessNeedsRepair, !deviceRemoved {
             error = nil
             launchUnlockAvailable = true
         }
@@ -1457,6 +1568,7 @@ final class AppModel {
     }
     private func clearSelection() {
         selectedLocalIdentityID = nil
+        syncStatusTask?.cancel(); syncStatusTask = nil; syncStatusID = nil; syncStatusDirty = false
         generation += 1; editorGeneration += 1; itemDraft = nil; draftConflict = false
         selectedDeleted = nil; itemToDelete = nil
         conceal(); catalog = nil; passwordQualities = [:]; passwordQualitySource = nil; selected = nil
@@ -1473,6 +1585,8 @@ final class AppModel {
         catalogs = [:]; deletedCatalogs = [:]; cachedVaults = []; enrollmentProgress = [:]
     }
     func lock(clearClipboard: Bool = true, reason: LockReason = .manual) {
+        reauthenticationTask?.cancel(); reauthenticationTask = nil
+        updateAuthenticationState = .ready; awaitingAuthenticatedProgress = false
         recoveryIdleLockHolds.removeAll()
         #if os(macOS)
         DistributedNotificationCenter.default().postNotificationName(LocalAuthorization.appLockNotification, object: nil, userInfo: nil, deliverImmediately: true)
@@ -1487,7 +1601,7 @@ final class AppModel {
         search = ""; searchHighlighted = nil; searchIsFocused = false; lastBackupURL = nil
         syncWakeTask?.cancel(); syncWakeTask = nil; syncWakeID = nil
         syncWakeAgain = false; refreshPrerequisitesOnNextWake = false; requestingSynchronization = false; syncIssue = nil; syncIssueDetails = nil
-        synchronizationHealth = nil
+        synchronizationHealth = nil; syncDiagnosticsPresented = false
         connectionUnlockPending = false; waitingForVaultMetadata = false; connectionLastProgress = nil
         lockReason = reason; unlocking = false; unlockQueued = false; launchUnlockAvailable = false
         cancelPendingTransition()
@@ -2246,7 +2360,7 @@ final class AppModel {
             }
         }
     }
-    /// Background reads cannot turn an expiring hardware authorization into an
+    /// Background reads cannot turn a request for renewed authorization into an
     /// application lock. Keep already verified UI state and the original idle
     /// deadline; protected operations still fail until the user authenticates.
     @discardableResult
@@ -2255,7 +2369,7 @@ final class AppModel {
               Authentication.requiresInteraction(failure) else { return false }
         catalogUpdatePaused = true
         catalogNeedsAuthentication = true
-        notice = catalogPauseMessage
+        updateAuthenticationState = awaitingAuthenticatedProgress ? .failed : .required
         recordError(failure, operation: operation)
         catalogIssueDetails = errorDetails
         return true
@@ -2267,6 +2381,10 @@ final class AppModel {
         refreshCloudIfNeeded()
     }
     func refreshCloudIfNeeded() {
+        // Keep pending changes queued while the existing context cannot unwrap keys.
+        // Retrying on its own failure notification disables the resume button again.
+        guard updateAuthenticationState != .authenticating,
+              !catalogNeedsAuthentication, !service.requiresLocalAuthentication else { return }
         guard launchAttempted, isActive, !busy, !refreshing, !loadingVaults, itemDraft == nil, sheet == nil,
               !accessNeedsRepair, pendingTransition == nil else { return }
         guard cloudRefreshPending else { refreshDisplayIfNeeded(); return }

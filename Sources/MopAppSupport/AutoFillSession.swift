@@ -24,18 +24,20 @@ public enum AutoFillSessionError: Error, Equatable, Sendable { case expired, end
         guard now() < deadline else { end(); throw AutoFillSessionError.expired }
         try Task.checkCancellation()
     }
-    public func password(_ identity: AutoFillIdentity) async throws -> ASPasswordCredential {
+    public func password(_ identity: AutoFillIdentity, remembering hosts: Set<String> = []) async throws -> ASPasswordCredential {
         defer { end() }
         try check()
+        try await remember(hosts, for: identity)
         let (entry, secret) = try await AutoFillAccess.resolve(recordIdentifier: identity.recordIdentifier, kind: .password, service: service)
         try check()
         guard let bytes = secret.value else { throw MopError.notFound }
         preparedUsage = secret.usageIdentity
         return ASPasswordCredential(user: entry.username, password: String(decoding: bytes, as: UTF8.self))
     }
-    public func code(_ identity: AutoFillIdentity) async throws -> (credential: ASOneTimeCodeCredential, expiresAt: Date) {
+    public func code(_ identity: AutoFillIdentity, remembering hosts: Set<String> = []) async throws -> (credential: ASOneTimeCodeCredential, expiresAt: Date) {
         defer { end() }
         try check()
+        try await remember(hosts, for: identity)
         let (_, secret) = try await AutoFillAccess.resolve(recordIdentifier: identity.recordIdentifier, kind: .oneTimeCode, service: service)
         try check()
         guard let bytes = secret.value, let expiry = secret.otpExpiresAt, expiry > Date(),
@@ -43,6 +45,13 @@ public enum AutoFillSessionError: Error, Equatable, Sendable { case expired, end
         preparedUsage = secret.usageIdentity
         return (ASOneTimeCodeCredential(code: String(decoding: bytes, as: UTF8.self)), expiry)
     }
+    private func remember(_ hosts: Set<String>, for identity: AutoFillIdentity) async throws {
+        guard !hosts.isEmpty else { return }
+        try check()
+        try await AutoFillRememberWebsite.save(hosts, for: identity, service: service)
+        try check()
+    }
+
     /// Called only by the controller when handing the validated credential to the OS.
     /// Merely constructing a credential or listing choices is not usage.
     public func recordDeliveredUsage() async {

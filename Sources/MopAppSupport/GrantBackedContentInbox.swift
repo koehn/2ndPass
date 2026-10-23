@@ -15,6 +15,10 @@ public struct ContentComparisonSession: Sendable {
         self.authorization = authorization; self.identical = identical; self.rebase = rebase
     }
 }
+struct ContentComparisonMissingGrant: Error {
+    let dependency: SyncDependency
+}
+
 private struct ContentInboxCommitPermit: RepositoryWritePermit {
     let publication: any RepositoryWritePermit
     let authorization: any RepositoryWritePermit
@@ -178,6 +182,10 @@ public struct GrantBackedContentInbox: Sendable {
             }
             try await repository.receiveContent(prepared, from: incoming, action: action, expectedHead: local.versionID, expectedPolicy: policy, permit: commitPermit)
             return action == .branch ? .attention(.conflict) : .completed
+        } catch let missing as ContentComparisonMissingGrant {
+            AccessSyncTrace.event("comparison waiting for grant", record: incoming.recordName)
+            try await repository.deferContentIncoming(incoming, dependencies: [missing.dependency], permit: permit)
+            return .waiting([missing.dependency])
         } catch Failure.missing(let dependencies) {
             try await repository.deferContentIncoming(incoming, dependencies: dependencies, permit: permit)
             return .waiting(dependencies)

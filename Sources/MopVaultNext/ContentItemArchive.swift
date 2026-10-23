@@ -59,12 +59,12 @@ extension ContentItemArchive {
     /// Storage IDs and save attribution are representation details. Compare the
     /// complete retained graph by field path and history order, including secrets.
     /// This never selects a winner by time; equivalence accepts the server copy.
-    public static func identical(_ lhs: [String: SecretBytes], _ rhs: [String: SecretBytes], item: UUID) throws -> Bool {
+    public static func identical(_ lhs: [String: SecretBytes], _ rhs: [String: SecretBytes], item: UUID, preservingEditMetadata: Bool = false) throws -> Bool {
         guard let a = lhs[catalogComponent], let b = rhs[catalogComponent] else { return lhs == rhs }
         var left = try catalog(a, item: item, componentNames: Set(lhs.keys))
         var right = try catalog(b, item: item, componentNames: Set(rhs.keys))
         func canonical(_ value: inout ItemContentCatalog, records: [String: SecretBytes]) throws -> [String: SecretBytes] {
-            value.editOrigin = nil; value.item.metadata?.updatedAt = nil
+            if !preservingEditMetadata { value.editOrigin = nil; value.item.metadata?.updatedAt = nil }
             var values: [String: SecretBytes] = [:]
             for path in value.references.keys.sorted() {
                 guard let id = value.references[path], let bytes = records[id] else { throw MopError.invalidVault }
@@ -79,7 +79,7 @@ extension ContentItemArchive {
                     guard let bytes = records[value.histories[index].entries[entry].id] else { throw MopError.invalidVault }
                     let canonical = "history:" + value.histories[index].path + ":" + String(entry)
                     values[canonical] = bytes; value.histories[index].entries[entry].id = canonical
-                    value.histories[index].entries[entry].replacedAt = Date(timeIntervalSince1970: 0)
+                    if !preservingEditMetadata { value.histories[index].entries[entry].replacedAt = Date(timeIntervalSince1970: 0) }
                 }
             }
             value.projectedValuePaths.sort()

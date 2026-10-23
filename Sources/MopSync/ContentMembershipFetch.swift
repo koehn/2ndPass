@@ -60,7 +60,13 @@ public struct ContentMembershipFetcher: Sendable {
             return .retry(.dependency)
         } catch SyncJournalError.inboxFull { return .retry(.inboxFull) }
         catch SyncJournalError.staleOperation { return .retry(.dependency) }
+        catch CloudSyncAdapterError.contentZoneUnavailable(let vault) {
+            guard vault == operation.vaultID else { return .attention(.invalidAuthority) }
+            return .waiting([.init(.trustedContentZone, identifier: vault.uuidString)])
+        }
+        catch CloudSyncAdapterError.invalidBinding { return .attention(.invalidAuthority) }
         catch let error as CKError {
+            try? await repository.recordSyncTransportFailure(operation, error: error)
             AccessSyncTrace.failure("membership fetch cloud failure", operation: operation.id, error: error)
             return .retry(.transport, retryAfter: (error.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue)
         }

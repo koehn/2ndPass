@@ -202,16 +202,53 @@ struct ContentView: View {
                             .background(.quaternary, in: RoundedRectangle(cornerRadius: 8)).padding()
                     }
                 }.accessibilityIdentifier("Item detail")
-                .safeAreaInset(edge: .bottom, spacing: 0) {
+                .mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout, isDetail: true)
+        }
+
+        .safeAreaInset(edge: .bottom, spacing: 0) { sessionStatusFooter }
+        .navigationSplitViewStyle(.balanced)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+            availableWidth = width
+
+        }
+        #if os(macOS)
+        .toolbar { SessionToolbar(model: model, settings: $settingsPresented) }
+        #endif
+    }
+    private var emptyCollectionTitle: String {
+        switch model.collection {
+        case .passkeys: "No Passkeys"
+        case .sshKeys: "No SSH Keys"
+        default: "No items"
+        }
+    }
+    private var sessionStatusFooter: some View {
+
                 VStack(spacing: 0) {
                 Divider()
+                if model.catalogTransferStatus == nil && model.syncIssue == nil && model.outgoingAccessStatus == nil && model.updateAuthenticationState == .ready && !model.needsCloudEnrollmentAuthorization {
                 HStack(spacing: 8) {
                     if model.showsCloudProgress { ProgressView().controlSize(.small).accessibilityLabel("iCloud activity") }
-                    Image(systemName: model.offline ? "icloud.slash" : "icloud")
+                    Button { model.showSyncIssue() } label: {
+                        Image(systemName: model.offline ? "icloud.slash" : "icloud")
+                    }.buttonStyle(.plain).accessibilityLabel("Sync diagnostics")
                     Text(model.sessionStatus)
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     Spacer()
                 }.padding(12)
+                }
+                if model.updateAuthenticationState != .ready {
+                    HStack {
+                        Text(model.updateAuthenticationMessage).font(.callout)
+                        Spacer()
+                        Button(model.updateAuthenticationButton) { model.resumeUpdates() }
+                            .disabled(!model.canResumeUpdates)
+                        if model.updateAuthenticationState == .failed {
+                            Button("Details…") { model.showUpdateAuthenticationDetails() }
+                        }
+                    }.padding(12)
+                    .accessibilityIdentifier("resume-authenticated-updates")
+                }
                 if model.needsCloudEnrollmentAuthorization {
                     HStack {
                         Text("Local access is unlocked. Connect to access your iCloud vaults.")
@@ -220,7 +257,7 @@ struct ContentView: View {
                             .disabled(!model.canAuthorizeVaultConnection || model.busy)
                     }.padding(.horizontal, 12).padding(.bottom, 8)
                 }
-                if let activity = model.outgoingAccessStatus, !model.needsCloudEnrollmentAuthorization {
+                if let activity = model.outgoingAccessStatus, !model.needsCloudEnrollmentAuthorization, model.syncIssue == nil, model.updateAuthenticationState == .ready, model.catalogTransferStatus == nil {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
                         Text(activity).font(.caption).foregroundStyle(.secondary)
@@ -252,24 +289,7 @@ struct ContentView: View {
                     .accessibilityIdentifier("catalog-transfer-progress")
                 }
                 }.background(.background)
-            }.mobileSessionToolbar(model: model, settings: $settingsPresented, compact: compactLayout, isDetail: true)
-        }
 
-        .navigationSplitViewStyle(.balanced)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
-            availableWidth = width
-
-        }
-        #if os(macOS)
-        .toolbar { SessionToolbar(model: model, settings: $settingsPresented) }
-        #endif
-    }
-    private var emptyCollectionTitle: String {
-        switch model.collection {
-        case .passkeys: "No Passkeys"
-        case .sshKeys: "No SSH Keys"
-        default: "No items"
-        }
     }
     private var sessionContent: some View {
         Group {
@@ -307,6 +327,7 @@ struct ContentView: View {
     }
     private var content: some View {
         sessionContent
+        .sheet(isPresented: $model.syncDiagnosticsPresented) { SyncDiagnosticsView(model: model) }
         .sheet(isPresented: $model.keyCreationPresented) { KeyCredentialCreateView(model: model) }
         .sheet(item: $model.vaultDetailsTarget) { target in
             VaultDetailsDialog(model: model, target: target)

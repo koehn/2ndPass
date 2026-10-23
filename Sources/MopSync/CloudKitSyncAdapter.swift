@@ -4,6 +4,21 @@ import MopCore
 import OSLog
 import CryptoKit
 
+/// Engine-local bookkeeping, not evidence that a zone exists or is trusted.
+/// CloudKit owns retries after registration. Re-adding a completed zone save on
+/// every checkpoint wake can keep database changes ahead of record uploads.
+struct GrantZoneRegistration {
+    private var submitted: Set<CKRecordZone.ID> = []
+
+    mutating func newlyRequired(_ zones: Set<CKRecordZone.ID>) -> Set<CKRecordZone.ID> {
+        let added = zones.subtracting(submitted)
+        submitted.formUnion(added)
+        return added
+    }
+
+    mutating func invalidate(_ zone: CKRecordZone.ID) { submitted.remove(zone) }
+}
+
 /// Whitelist numeric diagnostics only. CloudKit descriptions, partial-error
 /// dictionary keys and userInfo may contain private record identifiers/data.
 func cloudFailureSummary(_ errors: [CKError]) -> String {
@@ -163,6 +178,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         }
     }
 
+    public func hasTrustedContentAddress(_ vault: UUID) -> Bool {
+        addresses.values.contains { $0.vaultID == vault && $0.zoneName == SyncStoreLayout.contentZone(vault: vault) && $0.ownerName == CKCurrentUserDefaultName }
+    }
+
     public func addContentAddresses(_ added: [VaultCloudAddress]) async throws {
         guard contentReception != nil, added.allSatisfy({ $0.zoneName == SyncStoreLayout.contentZone(vault: $0.vaultID) && $0.ownerName == CKCurrentUserDefaultName }) else { throw CloudSyncAdapterError.invalidBinding }
         for address in added where addresses[address.storageKey] != address {
@@ -204,6 +223,9 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     // Diagnostic only, bounded and intentionally not persisted. Measures latest
     // engine handoff to server acknowledgement, not end-to-end durable latency.
     private var submissionTimes: [CKRecord.ID: ContinuousClock.Instant] = [:]
+    private var grantZoneRegistration = GrantZoneRegistration()
+    private var lastUploadStateTrace = Date.distantPast
+    private var networkPhases: [UUID: (name: String, started: ContinuousClock.Instant)] = [:]
     private var lastRetentionPrune = Date.distantPast
     private var recoveryOperation: UUID?
     private var activeDataEvents = 0
@@ -302,6 +324,7 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             startedEngine.state.remove(pendingDatabaseChanges: startedEngine.state.pendingDatabaseChanges.filter { ContentZoneRouting.belongs($0, to: address) })
         }
         engine = startedEngine
+        grantZoneRegistration = GrantZoneRegistration()
         Self.logger.notice("Sync trace: engine created; checkpointRestored=\(state != nil) zones=\(self.addresses.count) automaticallySync=\(automaticallySync)")
         if contentReception?.coordination != nil { startedEngine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: coordinationZoneID))]) }
         do {
@@ -388,6 +411,14 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
     }
 
     public func requestSync() async throws {
+        let traceID = UUID()
+        let started = ContinuousClock.now
+        networkPhases[traceID] = ("preparing", started)
+        AccessSyncTrace.event("network reconciliation started", operation: traceID)
+        defer {
+            networkPhases.removeValue(forKey: traceID)
+            AccessSyncTrace.elapsed("network reconciliation exited", since: started, operation: traceID)
+        }
         try Task.checkCancellation()
         try checkSuspension()
         guard let engine else { throw CloudSyncAdapterError.engineNotStarted }
@@ -402,7 +433,12 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         let pendingCount = try await repository.pendingScopes(account: account).count
         let conflictCount = try await repository.conflictedScopes(account: account).count
         Self.logger.notice("Sync trace: fetch starting; zones=\(self.addresses.count) pendingItems=\(pendingCount) conflicts=\(conflictCount) uploadsAllowed=\(self.uploadsAllowed)")
+        networkPhases[traceID] = ("fetching", .now)
+        AccessSyncTrace.event("network fetch started", operation: traceID,
+            detail: "zones=\(receiveZoneIDs.count) uploadsAllowed=\(uploadsAllowed)")
         try await engine.fetchChanges(.init(scope: .zoneIDs(receiveZoneIDs)))
+        networkPhases[traceID] = ("registering", .now)
+        AccessSyncTrace.event("network fetch returned", operation: traceID)
         Self.logger.notice("Sync trace: fetch returned; suspended=\(self.suspended)")
         guard expectedGeneration == identityGeneration, self.engine === engine, !suspended else {
             throw CloudSyncAdapterError.operationInterrupted
@@ -414,7 +450,10 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             }
             try Task.checkCancellation()
             Self.logger.notice("Sync trace: send starting")
+            networkPhases[traceID] = ("sending", .now)
+            AccessSyncTrace.event("network send started", operation: traceID)
             try await engine.sendChanges()
+            AccessSyncTrace.event("network send returned", operation: traceID)
             Self.logger.notice("Sync trace: send returned")
         }
         guard expectedGeneration == identityGeneration, self.engine === engine, !suspended else {
@@ -450,18 +489,32 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
                 guard let name = String(data: operation.payload, encoding: .utf8) else { throw ContentStoreError.invalidRecord }
                 return .deleteRecord(CKRecord.ID(recordName: name, zoneID: coordinationZoneID))
             }
-            engine.state.add(pendingRecordZoneChanges: removals)
+            guard expected == identityGeneration, self.engine === engine, !suspended else { throw CloudSyncAdapterError.operationInterrupted }
+            if !removals.isEmpty { engine.state.add(pendingRecordZoneChanges: removals) }
             let ids = Set(candidates.filter { address(for: $0.scope) != nil }.map(\.recordID) + coordination.map(\.recordID))
             let registered = Set(engine.state.pendingRecordZoneChanges.compactMap { change -> CKRecord.ID? in
                 if case .saveRecord(let id) = change { return id }; return nil
             })
+            if ids != registered || Date().timeIntervalSince(lastUploadStateTrace) >= 30 {
+                lastUploadStateTrace = Date()
+                let phases = networkPhases.values.map {
+                    "\($0.name):\($0.started.duration(to: .now))"
+                }.sorted().joined(separator: ",")
+                AccessSyncTrace.event("upload transport state",
+                    detail: "candidates=\(candidates.count) coordination=\(coordination.count) trustedRecords=\(ids.count) registered=\(registered.count) uploadsAllowed=\(uploadsAllowed) suspended=\(suspended) resolving=\(resolutionInProgress) network=\(phases.isEmpty ? "idle" : phases)")
+            }
             if ids != registered {
                 Self.logger.notice("Sync trace: upload registration; contentCandidates=\(candidates.count) coordinationCandidates=\(coordination.count) untrustedZoneCandidates=\(candidates.filter { address(for: $0.scope) == nil }.count) added=\(ids.subtracting(registered).count) removed=\(registered.subtracting(ids).count)")
             }
             let grantZones = Set(candidates.filter { $0.grant != nil && address(for: $0.scope) != nil }.map { $0.recordID.zoneID })
-            engine.state.add(pendingDatabaseChanges: grantZones.map { .saveZone(CKRecordZone(zoneID: $0)) })
-            engine.state.add(pendingRecordZoneChanges: ids.subtracting(registered).map { .saveRecord($0) })
-            engine.state.remove(pendingRecordZoneChanges: registered.subtracting(ids).map { .saveRecord($0) })
+            let newZones = grantZoneRegistration.newlyRequired(grantZones)
+            if !newZones.isEmpty {
+                AccessSyncTrace.event("grant zones registered", detail: "count=\(newZones.count)")
+                engine.state.add(pendingDatabaseChanges: newZones.map { .saveZone(CKRecordZone(zoneID: $0)) })
+            }
+            let added = ids.subtracting(registered), removed = registered.subtracting(ids)
+            if !added.isEmpty { engine.state.add(pendingRecordZoneChanges: added.map { .saveRecord($0) }) }
+            if !removed.isEmpty { engine.state.remove(pendingRecordZoneChanges: removed.map { .saveRecord($0) }) }
 
     }
 
@@ -1002,6 +1055,23 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
             do { try await registerPendingChanges() }
             catch { lastFailure = cloudSyncFailure(error, fallback: .storageFailure) }
             AccessSyncTrace.elapsed("rotation upload registration", since: registrationStart)
+            // Give registered publications a send opportunity before the next
+            // rotation batch cancels engine work for its readback barrier.
+            // Failure leaves the durable publications pending for normal retry.
+            if engine === owner, expected == identityGeneration, !stopping, !suspended, uploadsAllowed, !resolutionInProgress {
+                let sendStart = ContinuousClock.now
+                do {
+                    try await validateAccount(generation: expected)
+                    guard engine === owner, expected == identityGeneration, !stopping, !suspended, uploadsAllowed, !resolutionInProgress else {
+                        throw CloudSyncAdapterError.operationInterrupted
+                    }
+                    try await owner.sendChanges()
+                    AccessSyncTrace.elapsed("rotation send opportunity", since: sendStart, detail: "success=true")
+                } catch {
+                    lastFailure = cloudSyncFailure(error, fallback: .storageFailure)
+                    AccessSyncTrace.failure("rotation send deferred", operation: pending[0].1.id, error: error)
+                }
+            }
         }
         AccessSyncTrace.elapsed("rotation batch total", since: batchStart, detail: "items=\(pending.count)")
         return outcomes
@@ -1045,11 +1115,12 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         // Targeted dependencies can unblock staged records while bulk fetching
         // is paused. Their normal scope, signature, and inbox bounds still apply.
         try await validateAccount(generation: expected, allowingInboxDrain: true)
-        guard engine != nil, !stopping, contentReception != nil,
-              addresses.values.contains(where: { $0.zoneID == id.zoneID }) else {
-            AccessSyncTrace.event("direct fetch blocked", record: id.recordName,
-                detail: "enginePresent=\(engine != nil) stopping=\(stopping) trustedZone=\(addresses.values.contains { $0.zoneID == id.zoneID })")
-            throw CloudSyncAdapterError.invalidBinding
+        guard engine != nil, !stopping, contentReception != nil else { throw CloudSyncAdapterError.engineNotStarted }
+        guard addresses.values.contains(where: { $0.zoneID == id.zoneID }) else {
+            guard let address = Self.contentAddressHints([id.zoneID]).first else { throw CloudSyncAdapterError.invalidBinding }
+            AccessSyncTrace.event("direct fetch waiting for trusted zone", record: id.recordName,
+                detail: "vault=\(AccessSyncTrace.token(address.vaultID.uuidString))")
+            throw CloudSyncAdapterError.contentZoneUnavailable(address.vaultID)
         }
         AccessSyncTrace.event("direct fetch requested", record: id.recordName)
         let record = try await database.record(for: id)
@@ -1129,7 +1200,13 @@ public actor CloudKitSyncAdapter: CKSyncEngineDelegate {
         try await validateAccount(generation: identityGeneration)
         let scope = VaultScope(account: account, vaultID: zone.vault, database: databaseName, zoneOwner: address.ownerName)
         try await repository.invalidateGrantDestination(scope: scope, recipient: zone.recipient, identifier: identifier, permit: contentPermit)
-        if identifier == nil { engine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: id))]) }
+        if identifier == nil {
+            // Remote deletion/missing-zone recovery must be allowed to recreate a
+            // previously registered destination. This does not authorize grants.
+            grantZoneRegistration.invalidate(id)
+            let zones = grantZoneRegistration.newlyRequired([id])
+            engine.state.add(pendingDatabaseChanges: zones.map { .saveZone(CKRecordZone(zoneID: $0)) })
+        }
         _ = try await repository.requestSync(account: account, database: databaseName, reason: .manual)
     }
 

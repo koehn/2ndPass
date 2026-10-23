@@ -32,7 +32,7 @@ private struct OperationHealthFields: Decodable {
         guard state == .waitingForDependency || failure == .dependency else { return nil }
         let kinds = Set(dependencies.map(\.kind))
         if kinds.contains(.grant) { return .missingGrant }
-        if kinds.contains(.membership) || kind == .fetchMembership { return .missingMembership }
+        if kinds.contains(.trustedContentZone) || kinds.contains(.membership) || kind == .fetchMembership { return .missingMembership }
         if !kinds.isDisjoint(with: [.content, .contentHead, .contentKeyState, .contentKeyGeneration]) || [.fetchContentHead, .fetchContentVersion].contains(kind) { return .missingContent }
         if kinds.contains(.grantRequestState) { return .unprovenGeneration }
         return .prerequisite
@@ -362,10 +362,10 @@ extension EncryptedItemRepository {
         }
     }
 
-    public func quarantineSummary(account: String) throws -> (records: Int, retainedBytes: Int) {
+    public func quarantineSummary(account: String) throws -> (records: Int, retainedBytes: Int, retiredRecords: Int) {
         try transaction {
             let rows = try quarantineRows(account: account)
-            return (rows.count, rows.reduce(0) { $0 + ($1.1.payload?.count ?? 0) })
+            return (rows.filter { $0.1.retired != true }.count, rows.reduce(0) { $0 + ($1.1.payload?.count ?? 0) }, rows.filter { $0.1.retired == true }.count)
         }
     }
 
@@ -393,6 +393,14 @@ extension EncryptedItemRepository {
             guard old.kind == operation.kind, old.payload == operation.payload, old.vaultID == operation.vaultID,
                   old.zoneOwner == operation.zoneOwner else {
                 throw SyncJournalError.identityCollision
+            }
+            if old.kind == .fetchContentVersion, old.resolution == .unneededGrantSource {
+                var resumed = old
+                resumed.state = .ready; resumed.resolution = nil; resumed.completedAt = nil
+                resumed.dependencies = operation.dependencies; resumed.failure = nil
+                resumed.nextAttempt = nil; resumed.retryNotBefore = nil; resumed.revision = UUID()
+                try writeJournal(resumed, entity: "SyncOperation", key: key, account: operation.account, database: operation.database)
+                return resumed
             }
             return old
         }
@@ -574,6 +582,25 @@ extension EncryptedItemRepository {
         return try stageIncomingInTransaction(record, budget: budget, usage: &usage)
     }
     private func stageIncomingInTransaction(_ record: IncomingRecord, budget: Int, usage: inout InboxUsage?) throws -> IncomingRecord {
+        if let archived: IncomingRecord = try journalValue("StateBlob", key: blobKey(record.account, "discarded-incoming:" + record.id)),
+           archived.database == record.database, archived.zoneOwner == record.zoneOwner,
+           archived.zoneName == record.zoneName, archived.recordName == record.recordName,
+           archived.recordType == record.recordType, archived.bytes == record.bytes {
+            let old: SyncOperation? = try journalValue("SyncOperation", key: journalKey(record.account, record.database, record.operationID.uuidString))
+            var sourceArrived = false
+            if old?.resolution == .unneededGrantSource {
+                struct Source: Decodable { let item: UUID; let keyGeneration: UUID }
+                if let source = try? JSONDecoder().decode(Source.self, from: record.bytes), let vault = record.vaultID {
+                    let scope = ItemScope(account: record.account, vaultID: vault, itemID: source.item, database: record.database, zoneOwner: record.zoneOwner)
+                    sourceArrived = try contentRows("ContentVersion", field: "scopeKey", equals: scope.storageKey).contains {
+                        let content: PreparedContentVersion = try contentValue($0)
+                        return content.keyGeneration == source.keyGeneration
+                    }
+                }
+            }
+            // Reopening only queues normal verification; it never trusts replayed data.
+            if !sourceArrived { return record }
+        }
         guard budget > 0, !record.account.isEmpty, ["private", "shared"].contains(record.database),
               !record.id.isEmpty, !record.bytes.isEmpty,
               record.bytes.count <= Self.maximumCiphertextBytes * 4 / 3 + 16_384,
@@ -605,7 +632,7 @@ extension EncryptedItemRepository {
         let operationKey = journalKey(record.account, record.database, record.operationID.uuidString)
         if var operation: SyncOperation = try journalValue("SyncOperation", key: operationKey),
            operation.state == .completed || operation.state == .needsAttention {
-            operation.state = .ready; operation.completedAt = nil; operation.revision = UUID()
+            operation.state = .ready; operation.completedAt = nil; operation.resolution = nil; operation.revision = UUID()
             operation.attempts = 0; operation.nextAttempt = nil; operation.retryNotBefore = nil; operation.failure = nil
             try writeJournal(operation, entity: "SyncOperation", key: operationKey, account: record.account, database: record.database)
         }
@@ -862,6 +889,7 @@ extension EncryptedItemRepository {
     func finishPublicationInTransaction(_ id: UUID, account: String, database: String, confirmed: Bool = true) throws {
         let key = journalKey(account, database, id.uuidString)
         guard var operation: SyncOperation = try journalValue("SyncOperation", key: key) else { return }
+        guard operation.resolution != .discardedByUser else { return }
         operation.state = .completed; operation.completedAt = Date(); operation.failure = nil
         operation.deliveredAt = confirmed ? operation.completedAt : nil
         if confirmed, let delivered = operation.deliveredAt {

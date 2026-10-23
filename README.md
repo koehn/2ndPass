@@ -25,6 +25,17 @@ Formerly Mop. See [branding and upgrade compatibility](docs/BRANDING.md) for ret
 
 **Development preview.** Same-account private vaults connect automatically through iCloud while an existing device is unlocked. Shared vaults and general document import are unavailable. Device removal and permanent cloud-vault deletion are preview features awaiting physical acceptance; see the build gates below. See the [vault architecture](docs/VAULT.md), [backup guide](docs/BACKUPS.md) and [validation gates](docs/VALIDATION.md).
 
+## Cloud-key sessions
+
+Cloud vault identity keys are encrypted by a device-only Secure Enclave key and
+held in memory only while unlocked. Ordinary reads and signed writes continue
+after enclave authentication expires; app lock revokes the session keys.
+The first authenticated launch migrates all locally enrolled cloud vaults through
+confirmed membership changes and key-grant transfer, then retires the previous
+identities through normal key rotation. Interrupted or offline work resumes.
+Upgrade the app, AutoFill, and CLI together on each device. See the
+[migration details and security tradeoffs](docs/WRAPPED-DEVICE-MIGRATION.md).
+
 ## Recent items
 
 Recently Added, Recently Changed, and Recently Used show the newest 50 active, unarchived items across connected vaults. Search filters those 50 items. Item details show known creation, addition, change, and device-local usage times. Existing items have no invented historical dates; portable restores preserve source dates when available and record when they were added to 2ndPass.

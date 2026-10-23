@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Synchronization
 import Testing
 import MopCore
@@ -237,4 +238,59 @@ private actor AdmissionHeadServer: VaultMembershipTransport {
     #expect(throws: CloudSyncAdapterError.untrustedRecord) { try registry.install(stale, authority: successor.digest()) }
     #expect(registry.get(scope.binding.vaultID) === changed && changed.isUnlocked)
     registry.lock()
+}
+
+private final class RenewalValidity: Sendable { let value = Mutex(true) }
+
+private final class RenewableTestDevice: DeviceOperations {
+    let device: SessionDevice
+    let valid: RenewalValidity
+    var identity: DevicePublicKey { device.identity }
+    init(_ device: SessionDevice, valid: RenewalValidity) { self.device = device; self.valid = valid }
+    func checkAuthorization() throws { guard valid.value.withLock({ $0 }) else { throw MopError.authentication } }
+    func sign(_ bytes: Data) throws -> Data { try checkAuthorization(); return try device.sign(bytes) }
+    func unwrap(_ envelope: KeyEnvelope, context: Data) throws -> SymmetricKey {
+        try checkAuthorization(); return try device.unwrap(envelope, context: context)
+    }
+    func close() { device.close() }
+}
+
+@Test func renewedAuthorizationReplacesSameAuthorityAndRejectsStalePermit() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
+    let owner = try SessionDevice(), trust = MemoryItemInventory()
+    let scope = ItemVaultSetupScope(container: "iCloud.test", environment: "Development",
+        binding: ItemVaultBinding(account: "renewal", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
+    let oldValidity = RenewalValidity()
+    let old = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: scope,
+        device: RenewableTestDevice(SessionDevice(copying: owner), valid: oldValidity)).create(name: "test")
+    let pin = try #require(try trust.load(scope: scope))
+    let history = try ItemVaultMembershipAuthority.history(record: pin, trustStore: trust)
+    let registry = ItemVaultSessionRegistry(), authority = try history.current.digest()
+    _ = try registry.install(old, authority: authority)
+    let secondScope = ItemVaultSetupScope(container: scope.container, environment: scope.environment,
+        binding: ItemVaultBinding(account: "renewal", database: "private", zoneOwner: "__defaultOwner__", vaultID: UUID()))
+    let second = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: secondScope,
+        device: RenewableTestDevice(SessionDevice(copying: owner), valid: oldValidity)).create(name: "second")
+    let secondPin = try #require(try trust.load(scope: secondScope))
+    let secondHistory = try ItemVaultMembershipAuthority.history(record: secondPin, trustStore: trust)
+    let secondAuthority = try secondHistory.current.digest()
+    _ = try registry.install(second, authority: secondAuthority)
+    oldValidity.value.withLock { $0 = false }
+    #expect(!second.isUnlocked)
+    #expect(throws: MopError.authentication) { try second.currentDeviceID }
+    #expect(!old.isUnlocked)
+    #expect(throws: MopError.authentication) { try old.currentDeviceID }
+    let fresh = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: scope,
+        device: RenewableTestDevice(SessionDevice(copying: owner), valid: RenewalValidity())).open()
+    #expect(try registry.install(fresh, authority: authority) === fresh)
+    #expect(try await fresh.vaultMetadata().value.name == "test")
+    #expect(throws: CloudSyncAdapterError.operationInterrupted) { try registry.install(old, authority: authority) }
+    #expect(registry.get(scope.binding.vaultID) === fresh)
+    let secondFresh = try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: secondScope,
+        device: RenewableTestDevice(SessionDevice(copying: owner), valid: RenewalValidity())).open()
+    #expect(try registry.install(secondFresh, authority: secondAuthority) === secondFresh)
+    #expect(try await secondFresh.vaultMetadata().value.name == "second")
+    #expect(fresh.isUnlocked && secondFresh.isUnlocked)
 }

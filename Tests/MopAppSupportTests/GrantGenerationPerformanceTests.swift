@@ -254,7 +254,7 @@ extension GrantGenerationPerformanceTests {
         let revisions = try await repository.itemRevisionIndex(account: scope.account, vaultID: vault)
         let firstBatch = try await repository.contentPublications(account: scope.account)
         #expect(firstBatch.count == 100)
-        #expect(firstBatch.filter { $0.kind == .grant }.count == 16)
+        #expect(firstBatch.allSatisfy { $0.kind == .version }) // sources precede grants
         // Enumerate current publication payloads, not the bounded 100-record selector.
         func projectedUploads(_ repository: EncryptedItemRepository) async throws -> [ContentUpload] {
             var result: [ContentUpload] = []

@@ -10,7 +10,8 @@ import MopSync
 import MopVaultNext
 
 /// Native access to the shared item store. No legacy registry or snapshot path is
-/// consulted. User presence authorizes a shared context until explicit lock.
+/// consulted. User presence unlocks cached software identities until app lock;
+/// legacy hardware identities are used only while migrating their grants.
 public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unchecked Sendable {
     private static let logger = Logger(subsystem: "com.koehn.mop", category: "Enrollment")
     private struct Context: Sendable {
@@ -21,11 +22,16 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     }
     private struct State: @unchecked Sendable {
         var generation = 0
+        var authorizationGeneration = 0
+        var renewal: Task<Void, Error>?
+        var requiresAuthentication = false
         #if DEBUG
         var resettingEnrollment = false
         #endif
         var context: Context?
         var authorization: ContextInvalidator?
+        var deviceKeys: UnlockedDeviceCache?
+        var warmedKeys: ObjectIdentifier?
         var enrollmentAuthorizedAt: TimeInterval?
         var pendingAuthorization: ContextInvalidator?
         var listeners: [UUID: AsyncStream<Void>.Continuation] = [:]
@@ -39,9 +45,92 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     public var enrollmentAuthorizedAt: TimeInterval? {
         state.withLock { $0.authorization == nil ? nil : $0.enrollmentAuthorizedAt }
     }
+    public var requiresLocalAuthentication: Bool { state.withLock { $0.requiresAuthentication } }
+    private func authenticationRequired(_ error: Error, epoch: Int, operation: String) {
+        guard Authentication.requiresInteraction(error) else { return }
+        let listeners = state.withLock { value in
+            guard value.authorization != nil, value.authorizationGeneration == epoch,
+                  !value.requiresAuthentication else { return [AsyncStream<Void>.Continuation]() }
+            value.requiresAuthentication = true
+            return Array(value.listeners.values)
+        }
+        let native = error as NSError
+        Self.logger.notice("Protected operation requires authentication; operation=\(operation, privacy: .public) generation=\(epoch) domain=\(native.domain, privacy: .public) code=\(native.code)")
+        listeners.forEach { $0.yield(()) }
+    }
+    public func reauthenticate() async throws {
+        let task = state.withLock { value -> Task<Void, Error> in
+            if let task = value.renewal { return task }
+            let generation = value.generation
+            let task = Task { try await self.renewAuthorization(generation: generation) }
+            value.renewal = task
+            return task
+        }
+        try await task.value
+        try Task.checkCancellation()
+        guard let context = state.withLock({ $0.authorization == nil ? nil : $0.context }) else { throw CancellationError() }
+        // Authorization-blocked journal work only responds to an explicit unlock wake.
+        try await context.runtime.wake(reason: .unlocked)
+    }
+    private func renewAuthorization(generation: Int) async throws {
+        defer { state.withLock { if $0.generation == generation { $0.renewal = nil; $0.pendingAuthorization = nil } } }
+        guard let context = state.withLock({ $0.context }) else { throw MopError.authentication }
+        try requireNoRecovery(context)
+        Self.logger.debug("Creating fresh authentication context for renewal")
+        let authorization = try await Authentication.authorizeAsync(reason: "resume your 2ndPass vault updates", preserveCancellation: true) { value in
+            let accepted = self.state.withLock { state in
+                guard state.generation == generation else { return false }
+                state.pendingAuthorization = ContextInvalidator(value); return true
+            }
+            guard accepted else { value.invalidate(); throw CancellationError() }
+        }
+        do {
+            try Task.checkCancellation()
+            try context.account.withWritePermission {}
+            try requireNoRecovery(context)
+            let bootstraps = try state.withLock { value in
+                guard value.generation == generation else { throw CancellationError() }
+                value.authorizationGeneration += 1
+                value.deviceKeys?.invalidate(); value.deviceKeys = nil; value.warmedKeys = nil
+                value.authorization?.invalidate(); value.authorization = nil
+                let bootstraps = Array(value.provisionalBootstraps.values)
+                value.provisionalBootstraps.removeAll()
+                return bootstraps
+            }
+            context.runtime.lock()
+            bootstraps.forEach { $0.lock() }
+            try state.withLock { value in
+                guard value.generation == generation, value.context?.account === context.account else { throw CancellationError() }
+                // Synchronously revoke old permits before publishing fresh authorization.
+                value.authorization?.invalidate()
+                value.authorizationGeneration += 1
+                value.authorization = ContextInvalidator(authorization)
+                value.deviceKeys = UnlockedDeviceCache()
+                value.pendingAuthorization = nil
+                value.enrollmentAuthorizedAt = ProcessInfo.processInfo.systemUptime
+                value.requiresAuthentication = false
+            }
+            try await warmCloudDevices(context, authorization: authorization, generation: generation)
+            Self.logger.notice("Authentication context replaced")
+        } catch {
+            authorization.invalidate()
+            state.withLock { value in
+                guard value.generation == generation,
+                      value.authorization.map({ ObjectIdentifier($0.context) }) == ObjectIdentifier(authorization) else { return }
+                value.deviceKeys?.invalidate(); value.deviceKeys = nil; value.warmedKeys = nil
+                value.authorization = nil; value.enrollmentAuthorizedAt = nil
+            }
+            throw error
+        }
+    }
     public func lock() {
+        Self.logger.debug("Invalidating authentication contexts: lock")
         let resources = state.withLock { value in
             value.generation += 1
+            value.authorizationGeneration += 1
+            value.renewal?.cancel(); value.renewal = nil
+            value.requiresAuthentication = false
+            value.deviceKeys?.invalidate(); value.deviceKeys = nil; value.warmedKeys = nil
             value.authorization?.invalidate(); value.authorization = nil; value.enrollmentAuthorizedAt = nil
             value.pendingAuthorization?.invalidate(); value.pendingAuthorization = nil
             let bootstraps = Array(value.provisionalBootstraps.values)
@@ -77,7 +166,11 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                     let resources = (value.authorization, value.pendingAuthorization, value.changePump, Array(value.provisionalBootstraps.values))
                     value.provisionalBootstraps.removeAll()
                     value.generation += 1
-                            value.context = nil; value.authorization = nil; value.enrollmentAuthorizedAt = nil
+                    value.authorizationGeneration += 1
+                    value.renewal?.cancel(); value.renewal = nil
+                    value.requiresAuthentication = false
+                    value.deviceKeys?.invalidate(); value.deviceKeys = nil; value.warmedKeys = nil
+                    value.context = nil; value.authorization = nil; value.enrollmentAuthorizedAt = nil
                     value.pendingAuthorization = nil; value.changePump = nil
                     return resources
                 }
@@ -125,6 +218,20 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         }, grant: { [weak recovery = context.recovery] operation, session, permit in
             guard let recovery else { return nil }; return await recovery.grant(operation, session: session, permit: permit)
         })
+        await runtime.setMigrationGrantHandler { [weak self] operation, session, permit in
+            guard let self, [.prepareGrant, .rotateContent].contains(operation.kind),
+                  let authorization = self.state.withLock({ $0.authorization?.context }),
+                  let legacyIdentity = try DeviceKeychain.publicIdentity(scope: self.keyScope(account, session.binding.vaultID), member: account.memberID),
+                  legacyIdentity != session.identity,
+                  WrappedDeviceMigration.canUseLegacySource(legacyIdentity, replacement: session.identity, history: session.history) else { return nil }
+            let legacy = try self.openDevice(account, vaultID: session.binding.vaultID, context: authorization, create: false, legacy: true)
+            defer { legacy.close() }
+            if operation.kind == .rotateContent {
+                return await session.handle(operation, owner: permit, migration: legacy,
+                    grantRequestScope: self.enrollmentScope(account, vaultID: session.binding.vaultID))
+            }
+            return try await session.prepareMigratedGrant(operation, legacy: legacy, owner: permit) ? .completed : nil
+        }
         await runtime.setEnrollmentHandler { [weak self] vault, record, permit in
             guard let self else { throw MopError.authentication }
             try await self.progressEnrollment(vault, record: record, context: context, permit: permit)
@@ -141,6 +248,19 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         pair.continuation.yield(())
         return pair.stream
     }
+    public func checkConflicts(_ session: ItemVaultSession) async throws -> ItemVaultConflictCheck {
+        guard let context = state.withLock({ $0.context }),
+              let authorization = state.withLock({ $0.authorization?.context }),
+              session.binding.account == context.account.accountNamespace else { throw MopError.authentication }
+        var legacy: (any DeviceOperations)?
+        if let identity = try DeviceKeychain.publicIdentity(scope: keyScope(context.account, session.binding.vaultID), member: context.account.memberID),
+           WrappedDeviceMigration.canUseLegacySource(identity, replacement: session.contentSession.identity, history: session.contentSession.history) {
+            legacy = try openDevice(context.account, vaultID: session.binding.vaultID, context: authorization, create: false, legacy: true)
+        }
+        defer { legacy?.close() }
+        return try await session.checkConflicts(requestScope: enrollmentScope(context.account, vaultID: session.binding.vaultID), legacy: legacy)
+    }
+
     public func existing(_ vaultID: UUID) async -> ItemVaultSession? {
         if let context = state.withLock({ $0.context }), (try? requireNoRecovery(context)) == nil { return nil }
         guard let context = state.withLock({ $0.context }) else { return nil }
@@ -249,9 +369,9 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
                 let session: ItemVaultSession
                 if let existing = try? await context.runtime.session(vaultID: id), existing.isUnlocked { session = existing }
                 else {
-                    let device = try await device(context, vaultID: id, create: false)
-                    let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: KeychainItemVaultTrustStore(), scope: record.scope, device: device)
-                    session = try await context.runtime.register(session: bootstrap.open(), synchronize: !offline)
+                    let authorization = try await device(context, vaultID: id, create: false)
+                    authorization.close()
+                    session = try await context.runtime.register(session: openVaultSession(record, account: context.account, repository: context.repository), synchronize: !offline)
                 }
                 if try await session.vaultMetadata().value.name == name { matches.append(id) }
             }
@@ -408,9 +528,10 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             if let deletion = try await context.repository.deletion(scope.repositoryScope), deletion.phase != .prepared { throw VaultDeletionFailure.deleted }
             let trust = try KeychainItemVaultTrustStore()
             guard try trust.load(scope: scope) != nil else { throw MopError.vaultMissing }
-            let device = try await device(context, vaultID: vaultID, create: false)
-            let bootstrap = try ItemVaultBootstrap(repository: context.repository, trustStore: trust, scope: scope, device: device)
-            let session = try await bootstrap.open()
+            let authorization = try await device(context, vaultID: vaultID, create: false)
+            authorization.close()
+            guard let record = try trust.load(scope: scope) else { throw MopError.vaultMissing }
+            let session = try await openVaultSession(record, account: context.account, repository: context.repository)
             return try await context.runtime.register(session: session, synchronize: !offline)
         }
     }
@@ -471,6 +592,15 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         return result
     }
 
+    public func discardSynchronizationWork(on day: Date) async throws -> Int {
+        guard let context = state.withLock({ $0.context }), let interval = Calendar.current.dateInterval(of: .day, for: day) else { throw MopError.authentication }
+        return try await context.runtime.discardWork(interval: interval)
+    }
+    public func synchronizationDiagnostics() async throws -> [SyncOperationDiagnostic] {
+        guard let context = state.withLock({ $0.context }) else { return [] }
+        try context.account.withWritePermission {}
+        return try await context.repository.syncOperationDiagnostics(account: context.account.accountNamespace, database: "private")
+    }
     public func synchronizationHealth() async throws -> SyncHealthSnapshot? {
         guard let context = state.withLock({ $0.context }) else { return nil }
         try context.account.withWritePermission {}
@@ -514,9 +644,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             value.authorization.map { (value.generation, $0) }
         }) else { return nil }
         try account.withWritePermission {}
-        let device = try openDevice(account, vaultID: record.scope.binding.vaultID, context: snapshot.1.context, create: false)
-        let bootstrap = try ItemVaultBootstrap(repository: repository, trustStore: KeychainItemVaultTrustStore(), scope: record.scope, device: device)
-        let session = try await bootstrap.open()
+        let session = try await openVaultSession(record, account: account, repository: repository)
         guard state.withLock({ $0.generation == snapshot.0 }) else { session.lock(); return nil }
         return session
     }
@@ -610,6 +738,7 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
         for scope in reset.scopes {
             let vault = scope.binding.vaultID
             let keyScope = context.account.containerIdentifier + "/" + context.account.environment + "/content3/" + reset.account + "/" + vault.uuidString
+            try WrappedDeviceKeychain.remove(scope: keyScope, member: context.account.memberID)
             try DeviceKeychain.remove(scope: keyScope, member: context.account.memberID)
             try trust.removeDeletedVault(scope: scope)
             try ItemEnrollmentRequestStore(directory: context.account.directory.appendingPathComponent("ContentPreview3"),
@@ -623,12 +752,85 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
     }
     #endif
 
-    private func openDevice(_ account: NativeItemCloudAccount, vaultID: UUID, context: LAContext, create: Bool) throws -> any DeviceOperations {
-        let keyScope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vaultID.uuidString
-        return SharedAuthorizationDevice(try DeviceKeychain.open(scope: keyScope, member: account.memberID, context: context, create: create))
+    private func keyScope(_ account: NativeItemCloudAccount, _ vault: UUID) -> String {
+        account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vault.uuidString
+    }
+    private func openVaultSession(_ record: ItemVaultSetupRecord, account: NativeItemCloudAccount,
+                                  repository: EncryptedItemRepository) async throws -> ItemVaultSession {
+        guard let context = state.withLock({ $0.authorization?.context }) else { throw MopError.authentication }
+        let id = record.scope.binding.vaultID
+        let trust = try KeychainItemVaultTrustStore()
+        let legacyIdentity = try DeviceKeychain.publicIdentity(scope: keyScope(account, id), member: account.memberID)
+        let replacement = try openDevice(account, vaultID: id, context: context, create: legacyIdentity != nil)
+        if let legacyIdentity {
+            let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trust, allowingDeviceRemoval: true)
+            // A deliberately removed identity must not be reopened or resurrected.
+            if history.current.membership.role(of: legacyIdentity) == .owner {
+                let legacy = try openDevice(account, vaultID: id, context: context, create: false, legacy: true)
+                return try await WrappedDeviceMigration.open(repository: repository, trust: trust, scope: record.scope,
+                    legacy: legacy, replacement: replacement, owner: account)
+            }
+        }
+        return try await ItemVaultBootstrap(repository: repository, trustStore: trust, scope: record.scope, device: replacement).open()
+    }
+    private func openDevice(_ account: NativeItemCloudAccount, vaultID: UUID, context: LAContext,
+                            create: Bool, legacy: Bool = false) throws -> any DeviceOperations {
+        let scope = keyScope(account, vaultID)
+        let snapshot = state.withLock { ($0.authorizationGeneration, $0.deviceKeys) }
+        let epoch = snapshot.0
+        guard let keys = snapshot.1 else { throw MopError.authentication }
+        let contextID = ObjectIdentifier(context)
+        do {
+            let provider = try keys.open(scope + (legacy ? "/legacy" : "/wrapped")) {
+                if legacy { return try DeviceKeychain.open(scope: scope, member: account.memberID, context: context) }
+                let migrating = try DeviceKeychain.publicIdentity(scope: scope, member: account.memberID) != nil
+                return try WrappedDeviceKeychain.open(scope: scope, member: account.memberID, context: context, create: create || migrating)
+            }
+            return SharedAuthorizationDevice(provider, check: { [weak self] in
+                guard let self, self.state.withLock({ $0.authorizationGeneration == epoch && $0.authorization.map { ObjectIdentifier($0.context) } == contextID }) else { throw MopError.authentication }
+            }, failed: { [weak self] error, operation in self?.authenticationRequired(error, epoch: epoch, operation: operation) })
+        } catch {
+            authenticationRequired(error, epoch: epoch, operation: "open device keys")
+            throw error
+        }
+    }
+    private func warmCloudDevices(_ context: Context, authorization: LAContext, generation: Int) async throws {
+        guard let keys = state.withLock({ $0.deviceKeys }) else { throw MopError.authentication }
+        let cacheID = ObjectIdentifier(keys)
+        if state.withLock({ $0.warmedKeys == cacheID }) { return }
+        // Launch unlock covers every locally enrolled cloud vault, including
+        // those not selected in the UI. Roots survive runtime session replacement.
+        let trust = try KeychainItemVaultTrustStore()
+        let records = try await context.runtime.inventory().filter { record in
+            let history = try ItemVaultMembershipAuthority.history(record: record, trustStore: trust, allowingDeviceRemoval: true)
+            let scope = keyScope(context.account, record.scope.binding.vaultID)
+            let wrapped = try WrappedDeviceKeychain.publicIdentity(scope: scope, member: context.account.memberID)
+            let legacy = try DeviceKeychain.publicIdentity(scope: scope, member: context.account.memberID)
+            // One revoked vault must not block unlocking unrelated vaults, and a
+            // deliberately removed replacement must never be recreated at launch.
+            if let wrapped, (history.current.membership.removedDevices ?? []).contains(wrapped.device) { return false }
+            return [wrapped, legacy].compactMap { $0 }.contains { history.current.membership.role(of: $0) == .owner }
+        }
+        for record in records {
+            let warmed = try openDevice(context.account, vaultID: record.scope.binding.vaultID, context: authorization, create: false)
+            warmed.close()
+        }
+        for record in records {
+            guard state.withLock({ $0.generation == generation }) else { throw MopError.authentication }
+            if (try? await context.runtime.session(vaultID: record.scope.binding.vaultID)) == nil {
+                let session = try await openVaultSession(record, account: context.account, repository: context.repository)
+                try await context.runtime.register(session: session)
+            }
+        }
+        try state.withLock { value in
+            guard value.generation == generation, value.deviceKeys === keys else { throw MopError.authentication }
+            value.warmedKeys = cacheID
+        }
     }
     private func device(_ context: Context, vaultID: UUID, create: Bool, allowPrompt: Bool = true) async throws -> any DeviceOperations {
-        let generation = state.withLock { $0.generation }
+        let snapshot = state.withLock { ($0.generation, $0.authorizationGeneration, $0.renewal != nil) }
+        guard !snapshot.2 else { throw MopError.authentication }
+        let generation = snapshot.0
         let authorization: LAContext
         if let existing = state.withLock({ $0.authorization }) { authorization = existing.context }
         else {
@@ -642,31 +844,44 @@ public final class NativeItemVaultServiceBackend: ItemVaultServiceBackend, @unch
             }
         }
         let accepted = state.withLock { current in
-            guard current.generation == generation else { return false }
+            guard current.generation == generation, current.authorizationGeneration == snapshot.1, current.renewal == nil else { return false }
             // Only completed, interaction-disabled contexts are visible to the
             // no-prompt background loader. Pending authentication is separate.
-            if current.authorization == nil { current.enrollmentAuthorizedAt = ProcessInfo.processInfo.systemUptime }
+            if current.authorization == nil {
+                current.enrollmentAuthorizedAt = ProcessInfo.processInfo.systemUptime
+                current.deviceKeys = UnlockedDeviceCache()
+            }
             current.authorization = ContextInvalidator(authorization)
             current.pendingAuthorization = nil
             return true
         }
         guard accepted else { authorization.invalidate(); throw MopError.authentication }
+        try await warmCloudDevices(context, authorization: authorization, generation: generation)
         let device = try openDevice(context.account, vaultID: vaultID, context: authorization, create: create)
         guard state.withLock({ $0.generation == generation }) else { device.close(); throw MopError.authentication }
         return device
     }
 }
 
-/// Each session exclusively owns its key handles. The backend owns the shared
-/// authorization context and invalidates it on global lock; closing one session
-/// must not invalidate unrelated vault sessions that use the same context.
+/// Each session owns a revocable lease. The backend owns cached key roots and
+/// the authentication context; global lock revokes both. Closing one lease must
+/// not invalidate other vault sessions or force another enclave unwrap.
 private final class SharedAuthorizationDevice: DeviceOperations {
-    private let device: EnclaveDevice
-    init(_ device: EnclaveDevice) { self.device = device }
+    private let device: any DeviceOperations
+    private let check: @Sendable () throws -> Void
+    private let failed: @Sendable (Error, String) -> Void
+    init(_ device: any DeviceOperations, check: @escaping @Sendable () throws -> Void, failed: @escaping @Sendable (Error, String) -> Void) {
+        self.device = device; self.check = check; self.failed = failed
+    }
     var identity: DevicePublicKey { device.identity }
-    func sign(_ bytes: Data) throws -> Data { try device.sign(bytes) }
-    func unwrap(_ envelope: KeyEnvelope, context: Data) throws -> SymmetricKey { try device.unwrap(envelope, context: context) }
-    func close() { device.releaseHandles() }
+    func checkAuthorization() throws { try check(); try device.checkAuthorization() }
+    func sign(_ bytes: Data) throws -> Data {
+        do { try check(); return try device.sign(bytes) } catch { failed(error, "sign"); throw error }
+    }
+    func unwrap(_ envelope: KeyEnvelope, context: Data) throws -> SymmetricKey {
+        do { try check(); return try device.unwrap(envelope, context: context) } catch { failed(error, "unwrap"); throw error }
+    }
+    func close() { device.close() }
     deinit { close() }
 }
 

@@ -135,6 +135,8 @@ public protocol VaultService: Sendable {
     func requestSynchronization() async throws
     func requestSynchronization(refreshPrerequisites: Bool) async throws
     func synchronizationHealth() async throws -> SyncHealthSnapshot?
+    func discardSynchronizationWork(on day: Date) async throws -> Int
+    func synchronizationDiagnostics() async throws -> [SyncOperationDiagnostic]
     var sessionGeneration: Int { get }
     var authenticatedAt: TimeInterval? { get }
     /// Authorization retained while a new device waits for vault admission.
@@ -142,6 +144,8 @@ public protocol VaultService: Sendable {
     var operationProgress: String? { get }
     var operationFraction: Double? { get }
     func endRecoverySession()
+    func reauthenticate() async throws
+    var requiresLocalAuthentication: Bool { get }
     func lock()
     func execute(_ operation: VaultOperation, vault: String?, offline: Bool) async throws -> VaultResult
     func readLocal(_ reference: SecretReference, vault: String?) async throws -> VaultResult
@@ -155,6 +159,8 @@ public protocol VaultService: Sendable {
 }
 
 public extension VaultService {
+    func reauthenticate() async throws { throw ItemVaultServiceFailure.unavailable }
+    var requiresLocalAuthentication: Bool { false }
     #if DEBUG
     func debugResetEnrollment() async throws { throw ItemVaultServiceFailure.unavailable }
     #endif
@@ -180,6 +186,8 @@ public extension VaultService {
     func requestSynchronization() async throws {}
     func requestSynchronization(refreshPrerequisites: Bool) async throws { try await requestSynchronization() }
     func synchronizationHealth() async throws -> SyncHealthSnapshot? { nil }
+    func discardSynchronizationWork(on day: Date) async throws -> Int { throw ItemVaultServiceFailure.unavailable }
+    func synchronizationDiagnostics() async throws -> [SyncOperationDiagnostic] { [] }
     var capabilities: Set<VaultServiceCapability> { Set(VaultServiceCapability.allCases) }
     func events() async -> AsyncStream<VaultChange> {
         let pair = AsyncStream<VaultChange>.makeStream()

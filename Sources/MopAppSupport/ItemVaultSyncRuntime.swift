@@ -18,10 +18,12 @@ actor ItemVaultSyncRuntime {
     private var adapter: CloudKitSyncAdapter?
     private var adapterStartup: Task<CloudKitSyncAdapter, Error>?
     private var adapterStartupID: UUID?
+    private var migrationChecks: Set<UUID> = []
     private var coordinator: DurableSyncCoordinator?
     private var loader: (@Sendable (ItemVaultSetupRecord) async throws -> ItemVaultSession?)?
     private var enrollment: Enrollment?
     private var recoveryWork: (@Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome)?
+    private var migrationGrant: (@Sendable (SyncOperation, GrantBackedContentSession, any RepositoryWritePermit) async throws -> SyncOperationOutcome?)?
     private var recoveryGrant: (@Sendable (SyncOperation, GrantBackedContentSession, any RepositoryWritePermit) async -> SyncOperationOutcome?)?
     private var observers: ContentRuntimeObservers?
     private var startupRequested = false
@@ -36,6 +38,9 @@ actor ItemVaultSyncRuntime {
         trust = try KeychainItemVaultTrustStore()
     }
     func setSessionLoader(_ value: @escaping @Sendable (ItemVaultSetupRecord) async throws -> ItemVaultSession?) { loader = value }
+    func setMigrationGrantHandler(_ handler: @escaping @Sendable (SyncOperation, GrantBackedContentSession, any RepositoryWritePermit) async throws -> SyncOperationOutcome?) {
+        migrationGrant = handler
+    }
     func setEnrollmentHandler(_ value: @escaping Enrollment) { enrollment = value }
     func setRecoveryHandlers(work: @escaping @Sendable (SyncOperation, any RepositoryWritePermit) async -> SyncOperationOutcome,
                              grant: @escaping @Sendable (SyncOperation, GrantBackedContentSession, any RepositoryWritePermit) async -> SyncOperationOutcome?) {
@@ -94,11 +99,24 @@ actor ItemVaultSyncRuntime {
         enabled = false; adapterStartup?.cancel(); adapterStartup = nil; adapterStartupID = nil
         await adapter?.stop(); adapter = nil
     }
+    func discardWork(interval: DateInterval) async throws -> Int {
+        guard !retired else { throw CloudSyncAdapterError.accountChanged }
+        await coordinator?.stop(); coordinator = nil
+        await pauseNetwork()
+        do {
+            let count = try await repository.discardSyncWork(account: account.accountNamespace, interval: interval, permit: account)
+            try await start()
+            return count
+        } catch {
+            try? await start()
+            throw error
+        }
+    }
     func stop() async {
         retired = true; enabled = false; observers = nil; lock()
         adapterStartup?.cancel(); adapterStartup = nil; adapterStartupID = nil
         await coordinator?.stop(); coordinator = nil
-        await adapter?.stop(); adapter = nil; loader = nil; enrollment = nil
+        await adapter?.stop(); adapter = nil; loader = nil; enrollment = nil; migrationGrant = nil
     }
     private func automaticWake(_ reason: SyncWakeReason) async {
         guard enabled, !retired else { return }
@@ -113,9 +131,14 @@ actor ItemVaultSyncRuntime {
             kinds: [.publishItem, .grant, .publishCoordination, .removeCoordination, .reconcile, .recoverTransport, .applyIncoming, .fetchContentVersion, .fetchContentHead, .fetchMembership, .provision, .membership, .enrollment, .deletion, .recovery, .prepareGrant, .rotateContent, .resolveConflict],
             allowsConcurrentReconciliation: true, coalescesPublicationRegistration: true,
             dependencyAvailable: { [weak self] dependency in try await self?.dependency(dependency) ?? false },
+            dependenciesAvailable: { [weak self] dependencies in
+                try await self?.dependencies(dependencies) ?? [:]
+            },
             rotationBatchHandler: { [weak self] operations in
                 guard let self else { return operations.map { _ in .retry(.accountChanged) } }
                 return await self.handleRotations(operations)
+            }, afterDrain: { [weak self] in
+                try await self?.finishMigrationChecks()
             }) { [weak self] operation in
                 guard let self else { return .retry(.accountChanged) }
                 return await self.handle(operation)
@@ -132,6 +155,10 @@ actor ItemVaultSyncRuntime {
         // it must neither restart the engine nor masquerade as an account change.
         guard !startupRequested else { return }
         startupRequested = true
+        do {
+            let repaired = try await repository.repairUnpublishedGrantSources(account: account.accountNamespace, permit: account)
+            if repaired > 0 { Self.logger.notice("Sync trace: repaired missing grant source publications; grants=\(repaired)") }
+        } catch { startupRequested = false; throw error }
         Self.logger.notice("Sync trace: starting account coordinator for online discovery")
         do {
             // Terminal journal entries intentionally do not execute again, so
@@ -139,7 +166,7 @@ actor ItemVaultSyncRuntime {
             let operations = try await repository.operations(account: account.accountNamespace, database: "private")
             let blocked = operations.filter { $0.state != .completed && $0.failure != nil }
             let quarantine = try await repository.quarantineSummary(account: account.accountNamespace)
-            Self.logger.notice("Sync trace: persisted failures; operations=\(blocked.count) quarantined=\(quarantine.records)")
+            Self.logger.notice("Sync trace: persisted failures; operations=\(blocked.count) quarantined=\(quarantine.records) archivedQuarantine=\(quarantine.retiredRecords)")
             let groups = Dictionary(grouping: blocked) { "kind=\($0.kind.rawValue) state=\($0.state.rawValue) failure=\($0.failure!.rawValue)" }
             for key in groups.keys.sorted() {
                 AccessSyncTrace.event("persisted failure summary", detail: "\(key) count=\(groups[key]!.count)")
@@ -168,13 +195,14 @@ actor ItemVaultSyncRuntime {
         guard !retired else { throw CloudSyncAdapterError.accountChanged }
         enabled = true
         if refreshPrerequisites {
+            try await reconcileTargetedWork(retryMissing: true)
             try await GrantRequestPrerequisites(repository: repository).refreshWaitingHeads(
                 account: account.accountNamespace, owner: CKCurrentUserDefaultName, permit: account)
         }
         let request = try await repository.requestSync(account: account.accountNamespace, database: "private", reason: .manual)
         await ensureCoordinator()
         let coordinator = coordinator
-        Task { await coordinator?.wake(reason: .foreground) }
+        Task { await coordinator?.wake(reason: refreshPrerequisites ? .foreground : .storeChanged) }
         return request
     }
     func wake(reason: SyncWakeReason) async throws {
@@ -236,10 +264,11 @@ actor ItemVaultSyncRuntime {
             try await GrantBackedContentStorage(repository: repository).initializeReadableVersions(scope: scope, history: history, permit: permit)
             if try await repository.deletion(scope) != nil { continue }
             var bytes = try await repository.engineState(account: account.accountNamespace, database: "grant-local-recipient4:" + vault.uuidString)
+            let keyScope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vault.uuidString
+            let wrapped = try WrappedDeviceKeychain.publicIdentity(scope: keyScope, member: account.memberID)
+            let legacy = try DeviceKeychain.publicIdentity(scope: keyScope, member: account.memberID)
             if bytes == nil {
-                let keyScope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vault.uuidString
-                if let identity = try DeviceKeychain.publicIdentity(scope: keyScope, member: account.memberID),
-                   history.current.membership.devices.contains(identity) {
+                if let identity = [wrapped, legacy].compactMap({ $0 }).first(where: { history.current.membership.devices.contains($0) }) {
                     bytes = Data(identity.fingerprint.utf8)
                     try await repository.saveEngineState(bytes!, account: account.accountNamespace,
                         database: "grant-local-recipient4:" + vault.uuidString, permit: permit)
@@ -249,6 +278,12 @@ actor ItemVaultSyncRuntime {
                 devices: Set(history.current.membership.devices.map(\.fingerprint)),
                 local: bytes.flatMap { String(data: $0, encoding: .utf8) },
                 recovery: history.current.membership.offlineRecovery?.fingerprint, presentedRecovery: recoveryRecipient)
+            // Retired predecessor grants may arrive after the replacement has
+            // become this device's recipient. Subscribe only to our Keychain-bound
+            // predecessor, authenticated by the independently pinned pair history.
+            if let legacy, let wrapped, WrappedDeviceMigration.canUseLegacySource(legacy, replacement: wrapped, history: history) {
+                zones.append(try RecipientGrantZone(vault: vault, recipient: legacy.fingerprint).name)
+            }
 
         }
         return zones
@@ -369,8 +404,13 @@ actor ItemVaultSyncRuntime {
                     // History can be unavailable until a later fetch; never clear
                     // failures merely because verification could not be performed.
                     let trusted = try? history(vault)
-                    do { _ = try await coordinationInbox.retireObsoleteFailure(failed, history: trusted, permit: account) }
+                    do {
+                        if try await !coordinationInbox.retireObsoleteFailure(failed, history: trusted, permit: account) {
+                            _ = try await coordinationInbox.recoverFailedGrantRequest(failed, history: trusted, permit: account)
+                        }
+                    }
                     catch SyncJournalError.staleOperation { continue }
+                    catch { AccessSyncTrace.failure("enrollment recovery retained", operation: failed.id, error: error) }
                 }
                 if let request = try? JSONDecoder().decode(DurableSyncRequest.self, from: operation.payload) { try await repository.markSyncRequestHandled(request) }
                 return .completed
@@ -387,7 +427,36 @@ actor ItemVaultSyncRuntime {
             return Self.workFailureOutcome(error)
         }
     }
+    private func dependencies(_ dependencies: [SyncDependency]) async throws -> [SyncDependency: Bool] {
+        var result: [SyncDependency: Bool] = [:]
+        var queries: [ContentReadinessQuery] = []
+        var keys: [SyncDependency] = []
+        var memberships: [UUID: String] = [:]
+        for dependency in dependencies {
+            guard let wait = GrantRequestWait(dependency: dependency) else { continue }
+            let digest: String
+            if let cached = memberships[wait.vault] { digest = cached }
+            else {
+                guard let trusted = try history(wait.vault) else { result[dependency] = false; continue }
+                digest = try trusted.current.digest(); memberships[wait.vault] = digest
+            }
+            if digest != wait.membership { result[dependency] = true; continue }
+            keys.append(dependency)
+            queries.append(ContentReadinessQuery(scope: try account.setupScope(vaultID: wait.vault).binding.item(wait.item),
+                observedVersion: wait.version, recipient: wait.recipient, keyGeneration: wait.keyGeneration,
+                missingVersion: wait.missingVersion))
+        }
+        let values = try await repository.contentReadiness(queries)
+        for (key, value) in zip(keys, values) { result[key] = value }
+        // Other dependency kinds retain their established checks in the scheduler.
+        return result
+    }
+
     private func dependency(_ dependency: SyncDependency) async throws -> Bool {
+        if dependency.kind == .trustedContentZone {
+            guard let vault = UUID(uuidString: dependency.identifier), vault.uuidString == dependency.identifier else { return false }
+            return await adapter?.hasTrustedContentAddress(vault) == true
+        }
         if dependency.kind == .prerequisiteInboxCapacity {
             guard let kind = SyncOperation.Kind(rawValue: dependency.identifier) else { return false }
             return try await repository.prerequisiteInboxReadyToResume(account: account.accountNamespace, kind: kind)
@@ -495,6 +564,48 @@ actor ItemVaultSyncRuntime {
             throw error
         }
     }
+    /// A preceding membership proposal must be confirmed before migration can
+    /// enqueue admission/retirement. Retry after that confirmation, not only in
+    /// changedMembership's pre-confirm callback. Grant arrivals also unblock it.
+    private func reconcileTargetedWork(retryMissing: Bool = false) async throws {
+        guard !retired else { return }
+        try account.withWritePermission {}
+        let reconciliation = TargetedSyncReconciliation(repository: repository, account: account.accountNamespace,
+            history: { [weak self] vault in try await self?.history(vault) })
+        try await reconciliation.reconcile(permit: account, retryMissing: retryMissing)
+        for operation in try await repository.activeOperations(account: account.accountNamespace, database: "private")
+            where operation.kind == .enrollment {
+            guard let vault = operation.vaultID else { continue }
+            do {
+                let trusted = try history(vault)
+                if try await !coordinationInbox.retireObsoleteFailure(operation, history: trusted, permit: account) {
+                    _ = try await coordinationInbox.recoverFailedGrantRequest(operation, history: trusted, permit: account)
+                }
+            }
+            catch SyncJournalError.staleOperation { continue }
+            catch { AccessSyncTrace.failure("obsolete request retained", operation: operation.id, error: error) }
+        }
+    }
+
+    private func finishMigrationChecks() async throws {
+        try await reconcileTargetedWork()
+        for vault in migrationChecks {
+            migrationChecks.remove(vault)
+            do { try await advanceDeviceMigration(vault) }
+            catch { migrationChecks.insert(vault); throw error }
+        }
+    }
+
+    private func advanceDeviceMigration(_ vault: UUID) async throws {
+        guard let history = try history(vault), let record = try pin(vault), let loader else { return }
+        let scope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vault.uuidString
+        guard let legacy = try DeviceKeychain.publicIdentity(scope: scope, member: account.memberID),
+              history.current.membership.role(of: legacy) == .owner else { return }
+        let started = ContinuousClock.now
+        defer { AccessSyncTrace.elapsed("migration inventory check", since: started, detail: "vault=\(AccessSyncTrace.token(vault.uuidString))") }
+        if let loaded = try await loader(record) { try await register(session: loaded) }
+    }
+
     private func apply(_ operation: SyncOperation, permit: any RepositoryWritePermit) async -> SyncOperationOutcome {
         do {
             guard let id = String(data: operation.payload, encoding: .utf8),
@@ -552,9 +663,11 @@ actor ItemVaultSyncRuntime {
                         if try await session.reconcileMembership(operation, scope: coordinationInbox.scope(vault: vault), owner: permit) { return .retry(.dependency) }
                     }
                 }
-                return await JournaledContentMembership(repository: repository, trustStore: trust,
+                let outcome = await JournaledContentMembership(repository: repository, trustStore: trust,
                     transport: NativeVaultMembershipTransport(database: account.container.privateCloudDatabase), scope: try account.setupScope(vaultID: vault),
                     accountValidator: account.validator, committed: { [weak self] history in try await self?.changedMembership(history) }).handle(operation, permit: permit)
+                if case .completed = outcome { try await advanceDeviceMigration(vault) }
+                return outcome
             case .enrollment:
                 if operation.payload.isEmpty {
                     if try await repository.vaultInitialization(account.setupScope(vaultID: vault).repositoryScope) != nil { return .completed }
@@ -618,11 +731,9 @@ actor ItemVaultSyncRuntime {
                                 // recipient zone still exists on the server.
                                 let upload = ContentUpload(operationID: operation.id, content: content, grant: grant, kind: .grant, systemFields: nil)
                                 try await validate(upload, authority: PublicationAuthorityChecks())
-                                let transport = NativeGrantZoneTransport(database: account.container.privateCloudDatabase, account: account.accountNamespace, validator: account.validator, permit: permit)
-                                try permit.withWritePermission {}
-                                try await transport.provision(RecipientGrantZone(vault: vault, recipient: grant.recipient).name)
-                                let receipt = try await transport.publishAndVerify(grant)
-                                try await repository.stageIncoming(receipt, permit: permit)
+                                try await repository.repairGrantDelivery(grant, permit: permit)
+                                AccessSyncTrace.event("grant repair queued", operation: operation.id, item: scope.itemID,
+                                    generation: grant.keyGeneration, recipient: grant.recipient)
                             }
                         }
                         return outcome
@@ -666,6 +777,7 @@ actor ItemVaultSyncRuntime {
                 if state?.phase == .cloudDeleted {
                     try permit.withWritePermission {
                         let keyScope = account.containerIdentifier + "/" + account.environment + "/content3/" + account.accountNamespace + "/" + vault.uuidString
+                        try WrappedDeviceKeychain.remove(scope: keyScope, member: account.memberID)
                         try DeviceKeychain.remove(scope: keyScope, member: account.memberID)
                         try ItemEnrollmentRequestStore(directory: account.directory.appendingPathComponent("ContentPreview3"), scope: coordinationInbox.scope(vault: vault)).purge()
                     }
@@ -705,7 +817,11 @@ actor ItemVaultSyncRuntime {
             case .prepareGrant, .rotateContent:
                 let session = try await unlocked(vault).contentSession
                 if let recoveryGrant, let result = await recoveryGrant(operation, session, permit) { return result }
-                return await session.handle(operation, owner: permit, grantRequestScope: coordinationInbox.scope(vault: vault))
+                let outcome: SyncOperationOutcome
+                if let migrationGrant, let result = try await migrationGrant(operation, session, permit) { outcome = result }
+                else { outcome = await session.handle(operation, owner: permit, grantRequestScope: coordinationInbox.scope(vault: vault)) }
+                if case .completed = outcome { migrationChecks.insert(vault) }
+                return outcome
             default: return .attention(.invalidAuthority)
             }
         } catch MopError.authentication {

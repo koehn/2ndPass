@@ -55,3 +55,39 @@ public enum AutoFillLoginSaveError: LocalizedError {
         }
     }
 }
+
+/// Adds exact website hosts without replacing the login's existing fields or secrets.
+public enum AutoFillRememberWebsite {
+    public static func save(_ websites: Set<String>, for identity: AutoFillIdentity, service: any VaultService) async throws {
+        guard !websites.isEmpty, identity.kind != .passkey,
+              let vault = AutoFillEntry.vaultID(identity.recordIdentifier) else { throw MopError.notFound }
+        let hosts = Set(websites.compactMap(AutoFillEntry.website))
+        guard websites.allSatisfy({ AutoFillEntry.website($0) != nil }) else { throw AutoFillLoginSaveError.invalidDraft }
+        let generation = service.sessionGeneration
+        let catalog = try await service.execute(.catalog, vault: vault, offline: false).requireCatalog()
+        try Task.checkCancellation()
+        guard generation == service.sessionGeneration else { throw MopError.authentication }
+        guard catalog.canEdit == true else { throw AutoFillLoginSaveError.readOnly }
+        guard let entry = AutoFillEntry.entries(catalog: catalog, vaultID: vault).first(where: {
+            $0.recordIdentifier == identity.recordIdentifier && $0.kind == identity.kind
+        }), var item = catalog.items.first(where: { $0.name == entry.reference.item }) else { throw MopError.notFound }
+        let existing = Set(item.fields.filter { $0.type == .website }.compactMap { AutoFillEntry.website($0.value ?? "") })
+        let additions = hosts.subtracting(existing).sorted()
+        guard !additions.isEmpty else { return }
+        for host in additions {
+            var suffix = 1
+            var path = "website"
+            while item.fields.contains(where: { $0.path == path }) {
+                suffix += 1; path = "website\(suffix)"
+            }
+            item.fields.append(ItemField(path: path, type: .website, value: host))
+        }
+        let result = try await service.execute(.save(ItemEdit(revision: catalog.revision, item: item, create: false, originalName: item.name)), vault: vault, offline: false)
+        try Task.checkCancellation()
+        guard generation == service.sessionGeneration, service.isAuthenticated, !result.usingCache else { throw MopError.authentication }
+        let saved = try result.requireCatalog()
+        if let service = service as? ItemVaultService {
+            try await service.publishAutoFillSuggestions(catalog: saved, vault: vault, deferred: true)
+        }
+    }
+}

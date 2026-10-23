@@ -16,6 +16,7 @@ public actor EncryptedItemRepository {
     var grantPreparationReads = 0
     var grantPreparationRows = 0
     var missingGrantScanRows = 0
+    var conflictBatchReads = 0
     private let supportsQueryGenerations: Bool
     private var changeObserver: StoreChangeObserver?
     private var changeStreams: [UUID: AsyncStream<Void>.Continuation] = [:]

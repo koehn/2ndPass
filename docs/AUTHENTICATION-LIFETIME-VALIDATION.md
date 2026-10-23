@@ -1,5 +1,10 @@
 # Background authentication and inactivity
 
+Cloud vault identities now use [enclave-wrapped software keys](WRAPPED-DEVICE-MIGRATION.md).
+After migration, ordinary reads and signed writes depend on the app session, not
+on reuse of enclave authorization. The background-renewal behavior below remains
+relevant while migrating legacy grants and for device-local hardware credentials.
+
 The app's inactivity deadline and Secure Enclave authorization are independent.
 A native noninteractive operation can require user presence before the app's
 configured deadline. Background catalog refresh now preserves the live session
@@ -8,10 +13,10 @@ authentication, and leaves the inactivity deadline untouched. It neither retries
 with interactive authentication nor treats the failed operation as successful.
 Other authentication failures, account changes, removal, and explicit/system
 locking retain their existing behavior. Foreground protected operations still
-require authorization. No keys, identities, grants, or access controls change.
+require authorization. The background-renewal behavior itself does not change keys, identities, grants, or access controls.
 
-This fixes the premature application lock; it does not extend Apple's hardware
-authorization lifetime or guarantee unattended cryptographic work for 60 minutes.
+This renewal behavior does not extend Apple's hardware authorization lifetime.
+Migrated software-key sessions avoid that lifetime for ordinary cloud operations.
 To resume work requiring renewed presence, explicitly lock and unlock the app.
 
 ## Signed Mac validation

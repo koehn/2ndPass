@@ -13,12 +13,12 @@ Vault contents are encrypted before storage or upload. Access is granted to devi
 public keys; independently signed items are verified against separately pinned
 membership authority. These protections depend on several distinct boundaries:
 
-- **Device hardware and Apple platform security:** Secure Enclave protects private
-  key operations. Keychain, code signing, provisioning and local authentication
+- **Device hardware and Apple platform security:** Secure Enclave protects cloud
+  identity keys at rest and performs device-local credential operations. Keychain, code signing, provisioning and local authentication
   control access to device identities. The application does not implement these
   hardware or OS security boundaries itself.
-- **Authorized application code:** plaintext and temporary symmetric keys enter
-  the authorized process. Code controlling that process can request permitted
+- **Authorized application code:** unlocked cloud identity private keys, plaintext,
+  and temporary symmetric keys enter the authorized process. Code controlling that process can request permitted
   hardware operations and retain the results.
 - **Same-account bootstrap:** the authenticated private CloudKit container is an
   explicit trust channel for automatic device admission. An attacker able to write
@@ -45,15 +45,17 @@ of plaintext on a compromised endpoint.
 ### Devices and local identities
 
 Cloud-access identity keys and device-local credential keys serve different jobs.
-Both use Secure Enclave hardware, but the former unwrap item keys and sign vault
-operations while the latter perform SSH, Git, passkey or certificate operations.
+Cloud identities use software agreement/signing keys wrapped by a device-only
+Secure Enclave key. The software keys unwrap item keys and sign vault operations
+while unlocked. Device-local SSH, Git, passkey and certificate keys remain inside
+the Secure Enclave. These are different extraction-resistance guarantees.
 
 ```mermaid
 flowchart TB
   subgraph A[Device A]
     AA[App / CLI / AutoFill]
     AS[Encrypted App Group store]
-    AE[Secure Enclave identity: agreement and signing]
+    AE[Enclave-wrapped software agreement and signing keys]
     AL[Separate local credential keys]
     AA <--> AS
     AA --> AE
@@ -62,7 +64,7 @@ flowchart TB
   subgraph B[Device B]
     BA[App / CLI / AutoFill]
     BS[Encrypted App Group store]
-    BE[Independent Secure Enclave identity]
+    BE[Independent enclave-wrapped software identity]
     BL[Independent local credential keys]
     BA <--> BS
     BA --> BE
@@ -85,7 +87,8 @@ flowchart TB
   M[Signed membership control records] --> V
   I[Independently signed item envelope] --> V
   I --> W[Recipient HPKE wrappers for this item key]
-  D[Device agreement key in Secure Enclave] --> W
+  D[Unlocked software device agreement key] --> W
+  E[Device-only Secure Enclave wrapping key] --> D
   W --> K[Temporary item key in authorized process memory]
   K --> C[Encrypted item catalog]
   K --> F[Encrypted fields and retained history]
@@ -103,11 +106,20 @@ account recovery recipient protects cloud contents; see [recovery](OFFLINE-RECOV
 
 ### What the Secure Enclave does
 
-The Secure Enclave is an isolated hardware security subsystem. 2ndPass creates two
-separate P-256 private keys per device: a key-agreement key used to open encrypted
-item-key envelopes, and a signing key used to authenticate requests, item updates and membership changes. Private scalar values are not exported to 2ndPass. The shipping
-`EnclaveDevice` provider requires `SecureEnclave.isAvailable` and has no software
-fallback. Software key providers used in tests do not establish hardware behavior.
+The Secure Enclave is an isolated hardware security subsystem. New cloud identities
+use `WrappedDevice`: a P-256 hardware key protects a bundle of separate software
+P-256 agreement and signing private keys through HPKE (P256/SHA256/AES-GCM-256).
+The envelope binds the format domain, exact account/vault scope and public identity.
+Only authenticated unlock opens that bundle. The wrapping private key never leaves
+the enclave; the software private keys remain in the authorized process until lock.
+There is no production fallback when the Secure Enclave is unavailable.
+
+Existing enclave identities migrate through additive, cloud-confirmed membership
+and rewrapped content-key grants. Once local grant readiness is established, the
+replacement signs retirement of the old membership and normal key rotation follows.
+Original hardware keys remain as decryption sources for late legacy grants and
+obsolete epochs; they are not exported or deleted, and retain no signing authority
+after retirement. See [wrapped identity migration](WRAPPED-DEVICE-MIGRATION.md).
 
 Apple's [Secure Enclave overview](https://support.apple.com/guide/security/sec59b0b31ff/web)
 and [key protection documentation](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave)
@@ -117,14 +129,13 @@ whole vault engine, AES record decryption, or the UI inside the Enclave.
 ### What is stored on the device
 
 The Keychain is Apple's OS-managed credential store, distinct from the Enclave.
-2ndPass persists opaque, device-bound representations of the two hardware keys in
-the Data Protection Keychain. These are not portable private scalars or a
-recoverable backup of the device identity. The items are non-synchronizable,
-scoped to 2ndPass's signing access group, and use `WhenUnlockedThisDeviceOnly`.
-Copying their bytes, local vault storage or CloudKit records does not reveal the
-underlying private keys or let them be moved to another machine. 2ndPass holds
-opaque CryptoKit key references and asks the Secure Enclave to perform private-key
-operations; decrypted item keys and secrets are outside that hardware boundary.
+2ndPass persists an opaque device-bound wrapping-key representation and an encrypted
+software-key bundle in the Data Protection Keychain. Items are non-synchronizable,
+scoped to the signing access group, and use `WhenUnlockedThisDeviceOnly`. The
+wrapped identity has its own versioned namespace; legacy identity records remain
+intact. Copying these stored bytes does not yield portable plaintext identity keys.
+Unlocking materializes the cloud identity's private scalars in application memory.
+An attacker who extracts those unlocked keys can reuse them outside the device.
 
 Keychain access groups, provisioning and hardened-runtime validation constrain
 which signed clients can use these representations. They are not defenses
@@ -140,11 +151,15 @@ authentication, then disables unexpected interactive prompts during key
 operations. This is the platform's authentication policy, not a promise that
 biometrics are the only permitted authentication method.
 
-The GUI may reuse that authorization until session lock or expiry. Therefore a
-successful operation need not produce a fresh prompt. CLI sessions end with their
-command; AutoFill starts fresh authorization and locks after each fill. Providers
-release hardware-key handles after operations. Session lock invalidates the
-context and session generation, cancels work, and rejects late results.
+The authenticated app session opens all locally enrolled cloud-vault software keys.
+Session-owned roots survive membership/runtime reloads without another enclave
+operation. Ordinary cloud reads and signed writes therefore continue when the
+original enclave authorization expires. Session lock synchronously revokes every
+root and borrower, invalidates the context and generation, and rejects late work.
+A fresh unlock must authenticate and decrypt the persisted bundle again. CLI
+sessions end with their command; AutoFill authenticates independently and locks
+after each fill. Incomplete legacy migration may still need renewed authentication
+to unwrap previously unseen old grants; normal migrated-key operations do not.
 
 Invalidating an `LAContext` is **not established as revoking an already-used
 signing handle**: a real-host probe found signing still succeeded through such a
@@ -228,7 +243,7 @@ joining device's ability to decrypt metadata before installing device-only trust
 No private iCloud Keychain trust-circle API is queried.
 
 Ordinary same-account connection deliberately requires no second human comparison
-or approval ceremony. An existing device must be unlocked to use its hardware keys;
+or approval ceremony. An existing device must be unlocked to use its cloud identity keys;
 iCloud authentication cannot unlock them on its behalf. Protect account recovery
 channels and trusted devices as well as the local application.
 
@@ -364,6 +379,22 @@ prove absence. See [CloudKit schema and provisioning](CLOUDKIT.md).
 
 ### Conflicts and interrupted delivery
 
+Stored conflict recovery verifies signed ancestry before retiring an obsolete
+branch. Retirement preserves archived ciphertext, grants, the local head, and
+pending edits. Otherwise both branches must decrypt and compare equal, including
+edit metadata, before automatic resolution. Retained local legacy keys may read
+their original grants through the existing migration-source authorization gate;
+an obsolete key is never granted to a newly admitted identity. Equivalent legacy
+content can instead be sealed under a fresh current key and queued through the
+normal cloud-readback and stale-conflict checks. Genuine legacy differences remain
+preserved for manual recovery.
+
+Missing-key observations suppress automatic comparisons and repeated grant
+requests across restarts. They are scheduling hints only, invalidated by changes
+to the reviewed branches, archived ancestry, grants, membership, request scope,
+or available legacy identity. They never establish equivalence, authorize access,
+or prove that a key is permanently lost on every device.
+
 The repository preserves local and remote conflicting versions. Unresolved conflicts
 block affected publication, rather than silently choosing one secret. Explicit
 resolution is guarded by the full reviewed snapshot so a stale review cannot replace
@@ -487,8 +518,9 @@ and recipient behavior govern it afterward. See [AutoFill](AUTOFILL.md).
 
 A sufficiently privileged attacker on an unlocked endpoint may invoke authorized
 Enclave operations and observe item keys, secrets, clipboard data, AutoFill or
-CLI destinations even if it cannot extract the non-exportable device private
-key. Extraction resistance and resistance to key use are different guarantees.
+CLI destinations. It can also extract the unlocked software cloud identity keys.
+Device-local credential and hardware wrapping keys retain their non-exportability;
+extraction resistance and resistance to key use are different guarantees.
 
 ## Apple Passwords / iCloud Keychain
 
@@ -496,7 +528,7 @@ Secure Enclave protection is not unique to 2ndPass. Apple documents substantial
 hardware-backed protection in [Keychain data protection](https://support.apple.com/guide/security/secb0694df1a/web).
 Apple Passwords/iCloud Keychain is integrated deeper into the operating system;
 its full implementation is not publicly inspectable. 2ndPass makes its
-non-exportable device identity and per-item wrapping an explicit, inspectable
+enclave-wrapped device identity and per-item wrapping an explicit, inspectable
 part of its end-to-end vault protocol. This is a concrete design distinction,
 not evidence that 2ndPass is categorically more secure. Source availability enables
 inspection but does not substitute for professional review.
@@ -505,12 +537,13 @@ inspection but does not substitute for professional review.
 
 ### Reading secrets from memory
 
-Malware may try to inspect an unlocked password manager's process. 2ndPass keeps
-long-lived device private keys inside the Secure Enclave and decrypts concealed
-fields on demand. Its unlocked display session holds visible metadata and the display-catalog key,
+Malware may try to inspect an unlocked password manager's process. Cloud identity
+private keys are present in memory for the unlocked session. The enclave protects
+their stored form, not the decrypted session copy. Concealed fields are decrypted
+on demand. Its unlocked display session holds visible metadata and the display-catalog key,
 not a persistent cache of revealed passwords or unwrapped item keys.
 Owned secret buffers are wiped when released. Locking clears session state and
-hardware-key handles, invalidates authentication, and rejects late results.
+software cloud keys and hardware-key handles, invalidates authentication, and rejects late results.
 
 A password must still enter application memory to be displayed, copied, or
 filled, and temporary symmetric keys also enter memory. These measures reduce
@@ -551,7 +584,7 @@ screen capture, or receiving application has already copied.
 | Tampered item or fabricated role | AEAD, item signatures and independently pinned membership history | Authorized writers can make harmful valid edits; initial admission trusts its bootstrap channel. |
 | Replayed items or omitted updates | Known per-item revision checks and signed authority ancestry | No global freshness/completeness proof; older whole-store restoration can remove item evidence. |
 | Replayed enrollment | Exact request, scope, identity, approval-time and history checks | A fresh valid identity can still join through a compromised trusted account channel. |
-| Malware reading process memory | Concealed fields opened on demand; owned buffers cleared where practical | Temporary keys, visible metadata and requested secrets enter memory; not all framework copies can be wiped. |
+| Malware reading process memory | Concealed fields opened on demand; owned buffers cleared where practical | Unlocked software identity keys, temporary keys, visible metadata and requested secrets enter memory; not all framework copies can be wiped. |
 | Clipboard reader or screen capture | Concealment, reveal timeout and expiring device-local secret copies | Already captured plaintext cannot be retracted. |
 | Recipient retains data | No claim of retrospective secrecy | Device removal and key rotation cannot invalidate copied external credentials. |
 | All enrolled devices unavailable | Configured account recovery code, or portable archive plus its separate key | Same iCloud account required for live recovery; hardware credential keys cannot be recovered. Physical acceptance remains pending. |

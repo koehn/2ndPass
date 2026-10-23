@@ -69,8 +69,20 @@ public struct ContentVersionFetcher: Sendable {
         } catch SyncJournalError.staleOperation { return .retry(.dependency) }
         catch SyncJournalError.inboxFull { return .retry(.inboxFull) }
         catch CloudSyncAdapterError.operationInterrupted { return .retry(.authorization) }
+        catch CloudSyncAdapterError.contentZoneUnavailable(let vault) {
+            guard vault == operation.vaultID else { return .attention(.invalidAuthority) }
+            return .waiting([.init(.trustedContentZone, identifier: vault.uuidString)])
+        }
+        catch CloudSyncAdapterError.invalidBinding { return .attention(.invalidAuthority) }
         catch let error as CKError {
-            // unknownItem can be publication ordering, never proof of deletion.
+            try? await repository.recordSyncTransportFailure(operation, error: error)
+            AccessSyncTrace.failure("content version cloud failure", operation: operation.id, error: error)
+            // Missing immutable records await source publication. Foreground/cloud
+            // notifications must not reset this bounded recovery interval.
+            if error.code == .unknownItem,
+               let request = try? JSONDecoder().decode(ContentVersionFetch.self, from: operation.payload) {
+                return .waitingUntil([.init(.content, identifier: request.vault.uuidString + ":" + request.item.uuidString + ":" + request.version.uuidString)], Date().addingTimeInterval(300))
+            }
             return .retry(.transport, retryAfter: (error.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue)
         } catch let error as CloudSyncAdapterError {
             return error == .malformedRecord ? .attention(.invalidAuthority) : .retry(.transport)

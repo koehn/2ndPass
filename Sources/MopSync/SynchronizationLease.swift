@@ -6,6 +6,7 @@ import MopCore
 
 public enum CloudSyncAdapterError: Error, Equatable, Sendable {
     case membershipUnavailable
+    case contentZoneUnavailable(UUID)
     case invalidBinding
     case malformedRecord
     case untrustedRecord

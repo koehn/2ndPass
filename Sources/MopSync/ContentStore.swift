@@ -340,7 +340,13 @@ extension EncryptedItemRepository {
         let receiptKey = "content-grant-delivery4:" + key
         if let repair = try fetchOne("StateBlob", key: "grant-repair4:" + key) { context.delete(repair) }
         // Replay must not turn a 30-day receipt into perpetual confirmation.
-        if try fetchOne("StateBlob", key: receiptKey) != nil { return }
+        if try fetchOne("StateBlob", key: receiptKey) != nil {
+            // A source-repair pass may have rearmed the exact publication. An
+            // identical grant acknowledgment completes it without renewing TTL.
+            try finishPublicationInTransaction(contentOperationID("publish:" + key), account: grant.scope.account,
+                database: grant.scope.database, confirmed: true)
+            return
+        }
         try touchVaultBoundary(VaultScope(grant.scope))
         let receipt = NSEntityDescription.insertNewObject(forEntityName: "StateBlob", into: context)
         receipt.setValue(receiptKey, forKey: "key")
@@ -481,79 +487,181 @@ extension EncryptedItemRepository {
         "content-version-delivered:" + content.version.scope.storageKey + ":" + content.version.versionID.uuidString
     }
 
+    /// Repair publications from builds that sent grants before their immutable
+    /// source. Re-arm only exact retained grant publications, never discarded work.
+    public func repairUnpublishedGrantSources(account: String, permit: any RepositoryWritePermit) throws -> Int {
+        try permit.withWritePermission {
+            try transaction {
+                struct Candidate: Decodable {
+                    let operation: SyncOperation?
+                    enum CodingKeys: String, CodingKey { case kind, state, resolution }
+                    init(from decoder: any Decoder) throws {
+                        let fields = try decoder.container(keyedBy: CodingKeys.self)
+                        operation = try fields.decode(SyncOperation.Kind.self, forKey: .kind) == .grant
+                            && fields.decode(SyncOperationState.self, forKey: .state) == .completed
+                            && fields.decodeIfPresent(SyncResolution.self, forKey: .resolution) != .discardedByUser
+                            ? SyncOperation(from: decoder) : nil
+                    }
+                }
+                struct Source: Decodable { let sourceVersion: UUID }
+                let candidates: [Candidate] = try journalValues("SyncOperation", account: account, database: "private")
+                var repaired = 0
+                var delivery: [String: Bool] = [:]
+                for candidate in candidates {
+                    guard var operation = candidate.operation,
+                          let grant = try? JSONDecoder().decode(PreparedContentGrant.self, from: operation.payload),
+                          grant.scope.account == account, grant.scope.database == "private",
+                          let sourceID = try? JSONDecoder().decode(Source.self, from: grant.bytes).sourceVersion else { continue }
+                    let key = grant.scope.storageKey + ":" + sourceID.uuidString
+                    if delivery[key] == true { continue }
+                    let discarded: Bool = try journalValue("StateBlob", key: "discarded-content-version:" + key) ?? false
+                    if discarded { continue }
+                    guard let row = try fetchOne("ContentVersion", key: key) else { continue }
+                    let source: PreparedContentVersion = try contentValue(row)
+                    let delivered: Bool = try journalValue("StateBlob", key: contentVersionDeliveryKey(source)) ?? false
+                    delivery[key] = delivered
+                    guard !delivered, source.version.scope == grant.scope, source.keyGeneration == grant.keyGeneration,
+                          let policy = try contentPolicy(VaultScope(grant.scope)), policy.keyAuthority == source.keyAuthority,
+                          policy.recipients.contains(grant.recipient), try deletionInTransaction(VaultScope(grant.scope)) == nil else { continue }
+                    operation.state = .ready; operation.completedAt = nil; operation.resolution = nil
+                    operation.failure = nil; operation.nextAttempt = nil; operation.retryNotBefore = nil; operation.revision = UUID()
+                    try writeJournal(operation, entity: "SyncOperation", key: journalKey(account, "private", operation.id.uuidString), account: account, database: "private")
+                    repaired += 1
+                }
+                return repaired
+            }
+        }
+    }
+
     /// Select the oldest unsent edit per item. Immutable versions precede heads;
     /// independent signed grants never replace content or its mutation receipts.
     public func contentPublications(account: String) throws -> [ContentUpload] {
         return try transaction {
-            let receiving = try incomingCloudRecordIDsInTransaction(account: account, database: "private")
-            let pending = try activeOperationsInTransaction(account: account, database: "private")
-            var deletedVaults: Set<UUID> = []
-            for vault in Set(pending.compactMap(\.vaultID)) {
-                if try deletionInTransaction(VaultScope(account: account, vaultID: vault)) != nil { deletedVaults.insert(vault) }
-            }
-            let operations = pending.filter { $0.vaultID.map { !deletedVaults.contains($0) } ?? true }
-            let byID = Dictionary(uniqueKeysWithValues: operations.map { ($0.id, $0) })
-            let prerequisiteIDs = Set(operations.flatMap(\.dependencies).filter { $0.kind == .operation }.compactMap { UUID(uuidString: $0.identifier) })
-            var delivered: Set<UUID> = []
-            for id in prerequisiteIDs where try operationDeliveredInTransaction(id, account: account, database: "private") { delivered.insert(id) }
-            func eligible(_ operation: SyncOperation) -> Bool {
-                guard ![.completed, .needsAttention].contains(operation.state),
-                      operation.state != .retryScheduled || (operation.nextAttempt ?? .distantPast) <= Date() else { return false }
-                return operation.dependencies.allSatisfy { dependency in
-                    guard dependency.kind == .operation, let id = UUID(uuidString: dependency.identifier) else { return false }
-                    return delivered.contains(id)
+            let now = Date()
+            return try journalReadCache.storeResult(key: "content-publications:" + account, in: context, now: now) {
+                // Reuse repeated reads while building this candidate snapshot.
+                // History invalidation observes membership and content changes.
+                let started = ContinuousClock.now
+                var policyReads = 0, contentDecodes = 0, selectedCount = 0
+                var grantSkips: [String: Int] = [:]
+                defer {
+                    AccessSyncTrace.elapsed("publication candidate reads", since: started,
+                        detail: "policyReads=\(policyReads) contentDecodes=\(contentDecodes) selected=\(selectedCount) grantSkips=\(grantSkips.keys.sorted().map { "\($0):\(grantSkips[$0]!)" }.joined(separator: ","))")
                 }
+                var policies: [VaultScope: ContentRecipientPolicy] = [:]
+                var missingPolicies: Set<VaultScope> = []
+                func policy(_ scope: VaultScope) throws -> ContentRecipientPolicy? {
+                    if let cached = policies[scope] { return cached }
+                    if missingPolicies.contains(scope) { return nil }
+                    policyReads += 1
+                    let value = try contentPolicy(scope)
+                    if let value { policies[scope] = value } else { missingPolicies.insert(scope) }
+                    return value
+                }
+                var decodedContent: [NSManagedObjectID: PreparedContentVersion] = [:]
+                func decodeContent(_ row: NSManagedObject) throws -> PreparedContentVersion {
+                    if let cached = decodedContent[row.objectID] { return cached }
+                    contentDecodes += 1
+                    let value: PreparedContentVersion = try contentValue(row)
+                    // Bound memory even when many candidates are blocked.
+                    if decodedContent.count >= 128 { decodedContent.removeAll(keepingCapacity: true) }
+                    decodedContent[row.objectID] = value
+                    return value
+                }
+                let receiving = try incomingCloudRecordIDsInTransaction(account: account, database: "private")
+                let pending = try activeOperationsInTransaction(account: account, database: "private")
+                var deletedVaults: Set<UUID> = []
+                for vault in Set(pending.compactMap(\.vaultID)) {
+                    if try deletionInTransaction(VaultScope(account: account, vaultID: vault)) != nil { deletedVaults.insert(vault) }
+                }
+                let operations = pending.filter { $0.vaultID.map { !deletedVaults.contains($0) } ?? true }
+                let byID = Dictionary(uniqueKeysWithValues: operations.map { ($0.id, $0) })
+                let prerequisiteIDs = Set(operations.flatMap(\.dependencies).filter { $0.kind == .operation }.compactMap { UUID(uuidString: $0.identifier) })
+                var delivered: Set<UUID> = []
+                for id in prerequisiteIDs where try operationDeliveredInTransaction(id, account: account, database: "private") { delivered.insert(id) }
+                func eligible(_ operation: SyncOperation) -> Bool {
+                    guard ![.completed, .needsAttention].contains(operation.state),
+                          operation.state != .retryScheduled || (operation.nextAttempt ?? .distantPast) <= now else { return false }
+                    return operation.dependencies.allSatisfy { dependency in
+                        guard dependency.kind == .operation, let id = UUID(uuidString: dependency.identifier) else { return false }
+                        return delivered.contains(id)
+                    }
+                }
+                // Reserve a bounded share for grants while immutable versions/heads
+                // are pending. Otherwise every 100-record page can contain only
+                // content, delaying usable access until the whole vault is sent.
+                let contentLimit = operations.contains { $0.kind == .grant && eligible($0) } ? 84 : 100
+                var result: [ContentUpload] = [], totalBytes = 0
+                let request = NSFetchRequest<NSDictionary>(entityName: "PendingMutation")
+                request.resultType = .dictionaryResultType
+                request.propertiesToFetch = ["key", "mutationID", "versionID"]
+                request.predicate = NSPredicate(format: "account == %@ AND database == %@", account, "private")
+                request.sortDescriptors = [NSSortDescriptor(key: "sequence", ascending: true)]
+                var seen = Set<String>()
+                for metadata in try context.fetch(request) {
+                    guard let key = metadata["key"] as? String, let id = metadata["mutationID"] as? UUID,
+                          let versionID = metadata["versionID"] as? UUID else { throw ItemRepositoryError.corruptStore }
+                    guard seen.insert(key).inserted, let operation = byID[id], eligible(operation),
+                          let row = try fetchOne("ContentVersion", key: key + ":" + versionID.uuidString) else { continue }
+                    let content = try decodeContent(row)
+                    guard try policy(VaultScope(content.version.scope))?.keyAuthority == content.keyAuthority,
+                          try contentRows("ContentBranch", field: "scopeKey", equals: key).isEmpty else { continue }
+                    let detail = NSFetchRequest<NSManagedObject>(entityName: "PendingMutation")
+                    detail.predicate = NSPredicate(format: "mutationID == %@", id as NSUUID); detail.fetchLimit = 1
+                    guard let pending = try context.fetch(detail).first, try decodeVersion(pending) == content.version else { throw ContentStoreError.identityCollision }
+                    let delivered: Bool = try journalValue("StateBlob", key: contentVersionDeliveryKey(content)) ?? false
+                    let fields = delivered ? try fetchOne("Item", key: key)?.value(forKey: "serverSystemFields") as? Data : nil
+                    let upload = ContentUpload(operationID: operation.id, content: content, grant: nil,
+                        kind: delivered ? .head : .version, systemFields: fields)
+                    guard !receiving.contains(upload.recordID) else { continue }
+                    if !result.isEmpty, content.version.ciphertext.count > 16 * 1024 * 1024 - min(totalBytes, 16 * 1024 * 1024) { break }
+                    result.append(upload)
+                    totalBytes += content.version.ciphertext.count
+                    if result.count == contentLimit || totalBytes >= 16 * 1024 * 1024 { break }
+                }
+                // Dictionary-backed journal projections have no stable order.
+                // Keep the same oldest eligible grants registered across unrelated
+                // commits instead of replacing most of the 100-record window.
+                let grants = operations.filter { $0.kind == .grant && eligible($0) }
+                    .map { ($0, $0.id.uuidString) }
+                    .sorted { ($0.0.createdAt, $0.1) < ($1.0.createdAt, $1.1) }
+                for (operation, _) in grants {
+                    guard result.count < 100 else { break }
+                    let grant = try JSONDecoder().decode(PreparedContentGrant.self, from: operation.payload)
+                    guard grant.scope.account == account, grant.scope.database == "private", grant.scope.vaultID == operation.vaultID,
+                          grant.scope.zoneOwner == operation.zoneOwner else { throw ContentStoreError.invalidRecord }
+                    let request = NSFetchRequest<NSManagedObject>(entityName: "ContentVersion")
+                    request.predicate = NSPredicate(format: "scopeKey == %@ AND keyGeneration == %@", grant.scope.storageKey, grant.keyGeneration as NSUUID)
+                    request.fetchLimit = 1
+                    guard let row = try context.fetch(request).first else { grantSkips["missingGeneration", default: 0] += 1; continue }
+                    let content = try decodeContent(row)
+                    guard let policy = try policy(VaultScope(grant.scope)), policy.keyAuthority == content.keyAuthority,
+                          policy.recipients.contains(grant.recipient) else { grantSkips["policy", default: 0] += 1; continue }
+                    // A grant can outlive the local head that created it (for example
+                    // concurrent rotations). Publish its immutable verification source
+                    // before the grant, even when that head's mutation was superseded.
+                    struct Source: Decodable { let sourceVersion: UUID }
+                    let sourceID = (try? JSONDecoder().decode(Source.self, from: grant.bytes))?.sourceVersion ?? content.version.versionID
+                    let discarded: Bool = try journalValue("StateBlob", key: "discarded-content-version:" + grant.scope.storageKey + ":" + sourceID.uuidString) ?? false
+                    guard !discarded, let sourceRow = try fetchOne("ContentVersion", key: grant.scope.storageKey + ":" + sourceID.uuidString) else { grantSkips["missingOrDiscardedSource", default: 0] += 1; continue }
+                    let source = try decodeContent(sourceRow)
+                    guard source.keyGeneration == grant.keyGeneration, source.version.scope == grant.scope else { grantSkips["sourceBinding", default: 0] += 1; continue }
+                    let sourceDelivered: Bool = try journalValue("StateBlob", key: contentVersionDeliveryKey(source)) ?? false
+                    let upload = ContentUpload(operationID: operation.id, content: source,
+                        grant: sourceDelivered ? grant : nil, kind: sourceDelivered ? .grant : .version, systemFields: nil)
+                    guard !receiving.contains(upload.recordID) else { grantSkips["incoming", default: 0] += 1; continue }
+                    guard !result.contains(where: { $0.recordID == upload.recordID }) else { grantSkips["duplicateSource", default: 0] += 1; continue }
+                    let sourceBytes = sourceDelivered ? 0 : source.version.ciphertext.count
+                    if !result.isEmpty, sourceBytes > 16 * 1024 * 1024 - min(totalBytes, 16 * 1024 * 1024) { continue }
+                    result.append(upload)
+                    totalBytes += sourceBytes
+                    if result.count >= 100 { break }
+                }
+                selectedCount = result.count
+                let deadline = operations.filter { $0.state == .retryScheduled }
+                    .compactMap(\.nextAttempt).filter { $0 > now }.min()
+                return (result, deadline)
             }
-            // Reserve a bounded share for grants while immutable versions/heads
-            // are pending. Otherwise every 100-record page can contain only
-            // content, delaying usable access until the whole vault is sent.
-            let contentLimit = operations.contains { $0.kind == .grant && eligible($0) } ? 84 : 100
-            var result: [ContentUpload] = [], totalBytes = 0
-            let request = NSFetchRequest<NSDictionary>(entityName: "PendingMutation")
-            request.resultType = .dictionaryResultType
-            request.propertiesToFetch = ["key", "mutationID", "versionID"]
-            request.predicate = NSPredicate(format: "account == %@ AND database == %@", account, "private")
-            request.sortDescriptors = [NSSortDescriptor(key: "sequence", ascending: true)]
-            var seen = Set<String>()
-            for metadata in try context.fetch(request) {
-                guard let key = metadata["key"] as? String, let id = metadata["mutationID"] as? UUID,
-                      let versionID = metadata["versionID"] as? UUID else { throw ItemRepositoryError.corruptStore }
-                guard seen.insert(key).inserted, let operation = byID[id], eligible(operation),
-                      let row = try fetchOne("ContentVersion", key: key + ":" + versionID.uuidString) else { continue }
-                let content: PreparedContentVersion = try contentValue(row)
-                guard try contentPolicy(VaultScope(content.version.scope))?.keyAuthority == content.keyAuthority,
-                      try contentRows("ContentBranch", field: "scopeKey", equals: key).isEmpty else { continue }
-                let detail = NSFetchRequest<NSManagedObject>(entityName: "PendingMutation")
-                detail.predicate = NSPredicate(format: "mutationID == %@", id as NSUUID); detail.fetchLimit = 1
-                guard let pending = try context.fetch(detail).first, try decodeVersion(pending) == content.version else { throw ContentStoreError.identityCollision }
-                let delivered: Bool = try journalValue("StateBlob", key: contentVersionDeliveryKey(content)) ?? false
-                let fields = delivered ? try fetchOne("Item", key: key)?.value(forKey: "serverSystemFields") as? Data : nil
-                let upload = ContentUpload(operationID: operation.id, content: content, grant: nil,
-                    kind: delivered ? .head : .version, systemFields: fields)
-                guard !receiving.contains(upload.recordID) else { continue }
-                if !result.isEmpty, content.version.ciphertext.count > 16 * 1024 * 1024 - min(totalBytes, 16 * 1024 * 1024) { break }
-                result.append(upload)
-                totalBytes += content.version.ciphertext.count
-                if result.count == contentLimit || totalBytes >= 16 * 1024 * 1024 { break }
-            }
-            for operation in operations where operation.kind == .grant && eligible(operation) {
-                guard result.count < 100 else { break }
-                let grant = try JSONDecoder().decode(PreparedContentGrant.self, from: operation.payload)
-                guard grant.scope.account == account, grant.scope.database == "private", grant.scope.vaultID == operation.vaultID,
-                      grant.scope.zoneOwner == operation.zoneOwner else { throw ContentStoreError.invalidRecord }
-                let request = NSFetchRequest<NSManagedObject>(entityName: "ContentVersion")
-                request.predicate = NSPredicate(format: "scopeKey == %@ AND keyGeneration == %@", grant.scope.storageKey, grant.keyGeneration as NSUUID)
-                request.fetchLimit = 1
-                guard let row = try context.fetch(request).first else { continue }
-                let content: PreparedContentVersion = try contentValue(row)
-                guard let policy = try contentPolicy(VaultScope(grant.scope)), policy.keyAuthority == content.keyAuthority,
-                      policy.recipients.contains(grant.recipient) else { continue }
-                let upload = ContentUpload(operationID: operation.id, content: content, grant: grant, kind: .grant, systemFields: nil)
-                guard !receiving.contains(upload.recordID) else { continue }
-                result.append(upload)
-                if result.count >= 100 { break }
-            }
-            return result
         }
     }
 
@@ -875,7 +983,7 @@ extension EncryptedItemRepository {
         let hash = Array(SHA256.hash(data: Data(text.utf8)).prefix(16))
         return UUID(uuid: (hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]))
     }
-    private func contentPolicy(_ scope: VaultScope) throws -> ContentRecipientPolicy? {
+    func contentPolicy(_ scope: VaultScope) throws -> ContentRecipientPolicy? {
         guard let row = try fetchOne("StateBlob", key: "content-policy:" + contentVaultKey(scope)) else { return nil }
         return try contentValue(row)
     }
@@ -884,7 +992,7 @@ extension EncryptedItemRepository {
         request.predicate = NSPredicate(format: "%K == %@", field, value)
         return try context.fetch(request)
     }
-    private func contentValue<T: Decodable>(_ row: NSManagedObject) throws -> T {
+    func contentValue<T: Decodable>(_ row: NSManagedObject) throws -> T {
         guard let bytes = row.value(forKey: "value") as? Data else { throw ItemRepositoryError.corruptStore }
         return try JSONDecoder().decode(T.self, from: bytes)
     }
@@ -910,22 +1018,104 @@ extension EncryptedItemRepository {
                 let operations = try conflictDecisionOperationsInTransaction(account: account)
                 decisions = try operations.map { try JSONDecoder().decode(ContentConflictDecision.self, from: $0.payload) }
             }
-            return try rows.compactMap { row in
-                let state: ContentKeyState = try contentValue(row)
-                guard state.scope.account == account, let item = try fetchOne("Item", key: state.scope.storageKey),
-                      let remote = try fetchOne("ContentVersion", key: state.scope.storageKey + ":" + state.versionID.uuidString),
-                      let fields: Data = try journalValue("StateBlob", key: "content-branch-fields:" + state.scope.storageKey + ":" + state.versionID.uuidString) else { return nil }
+            let states: [ContentKeyState] = try rows.map { try contentValue($0) }
+                .filter { $0.scope.account == account }
+            let items = try conflictRows("Item", keys: states.map { $0.scope.storageKey })
+            let versions = try conflictRows("ContentVersion", keys: states.map { $0.scope.storageKey + ":" + $0.versionID.uuidString })
+            let fields = try conflictRows("StateBlob", keys: states.map { "content-branch-fields:" + $0.scope.storageKey + ":" + $0.versionID.uuidString })
+            return try states.compactMap { state in
+                let key = state.scope.storageKey + ":" + state.versionID.uuidString
+                guard let item = items[state.scope.storageKey], let remote = versions[key],
+                      let fieldRow = fields["content-branch-fields:" + key] else { return nil }
+                guard let bytes = fieldRow.value(forKey: "value") as? Data else { throw ItemRepositoryError.corruptStore }
+                let serverFields = try JSONDecoder().decode(Data.self, from: bytes)
                 let prepared: PreparedContentVersion = try contentValue(remote)
                 let local = try decodeVersion(item)
                 if !includePendingDecisions, decisions.contains(where: { $0.scope == state.scope && $0.local == local.versionID && $0.remote == state.versionID }) { return nil }
-                return EncryptedItemConflict(id: state.versionID, local: local, remote: prepared.version, serverSystemFields: fields)
+                return EncryptedItemConflict(id: state.versionID, local: local, remote: prepared.version, serverSystemFields: serverFields)
             }
         }
     }
     public func reviewedContentConflict(_ expected: EncryptedItemConflict) throws -> EncryptedItemConflict {
-        guard try contentConflicts(account: expected.local.scope.account, includePendingDecisions: true).contains(expected) else { throw ItemRepositoryError.staleConflict }
-        return expected
+        try transaction {
+            let scope = expected.local.scope
+            let key = scope.storageKey + ":" + expected.remote.versionID.uuidString
+            guard let branch = try fetchOne("ContentBranch", key: key),
+                  let item = try fetchOne("Item", key: scope.storageKey),
+                  let remote = try fetchOne("ContentVersion", key: key),
+                  let fields: Data = try journalValue("StateBlob", key: "content-branch-fields:" + key) else {
+                throw ItemRepositoryError.staleConflict
+            }
+            let state: ContentKeyState = try contentValue(branch)
+            let prepared: PreparedContentVersion = try contentValue(remote)
+            let current = EncryptedItemConflict(id: state.versionID, local: try decodeVersion(item),
+                remote: prepared.version, serverSystemFields: fields)
+            guard state.scope == scope, state.versionID == expected.remote.versionID,
+                  current == expected else { throw ItemRepositoryError.staleConflict }
+            return current
+        }
     }
+
+    /// The caller proves signed ancestry. Retire only the reviewed branch and its
+    /// diagnostic; preserve the head, pending edits, archived ciphertext and grants.
+    public func retireObsoleteContentBranch(_ expected: EncryptedItemConflict, policy: ContentRecipientPolicy,
+                                            permit: any RepositoryWritePermit) throws {
+        try permit.withWritePermission {
+            try transaction {
+                let scope = expected.local.scope
+                let key = scope.storageKey + ":" + expected.remote.versionID.uuidString
+                guard try contentPolicy(VaultScope(scope)) == policy,
+                      let item = try fetchOne("Item", key: scope.storageKey), try decodeVersion(item) == expected.local,
+                      let branch = try fetchOne("ContentBranch", key: key),
+                      let remote = try fetchOne("ContentVersion", key: key),
+                      (try contentValue(remote) as PreparedContentVersion).version == expected.remote,
+                      try journalValue("StateBlob", key: "content-branch-fields:" + key) as Data? == expected.serverSystemFields else {
+                    throw ItemRepositoryError.staleConflict
+                }
+                let state: ContentKeyState = try contentValue(branch)
+                guard state.scope == scope, state.versionID == expected.remote.versionID else { throw ContentStoreError.invalidRecord }
+                try touchVaultBoundary(VaultScope(scope))
+                let diagnosticKey = "content-branch-operation:" + key
+                if let operation: UUID = try journalValue("StateBlob", key: diagnosticKey) {
+                    try finishPublicationInTransaction(operation, account: scope.account, database: scope.database, confirmed: false)
+                }
+                context.delete(branch)
+                for key in [diagnosticKey, "content-branch-fields:" + key] {
+                    if let row = try fetchOne("StateBlob", key: key) { context.delete(row) }
+                }
+                try resumeConflictBlockedRotation(scope, policy: policy)
+            }
+        }
+    }
+
+    private func resumeConflictBlockedRotation(_ scope: ItemScope, policy: ContentRecipientPolicy) throws {
+        guard try contentRows("ContentBranch", field: "scopeKey", equals: scope.storageKey).isEmpty else { return }
+        let id = contentOperationID("rotate:" + scope.storageKey + ":" + policy.keyAuthority)
+        let key = journalKey(scope.account, scope.database, id.uuidString)
+        guard var operation: SyncOperation = try journalValue("SyncOperation", key: key),
+              operation.kind == .rotateContent, operation.state == .needsAttention, operation.failure == .conflict else { return }
+        operation.state = .ready; operation.failure = nil; operation.nextAttempt = nil
+        operation.retryNotBefore = nil; operation.revision = UUID()
+        try writeJournal(operation, entity: "SyncOperation", key: key)
+    }
+
+    /// Bound SQL parameters and share reads across branches of the same item.
+    /// Rows remain confined to the caller's transaction; this is not a trust cache.
+    private func conflictRows(_ entity: String, keys: [String]) throws -> [String: NSManagedObject] {
+        let keys = Array(Set(keys))
+        var result: [String: NSManagedObject] = [:]
+        for offset in stride(from: 0, to: keys.count, by: 256) {
+            let request = NSFetchRequest<NSManagedObject>(entityName: entity)
+            request.predicate = NSPredicate(format: "key IN %@", Array(keys[offset..<min(offset + 256, keys.count)]))
+            conflictBatchReads += 1
+            for row in try context.fetch(request) {
+                guard let key = row.value(forKey: "key") as? String else { throw ItemRepositoryError.corruptStore }
+                result[key] = row
+            }
+        }
+        return result
+    }
+
     /// Called within the engine's bounded publication barrier after exact head
     /// readback. Other unresolved branches survive the explicit user choice.
     public func resolveContentConflict(_ expected: EncryptedItemConflict, replacement: PreparedContentPublication?,
@@ -975,6 +1165,7 @@ extension EncryptedItemRepository {
                     for grant in replacement.grants { try storeContentGrant(grant, publish: true, publishExisting: true) }
                 }
                 try reconcileGrantRequirements(ContentKeyState(selected), policy: policy)
+                try resumeConflictBlockedRotation(scope, policy: policy)
                 let mutation = try replacement.map { try insertPending($0.content.version, status: .queued) }
                 if let decision { try finishPublicationInTransaction(decision.id, account: scope.account, database: scope.database, confirmed: false) }
                 return mutation
@@ -1160,6 +1351,52 @@ extension EncryptedItemRepository {
             }
             if try journalRow("StateBlob", key: key) == nil { try writeJournal(expected, entity: "StateBlob", key: key) }
             return (ready.count, total)
+        }
+    }
+}
+
+extension EncryptedItemRepository {
+    /// Migration admission uses the same durable membership queue as enrollment.
+    /// Recheck authorization inside the actor, after any suspension at the caller.
+    public func enqueueDeviceMigration(_ operation: SyncOperation, authorization: any RepositoryWritePermit) throws {
+        try authorization.withWritePermission {
+            guard operation.kind == .membership else { throw ContentStoreError.invalidRecord }
+            try transaction {
+                let pending: [SyncOperation] = try journalValues("SyncOperation", account: operation.account, database: operation.database)
+                // App and AutoFill may both stage the same replacement. One
+                // membership proposal per vault wins atomically; the next pinned
+                // head causes any remaining migration work to be reconsidered.
+                guard !pending.contains(where: { $0.kind == .membership && $0.vaultID == operation.vaultID && $0.state != .completed }) else { return }
+                _ = try enqueueInTransaction(operation)
+            }
+        }
+    }
+
+    /// Verified additive grant transfer preserves archived versions and pending
+    /// user edits. Only current-generation grants are published; historical copies
+    /// are local, retaining the existing publication rules for obsolete heads.
+    public func commitDeviceMigrationGrant(_ grant: PreparedContentGrant, sourceVersion: PreparedContentVersion,
+                                          expectedPolicy: ContentRecipientPolicy, authorization: any RepositoryWritePermit) throws {
+        try authorization.withWritePermission {
+            try transaction {
+                guard grant.scope == sourceVersion.version.scope, grant.keyGeneration == sourceVersion.keyGeneration,
+                      try contentPolicy(VaultScope(grant.scope)) == expectedPolicy,
+                      expectedPolicy.recipients.contains(grant.recipient),
+                      let stored = try fetchOne("ContentVersion", key: grant.scope.storageKey + ":" + sourceVersion.version.versionID.uuidString),
+                      try contentValue(stored) as PreparedContentVersion == sourceVersion else { throw ContentStoreError.staleAuthority }
+                // Concurrent app/extension migration may have randomized the same
+                // grant already. Keep the verified durable winner rather than replace.
+                let request = NSFetchRequest<NSManagedObject>(entityName: "ContentGrant")
+                request.predicate = NSPredicate(format: "scopeKey == %@ AND keyGeneration == %@ AND recipient == %@",
+                    grant.scope.storageKey, grant.keyGeneration as NSUUID, grant.recipient)
+                request.fetchLimit = 1
+                if try !context.fetch(request).isEmpty { return }
+                guard let row = try fetchOne("ContentKeyState", key: grant.scope.storageKey) else { throw ContentStoreError.invalidRecord }
+                let current: ContentKeyState = try contentValue(row)
+                try touchVaultBoundary(VaultScope(grant.scope))
+                try storeContentGrant(grant, publish: current.keyGeneration == grant.keyGeneration && current.keyAuthority == expectedPolicy.keyAuthority)
+                try reconcileGrantRequirements(current, policy: expectedPolicy)
+            }
         }
     }
 }

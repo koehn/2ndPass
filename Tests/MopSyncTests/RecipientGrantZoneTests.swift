@@ -8,6 +8,28 @@ private struct RecipientPermit: RepositoryWritePermit {
 }
 
 @Suite struct RecipientGrantZoneTests {
+    @Test func zoneRegistrationDoesNotRequeueAfterCheckpointOrCompletedSend() {
+        let a = CKRecordZone.ID(zoneName: "a", ownerName: CKCurrentUserDefaultName)
+        let b = CKRecordZone.ID(zoneName: "b", ownerName: CKCurrentUserDefaultName)
+        var registration = GrantZoneRegistration()
+        #expect(registration.newlyRequired([a]) == [a])
+        // Once CloudKit removes a successful database change, checkpoint wakes
+        // still ask for the same zone while its grant records remain pending.
+        for _ in 0..<100 { #expect(registration.newlyRequired([a]).isEmpty) }
+        #expect(registration.newlyRequired([a, b]) == [b])
+        #expect(registration.newlyRequired([]).isEmpty)
+        #expect(registration.newlyRequired([a]).isEmpty)
+        registration.invalidate(a)
+        #expect(registration.newlyRequired([a, b]) == [a])
+        #expect(registration.newlyRequired([a, b]).isEmpty)
+        // A fresh engine reconstructs requirements without treating memory as a
+        // durable receipt. A changed owner is a distinct destination as well.
+        registration = GrantZoneRegistration()
+        #expect(registration.newlyRequired([a, b]) == [a, b])
+        let otherOwner = CKRecordZone.ID(zoneName: "a", ownerName: "other-owner")
+        #expect(registration.newlyRequired([a, otherOwner]) == [otherOwner])
+    }
+
     func fixture() async throws -> (URL, EncryptedItemRepository, VaultScope, [PreparedContentGrant]) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let repository = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
@@ -89,6 +111,36 @@ private struct RecipientPermit: RepositoryWritePermit {
         #expect(try await reopened.engineState(account: scope.account, database: "discovery-test") == checkpoint)
     }
 
+    @Test func batchedReadsMatchIndividualReadsAndIsolateScopes() async throws {
+        let (root, repository, _, grants) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let grant = grants[0], scope = grants[0].scope
+        let state = try #require(await repository.contentState(scope: scope))
+        let other = ItemScope(account: "other-account", vaultID: scope.vaultID, itemID: scope.itemID,
+            database: scope.database, zoneOwner: scope.zoneOwner)
+        let queries = [
+            ContentReadinessQuery(scope: scope, observedVersion: state.versionID, recipient: grant.recipient, keyGeneration: grant.keyGeneration, missingVersion: nil),
+            ContentReadinessQuery(scope: scope, observedVersion: state.versionID, recipient: "missing", keyGeneration: grant.keyGeneration, missingVersion: nil),
+            ContentReadinessQuery(scope: scope, observedVersion: UUID(), recipient: nil, keyGeneration: nil, missingVersion: nil),
+            ContentReadinessQuery(scope: other, observedVersion: nil, recipient: grant.recipient, keyGeneration: grant.keyGeneration, missingVersion: state.versionID),
+            ContentReadinessQuery(scope: scope, observedVersion: state.versionID, recipient: nil, keyGeneration: nil, missingVersion: state.versionID),
+            ContentReadinessQuery(scope: scope, observedVersion: state.versionID, recipient: nil, keyGeneration: nil, missingVersion: UUID())
+        ]
+        #expect(try await repository.contentReadiness(queries) == [true, false, true, false, true, false])
+        #expect(try await repository.contentReadiness([]).isEmpty)
+        #expect(try await repository.contentReadiness(Array(repeating: queries[0], count: 64)).allSatisfy { $0 })
+        await #expect(throws: ContentStoreError.invalidRecord) {
+            try await repository.contentReadiness(Array(repeating: queries[0], count: 65))
+        }
+        let snapshot = try await repository.contentMigrationReads(scopes: [scope, other], recipients: [grant.recipient])
+        #expect(snapshot[other]?.versions.isEmpty == true && snapshot[other]?.grants.isEmpty == true)
+        #expect(Set(snapshot[scope]!.versions.map { $0.version.versionID }) == Set(try await repository.contentVersions(scope: scope).map { $0.version.versionID }))
+        #expect(snapshot[scope]?.grants == [grant])
+        await #expect(throws: ContentStoreError.invalidRecord) {
+            try await repository.contentMigrationReads(scopes: Array(repeating: scope, count: 17), recipients: [grant.recipient])
+        }
+    }
+
     @Test func recipientGrantRoutingRejectsRetiredContentZone() async throws {
         let (root, _, scope, grants) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -101,12 +153,17 @@ private struct RecipientPermit: RepositoryWritePermit {
         }
     }
 
-    @Test func targetedRepairSurvivesRestartAndPreservesOtherRecipients() async throws {
+    @Test(arguments: [false, true]) func targetedRepairSurvivesRestartAndPreservesOtherRecipients(exact: Bool) async throws {
         let (root, repository, scope, grants) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         for grant in grants { try await repository.acknowledgeContentGrant(grant, serverSystemFields: Data([1])) }
         let before = try await repository.item(grants[0].scope)
-        try await repository.invalidateGrantDestination(scope: scope, recipient: grants[0].recipient, identifier: grants[0].identifier, permit: RecipientPermit())
+        if exact {
+            try await repository.repairGrantDelivery(grants[0], permit: RecipientPermit())
+            try await repository.repairGrantDelivery(grants[0], permit: RecipientPermit())
+        } else {
+            try await repository.invalidateGrantDestination(scope: scope, recipient: grants[0].recipient, identifier: grants[0].identifier, permit: RecipientPermit())
+        }
         let reopened = try EncryptedItemRepository(storeURL: SyncStoreLayout.contentPreviewURL(in: root))
         #expect(try await reopened.hasGrantDestinationRepairs(scope: scope, recipient: grants[0].recipient))
         #expect(try await reopened.contentGrantDelivery(grants[1]) == .cloudConfirmed)

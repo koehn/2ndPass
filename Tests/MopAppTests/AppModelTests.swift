@@ -32,10 +32,17 @@ private final class FakeService: VaultService, Sendable {
         var displayResult: VaultResult?
         var suggestionRefreshes = 0
         var syncRequests = 0
+        var syncHealthReads = 0
+        var syncHealth: SyncHealthSnapshot?
+        var syncHealthWait: (@Sendable () async -> Void)?
         var prerequisiteRefreshes = 0
         var syncFails = false
         var enrollmentResets = 0
         var resetFails = false
+        var reauthentications = 0
+        var reauthenticationCancelled = false
+        var reauthenticationFails = false
+        var reauthenticationWait: (@Sendable () async -> Void)?
         var pendingDeletions: Int?
         var maintenanceActive = true
         var displayCalls = 0
@@ -54,6 +61,15 @@ private final class FakeService: VaultService, Sendable {
     init(cached: @escaping @Sendable (String) async throws -> VaultResult?,
          _ handler: @escaping @Sendable (VaultOperation, String?, Bool) async throws -> VaultResult) {
         cachedHandler = cached; self.handler = handler
+    }
+    func reauthenticate() async throws {
+        let outcome = state.withLock { value in
+            value.reauthentications += 1
+            return (value.reauthenticationCancelled, value.reauthenticationFails, value.reauthenticationWait)
+        }
+        await outcome.2?()
+        if outcome.0 { throw CancellationError() }
+        if outcome.1 { throw MopError.authentication }
     }
     func pendingVaultDeletionCount() async throws -> Int? { state.withLock { $0.pendingDeletions } }
     func setMaintenanceActive(_ active: Bool) { state.withLock { $0.maintenanceActive = active } }
@@ -113,6 +129,14 @@ private final class FakeService: VaultService, Sendable {
             continuation.onTermination = { [weak self] _ in self?.state.withLock { $0.observers[id] = nil } }
         }
     }
+    func synchronizationHealth() async throws -> SyncHealthSnapshot? {
+        let (snapshot, wait) = state.withLock { value in
+            value.syncHealthReads += 1
+            return (value.syncHealth, value.syncHealthWait)
+        }
+        await wait?()
+        return snapshot
+    }
     func events() async -> AsyncStream<VaultChange> {
         let id = UUID()
         return AsyncStream { continuation in
@@ -147,6 +171,7 @@ private actor Barrier {
     var continuation: CheckedContinuation<Void, Never>?
     func wait() async { entered = true; await withCheckedContinuation { continuation = $0 } }
     func release() { continuation?.resume(); continuation = nil }
+    func resetEntered() { entered = false }
 }
 @MainActor private final class Clock { var time: TimeInterval = 0 }
 
@@ -158,6 +183,52 @@ private actor Barrier {
         model.vaults = [VaultDescriptor(id: model.vault, name: "personal", format: "mop-content-v3", enrolled: true)]
         return model
     }
+    @Test func syncStatusBurstsCoalesceAndRetainTrailingChanges() async throws {
+        let service = FakeService(), delay = Barrier(), read = Barrier()
+        service.state.withLock {
+            $0.syncHealth = .init(pendingCount: 10, oldestPendingAt: nil, lastDeliveryAt: nil, blockedReasons: [])
+            $0.syncHealthWait = { await read.wait() }
+        }
+        let app = AppModel(service: service, syncStatusDelay: { await delay.wait() },
+                           automaticTimer: false, unlockOnActivation: false)
+        for _ in 0..<100 { app.requestSyncStatusRefresh() }
+        while !(await delay.entered) { await Task.yield() }
+        #expect(service.state.withLock { $0.syncHealthReads } == 0)
+        await delay.release()
+        while !(await read.entered) { await Task.yield() }
+        service.state.withLock {
+            $0.syncHealth = .init(pendingCount: 0, oldestPendingAt: nil, lastDeliveryAt: nil, blockedReasons: [])
+            $0.syncHealthWait = nil
+        }
+        for _ in 0..<100 { app.requestSyncStatusRefresh() }
+        await read.release()
+        while app.synchronizationHealth?.pendingCount != 10 { await Task.yield() }
+        // The trailing read waits for another interval, despite a continuous burst.
+        while await delay.continuation == nil { await Task.yield() }
+        await delay.release()
+        while app.synchronizationHealth?.pendingCount != 0 { await Task.yield() }
+        #expect(service.state.withLock { $0.syncHealthReads } == 2)
+    }
+
+    @Test func syncStatusReadCannotRestoreStateAfterLock() async throws {
+        let service = FakeService(), read = Barrier()
+        service.state.withLock {
+            $0.syncHealth = .init(pendingCount: 10, oldestPendingAt: nil, lastDeliveryAt: nil, blockedReasons: [])
+            $0.syncHealthWait = { await read.wait() }
+        }
+        let app = AppModel(service: service, syncStatusDelay: {}, automaticTimer: false, unlockOnActivation: false)
+        app.requestSyncStatusRefresh()
+        while !(await read.entered) { await Task.yield() }
+        app.lock(clearClipboard: false)
+        await read.release()
+        for _ in 0..<30 { await Task.yield() }
+        #expect(app.synchronizationHealth == nil)
+        service.state.withLock { $0.syncHealthWait = nil }
+        app.requestSyncStatusRefresh()
+        while app.synchronizationHealth == nil { await Task.yield() }
+        #expect(service.state.withLock { $0.syncHealthReads } == 2)
+    }
+
     @Test func startupDiscoveryShowsConnectedWaitingWithoutReactivation() async throws {
         let id = UUID().uuidString
         let service = FakeService { operation, _, _ in
@@ -336,6 +407,40 @@ private actor Barrier {
         #expect(!app.enrollmentResetAlertPresented)
     }
     #endif
+    @Test func backgroundConflictBurstWaitsAndLockCancelsDelayedScan() async throws {
+        let service = FakeService(), delay = Barrier()
+        service.authenticate()
+        let app = AppModel(service: service, conflictRefreshDelay: { await delay.wait() },
+            automaticTimer: false, unlockOnActivation: false)
+        app.vault = UUID().uuidString
+        app.catalogs[app.vault] = Self.catalog
+        app.authenticated = true
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !(await delay.entered) {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        for _ in 0..<100 { app.refreshConflicts() }
+        #expect(service.state.withLock { $0.conflictCalls } == 0)
+        await delay.release()
+        while app.checkingConflicts {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        #expect(service.state.withLock { $0.conflictCalls } == 1)
+        await delay.resetEntered()
+        app.refreshConflicts()
+        while !(await delay.entered) {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.coderInvalidValue) }
+            await Task.yield()
+        }
+        app.lock(clearClipboard: false)
+        await delay.release()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(service.state.withLock { $0.conflictCalls } == 1)
+        #expect(app.conflictPreviews.isEmpty && !app.checkingConflicts)
+    }
+
     @Test func repeatedConflictUpdatesCoalesceWhileScanIsBlocked() async throws {
         let service = FakeService(); service.authenticate()
         let app = model(service), gate = Barrier()
@@ -574,12 +679,84 @@ private actor Barrier {
         #expect(app.catalog?.items.map(\.name) == previousCatalog?.items.map(\.name))
         #expect(app.error == nil)
         #expect(app.catalogUpdatePaused)
-        #expect(app.notice?.contains("device authentication") == true)
+        #expect(app.updateAuthenticationState == .required)
         #expect(service.state.withLock { $0.locks } == 0)
-        clock.time = 3599; app.checkExpiration()
+        let pausedCalls = service.state.withLock { $0.displayCalls }
+        for _ in 0..<10 {
+            app.cloudChanged()
+            await Task.yield()
+            #expect(app.canResumeUpdates)
+        }
+        try await finish(app)
+        #expect(service.state.withLock { $0.displayCalls } == pausedCalls)
+        expired.withLock { $0 = false }
+        app.resumeUpdates()
+        for _ in 0..<1000 where app.updateAuthenticationState != .ready { await Task.yield() }
+        try await finish(app)
+        #expect(app.updateAuthenticationState == .ready)
+        #expect(service.state.withLock { $0.displayCalls } > pausedCalls)
+        #expect(service.state.withLock { $0.reauthentications } == 1)
+        // Successful explicit authentication starts a fresh idle interval.
+        clock.time = 600
+        app.checkExpiration()
+        clock.time = 4199; app.checkExpiration()
         #expect(app.authenticated && app.autoLockMinutes == 60)
-        clock.time = 3600; app.checkExpiration()
+        clock.time = 4200; app.checkExpiration()
         #expect(!app.authenticated && app.sessionState == .locked(.timeout))
+    }
+
+    @Test func reauthenticationSurvivesDialogDeactivationButNotBackground() async throws {
+        let service = FakeService(); service.authenticate()
+        let barrier = Barrier()
+        service.state.withLock { $0.reauthenticationWait = { await barrier.wait() } }
+        let app = model(service); app.authenticated = true
+        app.resumeUpdates()
+        while !(await barrier.entered) { await Task.yield() }
+        app.deactivate()
+        #expect(app.updateAuthenticationState == .authenticating)
+        #expect(service.isAuthenticated)
+        app.background()
+        #expect(!service.isAuthenticated && app.updateAuthenticationState == .ready)
+        await barrier.release()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(!app.authenticated && app.updateAuthenticationState == .ready)
+    }
+
+    @Test func successfulReauthenticationResetsIdleDeadlineAndPreservesSelection() async throws {
+        let service = FakeService(); service.authenticate()
+        let clock = Clock(), app = model(service, clock: clock)
+        app.authenticated = true; app.autoLockMinutes = 1; app.vault = "v"; app.selectedItem = "selected"
+        app.checkExpiration(); clock.time = 50
+        app.resumeUpdates()
+        for _ in 0..<100 where app.updateAuthenticationState == .authenticating { await Task.yield() }
+        #expect(app.updateAuthenticationState == .required)
+        #expect(app.selectedItem == "selected")
+        clock.time = 109; app.checkExpiration(); #expect(app.authenticated)
+        clock.time = 110; app.checkExpiration(); #expect(!app.authenticated)
+    }
+
+    @Test func explicitReauthenticationCancellationPreservesScreen() async throws {
+        let service = FakeService(); service.authenticate()
+        service.state.withLock { $0.reauthenticationCancelled = true }
+        let app = model(service); app.authenticated = true; app.vault = "v"; app.selectedItem = "selected"
+        #expect(app.deferBackgroundAuthentication(NSError(domain: "com.apple.LocalAuthentication", code: -1004), operation: "test"))
+        app.resumeUpdates(); app.resumeUpdates()
+        for _ in 0..<100 where app.updateAuthenticationState == .authenticating { await Task.yield() }
+        #expect(app.updateAuthenticationState == .required)
+        #expect(app.vault == "v" && app.selectedItem == "selected" && app.authenticated)
+        #expect(service.state.withLock { $0.reauthentications } == 1)
+        #expect(app.error == nil)
+    }
+
+    @Test func explicitReauthenticationFailureDoesNotLoop() async throws {
+        let service = FakeService(); service.authenticate()
+        service.state.withLock { $0.reauthenticationFails = true }
+        let app = model(service); app.authenticated = true
+        app.resumeUpdates()
+        for _ in 0..<100 where app.updateAuthenticationState == .authenticating { await Task.yield() }
+        #expect(app.updateAuthenticationState == .failed)
+        #expect(service.state.withLock { $0.reauthentications } == 1)
+        #expect(app.authenticated)
     }
 
     @Test func backgroundAuthenticationDeferralIsNarrowAndDoesNotReviveLockedSession() {
@@ -853,7 +1030,7 @@ private actor Barrier {
         #expect(model.authenticated && model.isActive)
         #expect(service.state.withLock { $0.maintenanceActive })
     }
-    @Test func advancingBacklogRenewsIdleTimerButStalledWorkExpires() {
+    @Test func advancingBacklogDoesNotRenewIdleTimer() {
         let clock = Clock(), service = FakeService(); service.authenticate()
         let app = model(service, clock: clock)
         app.checkExpiration()
@@ -863,7 +1040,7 @@ private actor Barrier {
         app.applySyncHealth(.init(pendingCount: 9, oldestPendingAt: nil, lastDeliveryAt: nil,
             blockedReasons: [], pendingKinds: [.rotateContent]))
         clock.time = 301; app.checkExpiration()
-        #expect(service.isAuthenticated)
+        #expect(!service.isAuthenticated)
         clock.time = 598
         app.applySyncHealth(.init(pendingCount: 9, oldestPendingAt: nil, lastDeliveryAt: nil,
             blockedReasons: [], pendingKinds: [.rotateContent]))
@@ -2775,6 +2952,25 @@ extension AppModelTests {
         return (app, service)
     }
 
+    @Test func returningToListDoesNotRestoreItemOnSyncRefresh() async throws {
+        let suite = "selection-back-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let vault = UUID().uuidString
+        var item = VaultItem(name: "Entry", fields: []); item.storageID = UUID().uuidString
+        var catalog = ItemCatalog(vault: "personal", revision: "r", items: [item])
+        catalog.usageScope = UUID().uuidString
+        let (app, service) = selectionModel([vault: catalog], defaults: defaults)
+        app.unlock(); try await finish(app)
+        app.selectedRow = .init(vault: vault, name: item.name)
+        app.lock(); service.authenticate(); app.unlock(); try await finish(app)
+        #expect(app.selectedItem == item.name)
+        app.selectedRow = nil
+        app.refresh(); try await finish(app)
+        #expect(app.selectedItem == nil)
+        app.lock()
+    }
+
     @Test func selectionSurvivesLockRestartAndItemRenameUsingDeviceLocalIDs() async throws {
         let suite = "selection-test-" + UUID().uuidString, account = UUID().uuidString, vault = UUID().uuidString
         let defaults = UserDefaults(suiteName: suite)!
@@ -3789,8 +3985,8 @@ extension AppModelTests {
             blockedWork: [.init(reason: .missingGrant, count: 1, oldestOperationAt: Date(timeIntervalSince1970: 100), nextAttempt: nil)]))
         #expect(app.syncIssue?.contains("authorized device") == true)
         app.showSyncIssue()
-        #expect(app.errorDetails?.contains("1 operation(s)") == true)
-        #expect(app.errorDetails?.contains("Oldest operation created") == true)
+        #expect(app.syncDiagnosticsPresented)
+        #expect(app.error == nil)
         app.applySyncHealth(.init(pendingCount: 0, oldestPendingAt: nil, lastDeliveryAt: nil, blockedReasons: []))
         #expect(app.syncIssue == nil)
         for reason in SyncBlockReason.allCases { #expect(!AppModel.blockedWorkExplanation(reason).isEmpty) }
@@ -3925,4 +4121,19 @@ extension AppModelTests {
         #expect(service.state.withLock { $0.enrollmentPrompts } == 1)
         app.lock()
     }
+}
+
+@Test func diagnosticsBoundsVisibleWorkAndExportsEntireSnapshot() async {
+    let snapshot = (0..<1001).map { index in
+        SyncOperationDiagnostic(operation: SyncOperation(account: "test", kind: .prepareGrant,
+            now: Date(timeIntervalSince1970: Double(index))), transport: nil)
+    }
+    #expect(SyncDiagnosticsView.visibleOperations(snapshot, page: 0).count == 25)
+    #expect(SyncDiagnosticsView.visibleOperations(snapshot, page: 1).first?.id == snapshot[25].id)
+    #expect(SyncDiagnosticsView.visibleOperations(snapshot, page: 40).map(\.id) == [snapshot[1000].id])
+    #expect(SyncDiagnosticsView.visibleOperations(snapshot, page: 41).isEmpty)
+    let report = await Task.detached { SyncDiagnosticsView.diagnosticReport(snapshot) }.value
+    #expect(report.contains(snapshot[0].id.uuidString))
+    #expect(report.contains(snapshot[1000].id.uuidString))
+    #expect(report.components(separatedBy: "Operation: ").count == 1002)
 }

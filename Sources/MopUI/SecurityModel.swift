@@ -125,7 +125,8 @@ extension AppModel {
                 if vault == id { try applyCatalog(updated) }
             } catch {
                 guard authenticated, healthToken == token else { return }
-                healthCacheLogger.error("Health evidence save failed: domain=\((error as NSError).domain, privacy: .public), code=\((error as NSError).code)")
+                let reason = (error as? MopError)?.errorDescription ?? "See error domain and code"
+                healthCacheLogger.error("Health evidence save failed: domain=\((error as NSError).domain, privacy: .public), code=\((error as NSError).code), reason=\(reason, privacy: .public)")
                 if let error = error as? MopError, error == .vaultConflict {
                     healthCacheDirty = true
                     // Refresh the source revision before the next coalesced write.

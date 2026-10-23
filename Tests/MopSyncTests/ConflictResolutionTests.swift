@@ -46,6 +46,9 @@ private func conflictedRepository() async throws -> (URL, EncryptedItemRepositor
         ciphertext: Data([4]), generation: 3)
     let newerPending = try await repository.commitTestContent(changed)
     await #expect(throws: ItemRepositoryError.staleConflict) {
+        try await repository.reviewedContentConflict(conflict)
+    }
+    await #expect(throws: ItemRepositoryError.staleConflict) {
         try await repository.chooseRemoteTestContent(conflict, authorization: ResolutionPermit())
     }
     let refreshed = try #require(try await repository.contentConflicts(account: changed.scope.account).first)
@@ -124,4 +127,33 @@ private func conflictedRepository() async throws -> (URL, EncryptedItemRepositor
         ciphertext: Data([4]), generation: 3)
     _ = try await repository.resolveTestContent(conflict, with: resolved, authorization: ResolutionPermit())
     #expect(try await repository.pendingScopes(account: account, excludingConflicts: true).contains(resolved.scope))
+}
+
+@Test func batchedConflictListingAndTargetedReviewPreserveExactChecks() async throws {
+    let (directory, repository, _, original) = try await conflictedRepository()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var expected = [original]
+    for index in 0..<256 {
+        let remote = EncryptedItemVersion(scope: original.remote.scope, baseVersionID: original.remote.versionID,
+            ciphertext: Data([UInt8(index % 255), 8]), generation: 3)
+        expected.append(try await repository.branchTestContent(remote: remote, serverSystemFields: Data([7])))
+    }
+    let before = await repository.conflictBatchReads
+    let listed = try await repository.contentConflicts(account: original.local.scope.account)
+    #expect(listed.count == expected.count)
+    #expect(listed.allSatisfy { expected.contains($0) })
+    // One shared local head, two bounded version fetches, two field fetches.
+    #expect(await repository.conflictBatchReads - before == 5)
+    let after = await repository.conflictBatchReads
+    for conflict in listed { #expect(try await repository.reviewedContentConflict(conflict) == conflict) }
+    #expect(await repository.conflictBatchReads == after)
+    #expect(try await repository.contentConflicts(account: "unrelated").isEmpty)
+    let changedFields = try await repository.branchTestContent(remote: original.remote, serverSystemFields: Data([99]))
+    await #expect(throws: ItemRepositoryError.staleConflict) { try await repository.reviewedContentConflict(original) }
+    #expect(try await repository.reviewedContentConflict(changedFields) == changedFields)
+    _ = try await repository.chooseRemoteTestContent(changedFields, authorization: ResolutionPermit())
+    await #expect(throws: ItemRepositoryError.staleConflict) { try await repository.reviewedContentConflict(changedFields) }
+    // The chosen branch is gone; other previews are stale because the head changed.
+    await #expect(throws: ItemRepositoryError.staleConflict) { try await repository.reviewedContentConflict(expected[1]) }
+    #expect(try await repository.contentConflicts(account: original.local.scope.account).count == 256)
 }

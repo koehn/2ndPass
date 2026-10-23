@@ -18,6 +18,7 @@ import MopLocalIdentity
     private var pendingList = false
     private var savingLogin = false
     private var pendingIdentity: AutoFillIdentity?
+    private var retryRememberedHosts: Set<String> = []
     private var retryIdentity: AutoFillIdentity?
     private var retryField: CredentialField?
     #if os(macOS)
@@ -27,7 +28,7 @@ import MopLocalIdentity
     private let model = CredentialListModel()
 
     override func loadView() {
-        let content = CredentialRootView(model: model, createLogin: { [weak self] in self?.createLogin() }, saveLogin: { [weak self] in self?.saveLogin() }, reloadLoginVaults: { [weak self] in self?.loadLoginVaults() }, passkeyPerform: { [weak self] in self?.performPasskey($0, vault: $1) }, select: { [weak self] in self?.fill($0, field: $1) },
+        let content = CredentialRootView(model: model, createLogin: { [weak self] in self?.createLogin() }, saveLogin: { [weak self] in self?.saveLogin() }, reloadLoginVaults: { [weak self] in self?.loadLoginVaults() }, passkeyPerform: { [weak self] in self?.performPasskey($0, vault: $1) }, select: { [weak self] in self?.fill($0, field: $1, remembering: $2) },
                                          retry: { [weak self] in self?.retry() },
                                          chooseAnother: { [weak self] in self?.prepareList(kind: self?.model.kind) },
                                          cancel: { [weak self] in self?.cancel() },
@@ -418,7 +419,7 @@ import MopLocalIdentity
         }
     }
     private func prepare(_ identity: AutoFillIdentity) {
-        stop(); retryIdentity = identity; pendingIdentity = identity
+        stop(); retryIdentity = identity; retryRememberedHosts = []; pendingIdentity = identity
         model.kind = identity.kind; model.showsPicker = false; model.textInsertion = false
         model.message = nil; model.loading = true
         updatePreferredContentSize()
@@ -447,38 +448,48 @@ import MopLocalIdentity
         preferredContentSize = model.loginDraft != nil || model.showsPicker ? NSSize(width: 480, height: 640) : NSSize(width: 440, height: model.message == nil ? 300 : 440)
         #endif
     }
-    private func fill(_ identity: AutoFillIdentity, field: CredentialField? = nil) {
+    private func fill(_ identity: AutoFillIdentity, field: CredentialField? = nil, remembering hosts: Set<String> = []) {
         guard !model.loading || session == nil else { return }
         task?.cancel()
-        retryIdentity = identity; retryField = field
+        retryIdentity = identity; retryField = field; retryRememberedHosts = hosts
         model.message = nil; model.loading = true
         let value = session ?? beginSession()
         let token = generation
+        // The local index is staged before filling. Refresh system suggestions
+        // only once the host has finished its credential request.
+        let completion: (@Sendable (Bool) -> Void)?
+        if hosts.isEmpty {
+            completion = nil
+        } else {
+            completion = { _ in
+                Task { try? await AutoFillPublisher.shared.refresh() }
+            }
+        }
         task = Task {
             do {
                 if identity.kind == .oneTimeCode {
-                    let result = try await value.code(identity)
+                    let result = try await value.code(identity, remembering: hosts)
                     guard token == generation, !Task.isCancelled else { return }
                     guard result.expiresAt > Date() else { throw MopError.invalidOTP }
                     await value.recordDeliveredUsage()
                     guard token == generation, !Task.isCancelled else { return }
                     finish()
                     #if os(iOS)
-                    if field == .code { extensionContext.completeRequest(withTextToInsert: result.credential.code, completionHandler: nil); return }
+                    if field == .code { extensionContext.completeRequest(withTextToInsert: result.credential.code, completionHandler: completion); return }
                     #endif
-                    extensionContext.completeOneTimeCodeRequest(using: result.credential, completionHandler: nil)
+                    extensionContext.completeOneTimeCodeRequest(using: result.credential, completionHandler: completion)
                 } else {
-                    let credential = try await value.password(identity)
+                    let credential = try await value.password(identity, remembering: hosts)
                     guard token == generation, !Task.isCancelled else { return }
                     await value.recordDeliveredUsage()
                     guard token == generation, !Task.isCancelled else { return }
                     finish()
                     #if os(iOS)
                     if let field {
-                        extensionContext.completeRequest(withTextToInsert: field == .username ? credential.user : credential.password, completionHandler: nil); return
+                        extensionContext.completeRequest(withTextToInsert: field == .username ? credential.user : credential.password, completionHandler: completion); return
                     }
                     #endif
-                    extensionContext.completeRequest(withSelectedCredential: credential, completionHandler: nil)
+                    extensionContext.completeRequest(withSelectedCredential: credential, completionHandler: completion)
                 }
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
@@ -487,11 +498,16 @@ import MopLocalIdentity
         }
     }
     private func retry() {
-        if let identity = retryIdentity { fill(identity, field: retryField) }
+        if let identity = retryIdentity { fill(identity, field: retryField, remembering: retryRememberedHosts) }
         else { prepareList(kind: model.kind) }
     }
     private func failure(_ error: Error) {
         finish(); model.loading = false
+        if let saveError = error as? AutoFillLoginSaveError {
+            model.message = saveError.localizedDescription
+            updatePreferredContentSize()
+            return
+        }
         switch error as? MopError {
         case .authentication: model.message = "Authentication was cancelled. Retry when you are ready."
         case .notFound: model.message = "This account was changed or removed. Choose another account, or refresh suggestions in 2ndPass."
@@ -562,7 +578,7 @@ private struct CredentialRootView: View {
     let saveLogin: () -> Void
     let reloadLoginVaults: () -> Void
     let passkeyPerform: (String?, String) -> Void
-    let select: (AutoFillIdentity, CredentialField?) -> Void
+    let select: (AutoFillIdentity, CredentialField?, Set<String>) -> Void
     let retry: () -> Void
     let chooseAnother: () -> Void
     let cancel: () -> Void
@@ -581,21 +597,23 @@ private struct CredentialRootView: View {
 private struct CredentialListView: View {
     @Bindable var model: CredentialListModel
     let createLogin: () -> Void
-    let select: (AutoFillIdentity, CredentialField?) -> Void
+    let select: (AutoFillIdentity, CredentialField?, Set<String>) -> Void
     let retry: () -> Void
     let chooseAnother: () -> Void
     let cancel: () -> Void
     @State private var search = ""
-    @State private var showsOtherAccounts = false
     @State private var selection: String?
     @State private var unrelated: AutoFillIdentity?
     @State private var insertionField: CredentialField?
     @FocusState private var searchFocused: Bool
     private var filtered: [AutoFillIdentity] {
-        model.entries.filter { search.isEmpty || [$0.website, $0.username].contains { $0.localizedCaseInsensitiveContains(search) } }
+        model.entries.filter { entry in
+            if search.isEmpty { return model.hosts.isEmpty || model.hosts.contains(entry.website) }
+            return [entry.website, entry.username].contains { $0.localizedCaseInsensitiveContains(search) }
+        }
     }
     private var ordered: [AutoFillIdentity] {
-        matching + (model.hosts.isEmpty || showsOtherAccounts ? other : [])
+        matching + other
     }
     private var matching: [AutoFillIdentity] { filtered.filter { model.hosts.contains($0.website) } }
     private var other: [AutoFillIdentity] { filtered.filter { !model.hosts.contains($0.website) } }
@@ -615,13 +633,9 @@ private struct CredentialListView: View {
                     .onSubmit { fillSelected() }
                     .onKeyPress(.downArrow) { moveSelection(1); return .handled }
                     .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
-                if !model.hosts.isEmpty {
+                if search.isEmpty && !model.hosts.isEmpty {
                     if !model.entries.contains(where: { model.hosts.contains($0.website) }) {
-                        Text("No accounts match this website exactly.").foregroundStyle(.secondary)
-                    }
-                    Button(showsOtherAccounts ? "Hide other accounts" : "Show other accounts") {
-                        showsOtherAccounts.toggle()
-                        selection = ordered.first?.id
+                        Text("No accounts match this website. Search to find an account for another site.").foregroundStyle(.secondary)
                     }
                 }
                 if ordered.isEmpty {
@@ -630,9 +644,7 @@ private struct CredentialListView: View {
                 else {
                     List(selection: $selection) {
                         if !model.hosts.isEmpty { section("For This Website", entries: matching) }
-                        if model.hosts.isEmpty || showsOtherAccounts {
-                            section(model.hosts.isEmpty ? "Accounts" : "Other Accounts", entries: other)
-                        }
+                        section(model.hosts.isEmpty ? "Accounts" : "Other Accounts", entries: other)
                     }
                     .onKeyPress(.return) { fillSelected(); return .handled }
                     if !model.textInsertion {
@@ -649,10 +661,10 @@ private struct CredentialListView: View {
         .frame(maxHeight: .infinity, alignment: .top)
         .onChange(of: model.entries) { _, _ in
             selection = ordered.first?.id; searchFocused = !model.entries.isEmpty
-            if model.entries.isEmpty { unrelated = nil; search = ""; showsOtherAccounts = false }
+            if model.entries.isEmpty { unrelated = nil; search = "" }
         }
         .onChange(of: model.hosts) { _, _ in
-            showsOtherAccounts = false; unrelated = nil; selection = ordered.first?.id
+            unrelated = nil; selection = ordered.first?.id
         }
         .onChange(of: search) { _, _ in selection = ordered.first?.id }
         .sheet(item: $unrelated) { account in
@@ -660,10 +672,14 @@ private struct CredentialListView: View {
                 AutoFillDialogHeader(title: "Use this account for another website?")
                 Text("The requested site is \(model.hosts.sorted().joined(separator: ", ")). This account is for \(account.website): \(account.username).")
                     .fixedSize(horizontal: false, vertical: true)
+                Text("Fill & Remember adds the requested website to this login for future AutoFill.")
+                    .font(.callout).foregroundStyle(.secondary)
                 HStack {
                     Button("Cancel", role: .cancel) { unrelated = nil }.keyboardShortcut(.cancelAction)
                     Spacer()
-                    Button("Fill Account") { unrelated = nil; select(account, insertionField) }
+                    Button("Fill") { unrelated = nil; select(account, insertionField, []) }
+                        .disabled(model.loading)
+                    Button("Fill & Remember") { unrelated = nil; select(account, insertionField, model.hosts) }
                         .buttonStyle(.borderedProminent).disabled(model.loading)
                 }
             }.padding(24)
@@ -702,7 +718,7 @@ private struct CredentialListView: View {
     private func choose(_ entry: AutoFillIdentity, field: CredentialField? = nil) {
         guard !model.loading else { return }
         if !model.hosts.isEmpty && !model.hosts.contains(entry.website) { insertionField = field; unrelated = entry }
-        else { select(entry, field) }
+        else { select(entry, field, []) }
     }
     private func fillSelected() {
         guard let entry = ordered.first(where: { $0.id == selection }) else { return }
