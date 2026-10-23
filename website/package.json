@@ -9,5 +9,5 @@
     "dev": "eleventy --serve --port=8080",
     "check": "python3 check.py"
   },
-  "devDependencies": { "@11ty/eleventy": "3.1.6" }
+  "devDependencies": { "@11ty/eleventy": "3.1.7" }
 }
